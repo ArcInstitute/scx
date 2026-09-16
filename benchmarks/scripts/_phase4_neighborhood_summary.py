@@ -23,9 +23,11 @@ import statistics
 import sys
 
 ARMS = ("graph", "coords")
-# Recorded on the same runs. These DO exist on main; they are here so that
-# "nothing else moved on this fixture" is a measurement rather than an
-# inference from another dataset's capture.
+# Recorded on the same runs. These DO exist on main — but every run in a
+# capture is a HEAD build, so what they show is within-build variance, not a
+# comparison against `main`. They would catch the shared gather path going
+# unstable under the new arms sharing its process; they cannot catch a
+# regression.
 CARRIED = (
     "cellsets_per_sec__gather_random",
     "cellsets_per_sec__gather_grouped",

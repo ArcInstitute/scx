@@ -131,6 +131,7 @@ pub struct BackedPairwiseReader {
 impl BackedPairwiseReader {
     /// Open a bounded reader over `obsp/<name>`.
     pub fn new_obsp(reader: ScxReader, name: &str) -> Result<Self> {
+        let n_obs = reader.n_obs();
         let layout = reader.row_sharded_mapping_layout(
             "obsp",
             name,
@@ -138,10 +139,15 @@ impl BackedPairwiseReader {
             SectionType::ObspEmbedding,
             LegacyRowCount::SchemaNRows,
         )?;
-        Self::from_layout(reader, name, layout)
+        Self::from_layout(reader, name, layout, n_obs)
     }
 
-    fn from_layout(reader: ScxReader, name: &str, layout: MappingLayout) -> Result<Self> {
+    fn from_layout(
+        reader: ScxReader,
+        name: &str,
+        layout: MappingLayout,
+        n_obs: u64,
+    ) -> Result<Self> {
         // The COO schema is exactly `row` / `col` / `data`. Anything else is a
         // section written by something this reader does not understand, and
         // reading it as COO would answer confidently wrong.
@@ -165,9 +171,15 @@ impl BackedPairwiseReader {
         // column index as a row id — so a non-square one hands the gather rows
         // that do not exist. Refused here, where the shape is known, rather
         // than at gather time where it is someone else's error message.
-        if n_cols != layout.n_rows {
+        // Square, AND the file's own obs axis. Squareness alone lets a 500x500
+        // graph open on a 1,000-cell file, and nothing downstream would say so:
+        // the plan builder would emit 500 centres, `read_obsp_rows(logical=False)`
+        // would report a 500-column physical graph against an `n_obs_physical`
+        // of 1,000, and the only symptom is half the cells quietly missing.
+        if n_cols != layout.n_rows || layout.n_rows != n_obs {
             return Err(ScxError::InvalidCatalog(format!(
-                "obsp/{name}: {} rows x {n_cols} columns — a pairwise obs mapping must be square",
+                "obsp/{name}: {} rows x {n_cols} columns on a file with {n_obs} observations — \
+                 a pairwise obs mapping must be square and on the file's own obs axis",
                 layout.n_rows
             )));
         }

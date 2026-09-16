@@ -1175,9 +1175,11 @@ def _coerce_read_path(p):
 
     The plan builders take a path and re-open the file, which means a closed or
     stale handle would otherwise sail straight through — every other
-    `Experiment` read refuses both. Touching `n_obs` routes through the same
-    guarded reader those reads use, so the handle raises here for the same
-    reason and with the same message.
+    `Experiment` read refuses both. Touching `n_obs_physical` routes through
+    the same guarded reader those reads use, so the handle raises here for the
+    same reason and with the same message — and unlike `n_obs`, it does not
+    also decode the deletion section, which the builder is about to do on its
+    own reader.
     """
     if getattr(p, "reload", None) is not None and isinstance(getattr(p, "path", None), str):
         # `n_obs_physical`, not `n_obs`: both go through the guarded reader, but
@@ -1207,7 +1209,8 @@ def neighborhood_plans_from_graph(
     `.iter_with_plans` consume, so a neighbourhood workload becomes an ordinary
     cell-set workload::
 
-        plans, centers = pyscx.neighborhood_plans_from_graph(exp, k=8, file_id=0)
+        plans, centers = pyscx.neighborhood_plans_from_graph(
+            exp, file_id=0, k=8, weight_order="desc")
         ds = pyscx.SparseCellSetDataset([exp.path])
         batch = ds.gather(*plans[0])
 

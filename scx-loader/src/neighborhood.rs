@@ -226,6 +226,14 @@ pub fn plans_from_graph_chunk(
             scratch.push((v, c));
         }
         if let Some(k) = k {
+            // Dropped, not merely sorted last. Ordering them last stops a
+            // non-finite edge DISPLACING a finite one, which is what the
+            // round-1 test checked — but with fewer than `k` finite edges the
+            // `inf` was still emitted, contradicting the contract that a
+            // distance graph's "not connected" is never a near neighbour. The
+            // partition in `cmp_weight` stays: it is what keeps the comparator
+            // a total order for `sort_by`, which is a separate obligation.
+            scratch.retain(|&(w, _)| w.is_finite());
             scratch.sort_by(|a, b| cmp_weight(*a, *b, weight_order));
             scratch.truncate(k);
             // Restore column order among the chosen edges, so which edges `k`
@@ -620,11 +628,6 @@ impl Grid {
     }
 }
 
-/// One set ended at `total`; record the boundary.
-fn rows_len_checked(set_offsets: &mut Vec<i64>, total: usize) {
-    set_offsets.push(total as i64);
-}
-
 /// (squared distance ascending, row ascending) — the declared tie order.
 ///
 /// `total_cmp` rather than `partial_cmp(..).unwrap_or(Equal)`: the latter is not
@@ -727,13 +730,12 @@ pub fn batch_plans(
         let mut set_offsets = vec![0i64];
         for &i in chunk {
             let p = &plans[i];
-            // Each input is expected to be a single set; a multi-set input is
-            // re-based set by set rather than collapsed into one, so batching
-            // an already-batched list is idempotent in shape.
+            // One set per input, refused above if not — so one appended
+            // boundary per input, and `sets_per_batch` counts sets.
             file_ids.extend_from_slice(&p.file_ids);
             rows.extend_from_slice(&p.rows);
             role_tags.extend_from_slice(&p.role_tags);
-            rows_len_checked(&mut set_offsets, rows.len());
+            set_offsets.push(rows.len() as i64);
         }
         out.push(SparseCellSetPlan {
             file_ids,
@@ -844,7 +846,12 @@ pub fn read_coords_from(scx: ScxReader, key: &str) -> Result<(Vec<f32>, usize)> 
             ),
         });
     }
-    let batch = reader.read_rows_range(0, n_rows as u64)?;
+    // `read_all`, not `read_rows_range(0, n_rows)`: the range path warms the
+    // shards into a cache and then gathers from it, so with the 1-shard cache
+    // this reader is built with, a multi-shard coordinate matrix is decoded
+    // twice as the two passes evict each other. There is no row selection to
+    // make here — every coordinate is wanted.
+    let batch = reader.read_all()?;
     let mut out = vec![0.0f32; n_rows * d];
     for (j, col) in batch.columns().iter().enumerate() {
         let vals = coord_column_f32(col.as_ref(), key, j)?;

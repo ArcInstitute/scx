@@ -649,3 +649,35 @@ fn a_column_index_past_the_matrix_extent_is_refused() {
     let err = open(&path).read_rows_range(0, 1).unwrap_err().to_string();
     assert!(err.contains("out of range"), "{err}");
 }
+
+#[test]
+fn an_obsp_that_is_square_but_not_on_the_file_s_obs_axis_is_refused() {
+    // Squareness alone lets a 4x4 graph open on an 8-cell file, and nothing
+    // downstream says so: the plan builder emits four centres, a physical
+    // `read_obsp_rows` reports four columns against an `n_obs_physical` of
+    // eight, and the only symptom is half the cells quietly missing.
+    let dir = tempfile::tempdir().unwrap();
+    let n_obs = 8usize;
+    let path = dir.path().join("wrong_axis.scx");
+    let mut w = ScxWriter::new(&path, header(n_obs as u64)).unwrap();
+    w.write_obs(&obs(n_obs)).unwrap();
+    w.write_var(&var(4)).unwrap();
+    // A perfectly square 4x4 graph on an 8-cell file.
+    w.write_obsp(
+        "connectivities",
+        &coo_i32(&[(0, 1, 1.0), (1, 0, 1.0)], 4, 4),
+    )
+    .unwrap();
+    w.finish().unwrap();
+    let err =
+        match BackedPairwiseReader::new_obsp(ScxReader::open(&path).unwrap(), "connectivities") {
+            Ok(r) => panic!(
+                "a {}x{} obsp opened on an {n_obs}-cell file",
+                r.n_rows(),
+                r.n_cols()
+            ),
+            Err(e) => e.to_string(),
+        };
+    assert!(err.contains("file's own obs axis"), "{err}");
+    assert!(err.contains("8 observations"), "{err}");
+}

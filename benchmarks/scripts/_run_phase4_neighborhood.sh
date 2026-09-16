@@ -9,11 +9,8 @@
 # records on the same runs are NOT a substitute: every run is a head build, so
 # their stability is within-build variance and not a comparison against `main`.
 # They would show a shared gather path going unstable under the new arms sharing
-# its process; they cannot show a regression. What the two builds WOULD have told us —
-# is covered instead by the four pre-existing `cellsets_per_sec__gather_*`
-# metrics, which this job records on the same runs: they come from the same
-# module and the same fixture, so a change in the shared gather path shows up in
-# them.
+# its process; they cannot show a regression. Nothing in this job can — that
+# would take a `main` arm, and `main` does not have these metrics to compare.
 #
 # The arms are captured TWICE (ROUNDS=2 by default) before any floor is
 # proposed, per the phase gate. `thresholds.yaml` item 23 records what would

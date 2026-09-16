@@ -90,7 +90,6 @@ class ScxRunner(FormatRunner):
         codec_per_modality: bool = True,
         with_csc: bool = False,
         row_group_rows: int | None = None,
-        shard_size: int | None = None,
     ) -> None:
         if codec not in _CODEC_NAMES:
             raise ValueError(
@@ -107,8 +106,10 @@ class ScxRunner(FormatRunner):
         # auto-defaulted above) for shufdelta / compact / compact-trial.
         self.row_group_rows = row_group_rows
         # Rows per shard at conversion time; `None` = the writer's default.
-        # Set per dataset (see `DatasetConfig.shard_size`), not per format.
-        self.shard_size = shard_size
+        # Set per DATASET rather than per format — `convert_dataset_format`
+        # assigns it from `DatasetConfig.shard_size` before converting — so
+        # there is no constructor parameter for it: no caller would pass one.
+        self.shard_size: int | None = None
         # Phase K.3.4: when False, route every modality through the
         # single-modality `select_codec` helper instead of
         # `select_codec_for_modality`. Only meaningful for the

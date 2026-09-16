@@ -1348,3 +1348,32 @@ fn a_null_coordinate_is_refused_rather_than_read_from_the_buffer() {
         "the error must name the column: {err}"
     );
 }
+
+#[test]
+fn a_non_finite_weight_is_never_emitted_as_a_neighbour_even_when_k_is_short() {
+    // The round-1 test had exactly `k` finite edges, so it could only prove
+    // that a non-finite edge does not DISPLACE a finite one. With fewer finite
+    // edges than `k` the `inf` was still emitted — contradicting the contract
+    // that a distance graph's "not connected" is never a near neighbour.
+    for bad in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        let triples = vec![(0u64, 1u64, bad), (0, 2, 2.0f32), (0, 3, bad)];
+        let rows = rows_from(&triples, 4);
+        for order in [WeightOrder::Desc, WeightOrder::Asc] {
+            let mut out = NeighborhoodPlans::default();
+            // k = 3, but only ONE finite edge exists.
+            plans_from_graph_chunk(&rows, None, Some(3), order, cfg(true), &mut out);
+            assert_eq!(
+                set_rows(&out.plans[0]),
+                vec![0, 2],
+                "{bad} at {order:?} was emitted to fill out k"
+            );
+        }
+    }
+    // Without `k` there is no ranking and every stored edge passes through,
+    // which is the documented behaviour and stays that way.
+    let triples = vec![(0u64, 1u64, f32::INFINITY), (0, 2, 2.0f32)];
+    let rows = rows_from(&triples, 3);
+    let mut all = NeighborhoodPlans::default();
+    plans_from_graph_chunk(&rows, None, None, WeightOrder::Desc, cfg(true), &mut all);
+    assert_eq!(set_rows(&all.plans[0]), vec![0, 1, 2]);
+}

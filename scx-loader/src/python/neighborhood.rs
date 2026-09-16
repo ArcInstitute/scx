@@ -177,16 +177,16 @@ fn _neighborhood_plans_from_coords<'py>(
     };
     let built = py
         .detach(|| build_coord_plans(p, obsm_key, drop_deleted, query, cfg))
-        // A bad argument is a `ValueError`, as `k = 0` already is here — the
-        // dimensionality refusal is the same class of mistake and was arriving
-        // as a `RuntimeError` through `loader_err_to_py`'s catch-all.
-        .map_err(|e| match &e {
-            crate::error::LoaderError::ConfigError { reason }
-                if reason.contains("must be 1..=") || reason.contains("coordinates must be") =>
-            {
-                PyValueError::new_err(reason.clone())
-            }
-            _ => loader_err_to_py(e),
+        // Every `ConfigError` out of this entry point is a bad argument or
+        // bad input data — the dimensionality cap, a non-finite coordinate, a
+        // malformed obsm — so all of them are `ValueError`, matching the
+        // `k = 0` refusal above. An earlier version matched on the message
+        // text to pick out the dimensionality case, which meant rewording
+        // either of the two messages silently reverted the exception type and
+        // no test would have noticed.
+        .map_err(|e| match e {
+            crate::error::LoaderError::ConfigError { reason } => PyValueError::new_err(reason),
+            other => loader_err_to_py(other),
         })?;
     built_to_py(py, built)
 }

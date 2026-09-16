@@ -3305,92 +3305,78 @@ coordinates and graphs were stored and nothing turned either into a plan. These
 are the first captured numbers for the two builders and for gathering what they
 produce.
 
-One-armed capture, SLURM `2959338`, host `GPU0F98`, partition
-`cpu_batch_high_mem`, `phase4-neighborhood-plans` `ab156ab9`, 8 rounds × 3
-timed runs on `visium_lymph_node` (4,035 spots × 36,601 genes, 8 shards),
+One-armed capture, SLURM `2961099`, host `GPU0F98`, partition
+`cpu_batch_high_mem`, `phase4-neighborhood-plans` `5a69d7ad`, 8 rounds x 3
+timed runs on `visium_lymph_node` (4,035 spots x 36,601 genes, 8 shards),
 `RAYON_NUM_THREADS=16`, page cache dropped before every run. Raw rows under
 `results/raw/phase4_neighborhood/neighborhood.json`.
 
-⚠️ **One-armed, not the paired A/B phases 1–3 ran.** These arms do not exist on
-`main`, so there is no before build and no ratio.
+⚠️ **This capture replaces two earlier ones, and what it does *not* reproduce
+is worth stating.** The first (job `2959318`, 2 rounds) and second (`2959338`,
+8 rounds) were taken at `ab156ab9`, before two review fix commits changed the
+timed path — the graph open now compares every shard's schema and the COO
+decode validates every row against its shard's stamped span. Publishing pre-fix
+figures as the current builders' numbers is a provenance slip a reader cannot
+detect, so the capture was re-run at the reviewed head rather than annotated,
+and the superseded artifacts are not shipped.
 
-⚠️ **That means this capture cannot show that nothing else regressed, and an
-earlier draft of this section claimed it did.** The four pre-existing `gather_*`
-metrics were recorded on the same runs, but every one of those runs is a *head*
-build — the driver never builds `main`. Their stability is within-build
-variance, which is a useful thing to know and is not a comparison. Three of the
-four are steady across all eight rounds — 659.8 sets/s `gather_random`
-(spread 7.9 %), 708.05 `gather_grouped` (6.2 %) and 62.6 `gather_random_s512`
-(3.8 %) — so the shared gather path is at least not *unstable* under the new
-arms sharing its process. What rules out a regression against `main` here is
-the change itself: this PR adds a reader and two builders and edits no existing
-gather code, and the one shared edit (the layout resolver's new
-`LegacyRowCount`) is pinned by the pre-existing obsm suite.
-
-The fourth, `gather_grouped_s512`, is **not** steady and resolves nothing here:
-its median is 67.2 but round 7 reads 122.2, and that round's own three runs span
-66.0 / 122.2 / 171.0 sets/s. On this 4,035-spot fixture an S=512 grouped batch
-is most of the file, so the arm runs a handful of very large plans and a single
-scheduling hiccup moves it 2.6×. The figure is reported rather than trimmed, and
-it is not evidence either way.
+Those earlier captures showed a first-touch effect — round 1 running 1.4x
+slower than rounds 2–8 even though every run drops the page cache — and **this
+one does not**: its eight rounds span 5.5 % and 1.6 %. So that effect was a
+property of those runs, not of the code, and no claim is made about it here.
+It is the reason the capture takes eight rounds rather than the two the phase
+gate asks for.
 
 #### Steady state, at k = 6 and 146 sets per batch
 
 | metric | graph-driven | coordinate-driven |
 |---|---|---|
-| sets/s | **13,459** (12,880–13,619) | **12,622** (10,898.5–12,908.7) |
-| µs/cell | 11.45 (11.32–11.97) | 11.32 (11.07–13.11) |
-| plan build, whole file | **3.2 ms** | **15 ms** |
-| peak RSS | 1,935 MB (1,615–2,042) | 1,998 MB (1,604–2,040) |
+| sets/s | **15,474** (15,239–16,083) | **14,971** (14,845–15,084) |
+| µs/cell | 9.96 (9.58–10.11) | 9.54 (9.47–9.62) |
+| plan build, whole file | **2.9 ms** | **13 ms** |
+| peak RSS | 1,813 MB (1,599–2,006) | 1,839 MB (1,596–2,005) |
 
-Median over rounds 2–8, min–max in brackets. The two paths agree to within 7 %
-on the gather, which they should: at k = 6 on a lattice they select nearly the
-same cells, and the gather does not know which builder produced the plan.
+Median over 8 rounds, min–max in brackets. Spread is 5.5 % and 1.6 % on the
+rates — unlike the superseded capture, this one has no first-touch outlier, so
+every round is reported rather than round 1 being split out. The two paths
+agree to within 3.4 % on the gather, which they should: at k = 6 on a lattice
+they select nearly the same cells, and the gather does not know which builder
+produced the plan.
 
 **Building the plans is not the cost.** 4,035 neighbourhoods come out of the
-stored graph in 3.2 ms and out of the coordinates in 15 ms — against roughly 300
-ms to gather them. The coordinate builder is ~4.6× the graph one and still
-under 2 % of the round, which is the answer to "should the grid search be
-parallel": not yet, and a measurement rather than a guess is what would change
-it. At Xenium scale (10⁵ cells) the build term is the one that grows, and this
+stored graph in 2.9 ms and out of the coordinates in 13 ms — against roughly
+260 ms to gather them. The coordinate builder is ~4.5x the graph one and still
+under 1 % of the round, which answers "should the grid search be parallel" with
+a measurement rather than a guess. The per-row span validation added between
+the two captures is invisible at this scale: 3.2 ms before, 2.9 ms after.
+
+At Xenium scale (10⁵ cells) the build term is the one that grows, and this
 capture does not reach it.
-
-#### Round 1 is a different measurement, not an outlier to discard
-
-| | sets/s graph | sets/s coords |
-|---|---|---|
-| round 1 | 9,455 | 6,510 |
-| rounds 2–8 | 12,880–13,619 | 10,899–12,909 |
-
-Every run drops the page cache first and every run reports `cold_fadvise`, yet
-the first invocation after the build is 1.4× slower on the graph arm and 1.9×
-on the coordinate one, while the three runs *within* round 1 agree to 3 %. So
-`posix_fadvise(DONTNEED)` is not evicting everything the later rounds benefit
-from, and round 1 is the genuinely-first-touch case. Both are reported; the
-table above is the repeat case, which is what a training loop sees.
-
-⚠️ **A correction to this capture's own predecessor.** A first two-round capture
-(`2959318`, also committed, as `neighborhood_2rounds.json`) showed the same
-split and peak RSS appeared to track it — 1,580 MB in the slow round against
-2,045 MB in the fast one. That pattern does not survive eight rounds: rounds 5,
-7 and 8 are fast at ~1,615 MB and rounds 2, 3, 4 and 6 are fast at ~2,000 MB.
-It was a two-point correlation, and it is stated here because the two-round
-artifact records it as a hypothesis.
 
 #### What these numbers are and are not
 
 **They are the pessimal scattered read.** The fixture's obs order is barcode
 order, which has nothing to do with position: a 7-cell neighbourhood spans a
 median of **3,024 row indices of 4,035** and every batch touches **all 8
-shards**. `scx sort` on a key that tracks position is the lever that turns these
-into contiguous reads, and this capture does not pull it — so read these as the
-floor a spatial file gets for free, not as what the regime can do.
+shards**. `scx sort` on a key that tracks position is the lever that turns
+these into contiguous reads, and this capture does not pull it — so read these
+as the floor a spatial file gets for free, not as what the regime can do.
+
+⚠️ **This capture cannot show that nothing else regressed.** Every run is a
+*head* build — the driver never builds `main` — so the four pre-existing
+`gather_*` metrics recorded on the same runs are within-build variance, not a
+comparison. Three of the four are steady across all eight rounds (782.9 sets/s
+`gather_random`, spread 5.4 %; 897.2 `gather_grouped`, 7.0 %; 85.6
+`gather_random_s512`, 9.8 %), which is worth knowing and is not the same claim.
+The fourth, `gather_grouped_s512`, is not steady and resolves nothing: its
+median is 95.3 but one round reads 233.2. At 4,035 spots an S=512 grouped batch
+is most of the file, so that arm runs a handful of very large plans and one
+scheduling hiccup moves it 2.4x. Reported rather than trimmed.
 
 **No floor is proposed**, and `thresholds.yaml` item 23 records three separate
-blockers, one of them specific to this phase: these arms run on a single dataset
-that is deliberately outside every `capture_baseline.TIERS` list, and a floor on
-a triple the default gate never schedules reads as coverage while providing
-none.
+blockers, one specific to this phase: these arms run on a single dataset that is
+deliberately outside every `capture_baseline.TIERS` list, and a floor on a
+triple the default gate never schedules reads as coverage while providing none.
 
 **The reuse signal this regime was supposed to provide is not set overlap.** The
 design called overlapping neighbourhoods "the reuse signal". Measured on the
