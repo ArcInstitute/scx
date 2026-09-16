@@ -235,12 +235,14 @@ import pyscx
 
 exp = pyscx.open("tissue.scx")
 
-# From a stored obsp graph (scanpy's connectivities, a spatial adjacency, ...)
-plans, centers = pyscx.neighborhood_plans_from_graph(exp, k=8, file_id=0)
+# From a stored obsp graph. `weight_order` says which end `k` keeps:
+# "desc" for an affinity (connectivities), "asc" for a distance graph.
+plans, centers = pyscx.neighborhood_plans_from_graph(
+    exp, "connectivities", file_id=0, k=8, weight_order="desc")
 
 # Or straight from obsm["spatial"], with no graph and no index
-plans, centers = pyscx.neighborhood_plans_from_coords(exp, k=8, file_id=0)
-plans, centers = pyscx.neighborhood_plans_from_coords(exp, radius=50.0, file_id=0)
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, file_id=0, k=8)
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, file_id=0, radius=50.0)
 
 ds = pyscx.SparseCellSetDataset(["tissue.scx"])
 for batch in ds.iter_with_plans(pyscx.batch_plans(plans, sets_per_batch=64)):
@@ -252,7 +254,14 @@ unchanged. Four things that bite first:
 
 - **`file_id` is a manifest position, not a file identity** — the index of this
   file in the `SparseCellSetDataset` you will gather with. Get it wrong and you
-  gather a different file's rows with nothing raising.
+  gather a different file's rows with nothing raising, which is why it is
+  required rather than defaulting to 0.
+- **`weight_order` is not inferred from the key's name.** `k=8` with the
+  default `"desc"` on `obsp["distances"]` returns each cell's eight *farthest*
+  neighbours. Use `"asc"` for a distance graph.
+- **The coordinate builder takes 1-D, 2-D or 3-D only.** `obsm_key="X_pca"` on
+  a wide embedding is refused; write a kNN into `obsp` and use the graph
+  builder instead.
 - **Rows are physical, and deletions are dropped.** A deleted centre yields no
   set at all (so `centers` is shorter than `n_obs` and tells you which survived)
   and a deleted neighbour is dropped from every set rather than backfilled.

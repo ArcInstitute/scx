@@ -330,12 +330,128 @@ fn an_empty_range_is_an_empty_csr_not_an_error() {
 }
 
 #[test]
-fn a_range_past_the_end_is_refused() {
+fn an_invalid_range_is_refused_rather_than_answered_empty() {
     let dir = tempfile::tempdir().unwrap();
     let triples = ring_triples(10);
     let path = write_sharded(&dir, 10, 2, &triples, false, false);
-    let err = open(&path).read_rows_range(8, 11).unwrap_err().to_string();
-    assert!(err.contains("exceeds n_rows"), "{err}");
+    let backed = open(&path);
+    // Past the end, inverted, and a `start` past the end with an in-range
+    // `end`. The last two used to fall through to the empty-range arm and come
+    // back `Ok` with a `row_start` naming no row, which a caller looping over
+    // blocks cannot tell from a genuinely empty graph.
+    for (start, stop) in [(8u64, 11u64), (7, 3), (20, 5), (11, 11), (0, 11)] {
+        let err = match backed.read_rows_range(start, stop) {
+            Ok(rows) => panic!(
+                "range [{start}, {stop}) was accepted, returning row_start={} n_rows={}",
+                rows.row_start, rows.n_rows
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("invalid row range"),
+            "[{start}, {stop}): {err}"
+        );
+    }
+    // The boundary that IS legal: an empty range at the very end.
+    let rows = backed.read_rows_range(10, 10).unwrap();
+    assert_eq!(rows.n_rows, 0);
+}
+
+#[test]
+fn a_shard_carrying_a_triple_outside_its_stamped_span_is_refused() {
+    // Silently filtering it makes one misfiled triple invisible twice: skipped
+    // in this shard's range, and never looked for in the shard that covers its
+    // row. Two wrong answers and no error.
+    let dir = tempfile::tempdir().unwrap();
+    let n = 12;
+    let path = dir.path().join("misfiled.scx");
+    let mut w = ScxWriter::new(&path, header(n as u64)).unwrap();
+    w.write_obs(&obs(n)).unwrap();
+    w.write_var(&var(4)).unwrap();
+    // Shard 0 covers rows [0, 6) but is handed a triple at row 9.
+    w.write_obsp_shard_coo(
+        "connectivities",
+        0,
+        0,
+        6,
+        n as u64,
+        &coo_i32(&[(1, 2, 1.0), (9, 3, 1.0)], n, n),
+    )
+    .unwrap();
+    w.write_obsp_shard_coo("connectivities", 1, 6, 6, n as u64, &coo_i32(&[], n, n))
+        .unwrap();
+    w.finish().unwrap();
+    let err = open(&path).read_rows_range(0, 6).unwrap_err().to_string();
+    assert!(err.contains("stamped [0, 6)"), "{err}");
+}
+
+#[test]
+fn a_nullable_coo_column_is_refused_rather_than_read_as_garbage() {
+    use arrow::array::{Float32Array, Int32Array};
+    let dir = tempfile::tempdir().unwrap();
+    let n = 4;
+    let path = dir.path().join("nulls.scx");
+    let mut w = ScxWriter::new(&path, header(n as u64)).unwrap();
+    w.write_obs(&obs(n)).unwrap();
+    w.write_var(&var(4)).unwrap();
+    let schema = Schema::new(vec![
+        Field::new("row", DataType::Int32, true),
+        Field::new("col", DataType::Int32, true),
+        Field::new("data", DataType::Float32, true),
+    ])
+    .with_metadata(coo_meta(n, n));
+    let batch = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(vec![Some(0), None])),
+            Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+            Arc::new(Float32Array::from(vec![Some(1.0), Some(2.0)])),
+        ],
+    )
+    .unwrap();
+    w.write_obsp("connectivities", &batch).unwrap();
+    w.finish().unwrap();
+    let err = open(&path).read_rows_range(0, 4).unwrap_err().to_string();
+    assert!(err.contains("null entries"), "{err}");
+}
+
+#[test]
+fn a_later_shard_with_the_wrong_column_count_errors_rather_than_panicking() {
+    // The layout resolver takes `n_cols` from shard 0 only, so this used to
+    // reach `batch.column(2)` — which arrow PANICS on out of bounds.
+    let dir = tempfile::tempdir().unwrap();
+    let n = 8;
+    let path = dir.path().join("ragged.scx");
+    let mut w = ScxWriter::new(&path, header(n as u64)).unwrap();
+    w.write_obs(&obs(n)).unwrap();
+    w.write_var(&var(4)).unwrap();
+    w.write_obsp_shard_coo(
+        "connectivities",
+        0,
+        0,
+        4,
+        n as u64,
+        &coo_i32(&[(0, 1, 1.0)], n, n),
+    )
+    .unwrap();
+    let two_col = Schema::new(vec![
+        Field::new("row", DataType::Int32, false),
+        Field::new("col", DataType::Int32, false),
+    ])
+    .with_metadata(coo_meta(n, n));
+    let batch = arrow::array::RecordBatch::try_new(
+        Arc::new(two_col),
+        vec![
+            Arc::new(Int32Array::from(vec![5])),
+            Arc::new(Int32Array::from(vec![6])),
+        ],
+    )
+    .unwrap();
+    w.write_obsp_shard_coo("connectivities", 1, 4, 4, n as u64, &batch)
+        .unwrap();
+    w.finish().unwrap();
+    let err = open(&path).read_rows_range(0, 8).unwrap_err().to_string();
+    assert!(err.contains("expected the 3-column COO"), "{err}");
 }
 
 #[test]

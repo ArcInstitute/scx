@@ -144,7 +144,7 @@ pub use metadata::{
     decode_arrow_ipc_schema, filter_batch_by_keep_mask, prune_unused_dictionary_values,
     scatter_batch_to_physical,
 };
-pub(crate) use metadata::{LegacyRowCount, MappingLayout};
+pub(crate) use metadata::{LegacyRowCount, MappingLayout, MappingShardLayoutEntry};
 
 // Reached from `typed_read.rs` (the typed assembler takes the same strategy) and
 // from `reader_tests.rs`, which is attached to this module and so cannot see

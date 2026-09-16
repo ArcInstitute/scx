@@ -17,38 +17,19 @@
 //! needed; if a `par_*` is ever added, it needs one within 12 lines, lexically
 //! inside the `py.detach` closure.
 
-use numpy::{IntoPyArray, PyArray1};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyList, PyModule, PyTuple};
 use pyo3::wrap_pyfunction;
 
 use crate::neighborhood::{
     batch_plans as batch_plans_impl, build_coord_plans, build_graph_plans, CoordQuery,
-    NeighborhoodConfig, NeighborhoodPlans, DEFAULT_GRAPH_CHUNK_ROWS,
+    NeighborhoodConfig, NeighborhoodPlans, WeightOrder, DEFAULT_GRAPH_CHUNK_ROWS,
 };
 use crate::sparse_cellset::SparseCellSetPlan;
 
 use super::*;
 
-/// Physical rows the file's deletion vectors retain, or `None` when the file
-/// has none.
-///
-/// Read here rather than passed in from Python: the keep mask is a property of
-/// the file the plans are being built from, and a caller-supplied one that
-/// disagreed with it would produce plans naming deleted rows with nothing to
-/// catch it.
-fn keep_mask(path: &std::path::Path) -> PyResult<Option<Vec<bool>>> {
-    let reader = scx_format_io::ScxReader::open(path)
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to open {}: {e}", path.display())))?;
-    reader
-        .deletion_keep_mask()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-}
-
-/// Consumes the plan: `PyArray1::from_vec` adopts the allocation, so taking
-/// `&SparseCellSetPlan` and cloning would pay a full copy of every array for
-/// nothing — which is what the module docs' "moved, not copied" claim would
-/// have been worth.
 fn plan_to_py(py: Python<'_>, plan: SparseCellSetPlan) -> PyResult<Bound<'_, PyTuple>> {
     let SparseCellSetPlan {
         file_ids,
@@ -79,34 +60,56 @@ fn built_to_py(py: Python<'_>, built: NeighborhoodPlans) -> PyResult<Bound<'_, P
     PyTuple::new(py, [plans.into_any(), centers.into_any()])
 }
 
+/// `"desc"` / `"asc"` → [`WeightOrder`], refusing anything else by name.
+fn parse_weight_order(s: &str) -> PyResult<WeightOrder> {
+    match s {
+        "desc" => Ok(WeightOrder::Desc),
+        "asc" => Ok(WeightOrder::Asc),
+        other => Err(PyValueError::new_err(format!(
+            "weight_order must be 'desc' (a connectivity/affinity graph, larger = closer) or \
+             'asc' (a distance graph, larger = farther); got {other:?}"
+        ))),
+    }
+}
+
 /// Graph-driven neighbourhood plans from `obsp/<key>`.
+///
+/// `file_id` has **no default** — see the module docs. `weight_order` has none
+/// either when `k` is given: the right answer depends on whether the graph's
+/// weights are affinities or distances, and the key's name is the caller's.
 #[pyfunction]
 #[pyo3(signature = (
-    path, key="connectivities", *, k=None, include_center=true, file_id=0,
-    drop_deleted=true, chunk_rows=DEFAULT_GRAPH_CHUNK_ROWS
+    path, key="connectivities", *, file_id, k=None, weight_order="desc",
+    include_center=true, drop_deleted=true, chunk_rows=DEFAULT_GRAPH_CHUNK_ROWS
 ))]
 #[allow(clippy::too_many_arguments)]
 fn _neighborhood_plans_from_graph<'py>(
     py: Python<'py>,
     path: &str,
     key: &str,
-    k: Option<usize>,
-    include_center: bool,
     file_id: u32,
+    k: Option<usize>,
+    weight_order: &str,
+    include_center: bool,
     drop_deleted: bool,
     chunk_rows: u64,
 ) -> PyResult<Bound<'py, PyTuple>> {
     if let Some(0) = k {
         return Err(PyValueError::new_err("k must be >= 1 or None"));
     }
+    let order = parse_weight_order(weight_order)?;
     let p = std::path::Path::new(path);
-    let keep = if drop_deleted { keep_mask(p)? } else { None };
     let cfg = NeighborhoodConfig {
         include_center,
         file_id,
     };
+    // `drop_deleted` goes IN rather than a keep mask coming out: reading the
+    // mask here meant a second `ScxReader::open` of the same path, so the mask
+    // and the graph were two snapshots that a file replaced between them could
+    // put out of step — with the disagreement showing up as a plan naming rows
+    // that no longer exist and nothing to catch it.
     let built = py
-        .detach(|| build_graph_plans(p, key, keep.as_deref(), k, cfg, chunk_rows))
+        .detach(|| build_graph_plans(p, key, drop_deleted, k, order, cfg, chunk_rows))
         .map_err(loader_err_to_py)?;
     built_to_py(py, built)
 }
@@ -114,20 +117,26 @@ fn _neighborhood_plans_from_graph<'py>(
 /// Coordinate-driven neighbourhood plans from `obsm/<obsm_key>`.
 #[pyfunction]
 #[pyo3(signature = (
-    path, obsm_key="spatial", *, k=None, radius=None, include_center=true,
-    file_id=0, drop_deleted=true
+    path, obsm_key="spatial", *, file_id, k=None, radius=None,
+    include_center=true, drop_deleted=true
 ))]
 #[allow(clippy::too_many_arguments)]
 fn _neighborhood_plans_from_coords<'py>(
     py: Python<'py>,
     path: &str,
     obsm_key: &str,
+    file_id: u32,
     k: Option<usize>,
     radius: Option<f32>,
     include_center: bool,
-    file_id: u32,
     drop_deleted: bool,
 ) -> PyResult<Bound<'py, PyTuple>> {
+    // Same refusal, same exception type, as the graph builder's. Left to
+    // `plans_from_coords` this came back as a RuntimeError there and a
+    // ValueError here for the identical mistake.
+    if let Some(0) = k {
+        return Err(PyValueError::new_err("k must be >= 1 or None"));
+    }
     // Exactly one of the two, refused rather than defaulted: "k or radius,
     // whichever you gave" is the kind of resolution that silently answers a
     // different question from the one asked.
@@ -145,13 +154,12 @@ fn _neighborhood_plans_from_coords<'py>(
             }
         };
     let p = std::path::Path::new(path);
-    let keep = if drop_deleted { keep_mask(p)? } else { None };
     let cfg = NeighborhoodConfig {
         include_center,
         file_id,
     };
     let built = py
-        .detach(|| build_coord_plans(p, obsm_key, keep.as_deref(), query, cfg))
+        .detach(|| build_coord_plans(p, obsm_key, drop_deleted, query, cfg))
         .map_err(loader_err_to_py)?;
     built_to_py(py, built)
 }
@@ -167,25 +175,53 @@ fn batch_plans<'py>(
 ) -> PyResult<Bound<'py, PyList>> {
     let mut owned: Vec<SparseCellSetPlan> = Vec::new();
     for item in plans.try_iter()? {
-        let (file_ids, rows, role_tags, set_offsets) = item?
-            .extract::<(Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>)>()
-            .map_err(|e| {
-                PyValueError::new_err(format!(
-                    "batch_plans: each plan must be a tuple \
-                     (file_ids:u32[], rows:u64[], role_tags:i32[], set_offsets:i64[]): {e}"
-                ))
-            })?;
-        owned.push(SparseCellSetPlan {
-            file_ids,
-            rows,
-            role_tags,
-            set_offsets,
-        });
+        // Typed numpy views first, falling back to the generic sequence
+        // protocol. `extract::<Vec<u32>>` boxes and unboxes one Python scalar
+        // per element, which on a whole file's worth of plans is millions of
+        // object round-trips under the GIL — and the builders hand back numpy
+        // arrays, so the fast path is the normal one.
+        let item = item?;
+        let plan = extract_plan_fast(&item).or_else(|| extract_plan_generic(&item));
+        owned.push(plan.ok_or_else(|| {
+            PyValueError::new_err(
+                "batch_plans: each plan must be a tuple \
+                 (file_ids:u32[], rows:u64[], role_tags:i32[], set_offsets:i64[])",
+            )
+        })?);
     }
     let batched = py
         .detach(|| batch_plans_impl(&owned, sets_per_batch, shuffle_seed))
         .map_err(loader_err_to_py)?;
     plans_to_py(py, batched)
+}
+
+/// Zero-copy numpy views, for the arrays these builders themselves return.
+fn extract_plan_fast(item: &Bound<'_, PyAny>) -> Option<SparseCellSetPlan> {
+    let t: (
+        PyReadonlyArray1<u32>,
+        PyReadonlyArray1<u64>,
+        PyReadonlyArray1<i32>,
+        PyReadonlyArray1<i64>,
+    ) = item.extract().ok()?;
+    Some(SparseCellSetPlan {
+        file_ids: t.0.as_slice().ok()?.to_vec(),
+        rows: t.1.as_slice().ok()?.to_vec(),
+        role_tags: t.2.as_slice().ok()?.to_vec(),
+        set_offsets: t.3.as_slice().ok()?.to_vec(),
+    })
+}
+
+/// Anything else a caller has: lists, tuples, arrays of another dtype.
+fn extract_plan_generic(item: &Bound<'_, PyAny>) -> Option<SparseCellSetPlan> {
+    let (file_ids, rows, role_tags, set_offsets) = item
+        .extract::<(Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>)>()
+        .ok()?;
+    Some(SparseCellSetPlan {
+        file_ids,
+        rows,
+        role_tags,
+        set_offsets,
+    })
 }
 
 /// Register the three plan-builder functions flat on the `pyscx` module.

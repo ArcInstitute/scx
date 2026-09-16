@@ -7,11 +7,21 @@
 //! `SparseCellSetDataset::gather` / `iter_with_plans` already consume — which
 //! makes R6 an R2 workload and hands it every R2 improvement for free.
 //!
-//! # Roles
+//! # Roles, and the order the rest of a set comes in
 //!
 //! Position 0 of a set is the **centre**, `role_tag = 0`; every other member is
 //! a neighbour, `role_tag = 1`. That maps onto Nicheformer's cell + context
 //! tokens and onto the per-set kernels in [`crate::tokenize`].
+//!
+//! ⚠️ **The two builders order the neighbours differently, and neither is
+//! wrong.** The graph builder emits them **column-ascending** — whether or not
+//! `k` selected them — because a stored graph's columns are the only order it
+//! carries and re-sorting by weight would make *which* edges `k` picked also
+//! change *where* they land. The coordinate builder emits them **nearest
+//! first**, because it computed the distances and that is the order it
+//! computed them in. So position 1 is the nearest neighbour on the coordinate
+//! path and merely the lowest-numbered one on the graph path. A consumer that
+//! cares about proximity ordering must not assume the graph path gives it.
 //!
 //! # Row space is physical, and deletions are dropped, not renumbered
 //!
@@ -23,8 +33,20 @@
 //! - a **deleted centre yields no set at all**, so the plan list is shorter
 //!   than `n_obs` and [`NeighborhoodPlans::centers`] says which centres
 //!   survived;
-//! - a **deleted neighbour is dropped** from every set it appears in, leaving a
-//!   shorter set rather than a backfilled one.
+//! - a **deleted neighbour is dropped** from every set it appears in.
+//!
+//! ⚠️ What "dropped" costs a set depends on whether `k` is in play, and the two
+//! are different answers rather than an inconsistency:
+//!
+//! - **Without `k`** — every stored edge, or a radius query — a set is simply
+//!   short by however many of its neighbours are gone. Nothing replaces them.
+//! - **With `k`**, deleted rows are **not candidates**, so the `k` best of the
+//!   *live* neighbours are taken: a centre whose nearest neighbour is deleted
+//!   gets its next one instead and the set is still `k` wide. That is what
+//!   asking for `k` neighbours means. The alternative — select `k` in physical
+//!   space and then delete from the selection — returns sets of varying width
+//!   for no stated benefit. A set is short under `k` only when the live
+//!   population runs out.
 //!
 //! That is the same rule `filter_coo_obsp_by_kept_rows` applies on the
 //! `to_anndata` path (drop the edge if either endpoint is gone); the difference
@@ -60,6 +82,23 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use scx_format_io::{BackedDenseReader, BackedPairwiseReader, PairwiseRows, ScxReader};
+
+/// Which end of a stored graph's weights `k` keeps.
+///
+/// There is no safe default per *key*, and inferring one from the key's name
+/// would be worse than asking: scanpy writes `obsp["connectivities"]` where a
+/// larger weight means *closer* and `obsp["distances"]` where a larger weight
+/// means *farther*, so the same `k` over the same neighbourhood picks opposite
+/// ends of it. A `k` against a distance graph under [`WeightOrder::Desc`]
+/// returns that cell's **farthest** stored neighbours — structurally valid, and
+/// the opposite of what was asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightOrder {
+    /// Keep the largest weights — a connectivity / affinity / similarity graph.
+    Desc,
+    /// Keep the smallest weights — a distance graph.
+    Asc,
+}
 
 /// Role tag of a set's centre cell.
 pub const ROLE_CENTER: i32 = 0;
@@ -134,9 +173,21 @@ fn kept(keep: Option<&[bool]>, row: u64) -> bool {
 /// `rows` is a physical row range of an `obsp` graph as
 /// [`scx_format_io::BackedPairwiseReader::read_rows_range`] returns it. With
 /// `k = None` every stored edge becomes a neighbour, in the graph's own
-/// column-ascending order; with `k = Some(k)` the `k` heaviest edges are taken,
-/// **weight descending, ties broken by column ascending** — a declared rule,
-/// since a stored graph carries no order of its own.
+/// column-ascending order; with `k = Some(k)` the `k` edges at the
+/// `weight_order` end are taken, ties broken by column ascending — a declared
+/// rule, since a stored graph carries no order of its own.
+///
+/// ⚠️ `weight_order` is not cosmetic and has no safe per-key default. Scanpy's
+/// `obsp["connectivities"]` is an affinity (larger = closer,
+/// [`WeightOrder::Desc`]); its `obsp["distances"]` is a metric (larger =
+/// farther, [`WeightOrder::Asc`]). The wrong one against a distance graph
+/// returns each cell's `k` **farthest** stored neighbours — a structurally
+/// valid plan that answers the opposite question. Inferring it from the key's
+/// name would be worse than asking, because the name is the caller's.
+///
+/// Non-finite weights sort **last** whatever the order, so `k` never takes one
+/// over a finite competitor: a distance graph's `inf` for "not connected" is
+/// never chosen as a near neighbour.
 ///
 /// A self-loop (an edge from a row to itself) is dropped when the centre is
 /// already being emitted, rather than letting the centre appear twice and be
@@ -145,6 +196,7 @@ pub fn plans_from_graph_chunk(
     rows: &PairwiseRows,
     keep: Option<&[bool]>,
     k: Option<usize>,
+    weight_order: WeightOrder,
     cfg: NeighborhoodConfig,
     out: &mut NeighborhoodPlans,
 ) {
@@ -157,6 +209,13 @@ pub fn plans_from_graph_chunk(
         let (cols, vals) = rows.row(i);
         scratch.clear();
         for (&c, &v) in cols.iter().zip(vals) {
+            // `BackedPairwiseReader` refuses a negative column, but this
+            // function is public and takes any `PairwiseRows`: `c as u64` on a
+            // negative turns it into a row index above 2^63 that `kept(None, _)`
+            // waves through and the gather then fails on, far from here.
+            if c < 0 {
+                continue;
+            }
             let c_u = c as u64;
             if !kept(keep, c_u) {
                 continue;
@@ -167,14 +226,7 @@ pub fn plans_from_graph_chunk(
             scratch.push((v, c));
         }
         if let Some(k) = k {
-            // Weight descending, then column ascending. `sort_by` is stable, so
-            // sorting on the key directly rather than reversing keeps the tie
-            // order explicit instead of implied by the sort's stability.
-            scratch.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.1.cmp(&b.1))
-            });
+            scratch.sort_by(|a, b| cmp_weight(*a, *b, weight_order));
             scratch.truncate(k);
             // Restore column order among the chosen edges, so which edges `k`
             // picked does not also change the order they are emitted in. Note
@@ -204,6 +256,18 @@ pub enum CoordQuery {
     Radius(f32),
 }
 
+/// Highest coordinate dimensionality the grid will accept.
+///
+/// Not a tuning knob — a structural bound. `Grid::walk_ring` enumerates the
+/// `(2r+1)^d` offset tuples of a Chebyshev shell and rejects the out-of-range
+/// ones at the leaf, so `d` sits in an exponent. At `d = 3` ring 1 is 27 visits;
+/// at `d = 50` — an ordinary `obsm["X_pca"]`, and a plausible typo for
+/// `obsm["spatial"]` — it is 3^50 and the call never returns. Spatial
+/// coordinates are 2-D (Visium, Slide-seq) or 3-D (Xenium, MERFISH); anything
+/// wider is a different problem and belongs on the graph path, over a kNN
+/// somebody else built.
+pub const MAX_COORD_DIMS: usize = 3;
+
 /// Upper bound on grid cells, as a multiple of the point count. A grid finer
 /// than this buys nothing and costs a bucket array; the cell size is widened
 /// until the bound holds.
@@ -228,9 +292,15 @@ pub fn plans_from_coords(
     query: CoordQuery,
     cfg: NeighborhoodConfig,
 ) -> Result<NeighborhoodPlans> {
-    if d == 0 {
+    if d == 0 || d > MAX_COORD_DIMS {
         return Err(LoaderError::ConfigError {
-            reason: "plans_from_coords: coordinate dimensionality must be >= 1".into(),
+            reason: format!(
+                "plans_from_coords: coordinate dimensionality must be 1..={MAX_COORD_DIMS}, got \
+                 {d}. The grid search is exponential in d — at d=50 it does not return — and \
+                 spatial coordinates are 2-D or 3-D. To build neighbourhoods in a wide embedding, \
+                 write a kNN graph into obsp (scanpy: sc.pp.neighbors(use_rep=...)) and use the \
+                 graph builder instead."
+            ),
         });
     }
     if !coords.len().is_multiple_of(d) {
@@ -445,6 +515,13 @@ impl Grid {
                     }
                 }
                 Some(k) => {
+                    // Everything there is, is already in hand — no ring can add
+                    // to it. Without this, `k` larger than the population means
+                    // `out.len() >= k` is never true and every centre scans the
+                    // whole bounding box to `max_ring`.
+                    if out.len() + 1 >= self.members_by_cell.len() {
+                        break;
+                    }
                     // Anything outside the rings scanned so far is at least
                     // `ring * cell` from the centre, wherever in its own cell
                     // the centre sits. Once we hold `k` candidates no further
@@ -544,10 +621,39 @@ impl Grid {
 }
 
 /// (squared distance ascending, row ascending) — the declared tie order.
+///
+/// `total_cmp` rather than `partial_cmp(..).unwrap_or(Equal)`: the latter is not
+/// a total order in the presence of a NaN (`NaN == 1.0` and `NaN == 2.0` while
+/// `1.0 != 2.0`), and `slice::sort_by` is entitled to panic on a comparator that
+/// is not one. Coordinates are refused if non-finite, so this cannot fire here
+/// today — it is written this way so that it still cannot if that ever changes.
 fn cmp_candidate(a: &(f32, u64), b: &(f32, u64)) -> std::cmp::Ordering {
-    a.0.partial_cmp(&b.0)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then(a.1.cmp(&b.1))
+    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+}
+
+/// Order two `(weight, column)` graph edges: **non-finite weights last**, then
+/// by weight in the requested direction, then column ascending.
+///
+/// Non-finite last, and not refused, because a distance graph legitimately
+/// carries `inf` for "not connected" and a NaN is a property of someone else's
+/// upstream computation. Sorting them to the end means `k` can never select one
+/// over a finite competitor, which is the outcome a caller wants; refusing the
+/// whole build over one edge is not.
+///
+/// A total order in every case, which `partial_cmp(..).unwrap_or(Equal)` is not
+/// — and `slice::sort_by` may panic on a comparator that is not one.
+fn cmp_weight(a: (f32, i64), b: (f32, i64), order: WeightOrder) -> std::cmp::Ordering {
+    match (a.0.is_finite(), b.0.is_finite()) {
+        (true, false) => return std::cmp::Ordering::Less,
+        (false, true) => return std::cmp::Ordering::Greater,
+        (false, false) => return a.1.cmp(&b.1),
+        (true, true) => {}
+    }
+    let by_weight = match order {
+        WeightOrder::Desc => b.0.total_cmp(&a.0),
+        WeightOrder::Asc => a.0.total_cmp(&b.0),
+    };
+    by_weight.then(a.1.cmp(&b.1))
 }
 
 // ---------------------------------------------------------------------------
@@ -659,11 +765,13 @@ pub const DEFAULT_GRAPH_CHUNK_ROWS: u64 = 65_536;
 /// plus one chunk's non-zeros, plus the accumulated plans. Note the caveat in
 /// [`scx_format_io::BackedPairwiseReader`]: a *legacy unsharded* obsp (what
 /// `scx sort` emits) has to be decoded whole whatever the chunk size.
+#[allow(clippy::too_many_arguments)]
 pub fn build_graph_plans(
     path: &std::path::Path,
     key: &str,
-    keep: Option<&[bool]>,
+    drop_deleted: bool,
     k: Option<usize>,
+    weight_order: WeightOrder,
     cfg: NeighborhoodConfig,
     chunk_rows: u64,
 ) -> Result<NeighborhoodPlans> {
@@ -672,13 +780,25 @@ pub fn build_graph_plans(
             reason: "build_graph_plans: chunk_rows must be >= 1".into(),
         });
     }
-    let reader = BackedPairwiseReader::new_obsp(ScxReader::open(path)?, key)?;
+    // ONE open, and the keep mask comes off the same reader as the graph.
+    // Taking a caller-supplied mask (or reading it through a second
+    // `ScxReader::open`) means two snapshots of one path, which can disagree if
+    // the file is replaced between them — and the disagreement is a plan naming
+    // rows that no longer exist, with nothing to catch it.
+    let scx = ScxReader::open(path)?;
+    let keep: Option<Vec<bool>> = if drop_deleted {
+        scx.deletion_keep_mask()?
+    } else {
+        None
+    };
+    let reader = BackedPairwiseReader::new_obsp(scx, key)?;
     let n_rows = reader.n_rows();
-    if let Some(mask) = keep {
+    if let Some(mask) = keep.as_deref() {
         if mask.len() as u64 != n_rows {
             return Err(LoaderError::ConfigError {
                 reason: format!(
-                    "build_graph_plans: keep mask has {} entries but obsp/{key} has {n_rows} rows",
+                    "build_graph_plans: the file's deletion keep mask has {} entries but \
+                     obsp/{key} has {n_rows} rows",
                     mask.len()
                 ),
             });
@@ -689,7 +809,7 @@ pub fn build_graph_plans(
     while start < n_rows {
         let end = (start + chunk_rows).min(n_rows);
         let rows = reader.read_rows_range(start, end)?;
-        plans_from_graph_chunk(&rows, keep, k, cfg, &mut out);
+        plans_from_graph_chunk(&rows, keep.as_deref(), k, weight_order, cfg, &mut out);
         start = end;
     }
     Ok(out)
@@ -702,7 +822,12 @@ pub fn build_graph_plans(
 /// round-trip can leave float64, so narrowing to the loader's f32 contract is
 /// done here rather than refused.
 pub fn read_coords(path: &std::path::Path, key: &str) -> Result<(Vec<f32>, usize)> {
-    let reader = BackedDenseReader::new_obsm(ScxReader::open(path)?, key, 1)?;
+    read_coords_from(ScxReader::open(path)?, key)
+}
+
+/// [`read_coords`] over a reader the caller already holds.
+pub fn read_coords_from(scx: ScxReader, key: &str) -> Result<(Vec<f32>, usize)> {
+    let reader = BackedDenseReader::new_obsm(scx, key, 1)?;
     let (n_rows, d) = reader.shape();
     if d == 0 {
         return Err(LoaderError::ConfigError {
@@ -754,10 +879,17 @@ fn coord_column_f32(col: &dyn arrow::array::Array, key: &str, j: usize) -> Resul
 pub fn build_coord_plans(
     path: &std::path::Path,
     key: &str,
-    keep: Option<&[bool]>,
+    drop_deleted: bool,
     query: CoordQuery,
     cfg: NeighborhoodConfig,
 ) -> Result<NeighborhoodPlans> {
-    let (coords, d) = read_coords(path, key)?;
-    plans_from_coords(&coords, d, keep, query, cfg)
+    // One open, for the same reason `build_graph_plans` takes one.
+    let scx = ScxReader::open(path)?;
+    let keep: Option<Vec<bool>> = if drop_deleted {
+        scx.deletion_keep_mask()?
+    } else {
+        None
+    };
+    let (coords, d) = read_coords_from(scx, key)?;
+    plans_from_coords(&coords, d, keep.as_deref(), query, cfg)
 }

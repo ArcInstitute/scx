@@ -26,7 +26,7 @@ use scx_format_io::header::FileHeader;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 use scx_loader::neighborhood::{
-    build_coord_plans, build_graph_plans, CoordQuery, NeighborhoodConfig,
+    build_coord_plans, build_graph_plans, CoordQuery, NeighborhoodConfig, WeightOrder,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -233,8 +233,26 @@ fn graph_plans_name_the_same_cells_after_a_row_reorder() {
         "the fixture's sort key must actually permute obs, or this test proves nothing"
     );
 
-    let before = build_graph_plans(&src, "connectivities", None, None, cfg(), 4096).unwrap();
-    let after = build_graph_plans(&sorted, "connectivities", None, None, cfg(), 4096).unwrap();
+    let before = build_graph_plans(
+        &src,
+        "connectivities",
+        true,
+        None,
+        WeightOrder::Desc,
+        cfg(),
+        4096,
+    )
+    .unwrap();
+    let after = build_graph_plans(
+        &sorted,
+        "connectivities",
+        true,
+        None,
+        WeightOrder::Desc,
+        cfg(),
+        4096,
+    )
+    .unwrap();
     assert_eq!(before.len(), N);
 
     // Anti-vacuity: the *row numbers* must differ, or "the same cells" is a
@@ -262,8 +280,8 @@ fn coordinate_plans_name_the_same_cells_after_a_row_reorder() {
     reorder(&src, &sorted);
 
     let q = CoordQuery::Radius(PITCH);
-    let before = build_coord_plans(&src, "spatial", None, q, cfg()).unwrap();
-    let after = build_coord_plans(&sorted, "spatial", None, q, cfg()).unwrap();
+    let before = build_coord_plans(&src, "spatial", true, q, cfg()).unwrap();
+    let after = build_coord_plans(&sorted, "spatial", true, q, cfg()).unwrap();
     let raw = |p: &scx_loader::neighborhood::NeighborhoodPlans| -> Vec<Vec<u64>> {
         p.plans.iter().map(|x| x.rows.clone()).collect()
     };

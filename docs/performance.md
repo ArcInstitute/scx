@@ -3312,12 +3312,20 @@ timed runs on `visium_lymph_node` (4,035 spots × 36,601 genes, 8 shards),
 `results/raw/phase4_neighborhood/neighborhood.json`.
 
 ⚠️ **One-armed, not the paired A/B phases 1–3 ran.** These arms do not exist on
-`main`, so there is no before build and no ratio. The four pre-existing
-`gather_*` metrics were recorded on the same runs instead, so "nothing else
-moved on this fixture" is measured rather than inferred. Three of the four are
-steady across all eight rounds — 659.8 sets/s `gather_random` (spread 7.9 %),
-708.05 `gather_grouped` (6.2 %) and 62.6 `gather_random_s512` (3.8 %) — and
-that is what carries the claim.
+`main`, so there is no before build and no ratio.
+
+⚠️ **That means this capture cannot show that nothing else regressed, and an
+earlier draft of this section claimed it did.** The four pre-existing `gather_*`
+metrics were recorded on the same runs, but every one of those runs is a *head*
+build — the driver never builds `main`. Their stability is within-build
+variance, which is a useful thing to know and is not a comparison. Three of the
+four are steady across all eight rounds — 659.8 sets/s `gather_random`
+(spread 7.9 %), 708.05 `gather_grouped` (6.2 %) and 62.6 `gather_random_s512`
+(3.8 %) — so the shared gather path is at least not *unstable* under the new
+arms sharing its process. What rules out a regression against `main` here is
+the change itself: this PR adds a reader and two builders and edits no existing
+gather code, and the one shared edit (the layout resolver's new
+`LegacyRowCount`) is pinned by the pre-existing obsm suite.
 
 The fourth, `gather_grouped_s512`, is **not** steady and resolves nothing here:
 its median is 67.2 but round 7 reads 122.2, and that round's own three runs span

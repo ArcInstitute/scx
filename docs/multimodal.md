@@ -463,7 +463,7 @@ perturbation regime uses.
 
 ### Identity rules
 
-Four, and each has bitten something:
+Five, and each has bitten something:
 
 1. **Rows are physical.** Plans name physical file rows, because that is what
    the gather takes. Deletion vectors are applied by *dropping*, not
@@ -474,14 +474,23 @@ Four, and each has bitten something:
 2. **`file_id` is a manifest position.** It says where this file sits in the
    `SparseCellSetDataset` the plans will be gathered with. Nothing checks it
    against the file, so a plan built from one file and gathered against another
-   manifest reads the wrong rows silently.
+   manifest reads the wrong rows silently — which is why it is required rather
+   than defaulting to `0`.
 3. **Row order survives, plan caches do not.** `scx sort` permutes `obsm` and
    remaps `obsp` in lockstep with obs, so plans *rebuilt* from a sorted file
    name the same cells. A plan list cached outside the file does not follow the
    permutation and must be rebuilt.
-4. **Coordinates must be finite.** A NaN or infinite coordinate on a live cell
-   is refused rather than bucketed, because a point with no defensible grid cell
-   would otherwise land in some neighbourhood it is not in.
+4. **Coordinates must be finite, and at most 3-D.** A NaN or infinite
+   coordinate on a live cell is refused rather than bucketed, because a point
+   with no defensible grid cell would otherwise land in some neighbourhood it
+   is not in. Dimensionality above 3 is refused too: the ring search is
+   exponential in it, so a wide embedding would not return rather than merely
+   being slow.
+5. **A stored graph's weights have no self-describing direction.** `k` keeps
+   the `weight_order` end, and that is the caller's to state: scanpy's
+   `connectivities` is an affinity (larger = closer) and its `distances` is a
+   metric (larger = farther), so one setting against the other graph returns
+   each cell's farthest neighbours instead of its nearest.
 
 ### Two things worth knowing about how `obsp` is stored
 

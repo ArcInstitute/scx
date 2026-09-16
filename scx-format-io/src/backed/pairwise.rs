@@ -62,34 +62,18 @@ struct PairwiseShard {
     vals: Vec<f32>,
 }
 
-impl SizeHint for PairwiseShard {
-    fn size_bytes(&self) -> usize {
-        self.rows.len() * 8 + self.cols.len() * 8 + self.vals.len() * 4
-    }
-}
-
-/// Per-shard catalog row retained by [`BackedPairwiseReader`].
-#[derive(Debug, Clone, Copy)]
-struct PairwiseShardEntryLite {
-    offset: u64,
-    length: u64,
-    section_type: SectionType,
-    modality_id: u8,
-    row_start: u64,
-    n_shard_rows: u64,
-}
-
-impl PairwiseShardEntryLite {
-    fn into_transient_full_entry(self) -> FullCatalogEntry {
-        FullCatalogEntry {
-            name: String::new(),
-            offset: self.offset,
-            length: self.length,
-            section_type: self.section_type,
-            checksum: [0u8; 32],
-            modality_id: self.modality_id,
-            stats: None,
-        }
+/// `MappingShardLayoutEntry` → a transient `FullCatalogEntry` the section
+/// reader can take. The layout entry is retained as-is rather than copied into
+/// a private twin: the two carried the same six fields.
+fn transient_entry(e: &crate::reader::MappingShardLayoutEntry) -> FullCatalogEntry {
+    FullCatalogEntry {
+        name: String::new(),
+        offset: e.offset,
+        length: e.length,
+        section_type: e.section_type,
+        checksum: [0u8; 32],
+        modality_id: e.modality_id,
+        stats: None,
     }
 }
 
@@ -120,7 +104,18 @@ impl PairwiseRows {
     }
 
     /// Columns and values of range-local row `i`.
+    ///
+    /// # Panics
+    ///
+    /// If `i >= n_rows`. Asserted rather than left to the slice index so the
+    /// message names the contract: this is a caller bug, not malformed input,
+    /// and the reader's error path is for the latter.
     pub fn row(&self, i: usize) -> (&[i64], &[f32]) {
+        assert!(
+            i < self.n_rows as usize,
+            "PairwiseRows::row({i}) on a range of {} rows",
+            self.n_rows
+        );
         let lo = self.indptr[i] as usize;
         let hi = self.indptr[i + 1] as usize;
         (&self.indices[lo..hi], &self.data[lo..hi])
@@ -139,7 +134,7 @@ pub struct BackedPairwiseReader {
     n_rows: u64,
     n_cols: u64,
     /// Ordered by `row_start`; a legacy single section is one entry.
-    sorted_entries: Vec<PairwiseShardEntryLite>,
+    sorted_entries: Vec<crate::reader::MappingShardLayoutEntry>,
     /// Single-entry memo: `(shard_idx, decoded)`. See the module docs for why
     /// this is not an LRU.
     memo: Mutex<Option<(usize, Arc<PairwiseShard>)>>,
@@ -177,18 +172,7 @@ impl BackedPairwiseReader {
                  extent is unknown"
             ))
         })?;
-        let sorted_entries: Vec<PairwiseShardEntryLite> = layout
-            .entries
-            .iter()
-            .map(|e| PairwiseShardEntryLite {
-                offset: e.offset,
-                length: e.length,
-                section_type: e.section_type,
-                modality_id: e.modality_id,
-                row_start: e.row_start,
-                n_shard_rows: e.n_shard_rows,
-            })
-            .collect();
+        let sorted_entries = layout.entries;
         Ok(BackedPairwiseReader {
             reader,
             name: name.to_string(),
@@ -291,7 +275,20 @@ impl BackedPairwiseReader {
         // `scx-ops::merge_pairwise` already reads COO obsp shards through it.
         let batch = self
             .reader
-            .read_dense_mapping_entry(&lite.into_transient_full_entry())?;
+            .read_dense_mapping_entry(&transient_entry(&lite))?;
+        // Per shard, not once at open. The layout resolver takes `n_cols` from
+        // shard 0 only, so a later shard with a different schema reached
+        // `batch.column(2)` — and arrow's `column` **panics** out of bounds
+        // rather than erroring, which on a truncated file is a process abort
+        // where the format's rule is "readers return errors, not panics".
+        if batch.num_columns() != 3 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "obsp/{}: shard {shard_idx} has {} columns, expected the 3-column COO \
+                 (row/col/data)",
+                self.name,
+                batch.num_columns()
+            )));
+        }
         let rows = coo_coord_column(&batch, 0, &self.name)?;
         let cols = coo_coord_column(&batch, 1, &self.name)?;
         let vals = coo_data_column(&batch, &self.name)?;
@@ -304,6 +301,23 @@ impl BackedPairwiseReader {
                 vals.len()
             )));
         }
+        // Every triple must belong to the span this shard is stamped with.
+        // Filtering silently — which the range scan below would otherwise do —
+        // makes a misfiled triple invisible **twice**: skipped here, and never
+        // looked for in the shard that covers its row. Two wrong answers, no
+        // error. A legacy single section is stamped `[0, n_rows)`, so this
+        // checks the whole matrix's extent there.
+        let lo = lite.row_start;
+        let hi = lite.row_start.saturating_add(lite.n_shard_rows);
+        for &r in &rows {
+            if r < 0 || (r as u64) < lo || (r as u64) >= hi {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "obsp/{}: shard {shard_idx} is stamped [{lo}, {hi}) but carries a triple at \
+                     row {r}",
+                    self.name
+                )));
+            }
+        }
         Ok(PairwiseShard { rows, cols, vals })
     }
 
@@ -312,13 +326,18 @@ impl BackedPairwiseReader {
     /// Decodes only the shards whose stamped span intersects the range. Peak
     /// memory is one shard plus the range's own non-zeros.
     pub fn read_rows_range(&self, start: u64, end: u64) -> Result<PairwiseRows> {
-        if end > self.n_rows {
+        // All three conditions here, not just `end > n_rows`. An inverted
+        // range (`start > end`) or an out-of-range `start` used to fall through
+        // to the empty-range arm below and come back `Ok` with a `row_start`
+        // that names no row — a caller looping over blocks then reads nothing
+        // and has no way to tell that from a genuinely empty graph.
+        if start > end || start > self.n_rows || end > self.n_rows {
             return Err(ScxError::InvalidCatalog(format!(
-                "obsp/{}: row range [{start}, {end}) exceeds n_rows {}",
+                "obsp/{}: invalid row range [{start}, {end}) over {} rows",
                 self.name, self.n_rows
             )));
         }
-        if start >= end {
+        if start == end {
             return Ok(PairwiseRows {
                 indptr: vec![0],
                 indices: Vec::new(),
@@ -338,15 +357,14 @@ impl BackedPairwiseReader {
         for shard_idx in self.shards_overlapping(start, end) {
             let shard = self.shard(shard_idx)?;
             for i in 0..shard.rows.len() {
+                // Non-negative and inside this shard's stamped span: checked
+                // once per shard in `decode_shard`, not once per triple here.
                 let r = shard.rows[i];
-                if r < 0 {
-                    return Err(ScxError::InvalidCatalog(format!(
-                        "obsp/{}: negative COO row index {r}",
-                        self.name
-                    )));
-                }
                 let r = r as u64;
                 if r < start || r >= end {
+                    // In range of the shard (decode_shard proved that) but not
+                    // of the request — the ordinary case for a shard the range
+                    // only partly covers.
                     continue;
                 }
                 let c = shard.cols[i];
@@ -413,6 +431,17 @@ fn coo_coord_column(
 ) -> Result<Vec<i64>> {
     use arrow::array::{Int32Array, Int64Array};
     let col = batch.column(col_idx);
+    // `values()` returns the raw buffer, so a null slot reads back as whatever
+    // happens to be there — a plausible-looking coordinate with nothing to
+    // mark it. Nothing in-tree writes a nullable COO column; a file that has
+    // one was not written by this workspace and is refused rather than read.
+    if col.null_count() > 0 {
+        return Err(ScxError::InvalidCatalog(format!(
+            "obsp/{name}: COO coordinate column {col_idx} has {} null entries; a COO triple has \
+             no meaning with a missing coordinate",
+            col.null_count()
+        )));
+    }
     if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
         return Ok(a.values().iter().map(|&v| v as i64).collect());
     }
@@ -431,6 +460,12 @@ fn coo_coord_column(
 fn coo_data_column(batch: &arrow::array::RecordBatch, name: &str) -> Result<Vec<f32>> {
     use arrow::array::{Float32Array, Float64Array};
     let col = batch.column(2);
+    if col.null_count() > 0 {
+        return Err(ScxError::InvalidCatalog(format!(
+            "obsp/{name}: COO data column has {} null entries",
+            col.null_count()
+        )));
+    }
     if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
         return Ok(a.values().to_vec());
     }

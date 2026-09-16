@@ -139,7 +139,7 @@ def test_graph_plans_match_the_numpy_reference(lattice):
 def test_graph_top_k_matches_the_numpy_reference(lattice, k):
     exp = pyscx.open(lattice)
     graph = exp.to_anndata().obsp["connectivities"].tocsr()
-    plans, _ = pyscx.neighborhood_plans_from_graph(exp, k=k, file_id=0)
+    plans, _ = pyscx.neighborhood_plans_from_graph(exp, file_id=0, k=k)
     want_rows, _ = reference_graph_plans(graph, k=k)
     assert as_rows(plans) == want_rows
 
@@ -148,7 +148,7 @@ def test_graph_top_k_matches_the_numpy_reference(lattice, k):
 def test_coord_knn_matches_the_numpy_reference(lattice, k):
     exp = pyscx.open(lattice)
     coords = exp.to_anndata().obsm["spatial"]
-    plans, centers = pyscx.neighborhood_plans_from_coords(exp, k=k, file_id=0)
+    plans, centers = pyscx.neighborhood_plans_from_coords(exp, file_id=0, k=k)
     want_rows, want_centers = reference_coord_plans(coords, k=k)
     assert list(map(int, centers)) == want_centers
     assert as_rows(plans) == want_rows
@@ -158,7 +158,7 @@ def test_coord_knn_matches_the_numpy_reference(lattice, k):
 def test_coord_radius_matches_the_numpy_reference(lattice, radius):
     exp = pyscx.open(lattice)
     coords = exp.to_anndata().obsm["spatial"]
-    plans, _ = pyscx.neighborhood_plans_from_coords(exp, radius=radius, file_id=0)
+    plans, _ = pyscx.neighborhood_plans_from_coords(exp, file_id=0, radius=radius)
     want_rows, _ = reference_coord_plans(coords, radius=radius)
     assert as_rows(plans) == want_rows
 
@@ -168,14 +168,14 @@ def test_the_two_builders_agree_where_the_relations_coincide(lattice):
     relation — two independent paths through two different sections."""
     exp = pyscx.open(lattice)
     g, _ = pyscx.neighborhood_plans_from_graph(exp, file_id=0)
-    c, _ = pyscx.neighborhood_plans_from_coords(exp, radius=PITCH, file_id=0)
+    c, _ = pyscx.neighborhood_plans_from_coords(exp, file_id=0, radius=PITCH)
     assert as_rows(g) == as_rows(c)
 
 
 def test_include_center_false_drops_the_centre(lattice):
     exp = pyscx.open(lattice)
     plans, centers = pyscx.neighborhood_plans_from_coords(
-        exp, k=3, include_center=False, file_id=0
+        exp, file_id=0, k=3, include_center=False
     )
     for plan, centre in zip(plans, centers):
         assert int(centre) not in list(map(int, plan[1]))
@@ -221,7 +221,7 @@ def test_deleted_centres_and_neighbours_are_dropped(deleted_lattice):
         assert not ({0, 9, 31} & set(map(int, plan[1])))
 
     coords = _lattice_adata().obsm["spatial"]
-    cplans, ccenters = pyscx.neighborhood_plans_from_coords(exp, k=3, file_id=0)
+    cplans, ccenters = pyscx.neighborhood_plans_from_coords(exp, file_id=0, k=3)
     cwant, cwant_centers = reference_coord_plans(coords, k=3, keep=keep)
     assert list(map(int, ccenters)) == cwant_centers
     assert as_rows(cplans) == cwant
@@ -347,7 +347,7 @@ def test_coords_needs_exactly_one_of_k_or_radius(lattice):
     with pytest.raises(ValueError, match="got neither"):
         pyscx.neighborhood_plans_from_coords(exp, file_id=0)
     with pytest.raises(ValueError, match="got both"):
-        pyscx.neighborhood_plans_from_coords(exp, k=3, radius=5.0, file_id=0)
+        pyscx.neighborhood_plans_from_coords(exp, file_id=0, k=3, radius=5.0)
 
 
 def test_a_missing_key_raises_rather_than_returning_nothing(lattice):
@@ -355,7 +355,7 @@ def test_a_missing_key_raises_rather_than_returning_nothing(lattice):
     with pytest.raises(Exception):
         pyscx.neighborhood_plans_from_graph(exp, "distances", file_id=0)
     with pytest.raises(Exception):
-        pyscx.neighborhood_plans_from_coords(exp, "X_umap", k=2, file_id=0)
+        pyscx.neighborhood_plans_from_coords(exp, "X_umap", file_id=0, k=2)
 
 
 def test_the_builders_accept_a_path_a_pathlib_and_a_handle(lattice):
@@ -513,4 +513,159 @@ def test_the_builders_release_the_gil(big_spatial, which):
         f"the {which} plan builder starved a concurrent Python thread for "
         f"{largest_gap:.3f}s of a {duration:.3f}s build "
         f"({largest_gap / duration:.0%}) — it is holding the GIL"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 — the defects the reviewers found
+# ---------------------------------------------------------------------------
+
+
+def test_file_id_is_required_not_defaulted(lattice):
+    """The docs say there is no safe default; the signature must agree.
+
+    A wrong `file_id` produces a structurally valid plan that gathers a
+    different file's rows with nothing raising, so a default of 0 is the one
+    value that turns the documented hazard into the quiet path.
+    """
+    exp = pyscx.open(lattice)
+    with pytest.raises(TypeError, match="file_id"):
+        pyscx.neighborhood_plans_from_graph(exp)
+    with pytest.raises(TypeError, match="file_id"):
+        pyscx.neighborhood_plans_from_coords(exp, k=3)
+
+
+def test_weight_order_picks_the_right_end_of_a_distance_graph(lattice):
+    """`connectivities` and `distances` want opposite ends of the same graph."""
+    exp = pyscx.open(lattice)
+    graph = exp.to_anndata().obsp["connectivities"].tocsr()
+
+    desc, _ = pyscx.neighborhood_plans_from_graph(
+        exp, file_id=0, k=2, weight_order="desc"
+    )
+    asc, _ = pyscx.neighborhood_plans_from_graph(
+        exp, file_id=0, k=2, weight_order="asc"
+    )
+    assert len(desc) == len(asc) == N
+
+    # Spelled out rather than through the reference builder: for each centre,
+    # the two orders must take opposite ends of its own weight list.
+    for centre in range(N):
+        lo, hi = graph.indptr[centre], graph.indptr[centre + 1]
+        weights = sorted(
+            ((float(v), int(j)) for j, v in zip(graph.indices[lo:hi], graph.data[lo:hi])
+             if int(j) != centre),
+            key=lambda t: (-t[0], t[1]),
+        )
+        if len(weights) < 3 or weights[0][0] == weights[-1][0]:
+            continue  # no decidable difference on this centre
+        heaviest = {j for _, j in weights[:2]}
+        lightest = {j for _, j in sorted(weights, key=lambda t: (t[0], t[1]))[:2]}
+        assert set(map(int, desc[centre][1])) - {centre} == heaviest
+        assert set(map(int, asc[centre][1])) - {centre} == lightest
+        break
+    else:
+        pytest.fail("no centre on this fixture could distinguish the two orders")
+
+    with pytest.raises(ValueError, match="weight_order must be"):
+        pyscx.neighborhood_plans_from_graph(exp, file_id=0, k=2, weight_order="nearest")
+
+
+def test_a_wide_obsm_key_is_refused_rather_than_hanging(tmp_path):
+    """A 50-component `X_pca` is a plausible slip for `"spatial"`.
+
+    The grid search is exponential in the dimensionality, so before the cap
+    this did not return. The test asserts the refusal and never calls the
+    builder at d=50 without it — a regression would hang the suite rather than
+    fail it.
+    """
+    import anndata as ad
+    import pandas as pd
+
+    n = 64
+    rng = np.random.default_rng(3)
+    a = ad.AnnData(
+        X=sp.csr_matrix((np.ones(n, dtype=np.float32), (np.arange(n), np.arange(n) % 4)),
+                        shape=(n, 4)),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(4)]),
+    )
+    a.obsm["X_pca"] = rng.random((n, 50), dtype=np.float32)
+    a.obsm["spatial"] = rng.random((n, 2), dtype=np.float32) * 100
+    path = tmp_path / "wide.scx"
+    pyscx.from_anndata(a, str(path), shard_size=16)
+
+    exp = pyscx.open(str(path))
+    with pytest.raises(Exception, match="1..=3|must be 1"):
+        pyscx.neighborhood_plans_from_coords(exp, "X_pca", file_id=0, k=4)
+    # And the 2-D key on the same file still works.
+    plans, _ = pyscx.neighborhood_plans_from_coords(exp, "spatial", file_id=0, k=4)
+    assert len(plans) == n
+
+
+def test_a_closed_or_stale_handle_is_refused_by_the_builders(tmp_path):
+    """Passing an `Experiment` must not launder away its lifecycle guards.
+
+    The builders take a path and re-open the file, so without an explicit gate
+    a closed or stale handle sails through while every other `Experiment` read
+    refuses it.
+    """
+    path = tmp_path / "gate.scx"
+    pyscx.from_anndata(_lattice_adata(g=4), str(path), shard_size=8)
+
+    closed = pyscx.open(str(path))
+    closed.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        pyscx.neighborhood_plans_from_graph(closed, file_id=0)
+    with pytest.raises(RuntimeError, match="closed"):
+        pyscx.neighborhood_plans_from_coords(closed, file_id=0, k=2)
+
+    stale = pyscx.open(str(path))
+    calls = tmp_path / "calls.csv"
+    calls.write_text("barcode,score\n" + "".join(
+        f"spot_{i:03d},{i}\n" for i in range(16)))
+    pyscx.obs_import(str(path), str(calls), key="obs_names", source_key="barcode")
+    for fn, kwargs in (
+        (pyscx.neighborhood_plans_from_graph, {}),
+        (pyscx.neighborhood_plans_from_coords, {"k": 2}),
+    ):
+        with pytest.raises(RuntimeError, match="changed on disk|replaced on disk"):
+            fn(stale, file_id=0, **kwargs)
+
+    # A path string has no handle to be stale, and still works.
+    plans, _ = pyscx.neighborhood_plans_from_graph(str(path), file_id=0)
+    assert len(plans) == 16
+
+
+def test_batch_plans_accepts_lists_as_well_as_numpy_arrays(lattice):
+    """The typed numpy fast path must not have narrowed what is accepted."""
+    exp = pyscx.open(lattice)
+    plans, _ = pyscx.neighborhood_plans_from_graph(exp, file_id=0)
+    as_lists = [tuple(np.asarray(a).tolist() for a in p) for p in plans[:8]]
+    from_arrays = pyscx.batch_plans(plans[:8], 4)
+    from_lists = pyscx.batch_plans(as_lists, 4)
+    assert [list(map(int, b[1])) for b in from_arrays] == [
+        list(map(int, b[1])) for b in from_lists
+    ]
+
+
+def test_read_obsp_rows_releases_the_gil(big_spatial):
+    """The bounded read is the atlas-scale surface; it must not block Python.
+
+    It opens the file, resolves every shard's footer schema, decodes Arrow IPC,
+    counting-sorts into CSR and (on the logical path) remaps every edge — all
+    of which ran under the GIL while both plan builders detached.
+    """
+    exp = pyscx.open(big_spatial)
+    n = exp.n_obs
+    duration, largest_gap = largest_gap_during(
+        lambda: exp.read_obsp_rows("connectivities", 0, n)
+    )
+    assert duration >= MIN_MEASURABLE_S, (
+        f"read_obsp_rows finished in {duration * 1000:.1f} ms — too fast to tell a held "
+        "GIL from a released one. Enlarge the fixture rather than skipping."
+    )
+    assert largest_gap < MAX_GAP_FRACTION * duration, (
+        f"read_obsp_rows starved a concurrent Python thread for {largest_gap:.3f}s of a "
+        f"{duration:.3f}s read ({largest_gap / duration:.0%}) — it is holding the GIL"
     )

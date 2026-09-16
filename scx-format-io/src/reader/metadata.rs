@@ -70,6 +70,10 @@ pub(crate) enum LegacyRowCount {
 
 /// One shard's catalog offset + stamped row range. Mirrors the fields
 /// the backed readers need (no `nnz`, since these are not CSR shards).
+///
+/// `Copy` so a backed reader can retain these directly rather than defining a
+/// private twin with the same six fields and copying them across one by one.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct MappingShardLayoutEntry {
     pub(crate) offset: u64,
     pub(crate) length: u64,
@@ -1178,35 +1182,65 @@ impl ScxReader {
             .get(&logical)
             .filter(|e| e.section_type == single_type)
             .ok_or_else(|| ScxError::SectionNotFound(logical.clone()))?;
-        let batch = self.read_arrow_ipc(entry)?;
-        let n_rows = match legacy_rows {
-            LegacyRowCount::BatchRows => batch.num_rows() as u64,
-            // A COO section's Arrow rows are triples, so `num_rows()` is
-            // nnz. The logical row count is the `n_rows` metadata key the
-            // pairwise writers always stamp (`writer::write_obsp`).
-            LegacyRowCount::SchemaNRows => batch
-                .schema_ref()
-                .metadata()
-                .get("n_rows")
-                .and_then(|v| v.parse::<u64>().ok())
-                .ok_or_else(|| {
-                    ScxError::InvalidCatalog(format!(
-                        "{logical}: legacy pairwise section has no parseable 'n_rows' schema                          metadata, so its logical row count is unknown"
-                    ))
-                })?,
+
+        // The pairwise arm reads the IPC **footer schema** and stops there.
+        // Everything it needs — the column fields, the dtype, and the `n_rows`
+        // / `n_cols` stamps — is in the schema, while the payload is every COO
+        // triple in the graph: on an atlas-scale unsharded obsp that is a
+        // multi-gigabyte decode, performed here only to be dropped and then
+        // performed again by the first `read_rows_range`. The dense arm cannot
+        // take this path: its row count IS `batch.num_rows()`, which the footer
+        // does not carry.
+        let (n_rows, n_cols, dtype, fields, matrix_n_cols) = match legacy_rows {
+            LegacyRowCount::SchemaNRows => {
+                let schema = self.read_arrow_ipc_schema_physical(entry)?;
+                let md = schema.metadata();
+                let n_rows = md
+                    .get("n_rows")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        ScxError::InvalidCatalog(format!(
+                            "{logical}: legacy pairwise section has no parseable 'n_rows' schema \
+                             metadata, so its logical row count is unknown"
+                        ))
+                    })?;
+                let n_cols = schema.fields().len();
+                let dtype = if n_cols > 0 {
+                    schema.field(0).data_type().clone()
+                } else {
+                    arrow::datatypes::DataType::Float32
+                };
+                let matrix_n_cols = md.get("n_cols").and_then(|v| v.parse::<u64>().ok());
+                (
+                    n_rows,
+                    n_cols,
+                    dtype,
+                    schema.fields().clone(),
+                    matrix_n_cols,
+                )
+            }
+            LegacyRowCount::BatchRows => {
+                let batch = self.read_arrow_ipc(entry)?;
+                let n_cols = batch.num_columns();
+                let dtype = if n_cols > 0 {
+                    batch.column(0).data_type().clone()
+                } else {
+                    arrow::datatypes::DataType::Float32
+                };
+                let matrix_n_cols = batch
+                    .schema_ref()
+                    .metadata()
+                    .get("n_cols")
+                    .and_then(|v| v.parse::<u64>().ok());
+                (
+                    batch.num_rows() as u64,
+                    n_cols,
+                    dtype,
+                    batch.schema_ref().fields().clone(),
+                    matrix_n_cols,
+                )
+            }
         };
-        let n_cols = batch.num_columns();
-        let dtype = if n_cols > 0 {
-            batch.column(0).data_type().clone()
-        } else {
-            arrow::datatypes::DataType::Float32
-        };
-        let fields = batch.schema_ref().fields().clone();
-        let matrix_n_cols = batch
-            .schema_ref()
-            .metadata()
-            .get("n_cols")
-            .and_then(|v| v.parse::<u64>().ok());
         Ok(MappingLayout {
             entries: vec![MappingShardLayoutEntry {
                 offset: entry.offset,

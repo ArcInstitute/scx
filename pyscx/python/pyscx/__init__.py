@@ -1170,13 +1170,28 @@ def obs_import(path, table, *, key=None, source_key=None, **kwargs):
 
 
 
+def _coerce_read_path(p):
+    """`_coerce_path`, but a live `Experiment` is checked before it is reduced.
+
+    The plan builders take a path and re-open the file, which means a closed or
+    stale handle would otherwise sail straight through — every other
+    `Experiment` read refuses both. Touching `n_obs` routes through the same
+    guarded reader those reads use, so the handle raises here for the same
+    reason and with the same message.
+    """
+    if getattr(p, "reload", None) is not None and isinstance(getattr(p, "path", None), str):
+        p.n_obs  # noqa: B018 — the guard IS the side effect
+    return _coerce_path(p)
+
+
 def neighborhood_plans_from_graph(
     path,
     key="connectivities",
     *,
+    file_id,
     k=None,
+    weight_order="desc",
     include_center=True,
-    file_id=0,
     drop_deleted=True,
     chunk_rows=65536,
 ):
@@ -1188,7 +1203,7 @@ def neighborhood_plans_from_graph(
     `.iter_with_plans` consume, so a neighbourhood workload becomes an ordinary
     cell-set workload::
 
-        plans, centers = pyscx.neighborhood_plans_from_graph(exp, k=8)
+        plans, centers = pyscx.neighborhood_plans_from_graph(exp, k=8, file_id=0)
         ds = pyscx.SparseCellSetDataset([exp.path])
         batch = ds.gather(*plans[0])
 
@@ -1207,10 +1222,29 @@ def neighborhood_plans_from_graph(
     Args:
         path: The SCX file (str, os.PathLike, or an open Experiment).
         key: `obsp` key holding the graph. Default `"connectivities"`.
-        k: Keep only the `k` heaviest edges per centre, weight descending with
-            ties broken by column ascending — a rule this function declares,
-            since a stored graph carries no order of its own. None keeps every
-            stored edge, in the graph's own column-ascending order.
+        k: Keep only `k` edges per centre, chosen at the `weight_order` end
+            with ties broken by column ascending — a rule this function
+            declares, since a stored graph carries no order of its own. None
+            keeps every stored edge, in the graph's own column-ascending order.
+            Non-finite weights sort last whatever the order, so a distance
+            graph's `inf` for "not connected" is never picked as a near
+            neighbour.
+
+            With `k`, a deleted row is **not a candidate**, so the `k` best of
+            the *live* neighbours are taken and the set is still `k` wide; a
+            centre whose nearest neighbour is deleted gets its next one. Without
+            `k`, a set is simply short by whatever is gone. Both are stated
+            because they are different answers, not an inconsistency.
+        weight_order: `"desc"` (default) keeps the **largest** weights — an
+            affinity graph such as scanpy's `obsp["connectivities"]`, where
+            larger means closer. `"asc"` keeps the smallest — a distance graph
+            such as `obsp["distances"]`, where larger means farther.
+
+            ⚠️ There is no safe per-key default and this is not inferred from
+            the key's name, which is yours to choose: `k` with `"desc"` against
+            a distance graph returns each cell's `k` **farthest** stored
+            neighbours, a structurally valid plan that answers the opposite
+            question.
         include_center: Emit the centre at position 0 with `role_tag` 0.
             With False a set is its neighbours only, and a self-loop is then an
             ordinary edge rather than a duplicate of the centre.
@@ -1232,11 +1266,12 @@ def neighborhood_plans_from_graph(
         physical rows, parallel to `plans`.
     """
     return _nb_graph_native(
-        _coerce_path(path),
+        _coerce_read_path(path),
         key,
-        k=k,
-        include_center=include_center,
         file_id=file_id,
+        k=k,
+        weight_order=weight_order,
+        include_center=include_center,
         drop_deleted=drop_deleted,
         chunk_rows=chunk_rows,
     )
@@ -1246,10 +1281,10 @@ def neighborhood_plans_from_coords(
     path,
     obsm_key="spatial",
     *,
+    file_id,
     k=None,
     radius=None,
     include_center=True,
-    file_id=0,
     drop_deleted=True,
 ):
     """Build one cell-set plan per cell from `obsm` coordinates, with no index.
@@ -1272,9 +1307,15 @@ def neighborhood_plans_from_coords(
     Args:
         path: The SCX file (str, os.PathLike, or an open Experiment).
         obsm_key: `obsm` key holding the coordinates. Default `"spatial"`.
-            Read as 2-D or 3-D; integer and float64 columns are narrowed to
-            float32, since scanpy writes Visium's spatial coordinates as int64
-            pixel positions.
+            **1-D, 2-D or 3-D only** — a wider key raises. The grid search is
+            exponential in the dimensionality, so a 50-component `X_pca` (a
+            plausible slip for `"spatial"`) would not return rather than being
+            merely slow. To build neighbourhoods in a wide embedding, write a
+            kNN graph into `obsp` (`sc.pp.neighbors(use_rep=...)`) and use
+            `neighborhood_plans_from_graph`.
+
+            Integer and float64 columns are narrowed to float32, since scanpy
+            writes Visium's spatial coordinates as int64 pixel positions.
         k: The `k` nearest other cells.
         radius: Every other cell within this distance, inclusive.
         include_center: As `neighborhood_plans_from_graph`.
@@ -1292,12 +1333,12 @@ def neighborhood_plans_from_coords(
             rather than clipped. Delete or impute the point first.
     """
     return _nb_coords_native(
-        _coerce_path(path),
+        _coerce_read_path(path),
         obsm_key,
+        file_id=file_id,
         k=k,
         radius=radius,
         include_center=include_center,
-        file_id=file_id,
         drop_deleted=drop_deleted,
     )
 

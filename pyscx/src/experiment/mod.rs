@@ -404,60 +404,83 @@ impl PyExperiment {
         } else {
             None
         };
-        let backed = scx_format_io::BackedPairwiseReader::new_obsp(
-            ScxReader::open(&self.path).map_err(to_pyerr)?,
-            key,
-        )
-        .map_err(to_pyerr)?;
-        let n_axis = match &kept {
-            Some(k) => k.len(),
-            None => backed.n_rows() as usize,
-        };
-        if stop > n_axis {
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "read_obsp_rows: stop ({stop}) exceeds the {} row count ({n_axis})",
-                if logical { "logical" } else { "physical" }
-            )));
-        }
-        let n_rows = stop - start;
+        let path = self.path.clone();
+        let key = key.to_string();
 
-        let (indptr, indices, data) = match &kept {
-            None => {
-                let rows = backed
-                    .read_rows_range(start as u64, stop as u64)
-                    .map_err(to_pyerr)?;
-                (rows.indptr, rows.indices, rows.data)
+        // Everything below is file I/O, Arrow decompression, a counting sort
+        // and — on the logical path — a remap over every edge in the range.
+        // It ran under the GIL, which on the surface documented as the
+        // atlas-scale bounded read starves every other Python thread for the
+        // duration; both plan builders detach and this did not. Only the numpy
+        // and scipy object construction stays attached, as it must.
+        /// `(indptr, indices, data, column extent)` of one decoded block.
+        type ObspBlock = (Vec<i64>, Vec<i64>, Vec<f32>, usize);
+        let decoded: PyResult<ObspBlock> = py.detach(move || {
+            let backed = scx_format_io::BackedPairwiseReader::new_obsp(
+                ScxReader::open(&path).map_err(to_pyerr)?,
+                &key,
+            )
+            .map_err(to_pyerr)?;
+            let n_axis = match &kept {
+                Some(k) => k.len(),
+                None => backed.n_rows() as usize,
+            };
+            if stop > n_axis {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "read_obsp_rows: stop ({stop}) exceeds the {} row count ({n_axis})",
+                    if logical { "logical" } else { "physical" }
+                )));
             }
-            Some(k) => {
-                // A logical range is a set of non-contiguous physical rows, so
-                // read the physical span that covers it and pick out the kept
-                // ones. Renumbering both axes through `k` is what makes the
-                // result square in live space.
-                let mut indptr = vec![0i64];
-                let mut indices: Vec<i64> = Vec::new();
-                let mut data: Vec<f32> = Vec::new();
-                if n_rows > 0 {
-                    let lo = k[start];
-                    let hi = k[stop - 1] + 1;
-                    let rows = backed.read_rows_range(lo, hi).map_err(to_pyerr)?;
-                    for i in start..stop {
-                        let local = (k[i] - lo) as usize;
-                        let (cols, vals) = rows.row(local);
-                        for (&c, &v) in cols.iter().zip(vals) {
-                            if let Ok(new_c) = k.binary_search(&(c as u64)) {
-                                indices.push(new_c as i64);
-                                data.push(v);
+            let n_rows = stop - start;
+            match &kept {
+                None => {
+                    let rows = backed
+                        .read_rows_range(start as u64, stop as u64)
+                        .map_err(to_pyerr)?;
+                    Ok((rows.indptr, rows.indices, rows.data, n_axis))
+                }
+                Some(k) => {
+                    // A logical range is a set of non-contiguous physical rows,
+                    // so read the physical span that covers it and pick out the
+                    // kept ones. Renumbering both axes through `k` is what makes
+                    // the result square in live space.
+                    let mut indptr = vec![0i64];
+                    let mut indices: Vec<i64> = Vec::new();
+                    let mut data: Vec<f32> = Vec::new();
+                    if n_rows > 0 {
+                        let lo = k[start];
+                        let hi = k[stop - 1] + 1;
+                        let rows = backed.read_rows_range(lo, hi).map_err(to_pyerr)?;
+                        // One inverted table rather than a binary search per
+                        // edge: the column remap runs once per non-zero, and
+                        // `k` is up to n_obs long, so the search was
+                        // O(nnz log n_obs) over a cold cache for a lookup that
+                        // is O(1) against one pass to build it.
+                        let mut live_of: Vec<i64> = vec![-1; backed.n_rows() as usize];
+                        for (live, &phys) in k.iter().enumerate() {
+                            if (phys as usize) < live_of.len() {
+                                live_of[phys as usize] = live as i64;
                             }
                         }
-                        indptr.push(indices.len() as i64);
+                        for &phys in &k[start..stop] {
+                            let local = (phys - lo) as usize;
+                            let (cols, vals) = rows.row(local);
+                            for (&c, &v) in cols.iter().zip(vals) {
+                                let live = live_of.get(c as usize).copied().unwrap_or(-1);
+                                if live >= 0 {
+                                    indices.push(live);
+                                    data.push(v);
+                                }
+                            }
+                            indptr.push(indices.len() as i64);
+                        }
                     }
-                } else {
-                    // `indptr` for an empty range is `[0]`, matching the
-                    // physical path rather than being special-cased away.
+                    Ok((indptr, indices, data, n_axis))
                 }
-                (indptr, indices, data)
             }
-        };
+        });
+        let (indptr, indices, data, n_axis) = decoded?;
+        let n_rows = stop - start;
 
         let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
         let args = ((

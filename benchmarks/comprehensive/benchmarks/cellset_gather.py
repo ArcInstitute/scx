@@ -1068,11 +1068,18 @@ def _build_neighborhood_plans(
     t0 = time.perf_counter()
     if arm == "graph":
         plans, _ = pyscx.neighborhood_plans_from_graph(
-            scx_path, "connectivities", k=_NEIGHBORHOOD_K_GRAPH, file_id=0
+            scx_path,
+            "connectivities",
+            file_id=0,
+            k=_NEIGHBORHOOD_K_GRAPH,
+            # An affinity graph: larger means closer. `obsp["distances"]` would
+            # need "asc", and getting it wrong here would silently time each
+            # cell's k FARTHEST neighbours.
+            weight_order="desc",
         )
     else:
         plans, _ = pyscx.neighborhood_plans_from_coords(
-            scx_path, "spatial", k=_NEIGHBORHOOD_K_COORDS, file_id=0
+            scx_path, "spatial", file_id=0, k=_NEIGHBORHOOD_K_COORDS
         )
     build_s = time.perf_counter() - t0
     n_sets = len(plans)

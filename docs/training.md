@@ -628,12 +628,15 @@ import pyscx
 exp = pyscx.open("tissue.scx")
 
 # From a stored graph — scanpy's obsp["connectivities"], a spatial adjacency,
-# any obs x obs sparse matrix. `k` keeps the heaviest edges per centre.
-plans, centers = pyscx.neighborhood_plans_from_graph(exp, k=8, file_id=0)
+# any obs x obs sparse matrix. `weight_order` says which end `k` keeps.
+plans, centers = pyscx.neighborhood_plans_from_graph(
+    exp, "connectivities", file_id=0, k=8, weight_order="desc")   # larger = closer
+plans, centers = pyscx.neighborhood_plans_from_graph(
+    exp, "distances", file_id=0, k=8, weight_order="asc")         # larger = farther
 
 # Or straight from coordinates, with no stored graph and no index.
-plans, centers = pyscx.neighborhood_plans_from_coords(exp, k=8, file_id=0)
-plans, centers = pyscx.neighborhood_plans_from_coords(exp, radius=50.0, file_id=0)
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, file_id=0, k=8)
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, file_id=0, radius=50.0)
 
 ds = pyscx.SparseCellSetDataset(["tissue.scx"])
 for batch in ds.iter_with_plans(pyscx.batch_plans(plans, sets_per_batch=64)):
@@ -641,7 +644,14 @@ for batch in ds.iter_with_plans(pyscx.batch_plans(plans, sets_per_batch=64)):
 ```
 
 Each plan is one set: the centre at position 0 with `role_tag` 0, then its
-neighbours with `role_tag` 1. That maps onto Nicheformer's cell + context tokens
+neighbours with `role_tag` 1.
+
+⚠️ The two builders order those neighbours differently, and neither is wrong.
+`_from_graph` emits them **column-ascending** — a stored graph carries no other
+order, and re-sorting by weight would make *which* edges `k` picked also change
+*where* they land. `_from_coords` emits them **nearest first**, the order it
+computed. So `rows[1]` is the nearest neighbour on the coordinate path and
+merely the lowest-numbered one on the graph path. That maps onto Nicheformer's cell + context tokens
 and feeds the [tokenisation kernels](#tokenisation-kernels) per set member
 unchanged. `batch_plans` concatenates single-set plans into batches for
 `iter_with_plans`; `shuffle_seed` reorders the sets, never a set's members.
@@ -649,17 +659,31 @@ unchanged. `batch_plans` concatenates single-set plans into batches for
 **`file_id` is a manifest position, not a file identity.** It is the index of
 this file in the `SparseCellSetDataset` you will gather with. Build plans from
 file A, hand them to a dataset whose manifest puts A third, and you gather the
-*first* file's rows with nothing raising — so it is a required argument rather
-than a default that guesses. Sets never span files: a neighbourhood is
+*first* file's rows with nothing raising — so it is keyword-only and required
+rather than defaulting to `0`, which would make that the quiet path.
+
+**`weight_order` decides which end of the graph `k` keeps, and the key's name
+does not.** scanpy's `obsp["connectivities"]` is an affinity — larger means
+closer, so `"desc"`. Its `obsp["distances"]` is a metric — larger means
+farther, so `"asc"`. Asking for `k=8` on a distance graph under the default
+returns each spot's eight **farthest** stored neighbours: a valid plan, and the
+opposite of the query. Non-finite weights sort last either way, so a distance
+graph's `inf` for "not connected" is never chosen as a near neighbour. Sets never span files: a neighbourhood is
 within-file by construction, which is what spares this regime the
 `remap_tables` requirement R2 has.
 
 **Deleted cells are dropped, not renumbered.** The emitted rows are physical
 file rows, which is what the gather wants. A deleted centre yields no set at all
 — `centers` is then shorter than `n_obs` and says which centres survived — and a
-deleted neighbour is dropped from every set it appeared in, leaving a shorter
-set rather than a backfilled one. Pass `drop_deleted=False` to build over
-physical rows including deleted ones.
+deleted neighbour is dropped from every set it appeared in. Pass
+`drop_deleted=False` to build over physical rows including deleted ones.
+
+What "dropped" costs a set depends on `k`. **Without** it — every stored edge,
+or a radius query — the set is simply short by whatever is gone. **With** it,
+deleted rows are not candidates, so the `k` best of the *live* neighbours are
+taken and the set is still `k` wide; a spot whose nearest neighbour is deleted
+gets its next one. Both are intended: asking for `k` neighbours and being
+handed `k - 1` because one was deleted is the less useful answer.
 
 **The coordinate builder is exact, not approximate.** It bins the points into a
 uniform grid at call time (O(n), no on-disk index) and searches ring by ring, so
@@ -671,6 +695,12 @@ coordinate columns are narrowed to float32 — scanpy writes Visium's
 kept cell raises: unlike an expression value, which clips to zero, a NaN
 coordinate has no defensible grid cell and bucketing it somewhere would put a
 cell in a neighbourhood it is not in.
+
+⚠️ **1-D, 2-D or 3-D only.** The ring search is exponential in the
+dimensionality, so `obsm_key="X_pca"` on a 50-component embedding — a plausible
+slip for `"spatial"` — would not return rather than merely being slow, and is
+refused. For neighbourhoods in a wide embedding, write a kNN into `obsp`
+(`sc.pp.neighbors(use_rep="X_pca")`) and use the graph builder.
 
 #### Layout decides what this costs
 

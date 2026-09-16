@@ -1441,23 +1441,33 @@ def neighborhood_plans_from_graph(
     path: Any,
     key: str = "connectivities",
     *,
+    file_id: int,
     k: int | None = None,
+    weight_order: Literal["desc", "asc"] = "desc",
     include_center: bool = True,
-    file_id: int = 0,
     drop_deleted: bool = True,
     chunk_rows: int = 65536,
 ) -> tuple[list[_NeighborhoodPlan], np.ndarray]:
     """One cell-set plan per cell, from a stored ``obsp`` neighbourhood graph.
 
     Each set is the centre first (``role_tag`` 0) then its neighbours
-    (``role_tag`` 1). ``k`` keeps only the ``k`` heaviest edges — weight
-    descending, ties by column ascending; ``None`` keeps every stored edge in
-    column order. Rows are **physical**: a deleted centre yields no set (so the
-    returned ``centers`` is shorter than ``n_obs``) and a deleted neighbour is
-    dropped rather than backfilled.
+    (``role_tag`` 1). ``k`` keeps only ``k`` edges, taken at the
+    ``weight_order`` end with ties by column ascending; ``None`` keeps every
+    stored edge in column order.
 
-    ``file_id`` is this file's position in the `SparseCellSetDataset` manifest
-    the plans will be gathered with, not a file identity.
+    ⚠️ ``weight_order`` has no safe per-key default and is not inferred from the
+    key's name. ``"desc"`` suits an affinity graph (``connectivities``: larger =
+    closer); ``"asc"`` suits a distance graph (``distances``: larger = farther).
+    The wrong one with ``k`` returns each cell's ``k`` **farthest** neighbours.
+
+    ``file_id`` is **required** — this file's position in the
+    `SparseCellSetDataset` manifest the plans will be gathered with, not a file
+    identity, and nothing checks it against the file.
+
+    Rows are **physical**: a deleted centre yields no set (so ``centers`` is
+    shorter than ``n_obs``). Without ``k`` a set is short by whatever neighbours
+    are gone; with ``k``, deleted rows are not candidates, so the ``k`` best
+    *live* neighbours are taken and the set is still ``k`` wide.
 
     The graph is read one ``chunk_rows`` range at a time; a graph stored as a
     single unsharded section — what ``scx sort`` emits — is decoded whole."""
@@ -1468,10 +1478,10 @@ def neighborhood_plans_from_coords(
     path: Any,
     obsm_key: str = "spatial",
     *,
+    file_id: int,
     k: int | None = None,
     radius: float | None = None,
     include_center: bool = True,
-    file_id: int = 0,
     drop_deleted: bool = True,
 ) -> tuple[list[_NeighborhoodPlan], np.ndarray]:
     """One cell-set plan per cell, from ``obsm`` coordinates, with no index.
@@ -1480,7 +1490,15 @@ def neighborhood_plans_from_coords(
     built at call time (O(n)) and searched ring by ring, so the answer is exact;
     ties are ordered by squared distance ascending, then row ascending. Integer
     and float64 coordinate columns are narrowed to float32. A NaN or infinite
-    coordinate on a kept cell raises rather than being bucketed somewhere."""
+    coordinate on a kept cell raises rather than being bucketed somewhere.
+
+    ⚠️ **1-D, 2-D or 3-D only** — the grid search is exponential in the
+    dimensionality, so a wide embedding such as a 50-component ``X_pca`` would
+    not return rather than merely being slow. Use
+    `neighborhood_plans_from_graph` over a kNN written into ``obsp`` instead.
+
+    ``file_id`` is **required**, for the reason
+    `neighborhood_plans_from_graph` gives."""
     ...
 
 
