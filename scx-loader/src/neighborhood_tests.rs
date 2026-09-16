@@ -519,6 +519,55 @@ fn batch_plans_refuses_a_zero_batch_size() {
 }
 
 #[test]
+fn batch_plans_refuses_a_plan_whose_offsets_are_not_an_indptr() {
+    // The rebase adds a running base to each input's offsets, so a plan that
+    // does not start at 0 would be shifted into the wrong place and produce a
+    // batch whose sets are silently wrong. `batch_plans` is public and takes
+    // whatever a caller has, so this is refused rather than assumed.
+    let good = SparseCellSetPlan {
+        file_ids: vec![0; 3],
+        rows: vec![1, 2, 3],
+        role_tags: vec![0, 1, 1],
+        set_offsets: vec![0, 3],
+    };
+    assert!(batch_plans(std::slice::from_ref(&good), 2, None).is_ok());
+
+    for (bad, needle) in [
+        (
+            SparseCellSetPlan {
+                set_offsets: vec![1, 3],
+                ..good.clone()
+            },
+            "must start at 0",
+        ),
+        (
+            SparseCellSetPlan {
+                set_offsets: vec![0, 2],
+                ..good.clone()
+            },
+            "must start at 0",
+        ),
+        (
+            SparseCellSetPlan {
+                set_offsets: vec![0, 2, 1, 3],
+                ..good.clone()
+            },
+            "non-monotonic",
+        ),
+        (
+            SparseCellSetPlan {
+                role_tags: vec![0, 1],
+                ..good.clone()
+            },
+            "role_tags",
+        ),
+    ] {
+        let err = batch_plans(&[bad], 2, None).unwrap_err().to_string();
+        assert!(err.contains(needle), "{needle} not in {err}");
+    }
+}
+
+#[test]
 fn file_id_is_stamped_on_every_row() {
     let n = 5;
     let rows = rows_from(&ring(n), n);

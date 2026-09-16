@@ -1052,9 +1052,15 @@ def _build_neighborhood_plans(
 ) -> tuple[list, float, int, dict[str, Any]]:
     """Build one arm's plans and batch them.
 
-    Returns `(batched, build_s, n_sets, locality)`. `build_s` times the builder
-    alone; the gather is timed separately, because conflating the two would hide
-    which half a change moved.
+    Returns `(batched, build_s, n_sets, locality)`.
+
+    `build_s` times **the builder alone** — not the premise check and not
+    `batch_plans`, both of which run after the clock stops. The gather is timed
+    separately again, because conflating the three would hide which one a change
+    moved. `batch_plans` is excluded on purpose rather than by accident: it is a
+    caller-side convenience over already-built plans, and its cost is dominated
+    by pyo3 extracting numpy arrays element-wise, which is a property of how this
+    arm calls it rather than of the regime.
     """
     import pyscx
 

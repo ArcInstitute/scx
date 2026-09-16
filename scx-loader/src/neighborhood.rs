@@ -572,6 +572,39 @@ pub fn batch_plans(
             reason: "batch_plans: sets_per_batch must be >= 1".into(),
         });
     }
+    // Every input's offsets must be a true indptr, because the rebase below adds
+    // a running base to them. A plan starting at a non-zero offset would be
+    // rebased to the wrong place and produce a batch whose sets are silently
+    // shifted — the builders here always emit `[0, n]`, but this is public and
+    // takes whatever a caller has.
+    for (i, p) in plans.iter().enumerate() {
+        let off = &p.set_offsets;
+        if off.first() != Some(&0) || off.last() != Some(&(p.rows.len() as i64)) {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "batch_plans: plan {i} has set_offsets {:?} over {} rows; each plan's \
+                     set_offsets must start at 0 and end at its row count",
+                    off,
+                    p.rows.len()
+                ),
+            });
+        }
+        if off.windows(2).any(|w| w[1] < w[0]) {
+            return Err(LoaderError::ConfigError {
+                reason: format!("batch_plans: plan {i} has non-monotonic set_offsets {off:?}"),
+            });
+        }
+        if p.file_ids.len() != p.rows.len() || p.role_tags.len() != p.rows.len() {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "batch_plans: plan {i} has {} rows but {} file_ids and {} role_tags",
+                    p.rows.len(),
+                    p.file_ids.len(),
+                    p.role_tags.len()
+                ),
+            });
+        }
+    }
     let mut order: Vec<usize> = (0..plans.len()).collect();
     if let Some(seed) = shuffle_seed {
         order.shuffle(&mut ChaCha8Rng::seed_from_u64(seed));

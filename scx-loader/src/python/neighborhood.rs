@@ -45,26 +45,36 @@ fn keep_mask(path: &std::path::Path) -> PyResult<Option<Vec<bool>>> {
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-fn plan_to_py<'py>(py: Python<'py>, plan: &SparseCellSetPlan) -> PyResult<Bound<'py, PyTuple>> {
+/// Consumes the plan: `PyArray1::from_vec` adopts the allocation, so taking
+/// `&SparseCellSetPlan` and cloning would pay a full copy of every array for
+/// nothing — which is what the module docs' "moved, not copied" claim would
+/// have been worth.
+fn plan_to_py(py: Python<'_>, plan: SparseCellSetPlan) -> PyResult<Bound<'_, PyTuple>> {
+    let SparseCellSetPlan {
+        file_ids,
+        rows,
+        role_tags,
+        set_offsets,
+    } = plan;
     PyTuple::new(
         py,
         [
-            PyArray1::from_vec(py, plan.file_ids.clone()).into_any(),
-            PyArray1::from_vec(py, plan.rows.clone()).into_any(),
-            PyArray1::from_vec(py, plan.role_tags.clone()).into_any(),
-            PyArray1::from_vec(py, plan.set_offsets.clone()).into_any(),
+            PyArray1::from_vec(py, file_ids).into_any(),
+            PyArray1::from_vec(py, rows).into_any(),
+            PyArray1::from_vec(py, role_tags).into_any(),
+            PyArray1::from_vec(py, set_offsets).into_any(),
         ],
     )
 }
 
-fn plans_to_py<'py>(py: Python<'py>, plans: &[SparseCellSetPlan]) -> PyResult<Bound<'py, PyList>> {
-    let items: PyResult<Vec<_>> = plans.iter().map(|p| plan_to_py(py, p)).collect();
+fn plans_to_py(py: Python<'_>, plans: Vec<SparseCellSetPlan>) -> PyResult<Bound<'_, PyList>> {
+    let items: PyResult<Vec<_>> = plans.into_iter().map(|p| plan_to_py(py, p)).collect();
     PyList::new(py, items?)
 }
 
 /// Owned plans plus their centres, returned as `(plans, centers)`.
-fn built_to_py<'py>(py: Python<'py>, built: NeighborhoodPlans) -> PyResult<Bound<'py, PyTuple>> {
-    let plans = plans_to_py(py, &built.plans)?;
+fn built_to_py(py: Python<'_>, built: NeighborhoodPlans) -> PyResult<Bound<'_, PyTuple>> {
+    let plans = plans_to_py(py, built.plans)?;
     let centers = built.centers.into_pyarray(py);
     PyTuple::new(py, [plans.into_any(), centers.into_any()])
 }
@@ -175,7 +185,7 @@ fn batch_plans<'py>(
     let batched = py
         .detach(|| batch_plans_impl(&owned, sets_per_batch, shuffle_seed))
         .map_err(loader_err_to_py)?;
-    plans_to_py(py, &batched)
+    plans_to_py(py, batched)
 }
 
 /// Register the three plan-builder functions flat on the `pyscx` module.
