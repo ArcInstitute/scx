@@ -147,9 +147,11 @@ def main(root: pathlib.Path) -> int:
         for m in CARRIED:
             vals = [r[m] for r in rows if isinstance(r.get(m), (int, float))]
             print(f"  {m:<46s}: {_stat(vals)}")
-        rss = [r["peak_rss_mb_median"] for r in rows
-               if isinstance(r.get("peak_rss_mb_median"), (int, float))]
-        print(f"  {'peak_rss_mb_median':<46s}: {_stat(rss)}")
+        for arm in ARMS:
+            key = f"peak_rss_mb__neighborhood_{arm}"
+            vals = [r[key] for r in rows if isinstance(r.get(key), (int, float))]
+            if vals:
+                print(f"  {key:<46s}: {_stat(vals)}")
         print()
 
     print(

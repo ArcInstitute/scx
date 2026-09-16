@@ -52,7 +52,7 @@ DATASETS="visium_lymph_node"
 FORMAT_KEY="scx_auto"
 FORMAT_RUNNER="scx_runner"
 N_RUNS=${N_RUNS:-3}
-ROUNDS=${ROUNDS:-2}
+ROUNDS=${ROUNDS:-8}
 
 export RAYON_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 export SCX_BENCH_OOC_MEM_CAP_GB=${SCX_BENCH_OOC_MEM_CAP_GB:-48}
@@ -223,6 +223,20 @@ for m in METRICS:
         if isinstance(v, (int, float)):
             vals.append(float(v))
     out[m] = statistics.median(vals) if vals else None
+# Per ARM, from the runs. `res["peak_rss_mb_median"]` is None on this
+# benchmark — it pools every scenario, which for a module with a dozen arms is
+# not a number about any of them. The neighbourhood arms' own RSS turned out to
+# be the most informative field in the first capture: it is what distinguished a
+# fast round from a slow one.
+for arm in ("graph", "coords"):
+    scenario = f"gather_neighborhood_{arm}"
+    vals = [
+        float(r["peak_rss_mb"])
+        for r in (res.get("runs") or [])
+        if (r.get("extra") or {}).get("scenario") == scenario
+        and isinstance(r.get("peak_rss_mb"), (int, float))
+    ]
+    out[f"peak_rss_mb__neighborhood_{arm}"] = statistics.median(vals) if vals else None
 out["peak_rss_mb_median"] = res.get("peak_rss_mb_median")
 
 # Which arms the fixture could exercise, why not where it could not, and the
@@ -278,6 +292,7 @@ cat > "$OUT/provenance.json" <<JSON
  "fixture": "$FIXTURE",
  "format_key": "$FORMAT_KEY",
  "rounds": $ROUNDS,
+ "rounds_note": "Eight, not the two the phase gate asks for, because two could not resolve these arms: the first capture (job 2959318) measured 9,597 vs 13,387 sets/s on the graph arm between two rounds while the three runs WITHIN each round agreed to ~3%, and peak RSS tracked the difference (1,580 MB in the slow round, 2,045 MB in the fast one). The variation is between processes, not within one.",
  "n_runs_per_invocation": $N_RUNS,
  "rayon_num_threads": "${RAYON_NUM_THREADS}",
  "design": "ONE-ARMED. The two neighbourhood arms do not exist on main, so there is no before build to interleave against and no ratio to take. Two rounds on one host, three timed runs per round, cold page cache per run. The four pre-existing gather_* metrics are recorded on the same runs so that 'nothing else moved on this fixture' is measured rather than inferred.",
