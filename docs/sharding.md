@@ -639,7 +639,34 @@ consumed): an admitted plan is pre-decoded by the L2 prefetcher and retained by 
 an over-share plan is neither — else a plan of many individually-fitting gathers (the
 cell-set loader gathers one set at a time) would churn the LRU for zero hits. A standalone
 `read_rows_with` / `read_rows` outside the loaders decides for itself against the whole
-budget. Both size from the block index, no decode. The win is therefore capacity-bound: at G=256 and ~2k nnz/row a touched group is
+budget, counting its own whole shards alongside its groups, as the plan rule does. Both
+size from the block index, no decode.
+
+**A plan over its share keeps what its neighbours also want (W10).** "Neither" above was
+all-or-nothing, and phase 0 measured what that costs: on the shipped default budget with
+random plans, pbmc10k retained at 0.987 while tabula_sapiens_100k, census_500k and census_1m
+all retained **0.000**. An over-share plan now keeps the row groups **another plan of the
+lookahead window also touches** — the control pool of a perturbation screen, the shared
+neighbours of a spatial batch, a pair member repeated across pairs — taken hottest-first and
+only while they fit that same `budget / (lookahead + 1)` share, with its cold tail still
+decoded and dropped. `cache_metrics()` reports the split as `reuse_admissions` (plans given a
+partial verdict) and `admitted_group_bytes` / `rejected_group_bytes`.
+
+⚠️ **The share bound on that partial verdict is load-bearing.** A wide random plan can touch
+nearly every row group a file has — a 64-set batch on tabula_sapiens_100k touches most of its
+~392 groups at G=256 — so every key reaches a window count of two and an unbounded "admit the
+reused groups" collapses into "admit everything", which is the regime the first row-group LRU
+capture measured at 0 % hits, +350-500 MB and 2-4 % slower. `SCX_ROW_GROUP_ADMIT=plan`
+restores the all-or-nothing rule as the same-build A/B arm.
+
+**Decode is chunked and parallel across shards.** A gather decodes its touched row groups a
+pool-width chunk at a time and scatters each chunk before decoding the next, so the transient
+is one chunk rather than the gather's whole group set — which matters most for an over-budget
+gather, since that is both the one with the most groups to overlap and the one that retains
+none of them. `cache_metrics()["parallel_group_decodes"]` counts the groups decoded inside a
+chunk; it is 0 when every gather was narrow enough to decode one group at a time.
+
+The win is therefore capacity-bound: at G=256 and ~2k nnz/row a touched group is
 ~4 MB, so a 512-row batch over a large file wants a budget of a few GB
 (`max_memory_mb`); a budget under one batch's groups gets the pre-change behaviour, not a
 slower one. `SCX_ROW_GROUP_CACHE=0` disables retention (the

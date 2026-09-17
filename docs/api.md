@@ -3537,8 +3537,17 @@ index with no decode, against `max_memory_mb`'s cache share
 `budget / (lookahead + 1)` — and that verdict drives both sides: an admitted
 plan's eligible shards are pre-decoded into the row-group half of the LRU and
 the gather reports them as `cache_metrics()["row_group_hits"]`; an over-share
-plan is neither warmed nor retained by its gathers (they decode and drop), so
-`row_group_misses` grows while `row_group_bytes_inserted` stays flat. It is a useful
+plan is not warmed, and retains only the groups **another plan of the lookahead
+window also touches**, hottest-first and only while they fit the same share —
+its cold tail still decodes and drops, so `row_group_misses` keeps growing while
+`row_group_bytes_inserted` moves only by the reused groups.
+`cache_metrics()["reuse_admissions"]` counts the plans that got such a partial
+verdict, and `admitted_group_bytes` / `rejected_group_bytes` is the split it
+decided. Before that, an over-share plan retained nothing at all —
+`SCX_ROW_GROUP_ADMIT=plan` restores it as the same-build A/B arm. The bound on
+the partial verdict is load-bearing, not belt-and-braces: a wide random plan can
+touch nearly every row group a file has, at which point every key is "reused"
+and an unbounded rule degenerates into admitting everything. It is a useful
 confirmation that `scatter_block_index=True` had an effect — it stays 0 against
 an unframed file. Both classes now warn at construction when the kwarg is set
 and no shard is framed, so this is a confirmation rather than the only signal;

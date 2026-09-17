@@ -2593,6 +2593,13 @@ framing the phase was written around.
 **Admission is the other half, and it is off at scale by default.** Row-group
 retention (`cache_metrics()`, shipped default budget, random plans):
 
+> [!WARNING]
+> This table is the **before** side of the reuse-signal admission change (W10)
+> and is not re-measured here. The `0.000` rows below are what an
+> all-or-nothing per-plan verdict produces; the shipped rule now admits, within
+> the same share, the groups two plans of the lookahead window both touch.
+> Re-capture before quoting these as current.
+
 | fixture | shards | cells | `row_group_hits` | `row_group_misses` | hit rate |
 |---|---|---|---|---|---|
 | pbmc10k | 1 | 11 769 | 3 597 | 46 | **0.987** |

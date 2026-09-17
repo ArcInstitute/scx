@@ -4077,3 +4077,60 @@ absolute_floors:
 #          reason and are echoed into `runs[].extra`; so is the fixture's
 #          `DatasetConfig.shard_size`, which decides how many shards a batch
 #          touches. Changing any of them invalidates the numbers above.
+#
+# 24. cellset_gather / hot-control cold-tail arm (W10 reuse-signal admission)
+#     `cellsets_per_sec__gather_hot_control_cold_tail`,
+#     `us_per_cell__*`, `row_group_hit_rate__*`, `peak_rss_mb__*`,
+#     `ttfb_first_set_s__*`, `reuse_admissions__*`, `admitted_group_bytes__*`
+#     and `rejected_group_bytes__*` are emitted as of the reuse-signal
+#     admission PR. NO floor is proposed, for four reasons, and the fourth is
+#     the one that matters:
+#
+#     (a) The phase's own gate is two captures before a floor — the sequencing
+#         items 22 and 23 follow.
+#     (b) No baseline carries `cellset_gather` rows at all (item 15).
+#     (c) The arm self-skips on any fixture too small to hold a cold tail apart
+#         from itself: at the pinned shape a batch draws 56 x 64 rows, so on
+#         pbmc3k (2,700 rows) the "cold" tails overlap 0.55 of their rows and
+#         `metadata.hot_control_cold_tail.applicable` comes back false. A floor
+#         on a skipped arm synthesises a "missing metric" violation every run.
+#     (d) ⚠️ **The policy has not been shown to pay.** Interactively on
+#         tabula_sapiens_100k, one run per arm, the `plan` arm (pre-W10) read
+#         20.7 / 23.1 / 23.0 sets/s across three probe pairs and the `reuse`
+#         arm 19.0 / 21.9 / 19.1 — consistently lower, with ~12 % spread inside
+#         each arm, for a recovered `row_group_hit_rate` of 0.039 against this
+#         shape's 0.125 ceiling. A floor authored now could pin a regression.
+#
+#     ⚠️ Read `row_group_hit_rate__*` against
+#     `metadata.hot_control_cold_tail.row_group_hit_rate_ceiling`, never against
+#     1.0. Only the control sets can be served from cache, so at
+#     `_HOT_CONTROL_SETS` of `_HOT_CONTROL_SETS + _HOT_TAIL_SETS` the ceiling is
+#     0.125 and a measured 0.039 is 31 % of what the shape can reach. Against
+#     1.0 the same number reads as a failure.
+#
+#     ⚠️ Read it together with `rejected_group_bytes__*`. A policy that
+#     recovered the hit rate by admitting the cold tail too would show a HIGHER
+#     rate and a collapsed rejection, and would reproduce the regime the first
+#     row-group LRU capture measured at 0 % hits, +350-500 MB and 2-4 % slower.
+#     Neither number alone can tell the two apart.
+#
+#     ACTIVATION, once a baseline carries the arm AND the A/B shows the policy
+#     pays on a scheduled dataset:
+#       1. Read the medians from
+#          `<candidate>/raw/cellset_gather__scx_auto__tabula_sapiens_100k.json`,
+#          from runs whose `extra.scenario == "gather_hot_control_cold_tail"`.
+#       2. Author:
+#              metric: cellsets_per_sec__gather_hot_control_cold_tail -> min: 0.85 x median
+#              metric: row_group_hit_rate__gather_hot_control_cold_tail -> min: 0.85 x median
+#          and add BOTH names to `_FROZEN_CELLSET_KEYS` in
+#          `tests/test_dataload_phase0.py`, or
+#          `test_thresholds_yaml_floor_keys_match_frozen_list` fails — that test
+#          is the guard on this file's `cellset_gather` metric names and it is
+#          exact, not a subset.
+#       3. The floors bind only while the shape stays pinned. `_HOT_CONTROL_SETS`,
+#          `_HOT_TAIL_SETS`, `_HOT_SET_SIZE`, `_HOT_CONTROL_POOL`,
+#          `_HOT_N_BATCHES`, `_HOT_SEED` and `_HOT_MAX_MEMORY_MB` are module
+#          constants for exactly that reason and are echoed into `runs[].extra`.
+#          `_HOT_MAX_MEMORY_MB` is the load-bearing one: it decides whether a
+#          plan is over its budget share at all, and a larger budget makes every
+#          plan fit and the arm measure `Admit::All` under the reuse name.
