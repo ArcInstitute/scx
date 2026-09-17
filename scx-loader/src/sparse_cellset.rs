@@ -356,8 +356,8 @@ pub(crate) struct SparseCellSetParams {
 ///   (census_500k affords 22 of the 31 shards it wants) that is throughput
 ///   traded away for an estimate nobody asked for.
 /// * **Charged with it**: the batch executor's unique-row read, on the
-///   configurations that cannot avoid it — see
-///   [`SparseCellSetBudgetModel::transient_bytes_for`].
+///   configurations that cannot avoid it — a remap, a downsample, or a manifest
+///   of more than one file; see `SparseCellSetBudgetModel::transient_bytes`.
 /// * **Not charged**: the batch's per-row transients, and nothing at all when
 ///   `max_plan_rows` is `None`.
 /// * **Not a hard cap**: `WeightedLruCache::put_with_budget` deliberately keeps
@@ -377,9 +377,24 @@ pub(crate) struct SparseCellSetBudgetModel {
     shard_decoded_bytes: usize,
     /// One gathered batch at the caller's declared `max_plan_rows`, or 0.
     batch_bytes: usize,
-    /// The batch executor's unique-row read, co-resident with the batch while
-    /// it is being assembled, or 0 when this loader's configuration cannot need
-    /// one. See [`SparseCellSetBudgetModel::transient_bytes_for`].
+    /// Bytes the batch executor's unique-row read holds **beside** the batch.
+    ///
+    /// W11 reads a plan's deduplicated rows into one exactly-sized `ScxCsr` and
+    /// then writes the batch from it, so for the span of a gather two buffers
+    /// are live. Not always, though: a single-file plan with no repeated rows
+    /// and no length-changing transform is handed the read's own buffers as the
+    /// batch, and holds one.
+    ///
+    /// Which of the two a gather takes is decided per *plan* — a repeated row
+    /// forces the general path on any configuration — so the model charges on
+    /// the three facts it knows at construction: a remap or a downsample makes
+    /// every plan take it, and so does a manifest of more than one file. On a
+    /// single-file raw-local loader the term is 0 and a plan that repeats a row
+    /// pays an uncharged transient, which is a **floor rather than a bound** and
+    /// is said here rather than left to be discovered. The charged figure is one
+    /// batch, which is its ceiling: the unique rows of a plan are at most its
+    /// rows, and are fewer exactly when the duplicates that force this path
+    /// exist.
     transient_bytes: usize,
 }
 
@@ -403,32 +418,6 @@ impl SparseCellSetBudgetModel {
         let nnz = presize_nnz(max_plan_rows, mean_nnz_per_row);
         nnz.saturating_mul(8)
             .saturating_add(max_plan_rows.saturating_add(1).saturating_mul(8))
-    }
-
-    /// Bytes the batch executor's unique-row read holds **beside** the batch.
-    ///
-    /// W11 reads a plan's deduplicated rows into one exactly-sized `ScxCsr` and
-    /// then writes the batch from it, so for the span of a gather two buffers
-    /// are live. Not always, though: a single-file plan with no repeated rows
-    /// and no length-changing transform is handed the read's own buffers as the
-    /// batch, and holds one.
-    ///
-    /// Which of the two a gather takes is decided per *plan* — a repeated row
-    /// forces the general path on any configuration — so the model charges on
-    /// the three facts it knows at construction: a remap or a downsample makes
-    /// every plan take it, and so does a manifest of more than one file. On a
-    /// single-file raw-local loader the term is 0 and a plan that repeats a row
-    /// pays an uncharged transient, which is a **floor rather than a bound** and
-    /// is said here rather than left to be discovered. The charged figure is one
-    /// batch, which is its ceiling: the unique rows of a plan are at most its
-    /// rows, and are fewer exactly when the duplicates that force this path
-    /// exist.
-    fn transient_bytes_for(batch_bytes: usize, general_path: bool) -> usize {
-        if general_path {
-            batch_bytes
-        } else {
-            0
-        }
     }
 }
 
@@ -790,10 +779,13 @@ impl SparseCellSetLoader {
         let model = SparseCellSetBudgetModel {
             shard_decoded_bytes,
             batch_bytes,
-            transient_bytes: SparseCellSetBudgetModel::transient_bytes_for(
-                batch_bytes,
-                remap.is_some() || downsample.is_some() || n_files > 1,
-            ),
+            // Charged only where a gather cannot take the fast path — see
+            // the field's doc.
+            transient_bytes: if remap.is_some() || downsample.is_some() || n_files > 1 {
+                batch_bytes
+            } else {
+                0
+            },
         };
         let requested = SparseCellSetParams { cache_shards };
         let cache_bytes_budget = match bytes_budget {
