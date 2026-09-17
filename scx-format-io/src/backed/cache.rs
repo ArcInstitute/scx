@@ -126,11 +126,12 @@ pub struct CacheMetrics {
     pub row_group_duplicate_waiters: AtomicU64,
 
     // --- W10: what the reuse-signal verdict actually decided -----------------
-    /// Row groups a gather decoded inside a parallel chunk. Zero when the
-    /// gather decoded one group, when the `parallel` feature is off, or when
-    /// nothing took the block-index route — so a flat zero beside a non-zero
-    /// `block_index_groups` says the gathers are too narrow to overlap, not
-    /// that the pool is missing.
+    /// Row groups a gather **fetched** inside a parallel chunk — a decode or a
+    /// cache hit, since the chunk cannot know which before it runs. Zero when a
+    /// gather's chunk held one group, when the `parallel` feature is off, or
+    /// when nothing took the block-index route, so a flat zero beside a
+    /// non-zero `block_index_groups` says the gathers are too narrow to
+    /// overlap, not that the pool is missing.
     pub parallel_group_decodes: AtomicU64,
     /// Bytes of the row groups an admission verdict let a gather retain.
     ///

@@ -663,8 +663,11 @@ restores the all-or-nothing rule as the same-build A/B arm.
 pool-width chunk at a time and scatters each chunk before decoding the next, so the transient
 is one chunk rather than the gather's whole group set — which matters most for an over-budget
 gather, since that is both the one with the most groups to overlap and the one that retains
-none of them. `cache_metrics()["parallel_group_decodes"]` counts the groups decoded inside a
-chunk; it is 0 when every gather was narrow enough to decode one group at a time.
+none of them. `cache_metrics()["parallel_group_decodes"]` counts the groups *fetched* inside a chunk (a
+decode or a hit — the chunk cannot know which before it runs); it is 0 when every gather was
+narrow enough to fetch one group at a time. ⚠️ Note for anyone re-running the OPT-FORMATIO-1
+A/B: `SCX_ROW_GROUP_CACHE=0` now disables **retention only**, not the chunked parallel decode,
+so that arm is no longer the pre-change regime in full.
 
 The win is therefore capacity-bound: at G=256 and ~2k nnz/row a touched group is
 ~4 MB, so a 512-row batch over a large file wants a budget of a few GB
