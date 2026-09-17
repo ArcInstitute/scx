@@ -206,9 +206,17 @@ def _one_run(scx_path: str, n_obs: int, pairs_per_batch: int, n_batches: int) ->
         block_index_groups = int(cm.get("block_index_groups", 0))
         row_group_hits = int(cm.get("row_group_hits", 0))
         row_group_misses = int(cm.get("row_group_misses", 0))
+        # W10. `.get` with a default so a build predating these keys reports
+        # zero rather than dropping every counter through the `except`.
+        reuse_admissions = int(cm.get("reuse_admissions", 0))
+        admitted_group_bytes = int(cm.get("admitted_group_bytes", 0))
+        rejected_group_bytes = int(cm.get("rejected_group_bytes", 0))
+        parallel_group_decodes = int(cm.get("parallel_group_decodes", 0))
     except Exception:
         sidecar_groups = full_shard_groups = block_index_groups = None
         row_group_hits = row_group_misses = None
+        reuse_admissions = admitted_group_bytes = None
+        rejected_group_bytes = parallel_group_decodes = None
 
     # Row-group LRU effectiveness (OPT-FORMATIO-1): the share of group lookups
     # the gather served without a decode. `None` when the path never ran (an
@@ -259,6 +267,15 @@ def _one_run(scx_path: str, n_obs: int, pairs_per_batch: int, n_batches: int) ->
         "row_group_hits": row_group_hits,
         "row_group_misses": row_group_misses,
         "row_group_hit_rate": row_group_hit_rate,
+        # Without these the benchmark can see that retention CHANGED but not
+        # which verdict changed it, and this is the triple the W10 policy was
+        # built for: `thresholds.yaml` records tabula and smartseq2 as sitting
+        # at a 0.000 hit rate here **by design**, because the pre-change rule
+        # bypassed the LRU whenever a plan exceeded its budget share.
+        "reuse_admissions": reuse_admissions,
+        "admitted_group_bytes": admitted_group_bytes,
+        "rejected_group_bytes": rejected_group_bytes,
+        "parallel_group_decodes": parallel_group_decodes,
     }
 
 
@@ -324,6 +341,10 @@ def run(
             row_group_hits=m["row_group_hits"],
             row_group_misses=m["row_group_misses"],
             row_group_hit_rate=m["row_group_hit_rate"],
+            reuse_admissions=m["reuse_admissions"],
+            admitted_group_bytes=m["admitted_group_bytes"],
+            rejected_group_bytes=m["rejected_group_bytes"],
+            parallel_group_decodes=m["parallel_group_decodes"],
             n_batches=m["n_batches"],
         )
 

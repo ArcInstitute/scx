@@ -92,6 +92,15 @@ _DEFAULT_N_BATCHES = 1000
 # ctrl are sampled from the same group. A group of 4096 corresponds to roughly
 # one shard of the typical 16k-shard fixture, giving high cache reuse.
 _LOCALITY_GROUP_SIZE = 4096
+# Rows the shared-control scenario draws every `ctrl` from, as a contiguous
+# prefix of the obs axis. This is the perturbation-screen shape §5.3 names as
+# W10's reuse case — a non-targeting control pool re-read by every pair — and
+# the R3 analogue of `cellset_gather`'s hot-control arm, at a much higher hot
+# fraction: HALF of every plan's rows land in the pool, against 8 sets of 64
+# there. Contiguous because a uniformly drawn pool of this size touches nearly
+# every row group a large file has, and "retain the hot set" would then mean
+# retaining the whole decoded matrix.
+_SHARED_CTRL_POOL = 2048
 
 # Cost-knob scaling (mirrors read_scattered.py). The fixed 1000-batch × up-to-5
 # timed-run × up-to-5-scenario worst case (plus a full 1000-batch untimed
@@ -198,6 +207,39 @@ def _random_plans(
         yield list(zip(map(int, pert), map(int, ctrl)))
 
 
+def _rate(hits: int | None, misses: int | None) -> float | None:
+    """`hits / (hits + misses)`, or `None` when the pair never fired.
+
+    `None` rather than `0.0`: a route that was not taken has no rate, and a
+    floor reading an absent metric as zero is a false failure.
+    """
+    if hits is None or misses is None:
+        return None
+    total = hits + misses
+    return round(hits / total, 4) if total > 0 else None
+
+
+def _shared_ctrl_plans(
+    n_obs: int,
+    pairs_per_batch: int,
+    n_batches: int,
+    seed: int = 0,
+) -> Iterator[list[tuple[int, int]]]:
+    """`pert` uniform over the corpus, `ctrl` from a small fixed contiguous
+    pool re-read by every batch.
+
+    Every other generator here draws both endpoints fresh, so no row group is
+    reliably touched by two plans of a lookahead window and the row-group cache
+    has no reuse signal to admit on. That is the case §5.3 calls out and the
+    reason R3's `p` funded W10 at all."""
+    rng = np.random.default_rng(seed)
+    pool_end = max(1, min(n_obs, _SHARED_CTRL_POOL))
+    for _ in range(n_batches):
+        pert = rng.integers(0, n_obs, size=pairs_per_batch).astype(np.int64)
+        ctrl = rng.integers(0, pool_end, size=pairs_per_batch).astype(np.int64)
+        yield list(zip(map(int, pert), map(int, ctrl)))
+
+
 def _locality_plans(
     n_obs: int,
     group_size: int,
@@ -266,6 +308,16 @@ class _ScenarioOutcome:
     # framed file proves the row-group path is exercised (the "ship the no-op"
     # guard). `None` for older pyscx that lacks the key.
     block_index_groups: int | None = None
+    # The row-group half of the same LRU, and what the W10 admission verdict
+    # decided about it. This benchmark read NONE of these before: it is the R3
+    # consumer whose `p` funded the admission work, and its retention was
+    # therefore invisible to the only benchmark that drives it.
+    row_group_hits: int | None = None
+    row_group_misses: int | None = None
+    reuse_admissions: int | None = None
+    admitted_group_bytes: int | None = None
+    rejected_group_bytes: int | None = None
+    parallel_group_decodes: int | None = None
     # Consumer-observed per-batch latency (ms): the wall time between successive
     # batches yielded by `iter_with_plans` (prefetch-overlapped). The sidecar
     # (L1+L2) trades an async full-shard warm for a synchronous O(rows) sidecar
@@ -356,10 +408,25 @@ def _run_index_plan(
         sidecar_groups = int(cm.get("sidecar_groups", 0))
         full_shard_groups = int(cm.get("full_shard_groups", 0))
         block_index_groups = int(cm.get("block_index_groups", 0))
+        # `.get` with a default on the W10 keys too: a capture may run against
+        # a build that predates them, and an absent counter must read as zero
+        # rather than dropping the whole scenario through the `except` below.
+        row_group_hits = int(cm.get("row_group_hits", 0))
+        row_group_misses = int(cm.get("row_group_misses", 0))
+        reuse_admissions = int(cm.get("reuse_admissions", 0))
+        admitted_group_bytes = int(cm.get("admitted_group_bytes", 0))
+        rejected_group_bytes = int(cm.get("rejected_group_bytes", 0))
+        parallel_group_decodes = int(cm.get("parallel_group_decodes", 0))
     except Exception:
         sidecar_groups = None
         full_shard_groups = None
         block_index_groups = None
+        row_group_hits = None
+        row_group_misses = None
+        reuse_admissions = None
+        admitted_group_bytes = None
+        rejected_group_bytes = None
+        parallel_group_decodes = None
     peak_rss_after = _peak_rss_mb()
     peak_rss = max(rss0, peak_rss_after)
     # Scenario-local ru_maxrss growth — eliminates cross-scenario
@@ -388,6 +455,12 @@ def _run_index_plan(
         sidecar_groups=sidecar_groups,
         full_shard_groups=full_shard_groups,
         block_index_groups=block_index_groups,
+        row_group_hits=row_group_hits,
+        row_group_misses=row_group_misses,
+        reuse_admissions=reuse_admissions,
+        admitted_group_bytes=admitted_group_bytes,
+        rejected_group_bytes=rejected_group_bytes,
+        parallel_group_decodes=parallel_group_decodes,
         gather_latency_ms_mean=round(mean_ms, 3) if mean_ms is not None else None,
         gather_latency_ms_p50=round(p50_ms, 3) if p50_ms is not None else None,
         gather_latency_ms_p99=round(p99_ms, 3) if p99_ms is not None else None,
@@ -791,6 +864,15 @@ def run(
             ),
         ),
         (
+            "pyscx_index_plan_shared_ctrl",
+            lambda nb: _run_index_plan(
+                scx_path,
+                lambda: _shared_ctrl_plans(n_obs, pairs_per_batch, nb),
+                pairs_per_batch,
+                **common_index_plan,
+            ),
+        ),
+        (
             "pyscx_index_plan_locality",
             lambda nb: _run_index_plan(
                 scx_path,
@@ -904,6 +986,18 @@ def run(
                 # `read_rows_with` (Phase 1). Raw counts kept for debugging.
                 f"sidecar_adoption_rate__{scenario_name}": adoption_rate,
                 f"sidecar_groups__{scenario_name}": outcome.sidecar_groups,
+                # W10. `row_group_hit_rate` is `None`, never 0.0, when the route
+                # was not taken — an absent metric must not read as a floor
+                # failure, the same rule `read_scattered` follows.
+                f"row_group_hit_rate__{scenario_name}": _rate(
+                    outcome.row_group_hits, outcome.row_group_misses
+                ),
+                f"row_group_hits__{scenario_name}": outcome.row_group_hits,
+                f"row_group_misses__{scenario_name}": outcome.row_group_misses,
+                f"reuse_admissions__{scenario_name}": outcome.reuse_admissions,
+                f"admitted_group_bytes__{scenario_name}": outcome.admitted_group_bytes,
+                f"rejected_group_bytes__{scenario_name}": outcome.rejected_group_bytes,
+                f"parallel_group_decodes__{scenario_name}": outcome.parallel_group_decodes,
                 f"full_shard_groups__{scenario_name}": outcome.full_shard_groups,
                 # F5 framed-adoption counter — `> 0` proves a scattered read
                 # over a framed (v4) file exercised the row-group block-index

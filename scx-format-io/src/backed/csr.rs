@@ -1820,6 +1820,11 @@ impl BackedCsrReader {
     /// bound on peak is one decode per worker and no worker idles inside a
     /// chunk.
     fn group_decode_chunk(&self) -> usize {
+        // The A/B arm first: `SCX_ROW_GROUP_DECODE_CHUNK=1` forces one group per
+        // chunk and therefore the serial path, which is the pre-change regime.
+        if let Some(n) = row_group_decode_chunk_override() {
+            return n;
+        }
         #[cfg(feature = "parallel")]
         {
             match self.cpu_pool.as_ref() {

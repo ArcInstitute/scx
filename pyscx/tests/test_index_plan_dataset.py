@@ -1690,3 +1690,76 @@ class TestReuseSignalAdmission:
         )
         hit_rate = reuse_arm["row_group_hits"] / total_reuse
         assert hit_rate > 0.2, f"recovered hit rate {hit_rate:.3f}: {reuse_arm}"
+
+
+class TestDecodeChunkKillSwitch:
+    """`SCX_ROW_GROUP_DECODE_CHUNK=1` forces one group per chunk — the serial
+    decode path, and the same-build A/B arm for the chunked parallel decode.
+
+    Without this knob that change cannot be measured on one build: it is not
+    gated by `SCX_ROW_GROUP_ADMIT`, so it is identical in both admission arms
+    and cancels out of every ratio they produce. Read once per process, hence a
+    subprocess per arm.
+    """
+
+    @staticmethod
+    def _probe(path, chunk):
+        import json
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        src = textwrap.dedent(
+            f"""
+            import json, pyscx
+            ds = pyscx.IndexPlanDataset({path!r}, normalize=False, cache_shards=4,
+                                        sort_by_shard=True, lookahead=0,
+                                        scatter_block_index=True)
+            # 40 unique rows spread over ~11 row groups. Narrow on purpose:
+            # `block_index_eligible` needs `rows * 4 < shard_rows`, so a wider
+            # request takes the WHOLE-SHARD route and there is no group decode
+            # to batch at all — which is what the first version of this test
+            # did (134 rows of 400), and what its premise assertion caught.
+            plan = [(i * 4, i * 4 + 200) for i in range(20)]
+            list(ds.iter_with_plans(iter([list(plan)]), lookahead=0))
+            print(json.dumps(ds.cache_metrics()))
+            """
+        )
+        env = {**os.environ}
+        if chunk is not None:
+            env["SCX_ROW_GROUP_DECODE_CHUNK"] = chunk
+        else:
+            env.pop("SCX_ROW_GROUP_DECODE_CHUNK", None)
+        r = subprocess.run(
+            [sys.executable, "-c", src], capture_output=True, text=True, env=env
+        )
+        assert r.returncode == 0, r.stderr[-3000:]
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_chunk_one_takes_the_serial_path_and_default_does_not(self, tmp_path):
+        path = str(tmp_path / "chunk_ab.scx")
+        TestBlockIndexAdoption._write_framed(path, n_obs=400)
+
+        default = self._probe(path, None)
+        serial = self._probe(path, "1")
+        assert default["block_index_groups"] > 0, default
+        assert default["parallel_group_decodes"] > 0, (
+            "premise: the default chunk really does batch this gather's groups, "
+            f"or the arms below are two serial runs: {default}"
+        )
+        assert serial["parallel_group_decodes"] == 0, serial
+        # Output is a cache policy away from identical; the counters that
+        # describe WORK must match, so the arms differ in batching alone.
+        assert serial["block_index_groups"] == default["block_index_groups"]
+        assert serial["row_group_misses"] == default["row_group_misses"]
+
+    def test_a_typo_is_ignored_rather_than_serialising_the_capture(self, tmp_path):
+        path = str(tmp_path / "chunk_typo.scx")
+        TestBlockIndexAdoption._write_framed(path, n_obs=400)
+        # `0` and a non-number must both fall back to the pool width, or a
+        # mistyped arm silently measures the serial path and reports itself as
+        # the default.
+        for bad in ("0", "yes", "", "-1"):
+            got = self._probe(path, bad)
+            assert got["parallel_group_decodes"] > 0, (bad, got)
