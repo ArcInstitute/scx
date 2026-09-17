@@ -1,0 +1,31 @@
+{
+ "phase": 5,
+ "what": "W10 three-arm factor A/B: admission x parallel decode",
+ "head_sha": "dabdbd3243dbde2843806e37d50cfffc6fe915b1",
+ "job_id": "2967288",
+ "partition": "cpu_batch_high_mem",
+ "node": "GPU0F98",
+ "cpus": "16",
+ "rounds": 12,
+ "n_runs": 1,
+ "arms": {
+  "plan": "SCX_ROW_GROUP_ADMIT=plan (pre-W10 admission), parallel decode on",
+  "reuse": "shipped: reuse-signal admission, parallel decode on",
+  "serial": "shipped admission, SCX_ROW_GROUP_SERIAL_DECODE=1 (pre-change serial decode)"
+ },
+ "contrasts": {
+  "admission": "reuse vs plan",
+  "parallel_decode": "reuse vs serial"
+ },
+ "cells": [
+  "read_scattered|tabula_sapiens_100k|scx_compact_trial_g256|scx_runner",
+  "read_scattered|smartseq2|scx_compact_trial_g256|scx_runner",
+  "index_plan|tabula_sapiens_100k|scx_auto|scx_runner"
+ ],
+ "design": "one build, three arms selected by environment; arm order rotated by round so each arm occupies each slot equally; exact two-sided sign test over per-round ratios within a cell",
+ "why_three_arms": "the parallel decode is not gated by SCX_ROW_GROUP_ADMIT, so a two-arm admission A/B holds it constant and cannot measure it at all \u2014 which is what job 2964125 did",
+ "what_this_is_not": "not a census measurement, and not a claim about cellset_gather, whose own arm caps its hit rate at 8/64 by construction",
+ "arms_verified_by": "behaviour, per arm, before every timed invocation",
+ "recapture_of": "job 2966558 (head c5d8a62a), same script, same three arms, same three cells",
+ "why": "the first factor capture measured index_plan random-plan gather p50 at 0.952x (1/12, p=0.006) and p99 at 0.937x (2/12, p=0.039) against the serial arm, because every group lookup \u2014 including the ~38.5k LRU hits \u2014 was dispatched through rayon. The resident-probe hit-path split dispatches only misses; this capture re-measures that latency on the current build."
+}

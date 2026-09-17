@@ -2832,19 +2832,56 @@ design* — a plan over its budget share used to forfeit retention outright.
 | `gather_latency_ms_p50` | 1,192.3 | 431.3 | **2.79×** | 12/12 | 0.000 |
 | `gather_latency_ms_p99` | 1,232.6 | 471.6 | **2.60×** | 12/12 | 0.000 |
 
+> [!NOTE]
+> ⚠️ **The decode was also a reliable regression on the high-hit-rate path.
+> It was fixed, and the fix was then re-captured rather than asserted.** In the
+> capture above, `index_plan` / tabula random-plan `gather_latency_ms_p50` read
+> 27.96 → 29.17 ms (1 of 12 rounds won, p = 0.006) and p99 29.91 → 31.84 ms
+> (2/12, p = 0.039) against the serial arm. The cause was routing every run
+> through rayon including LRU hits — ~38,500 hits against 391 misses on that
+> path, where a "decode" is a mutex lookup. Residents are now probed and served
+> serially and only misses are dispatched. **The whole three-arm capture was then
+> re-run on the fixed build** (job 2967288, head `dabdbd32`, same script, same
+> three cells, 12 rounds), and both regressed rows are neutral:
+
+| index_plan / tabula, random plans | serial | reuse | ratio | wins | p |
+|---|---|---|---|---|---|
+| `gather_latency_ms_p50`, as first captured | 27.96 | 29.17 | 0.952× | 1/12 | **0.006** |
+| `gather_latency_ms_p50`, re-captured | 28.03 | 27.76 | 1.01× | 8/12 | 0.388 |
+| `gather_latency_ms_p99`, as first captured | 29.91 | 31.84 | 0.937× | 2/12 | **0.039** |
+| `gather_latency_ms_p99`, re-captured | 30.19 | 29.57 | 1.01× | 9/12 | 0.146 |
+
+The counter says the same thing and says it exactly:
+`parallel_group_decodes` on that path is **19,441 → 0** between the two captures
+— at a 0.9899 hit rate nothing reaches rayon any more — while `row_group_hits`
+(38,495) and `row_group_misses` (391) are unchanged to the unit. On
+`read_scattered`/tabula, where the misses are real, the shipped arm dispatches
+2,903 of its 2,911 misses (the eight are groups a peer inserted between the
+probe and the dispatch) against 3,427 in the `plan` arm.
+
+The decode win reproduces on the same build, slightly larger than first
+measured:
+
+| re-captured decode (`serial` → `reuse`) | serial | reuse | ratio | wins | p |
+|---|---|---|---|---|---|
+| tabula g256 `gather_latency_ms_p50` | 1,011.1 | 397.7 | **2.56×** | 12/12 | 0.000 |
+| tabula g256 `gather_latency_ms_p99` | 1,147.7 | 421.3 | **2.70×** | 12/12 | 0.000 |
+| smartseq2 g256 `gather_latency_ms_p50` | 1,184.6 | 407.3 | **2.90×** | 12/12 | 0.000 |
+| smartseq2 g256 `gather_latency_ms_p99` | 1,229.6 | 434.2 | **2.83×** | 12/12 | 0.000 |
+
 > [!WARNING]
-> ⚠️ **The decode was also a reliable regression on the high-hit-rate path, and
-> that is fixed rather than excused.** In this same capture, `index_plan` /
-> tabula random-plan `gather_latency_ms_p50` read 27.96 → 29.17 ms (1 of 12
-> rounds won, p = 0.006) and p99 29.91 → 31.84 ms (p = 0.039) against the serial
-> arm. The cause was routing every run through rayon including LRU hits — ~38,500
-> hits against 391 misses on that path, where a "decode" is a mutex lookup.
-> Residents are now served serially and only misses are dispatched
-> (`parallel_group_decodes` on that path 19,441 → 0; `read_scattered` keeps 2,903
-> of 3,427), so the figures above describe the arm as captured and the shipped
-> build no longer pays rayon on a hit. **The numbers here have not been
-> re-captured against that fix** — the mechanism is verified by counter, the
-> latency is not.
+> ⚠️ **One regression the split did not remove: peak RSS on the
+> triple-buffered loader.** `peak_rss_mb` on `pyscx_training_dataset` /
+> `pyscx_index_plan_dataset_workers2` reads 3,232 → 3,460 MB against the serial
+> arm (1/12, p = 0.006) on the re-capture, and 3,239 → 3,485 MB (1/12,
+> p = 0.006) on the first — the same ~230 MB, reliable in both. That is the
+> chunked decode holding a pool-width chunk of groups live plus rayon's
+> per-worker scratch, and it is the cost the chunking bounds rather than
+> removes. It stays far under the scenario's own 8,166 MB budget, and it is
+> **not** a bound this capture claims is tight. The `index_plan` /
+> `backed_python_loop` peak-RSS regression the first capture reported
+> (2,914 → 2,971 MB, 2/12, p = 0.039) does **not** reproduce
+> (2,999.6 → 2,912.1 MB, 8/12, p = 0.388).
 
 **Every work counter is identical on all 12 rounds across those two arms** —
 `block_index_groups`, `block_index_adoption_rate`, `row_group_hits`,
@@ -2863,10 +2900,21 @@ And the admission policy, on the same runs:
 | `row_group_hit_rate` | **0** | **0.1506** | — | — | — |
 | `reuse_admissions` | 0 | 11 | — | — | — |
 
-18 % fewer row-group decodes on every one of 12 rounds, and a 1.05× p50 gain
-that is reliable but small. On smartseq2 the same contrast gives 2,913 → 2,683
-misses (−8 %) and no reliable latency difference. The retention is real; the
-latency it buys is a few per cent, and the decode is where the time went.
+18 % fewer row-group decodes on every one of 12 rounds. On smartseq2 the same
+contrast gives 2,913 → 2,683 misses (−8 %). The retention is real; the latency
+it buys is not separable from noise, and the decode is where the time went.
+
+> [!WARNING]
+> ⚠️ **The 1.05× p50 row above did not reproduce, and is withdrawn as a
+> latency claim.** The re-capture (job 2967288, head `dabdbd32`) reads the same
+> contrast at 416.1 → 397.7 ms, 1.05× but **8/12, p = 0.388**, and smartseq2 at
+> 419.4 → 407.3 ms, 1.01×, 9/12, p = 0.146. A 10/12 at p = 0.039 is one round
+> from the 0.05 line, so this is what a marginal sign test does on a second
+> sample, not a changed build. **The counters reproduced to the unit** — 3,427
+> → 2,911 misses, 0 → 0.1506 hit rate, 0 → 11 `reuse_admissions` on tabula and
+> 2,913 → 2,683 / 0 → 0.079 / 0 → 15 on smartseq2, each identical across the
+> two captures. What admission buys is measured as retention; on these two
+> cells it does not buy measurable wall clock.
 
 `index_plan` at its own 8 GB default budget shows the admission contrast at
 noise — its plans **fit** their share, so both arms read a 0.99 hit rate and the
@@ -2877,9 +2925,15 @@ only acts where a plan is over its share.
 > Manifest entry: `results/raw/phase5_factors/factors_ab.json` (108 rounds, each
 > carrying its full `BenchmarkResult` envelope) beside `provenance.json`,
 > written by the running job. SLURM job **2966558**, `cpu_batch_high_mem`, at
-> `83d022d9`, via `benchmarks/scripts/_run_phase5_factors_ab.sh`; summarised by
+> `c5d8a62a`, via `benchmarks/scripts/_run_phase5_factors_ab.sh`; summarised by
 > `_phase5_factors_summary.py`. Force-added. Every figure above was checked
 > programmatically against that file.
+>
+> The re-capture on the fixed build is
+> `results/raw/phase5_factors_recapture/factors_ab.json` (108 rounds) beside its
+> own `provenance.json`: SLURM job **2967288**, same partition, same node
+> (GPU0F98), same driver, at `dabdbd32`. Every re-captured figure above was
+> checked programmatically against that file.
 >
 > **Not measured**: census at any scale, and `cellset_gather` under the third
 > arm (its hot/cold arm's hit-rate ceiling makes it the weakest witness of
