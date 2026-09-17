@@ -4102,6 +4102,14 @@ absolute_floors:
 #         `row_group_hit_rate__*` (0 -> 0.0421), and that one needs a baseline
 #         carrying the arm, which is blocker (b).
 #
+#         ⚠️ That is a statement about THIS ARM, not about the phase. A
+#         three-arm capture (SLURM 2966558) measured both of W10's factors on
+#         `read_scattered`, where the auto-tuned two-shard budget puts a plan
+#         over its share: the chunked parallel decode is 2.39-2.79x on gather
+#         p50 at 12/12 rounds, and the admission policy is 1.18x fewer
+#         row-group decodes at 12/12 on tabula. The metrics worth flooring are
+#         there, on `read_scattered`, not here.
+#
 #         ⚠️ An interactive probe said the opposite before that capture — three
 #         pairs at 20.7/23.1/23.0 against 19.0/21.9/19.1 sets/s, a consistent
 #         ~10-17 % slowdown — and it does not survive interleaving. Recorded so
