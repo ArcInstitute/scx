@@ -31,12 +31,19 @@
 //! enumerate that product, and every branch it forgets is an op that starts
 //! refusing a file it used to write.
 //!
-//! So the COO emitter never looks at the value column at all. It computes,
-//! per shard, the list of *triple positions* that belong to it and hands the
-//! whole batch to [`arrow::compute::take_record_batch`], which builds the
-//! output from `batch.schema()` — preserving every field's dtype and
-//! nullability, and the schema metadata (`n_rows` / `n_cols`) with it.
-//! Adding a coordinate or value width to the format needs no change here.
+//! So the COO emitter never *rebuilds* an array. It computes, per shard, the
+//! list of *triple positions* that belong to it and hands the whole batch to
+//! [`arrow::compute::take_record_batch`], which builds the output from
+//! `batch.schema()` — preserving every field's dtype and nullability, and the
+//! schema metadata (`n_rows` / `n_cols`) with it. The gather is dtype-agnostic
+//! and stays that way as the format gains widths.
+//!
+//! The *gate* is not dtype-agnostic, and deliberately so: `validate_coo_schema`
+//! enumerates the contract the readers in this crate can decode, because
+//! `BackedPairwiseReader::from_layout` checks only field names and everything
+//! else would be a payload that opens and then fails on first decode. Adding a
+//! supported coordinate or value width therefore means a coordinated change to
+//! that gate and to the readers — not to the partition or the gather.
 //!
 //! # The cover contract
 //!
@@ -59,10 +66,13 @@ use scx_format::{Result, ScxError};
 
 /// Bucket-count ceiling for the COO emitter.
 ///
-/// The bucket table is sized by the logical row axis, not by nnz, so a v2
-/// wide-axis `obsp` (axis ≥ 2^31) at a small shard target would allocate
-/// hundreds of thousands of empty `Vec`s before looking at a single triple.
-/// Fail with a message that names the two ways out rather than OOM.
+/// Bucket count is set by the logical row axis, not by nnz, so a v2 wide-axis
+/// `obsp` (axis ≥ 2^31) at a small shard target would ask for millions of
+/// shards. Since the counting-sort rewrite the tables themselves are three
+/// `u32` arrays of `n_shards + 1`, so the cost is no longer the allocation —
+/// it is issuing that many `take` + section-write calls, most of them for an
+/// empty band. Fail with a message that names the two ways out rather than
+/// grinding.
 const MAX_BUCKETS: usize = 1_000_000;
 
 /// Read the logical `n_rows` / `n_cols` a pairwise COO batch declares.
@@ -110,8 +120,9 @@ fn coo_dims(logical: &str, batch: &RecordBatch) -> Result<(usize, usize)> {
 fn validate_coo_schema(logical: &str, batch: &RecordBatch) -> Result<()> {
     use arrow::datatypes::DataType;
     let schema = batch.schema_ref();
-    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    if names != ["row", "col", "data"] {
+    let named = |i: usize, want: &str| schema.fields().len() > i && schema.field(i).name() == want;
+    if !(schema.fields().len() == 3 && named(0, "row") && named(1, "col") && named(2, "data")) {
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         return Err(ScxError::InvalidCatalog(format!(
             "{logical}: pairwise COO batch has columns {names:?}, expected exactly \
              [\"row\", \"col\", \"data\"]"

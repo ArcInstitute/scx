@@ -278,9 +278,9 @@ unchanged. Four things that bite first:
 
 `Experiment.read_obsp_rows(key, start, stop)` is the bounded graph read the
 builder uses, and is public — use it instead of `to_anndata().obsp[k]`, which
-materialises the whole matrix. It is only bounded on a *sharded* graph; `scx
-sort` and `scx compact` emit a sharded obsp as of phase 9, so a file written
-before that is the unbounded case.
+materialises the whole matrix. It is only bounded on a *sharded* graph. Every
+obsp writer emits one now (`scx sort` / `scx compact` as of phase 9), so the
+unbounded case is a file written before that.
 
 ## Train / val / test splits
 

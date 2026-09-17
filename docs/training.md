@@ -731,10 +731,11 @@ materialises all of it. Two caveats worth knowing:
   live row space, drops any edge whose *either* endpoint is deleted and
   renumbers both axes into live space. `logical=False` is the physical graph.
 - A graph stored as **one unsharded section** has to be decoded whole whatever
-  range you ask for — it is a single Arrow batch. Since **phase 9** `scx sort`
-  and `scx compact` write obsp back as shards, so their output is bounded; a
-  file written before that change is the unbounded case, and `scx subset` drops
-  obsp altogether.
+  range you ask for — it is a single Arrow batch. Every path that writes an
+  obsp emits shards — `scx sort` / `scx compact` since **phase 9**, the h5ad and
+  `from_anndata` paths always — so the unbounded case is a file written before
+  phase 9, or a graph from the low-level `write_obsp` that `scx optimize`
+  carried forward. `scx subset` drops obsp altogether.
 
 ### Tokenisation kernels
 

@@ -16,7 +16,8 @@
 //!    read branch — where the row-count trap lives, an unsharded COO
 //!    section's Arrow row count being nnz rather than `n_obs` — is no longer
 //!    reachable through a sorted file. It is still reachable through a file
-//!    written before phase 9 or by `scx subset`, and it is still covered, by
+//!    written before phase 9, or a graph written through the low-level
+//!    `write_obsp`, and it is still covered, by
 //!    `scx-loader`'s `the_graph_driver_reads_a_legacy_unsharded_file` and
 //!    `scx-format-io`'s `a_legacy_unsharded_obsp_reads_its_true_row_count`.
 //!    Both build their own unsharded fixtures, so neither depends on an op to

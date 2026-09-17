@@ -352,11 +352,11 @@ impl PyExperiment {
     /// the whole graph: only the shards covering the range are decoded, so a
     /// caller can walk an atlas-scale graph a block at a time. (A graph stored
     /// as one unsharded section has to be decoded whole whatever range is
-    /// asked for; the range is then applied to the decoded triples. Which
-    /// files those are is a question about the **producer**, not the date:
-    /// `scx sort` / `scx compact` emit shards as of phase 9 and the h5ad /
-    /// `from_anndata` paths always did, but `from_h5mu` still writes one
-    /// unsharded section, and so do the in-place metadata ops.)
+    /// asked for; the range is then applied to the decoded triples. Every
+    /// path that writes an `obsp` emits shards — `sort` / `compact` as of
+    /// phase 9, the h5ad and `from_anndata` paths always — so that is a file
+    /// written before phase 9, or a graph written through the low-level
+    /// `write_obsp` and carried forward by `scx optimize`.)
     ///
     /// **Row space.** `logical=True` (the default, matching `read_obs`) treats
     /// `start` / `stop` as **live** row indices, drops any edge whose *either*

@@ -766,10 +766,9 @@ pub const DEFAULT_GRAPH_CHUNK_ROWS: u64 = 65_536;
 /// Streams the graph one row range at a time — peak memory is one obsp shard
 /// plus one chunk's non-zeros, plus the accumulated plans. Note the caveat in
 /// [`scx_format_io::BackedPairwiseReader`]: a *legacy unsharded* obsp has to be
-/// decoded whole whatever the chunk size. `scx sort` / `scx compact` emit
-/// shards as of phase 9, but `from_h5mu` and the in-place metadata ops still
-/// write one section, so this is a property of the producer rather than of the
-/// file's age.
+/// decoded whole whatever the chunk size. Every obsp writer emits shards now
+/// (`sort` / `compact` since phase 9), so this is a file written before that,
+/// or a graph from the low-level `write_obsp` carried forward by `optimize`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_graph_plans(
     path: &std::path::Path,

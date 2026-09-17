@@ -907,9 +907,9 @@ fn fixture_interior_index(g: usize) -> usize {
 #[test]
 fn the_graph_driver_reads_a_legacy_unsharded_file() {
     // Since phase 9 no rewrite op emits an unsharded graph, so this branch is
-    // reached by a file written before it (or by `scx subset`, which drops
-    // obsp). The fixture writes one directly, so the coverage does not depend
-    // on an op producing one.
+    // reached by a file written before it, or by a graph written through the
+    // low-level `write_obsp`. The fixture writes one directly, so the coverage
+    // does not depend on an op producing one.
     let dir = tempfile::tempdir().unwrap();
     let sharded = fixture::write(&dir, 6, 3, true);
     let legacy = fixture::write(&dir, 6, 3, false);

@@ -42,8 +42,8 @@
 //! That branch is no longer what `sort` / `compact` produce — since phase 9
 //! they emit all four mapping families as shards — but it is still reachable,
 //! and not hypothetically: a file written before phase 9 has an unsharded
-//! graph, `from_h5mu` and the in-place metadata ops still write one, and
-//! `scx subset` drops obsp entirely.
+//! graph, the low-level `write_obsp` still emits one and `scx optimize` will
+//! carry it forward, and `scx subset` drops obsp entirely.
 //!
 //! # Row space
 //!
@@ -226,9 +226,9 @@ impl BackedPairwiseReader {
     }
 
     /// `true` when the mapping is stored as one unsharded section, which is
-    /// what makes a read unbounded. `sort` and `compact` stopped writing one
-    /// in phase 9; a file predating that, or one from `from_h5mu` or an
-    /// in-place metadata op, still is.
+    /// what makes a read unbounded. `sort` and `compact` stopped writing one in
+    /// phase 9, and no obsp writer emits one now; a file predating that, or a
+    /// graph written through the low-level `write_obsp`, still is.
     pub fn is_legacy_single_section(&self) -> bool {
         self.sorted_entries
             .iter()

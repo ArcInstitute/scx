@@ -61,8 +61,10 @@ pub(crate) struct MappingLayout {
 /// back **sharded** (both go through
 /// `scx_format_io::for_each_coo_mapping_shard`), so the legacy arm is no
 /// longer something those two ops produce — but it is still not a hypothetical
-/// branch: every file written before phase 9 takes it, and so does anything
-/// `from_h5mu` or an in-place metadata op writes today.
+/// branch: every file written before phase 9 takes it, as does a graph written
+/// through the low-level `write_obsp` and carried forward by `optimize`. (The
+/// dense `obsm` arm has more live producers than the pairwise one — `from_h5mu`
+/// and the in-place metadata ops still emit a single `obsm` section.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LegacyRowCount {
     /// One Arrow row per logical row — dense `obsm` / `varm`.
