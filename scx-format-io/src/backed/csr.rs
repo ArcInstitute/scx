@@ -1437,6 +1437,26 @@ impl BackedCsrReader {
     /// row group decoding — not a per-row `ScxCsr` per requested row and a
     /// second copy of the result, as before.
     pub fn read_row_indices(&self, rows: &[u64]) -> Result<ScxCsr> {
+        self.read_row_indices_with_admission(rows, None)
+    }
+
+    /// [`Self::read_row_indices`] with the row-group admission decided by the
+    /// caller, exactly as [`Self::read_rows_with_admission`] is to
+    /// [`Self::read_rows_with`].
+    ///
+    /// `None` decides per gather (this call's groups must fit the whole byte
+    /// budget); `Some(admit)` is a verdict taken over a larger working set —
+    /// `scx-loader`'s plan engine decides once per plan, and the cell-set
+    /// gather then reads the plan's whole deduplicated row list through this
+    /// method, so the L1 gather and the L2 warm cannot disagree. Without it a
+    /// caller that already holds a plan-wide verdict would have to choose
+    /// between the exact prescan here and carrying that verdict, which is why
+    /// this variant exists rather than a second prescan in the loader.
+    pub fn read_row_indices_with_admission(
+        &self,
+        rows: &[u64],
+        admit_row_groups: Option<&Admit>,
+    ) -> Result<ScxCsr> {
         if rows.is_empty() {
             return Ok(Self::empty_csr(self.n_vars));
         }
@@ -1463,7 +1483,7 @@ impl BackedCsrReader {
         let mut data = vec![0f32; nnz];
         let mut fired = 0usize;
         let mut copied = 0usize;
-        self.scatter_groups(&sorted, &groups, None, |pos, idx, val| {
+        self.scatter_groups(&sorted, &groups, admit_row_groups, |pos, idx, val| {
             let lo = indptr[pos] as usize;
             let hi = indptr[pos + 1] as usize;
             if idx.len() != hi - lo || val.len() != hi - lo {

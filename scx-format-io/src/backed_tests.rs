@@ -5333,3 +5333,129 @@ fn a_mixed_request_scatters_full_shard_groups_before_block_index_groups() {
         "premise: the fixture actually exercises out-of-row-order scatter"
     );
 }
+
+/// `read_row_indices` can carry a caller's plan-wide admission verdict.
+///
+/// W11's cell-set executor reads a whole plan's **deduplicated** row list
+/// through this method, for the exact indptr prescan and the disjoint output
+/// spans it already has. Without this variant the caller would have to choose
+/// between that prescan and the plan-wide verdict its prefetch engine already
+/// took — `read_row_indices` passed a literal `None` and decided for itself.
+#[test]
+fn read_row_indices_carries_the_callers_admission_verdict() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    // 2 shards x 32 rows, 8 row groups of 4 per shard. Two rows in shard 0 is
+    // 2 * 4 < 32, so the request takes the block-index route.
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let rows = [0u64, 5];
+    let budget = RG_GROUP_BYTES * 8;
+
+    let open = |p: &std::path::Path| {
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(p).unwrap(), 4, budget)
+    };
+
+    // Self-deciding (`None`): the two groups fit the budget, so both are kept.
+    let mut a = open(&path);
+    let ma = a.enable_metrics();
+    let got = a.read_row_indices(&rows).unwrap();
+    assert_eq!(
+        ma.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES * 2,
+        "premise: left to itself this read retains both groups"
+    );
+
+    // The bytes are right, and are the reference's.
+    for (out, &r) in rows.iter().enumerate() {
+        let want = full.row_slice(r as usize, r as usize + 1).unwrap();
+        let lo = got.indptr[out] as usize;
+        let hi = got.indptr[out + 1] as usize;
+        assert_eq!(&got.indices[lo..hi], &want.indices[..], "row {r}");
+        assert_eq!(&got.data[lo..hi], &want.data[..], "row {r}");
+    }
+
+    // `Admit::None` over the same read: identical output, nothing retained.
+    let mut b = open(&path);
+    let mb = b.enable_metrics();
+    let refused = b
+        .read_row_indices_with_admission(&rows, Some(&Admit::None))
+        .unwrap();
+    assert_eq!(refused.indptr, got.indptr);
+    assert_eq!(refused.indices, got.indices);
+    assert_eq!(refused.data, got.data);
+    assert_eq!(
+        mb.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "the caller's verdict refused every group"
+    );
+    assert_eq!(b.cache_bytes_used(), 0);
+
+    // `Admit::Groups` keeps exactly the named key. Row 0 is group 0 of shard 0,
+    // row 5 is group 1; naming only the first retains one group's bytes.
+    let mut c = open(&path);
+    let mc = c.enable_metrics();
+    let keys: std::collections::HashSet<RowGroupKey> =
+        [(0u32, 0usize, 0usize)].into_iter().collect();
+    let partial = c
+        .read_row_indices_with_admission(&rows, Some(&Admit::groups(keys)))
+        .unwrap();
+    assert_eq!(partial.indices, got.indices);
+    assert_eq!(partial.data, got.data);
+    assert_eq!(
+        mc.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES,
+        "one named key, one group's bytes"
+    );
+}
+
+/// The sibling guard, and it was missing: `read_rows_with_admission` must
+/// honour the caller's verdict too.
+///
+/// ⚠️ Found while mutation-testing the `read_row_indices` split above. Passing
+/// a literal `None` in place of `admit_row_groups` here — i.e. ignoring every
+/// caller's verdict outright — left **all 475** of this crate's tests green;
+/// only `scx-loader` reddened (10 `plan_engine` / `sparse_cellset` tests). The
+/// crate that owns the API could not see its own contract break, so this is
+/// the accept-side test for it rather than a restatement of the loader's.
+#[test]
+fn read_rows_with_admission_honours_the_callers_verdict() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let rows = [0u64, 5];
+    let budget = RG_GROUP_BYTES * 8;
+    let open = |p: &std::path::Path| {
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(p).unwrap(), 4, budget)
+    };
+
+    let collect = |backed: &BackedCsrReader, admit: Option<&Admit>| {
+        let mut out: Vec<(usize, Vec<i32>, Vec<f32>)> = Vec::new();
+        backed
+            .read_rows_with_admission(&rows, admit, |pos, idx, val| {
+                out.push((pos, idx.to_vec(), val.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        out.sort_by_key(|&(p, _, _)| p);
+        out
+    };
+
+    let mut a = open(&path);
+    let ma = a.enable_metrics();
+    let want = collect(&a, None);
+    assert_eq!(
+        ma.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES * 2,
+        "premise: left to itself this read retains both groups"
+    );
+
+    let mut b = open(&path);
+    let mb = b.enable_metrics();
+    assert_eq!(collect(&b, Some(&Admit::None)), want, "same bytes");
+    assert_eq!(
+        mb.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "the caller's verdict refused every group"
+    );
+    assert_eq!(b.cache_bytes_used(), 0);
+}
