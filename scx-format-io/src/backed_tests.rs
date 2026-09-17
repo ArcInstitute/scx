@@ -4892,6 +4892,124 @@ fn touched_row_groups_names_the_groups_planned_bytes_sizes() {
     assert_eq!(off.planned_row_group_bytes(1, &rows), 0);
 }
 
+/// A gather's own whole shards count against the budget beside its row groups,
+/// because they share one and `read_shard_cached_arc` inserts them whether or
+/// not row groups are admitted.
+///
+/// This is the half of the phase-5 accounting item that is real. The per-gather
+/// rule used to sum only the `use_block_index` groups, while the plan-level rule
+/// (`PrefetchEngine::plan_footprint`) has summed both since review on #528 — so
+/// a mixed gather could admit row groups it was about to evict with its own
+/// whole-shard decode.
+///
+/// Fixture: 64 rows, 2 shards of 32, row groups of 4. Eight rows of shard 0 is
+/// a quarter of the shard, which fails `block_index_eligible`'s
+/// `len * 4 < shard_rows` window and takes the whole-shard path (776 B); two
+/// rows of shard 1 land in one row group (104 B). Budget 400 B sits between the
+/// two sums, so the two rules disagree on exactly this gather.
+///
+/// Mutation: restore `groups.iter().filter(|g| g.use_block_index)` and this
+/// reddens.
+#[test]
+fn the_per_gather_rule_counts_its_own_whole_shards() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let budget = 400usize;
+    assert!(
+        RG_GROUP_BYTES < budget && budget < RG_SHARD_BYTES + RG_GROUP_BYTES,
+        "premise: the budget separates the group-only sum from the mixed sum \
+         ({RG_GROUP_BYTES} < {budget} < {} )",
+        RG_SHARD_BYTES + RG_GROUP_BYTES
+    );
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Eight rows of shard 0 (whole-shard route) + two rows of shard 1 that share
+    // one row group (block-index route).
+    let mixed = [0u64, 1, 2, 3, 4, 5, 6, 7, 40, 41];
+    rg_assert_matches_full(&rg_gather(&backed, &mixed), &mixed, &full, "mixed");
+
+    // Premise: the gather really did split across the two routes. Without this
+    // the assertion below would pass on a gather that never took either.
+    assert_eq!(
+        m.full_shard_groups.load(Ordering::Relaxed),
+        1,
+        "premise: shard 0 took the whole-shard route"
+    );
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        1,
+        "premise: shard 1 took the block-index route"
+    );
+
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "the row group is NOT retained: 776 B of whole shard + 104 B of group is \
+         over the 400 B budget, so retaining it would only have been evicted by \
+         the shard decode on the next repeat"
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        1,
+        "it still decoded — admission governs retention, never correctness"
+    );
+}
+
+/// **The free-bytes falsification.** The phase-5 plan text prescribed comparing
+/// a gather's planned row-group bytes against `bytes_budget() - bytes_used()`.
+/// This test states what that would mean, so the prescription is measured
+/// rather than adopted: a cache sitting *at* its budget — the steady state of
+/// any correctly sized cache — would have zero free bytes, and every subsequent
+/// gather would be refused admission forever, however small.
+///
+/// The LRU already handles the arithmetic the prescription was reaching for:
+/// `evict_bytes_for` makes room by evicting, so a resident entry is displaceable
+/// and is not a claim on the budget. What a gather must fit is its OWN
+/// footprint, which is what the rule compares.
+///
+/// Mutation: change `gather_row_groups_fit_budget`'s comparison to
+/// `bytes_budget().saturating_sub(bytes_used())` and this reddens.
+#[test]
+fn a_full_cache_does_not_refuse_a_small_gather() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    // Exactly three groups fit.
+    let budget = 3 * RG_GROUP_BYTES;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Fill the cache to its budget with three groups of shard 0.
+    let fill = [0u64, 4, 8];
+    rg_assert_matches_full(&rg_gather(&backed, &fill), &fill, &full, "fill");
+    assert_eq!(
+        backed.cache_bytes_used(),
+        budget,
+        "premise: the cache is exactly full"
+    );
+    let inserted_after_fill = m.row_group_bytes_inserted.load(Ordering::Relaxed);
+    assert_eq!(inserted_after_fill as usize, 3 * RG_GROUP_BYTES);
+
+    // A one-group gather elsewhere in the file. Its own footprint is a twelfth
+    // of the budget; there are zero free bytes.
+    let small = [40u64];
+    rg_assert_matches_full(&rg_gather(&backed, &small), &small, &full, "small");
+    assert!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) > inserted_after_fill,
+        "a gather that fits the budget is admitted even against a full cache; \
+         got {} inserted bytes, unchanged from the fill",
+        m.row_group_bytes_inserted.load(Ordering::Relaxed)
+    );
+    assert!(
+        m.row_group_evictions.load(Ordering::Relaxed) > 0,
+        "and it made room by evicting, which is the LRU doing its job"
+    );
+}
+
 /// A non-admitted gather still serves resident groups as hits — admission only
 /// stops *misses* from being inserted — and its misses decode uncached with no
 /// singleflight slot (the leader of a slot that inserts nothing would make

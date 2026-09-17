@@ -1135,7 +1135,20 @@ impl BackedCsrReader {
             return true;
         }
         let mut planned = 0usize;
-        for g in groups.iter().filter(|g| g.use_block_index) {
+        for g in groups {
+            if !g.use_block_index {
+                // The shards this gather takes WHOLE count too, exactly as the
+                // plan-level rule counts them (`PrefetchEngine::plan_footprint`).
+                // They share one budget with the row groups, and
+                // `read_shard_cached_arc` inserts them whether or not row groups
+                // are admitted — so a mixed gather whose groups fit on their own
+                // but not beside its whole shards would evict one with the other
+                // on every repeat. Counted unconditionally, resident or not, for
+                // the same reason the plan rule does: residency is not stable
+                // between the decision and the read.
+                planned = planned.saturating_add(self.shard_decoded_bytes(g.shard_idx));
+                continue;
+            }
             let Some(layout) = self.framed_layout(g.shard_idx) else {
                 continue;
             };
@@ -1146,6 +1159,14 @@ impl BackedCsrReader {
                 .map(|&(r, _)| (r - g.s_start) as usize);
             planned = planned.saturating_add(Self::planned_bytes_sorted(&layout, locals));
         }
+        // Against the WHOLE budget, not against its free bytes. A resident
+        // entry is displaceable — `evict_bytes_for` makes room — so it is not a
+        // claim on the budget, and subtracting `bytes_used()` would refuse every
+        // gather once the cache reached its budget, which is the steady state of
+        // a correctly sized cache. Falsified rather than assumed: see
+        // `a_full_cache_does_not_refuse_a_small_gather`, and note that the
+        // subtraction also reddens the pre-existing
+        // `row_group_lru_evicts_to_fit_the_budget`.
         planned <= self.shard_cache.bytes_budget()
     }
 
