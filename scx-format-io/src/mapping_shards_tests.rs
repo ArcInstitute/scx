@@ -77,16 +77,12 @@ fn coo(
             )),
         )
     };
-    // On the nullable arm the LAST value is actually null. Flipping the field's
-    // nullable bit alone proves nothing: `Float32Array::from(Vec<f32>)` has
-    // `null_count == 0`, so schema equality would still hold if `take` dropped
-    // the null bitmap. The bitmap has to be there to be preserved.
-    let mut vals: Vec<Option<f64>> = triples.iter().map(|t| Some(t.2)).collect();
-    if nullable_values {
-        if let Some(last) = vals.last_mut() {
-            *last = None;
-        }
-    }
+    // `nullable_values` flips the FIELD's bit while leaving every value present,
+    // which is exactly what `scx-ops::compact::remap_obsp_coo_to_dim` produces:
+    // it preserves its input's nullability, and its values come from a
+    // `Vec<Option<f64>>` that is populated. An actual null is a separate case
+    // and is now *refused* — see `coo_rejects_nulls_the_reader_would_refuse`.
+    let vals: Vec<Option<f64>> = triples.iter().map(|t| Some(t.2)).collect();
     let val_arr: Arc<dyn Array> = if wide_values {
         Arc::new(Float64Array::from(vals))
     } else {
@@ -131,6 +127,9 @@ fn triples_of(b: &RecordBatch) -> Vec<(i64, i64, String)> {
             // Formatted rather than cast so an f64 value is compared at its
             // own width; a lossy narrow here would hide a lossy narrow there.
             let v = if data.is_null(i) {
+                // Not reachable through the emitter any more (nulls are refused
+                // at write), but reading one as a null rather than as buffer
+                // garbage keeps this helper usable on a hand-built batch.
                 "null".to_string()
             } else if let Some(a) = data.as_any().downcast_ref::<Float64Array>() {
                 format!("{:?}", a.value(i))
@@ -242,16 +241,15 @@ fn coo_preserves_every_dtype_the_ops_can_produce() {
                     sorted_triples(std::slice::from_ref(&b)),
                     "triples changed (coords_i64={wide_coords} values_f64={wide_values} nullable={nullable})"
                 );
-                // The null bitmap itself, not just the field's nullable bit.
-                let nulls: usize = shards.iter().map(|s| s.column(2).null_count()).sum();
+                // The field's nullable bit is what varies here, and it rides on
+                // the schema equality above. Assert the value count too, so a
+                // shard that silently dropped a row would be caught by more
+                // than the multiset comparison.
                 assert_eq!(
-                    nulls,
-                    b.column(2).null_count(),
-                    "null count changed (coords_i64={wide_coords} values_f64={wide_values} nullable={nullable})"
+                    shards.iter().map(|s| s.num_rows()).sum::<usize>(),
+                    b.num_rows(),
+                    "triple count changed (coords_i64={wide_coords} values_f64={wide_values} nullable={nullable})"
                 );
-                if nullable {
-                    assert_eq!(nulls, 1, "the nullable arm must actually carry a null");
-                }
             }
         }
     }
@@ -461,3 +459,105 @@ fn coo_rejects_a_schema_its_own_reader_would_refuse() {
 // constructing a batch with 4.3e9 triples is not possible here, and asserting on
 // the source text of the error would be a grep dressed up as coverage. The
 // guard's justification lives with the guard.
+
+#[test]
+fn coo_rejects_nulls_the_reader_would_refuse() {
+    // `coo_data_column` / `coo_coord_column` both refuse a null, and
+    // `BackedPairwiseReader::from_layout` checks only field NAMES — so a null
+    // anywhere in the three columns writes a graph that opens and then dies on
+    // first decode. The emitter refuses it instead.
+    //
+    // This is the case a previous round's test asserted the *opposite* of: it
+    // put a real null in `data` and checked the emitter preserved it, which
+    // blessed a payload this crate cannot read back.
+    let base = coo(8, &[(0, 1, 1.0), (5, 2, 2.0)], false, false, true);
+    let schema = base.schema();
+
+    let with_null_data = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            base.column(0).clone(),
+            base.column(1).clone(),
+            Arc::new(Float32Array::from(vec![Some(1.0f32), None])) as Arc<dyn Array>,
+        ],
+    )
+    .unwrap();
+    let err = run_coo(&with_null_data, 4).unwrap_err();
+    assert!(err.to_string().contains("data column has 1 null"), "{err}");
+
+    // And a null coordinate, in the column the partition never scans.
+    let nullable_coord = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int32, false),
+            Field::new("col", DataType::Int32, true),
+            Field::new("data", DataType::Float32, false),
+        ],
+        schema.metadata().clone(),
+    ));
+    let with_null_col = RecordBatch::try_new(
+        nullable_coord,
+        vec![
+            base.column(0).clone(),
+            Arc::new(Int32Array::from(vec![Some(1i32), None])) as Arc<dyn Array>,
+            base.column(2).clone(),
+        ],
+    )
+    .unwrap();
+    let err = run_coo(&with_null_col, 4).unwrap_err();
+    assert!(
+        err.to_string().contains("coordinate column 1 has 1 null"),
+        "{err}"
+    );
+}
+
+#[test]
+fn coo_rejects_value_and_coordinate_dtypes_the_reader_would_refuse() {
+    // `from_layout` passes on names alone, so an Int32 `data` column opens and
+    // then fails in `coo_data_column`. Refuse at the writer.
+    let b = coo(8, &[(0, 1, 1.0)], false, false, false);
+    let int_data = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("row", DataType::Int32, false),
+                Field::new("col", DataType::Int32, false),
+                Field::new("data", DataType::Int32, false),
+            ],
+            b.schema_ref().metadata().clone(),
+        )),
+        vec![
+            b.column(0).clone(),
+            b.column(1).clone(),
+            Arc::new(Int32Array::from(vec![7i32])) as Arc<dyn Array>,
+        ],
+    )
+    .unwrap();
+    let err = run_coo(&int_data, 4).unwrap_err();
+    assert!(
+        err.to_string().contains("data column has dtype Int32"),
+        "{err}"
+    );
+
+    // Coordinates of an unsupported width pass an `r == c` test but not this.
+    let float_coords = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("row", DataType::Float32, false),
+                Field::new("col", DataType::Float32, false),
+                Field::new("data", DataType::Float32, false),
+            ],
+            b.schema_ref().metadata().clone(),
+        )),
+        vec![
+            Arc::new(Float32Array::from(vec![0.0f32])) as Arc<dyn Array>,
+            Arc::new(Float32Array::from(vec![1.0f32])) as Arc<dyn Array>,
+            b.column(2).clone(),
+        ],
+    )
+    .unwrap();
+    let err = run_coo(&float_coords, 4).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("coordinate columns have dtype Float32"),
+        "{err}"
+    );
+}

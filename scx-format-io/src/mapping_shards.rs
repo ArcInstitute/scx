@@ -89,31 +89,66 @@ fn coo_dims(logical: &str, batch: &RecordBatch) -> Result<(usize, usize)> {
     Ok((get("n_rows")?, get("n_cols")?))
 }
 
-/// The COO wire schema every reader in this crate requires: exactly three
-/// columns named `row` / `col` / `data`, with the two coordinate columns at the
-/// same width.
+/// The **whole** COO wire contract this crate can read back: exactly three
+/// columns named `row` / `col` / `data`; both coordinates `Int32` or `Int64`
+/// and at the same width; `data` `Float32` or `Float64`; and no nulls in any of
+/// the three.
 ///
-/// Checked at **write** time because the emitter is `pub`: without it a caller
-/// could hand over a four-column batch, or one whose coordinate columns
-/// disagree in width, and get a file written that `BackedPairwiseReader`'s own
-/// `from_layout` then refuses to open. A write that succeeds into an unreadable
-/// file is the worst of the available failures — it is discovered later, by
-/// someone else, on a different machine.
+/// Checked at **write** time because the emitter is `pub`, and because
+/// `BackedPairwiseReader::from_layout` only inspects field *names* — so
+/// everything else here is a payload that opens fine and then fails on first
+/// decode, in `coo_coord_column` or `coo_data_column`. A write that succeeds
+/// into an unreadable file is the worst of the available failures: it is
+/// discovered later, by someone else, on a different machine.
+///
+/// The null rule is the one that narrows what callers may pass.
+/// `scx-ops::compact::remap_obsp_coo_to_dim` *preserves* its input's `data`
+/// nullability, so a nullable field reaches here routinely — that is fine, and
+/// the field's bit is preserved. An actual null is not: `coo_data_column`
+/// refuses one, so emitting it would write a graph no bounded read can decode.
+/// Refusing at the writer converts that into an error naming the column.
 fn validate_coo_schema(logical: &str, batch: &RecordBatch) -> Result<()> {
-    let fields = batch.schema_ref().fields().clone();
-    let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+    use arrow::datatypes::DataType;
+    let schema = batch.schema_ref();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     if names != ["row", "col", "data"] {
         return Err(ScxError::InvalidCatalog(format!(
             "{logical}: pairwise COO batch has columns {names:?}, expected exactly \
              [\"row\", \"col\", \"data\"]"
         )));
     }
-    let (r, c) = (fields[0].data_type(), fields[1].data_type());
+    let (r, c) = (schema.field(0).data_type(), schema.field(1).data_type());
+    if !matches!(r, DataType::Int32 | DataType::Int64) {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{logical}: pairwise COO coordinate columns have dtype {r:?}, expected Int32 \
+             or Int64"
+        )));
+    }
     if r != c {
         return Err(ScxError::InvalidCatalog(format!(
             "{logical}: pairwise COO batch has row dtype {r:?} and col dtype {c:?}; both \
              coordinate columns must be the same width"
         )));
+    }
+    let d = schema.field(2).data_type();
+    if !matches!(d, DataType::Float32 | DataType::Float64) {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{logical}: pairwise COO data column has dtype {d:?}, expected Float32 or Float64"
+        )));
+    }
+    for (idx, what) in [
+        (0usize, "coordinate column 0"),
+        (1, "coordinate column 1"),
+        (2, "data column"),
+    ] {
+        let n = batch.column(idx).null_count();
+        if n > 0 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "{logical}: pairwise COO {what} has {n} null entries; the bounded reader \
+                 refuses a null coordinate or value, so emitting one would write a graph \
+                 it cannot decode"
+            )));
+        }
     }
     Ok(())
 }
@@ -164,11 +199,12 @@ where
 /// relative input order — a stable partition, not a sort. Concatenating the
 /// shards therefore does **not** reproduce the input batch row for row unless
 /// the input was already ordered by `row / step`; it reproduces the same
-/// *multiset* of triples. Every reader of a COO mapping establishes its own
-/// order (`BackedPairwiseReader::read_rows_range` counting-sorts and then
-/// sorts columns within each row; the h5ad exporter sorts by `(row, col)` to
-/// build a canonical CSR; scipy's `coo_matrix` does not care), so the
-/// regrouping is not observable through any of them.
+/// *multiset* of triples. No reader's **matrix semantics** depend on that
+/// order (`BackedPairwiseReader::read_rows_range` counting-sorts and then sorts
+/// columns within each row; the h5ad exporter sorts by `(row, col)` to build a
+/// canonical CSR; scipy's `coo_matrix` does not care), but a caller reading the
+/// raw triples through `ScxReader::read_obsp` and relying on their sequence
+/// does see the regrouping.
 pub fn for_each_coo_mapping_shard<F>(
     logical: &str,
     batch: &RecordBatch,
@@ -268,12 +304,18 @@ where
         cursor[shard] += 1;
     }
 
+    // One index array over the whole partition, sliced per shard. A
+    // `positions[lo..hi].to_vec()` per shard would hold the full 4 B/nnz buffer
+    // *and* a copy of the current bucket — on a graph concentrated in one row
+    // band that doubles the partition's peak, which is the cost this counting
+    // sort exists to avoid. Arrow slicing shares the buffer.
+    let all_indices = UInt32Array::from(positions);
     let total = n_rows as u64;
     for shard_idx in 0..n_shards {
         let row_start = shard_idx * step;
         let n_shard_rows = step.min(n_rows - row_start);
         let (lo, hi) = (starts[shard_idx] as usize, starts[shard_idx + 1] as usize);
-        let indices = UInt32Array::from(positions[lo..hi].to_vec());
+        let indices = all_indices.slice(lo, hi - lo);
         // Reuses `batch.schema()`, so field dtypes, field nullability and the
         // `n_rows` / `n_cols` metadata all survive verbatim.
         let shard = arrow::compute::take_record_batch(batch, &indices)?;

@@ -88,7 +88,9 @@ mapping to a single section and every row-range read decoded the whole graph.
 Three consequences:
 
 - A file written before phase 9 keeps its single section and stays readable —
-  the readers prefer shards and fall back — it is just not bounded.
+  the readers prefer shards and fall back — it is just not bounded. So does
+  anything `scx convert --from h5mu` or an in-place metadata op writes today;
+  see [sharding.md](sharding.md) for which producers shard.
 - A sorted or compacted file's header now reports `has_obsp`. The unsharded
   `write_obsp` never set that flag, so `scx info` used to under-report a graph
   the file did carry.

@@ -2641,11 +2641,12 @@ fn sharding_obsp_does_not_change_which_edges_survive() {
     //
     // Bucketing groups triples by `row / step` while `remap_obsp_coo` emits
     // them in input order, so the assembled batch is NOT byte-identical to the
-    // pre-phase-9 single section — it is the same MULTISET of triples. That is
-    // not observable through any reader: `BackedPairwiseReader` counting-sorts
-    // and then sorts columns within a row, the h5ad exporter sorts by
-    // `(row, col)` for a canonical CSR, and scipy's `coo_matrix` imposes no
-    // order.
+    // pre-phase-9 single section — it is the same MULTISET of triples. No
+    // reader's matrix semantics depend on that order: `BackedPairwiseReader`
+    // counting-sorts and then sorts columns within a row, the h5ad exporter
+    // sorts by `(row, col)` for a canonical CSR, and scipy's `coo_matrix`
+    // imposes none. A caller reading raw triples through `read_obsp` and
+    // relying on their sequence does see it.
     let dir = tempfile::tempdir().unwrap();
     let inp = fixture_obsp_layers(&dir); // 8 obs, ring edge r -> (r+1)%8, data r+1
     let out = dir.path().join("out.scx");

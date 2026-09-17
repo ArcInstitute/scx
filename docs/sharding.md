@@ -915,6 +915,7 @@ shards**, so the producer matters:
 | `scx optimize` | copies the section verbatim, preserving whatever it finds |
 | **`scx convert --from h5mu`, `pyscx.from_h5mu`, `pyscx.to_mudata` writeback** | ⚠️ **one unsharded section** — global `obsm` via `write_obsm`, per-modality via `write_obsm_for` |
 | **`modify_metadata`, `obs_import` / `var_import`, `attach_external_layer`** | ⚠️ **one unsharded section** — they re-emit `obsm` whole |
+| **`scx-engine`'s fused ops** (`fused_ops.rs`) | ⚠️ **one unsharded section** — `write_obsm` |
 | **`scx subset`** | ⚠️ drops all four families |
 
 A mapping at or below the target becomes a single `…_shard_0` — still the
@@ -925,12 +926,21 @@ The rows marked ⚠️ are the remaining unsharded producers; a freshly converte
 bounded read over it is unbounded until the file has been through `sort` or
 `compact`.
 
-Every writer that *does* shard goes through one emitter pair
+Most of the sharding writers go through one emitter pair
 (`scx_format_io::for_each_dense_mapping_shard` / `for_each_coo_mapping_shard`),
-which is what keeps those producers from disagreeing about a boundary. The
-disk-streaming h5ad path is the exception that is not a disagreement: it cuts
-by HDF5 hyperslab as it reads, never holding the whole mapping, and stamps the
-same cover contract.
+which is what keeps them from disagreeing about a boundary: the h5ad override
+path, every `pyscx.from_anndata` route, PFlog's materialise, and all eight
+`sort` / `compact` sites.
+
+Two writers decide boundaries themselves, and neither is a disagreement:
+
+- the **disk-streaming h5ad** path cuts by HDF5 hyperslab as it reads, so it
+  never holds the whole mapping — it stamps the same cover contract from a
+  different loop;
+- **`scx merge`** emits one output shard per *input* section
+  (`scx-ops/src/merge_pairwise.rs`, `merge.rs`), shifting each input's stamped
+  span into the concatenated axis. It has no target to cut at, because it is
+  concatenating covers rather than building one.
 
 Note this does **not** contradict the obs rule above that "optimize never
 collapses or re-sizes existing obs shards": that is a statement about `obs`,
@@ -945,9 +955,9 @@ position-tracking key is the lever for spatial shard locality, and pulling it
 used to cost the bounded read.
 
 **Reading a pre-phase-9 file.** `read_obsp` / `read_obsm` prefer the sharded
-layout and fall back to the single section, so a file written before phase 9
-reads unchanged — just unbounded. The sharded layout itself is not new; it has
-been readable since pyscx-v0.4.4.
+layout and fall back to the single section, so a file written before phase 9 —
+or by one of the ⚠️ producers above — reads unchanged, just unbounded. The
+sharded layout itself is not new; it has been readable since pyscx-v0.4.4.
 
 ## CSC sharding
 

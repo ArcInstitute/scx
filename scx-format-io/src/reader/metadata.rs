@@ -60,8 +60,9 @@ pub(crate) struct MappingLayout {
 /// answers **nnz**. Since phase 9 `scx sort` and `scx compact` write obsp
 /// back **sharded** (both go through
 /// `scx_format_io::for_each_coo_mapping_shard`), so the legacy arm is no
-/// longer something an op produces — but it is still not a hypothetical
-/// branch, because every file written before phase 9 takes it.
+/// longer something those two ops produce — but it is still not a hypothetical
+/// branch: every file written before phase 9 takes it, and so does anything
+/// `from_h5mu` or an in-place metadata op writes today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LegacyRowCount {
     /// One Arrow row per logical row — dense `obsm` / `varm`.

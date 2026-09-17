@@ -39,10 +39,11 @@
 //! `ObspEmbedding` is one Arrow batch and must be deserialised whole whatever
 //! range is asked for; the range is then applied to the decoded triples.
 //!
-//! That branch is no longer what the rewrite ops produce — since phase 9,
-//! `scx sort` and `scx compact` emit all four mapping families as shards — but
-//! it is still reachable, and not hypothetically: a file written before
-//! phase 9 has an unsharded graph, and `scx subset` drops obsp entirely.
+//! That branch is no longer what `sort` / `compact` produce — since phase 9
+//! they emit all four mapping families as shards — but it is still reachable,
+//! and not hypothetically: a file written before phase 9 has an unsharded
+//! graph, `from_h5mu` and the in-place metadata ops still write one, and
+//! `scx subset` drops obsp entirely.
 //!
 //! # Row space
 //!
@@ -225,8 +226,9 @@ impl BackedPairwiseReader {
     }
 
     /// `true` when the mapping is stored as one unsharded section, which is
-    /// what makes a read unbounded. Since phase 9 no rewrite op writes one;
-    /// a file predating it does.
+    /// what makes a read unbounded. `sort` and `compact` stopped writing one
+    /// in phase 9; a file predating that, or one from `from_h5mu` or an
+    /// in-place metadata op, still is.
     pub fn is_legacy_single_section(&self) -> bool {
         self.sorted_entries
             .iter()

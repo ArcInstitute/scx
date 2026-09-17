@@ -520,7 +520,8 @@ Five, and each has bitten something:
   unbounded `obsm` until it has been through `sort` or `compact`.
   `scx optimize` copies a mapping section verbatim, so it preserves whichever
   form it finds, and `scx subset` drops all four families outright. The
-  producer table in [sharding.md](sharding.md) is the full list.
+  producer table in [sharding.md](sharding.md) lists the producers family by
+  family.
 
   Two side effects of the phase-9 change worth knowing. A sorted or compacted
   file's header now reports `has_obsp` (the unsharded `write_obsp` never set
