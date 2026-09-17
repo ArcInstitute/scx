@@ -92,6 +92,25 @@ pub fn row_group_cache_enabled() -> bool {
     })
 }
 
+/// Process-wide switch for the **reuse-signal** admission policy (W10).
+///
+/// Default `reuse`: a plan over its `budget / (lookahead + 1)` share keeps the
+/// row groups another plan of the prefetch window also touches.
+/// `SCX_ROW_GROUP_ADMIT=plan` restores the pre-W10 all-or-nothing rule — a plan
+/// over its share retains nothing — which is the same-build A/B arm for the
+/// capture, exactly as `SCX_ROW_GROUP_CACHE=0` is for the row-group LRU itself.
+/// Read once per process.
+///
+/// Anything other than `plan` (case-insensitive) is `reuse`, including an unset
+/// variable and a typo: a misspelled arm must not silently disable the shipped
+/// policy in a capture that then reports it as the default.
+pub fn row_group_admit_reuse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("SCX_ROW_GROUP_ADMIT").is_ok_and(|v| v.eq_ignore_ascii_case("plan"))
+    })
+}
+
 /// A shard request-group takes the O(rows) block-index path only when the
 /// requested rows are a small fraction of the shard — `group_len * DIVISOR <
 /// shard_rows`. Shared by `read_rows_with`'s `use_block_index` decision and the

@@ -932,9 +932,11 @@ def _slurm_setup_cmds(env_name: str | None = None, format_key: str | None = None
     # (io/decode/reduction/marshalling → `runs[].extra["cpu_profile_*"]`); it is
     # read once at profiler init, so it must be exported before the worker
     # imports pyscx — hence forward it here like the other runtime knobs.
-    # `SCX_ROW_GROUP_CACHE` / `SCX_SCATTER_BLOCK_INDEX` are the reader-layer
-    # kill-switches for the row-group LRU (OPT-FORMATIO-1) and the block-index
-    # scattered path; both are `OnceLock`-cached per process, so a same-build
+    # `SCX_ROW_GROUP_CACHE` / `SCX_SCATTER_BLOCK_INDEX` / `SCX_ROW_GROUP_ADMIT`
+    # are the reader-layer kill-switches for the row-group LRU
+    # (OPT-FORMATIO-1), the block-index scattered path, and the reuse-signal
+    # admission policy (W10 — `SCX_ROW_GROUP_ADMIT=plan` restores the pre-W10
+    # all-or-nothing verdict). All three are `OnceLock`-cached per process, so a same-build
     # A/B (`SCX_ROW_GROUP_CACHE=0 capture_baseline.py ...`) only selects its
     # arm if the value reaches the worker before it imports pyscx. Recorded in
     # the snapshot's `environment.json` so the arm is legible after the fact.
@@ -950,6 +952,7 @@ def _slurm_setup_cmds(env_name: str | None = None, format_key: str | None = None
                 "SCX_BENCH_WITH_CSC",
                 "SCX_ROW_GROUP_CACHE",
                 "SCX_SCATTER_BLOCK_INDEX",
+                "SCX_ROW_GROUP_ADMIT",
                 "PYTHONPATH"):
         val = os.environ.get(var, "").strip()
         if val:

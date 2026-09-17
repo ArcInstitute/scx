@@ -618,6 +618,11 @@ fn verdict_from_window(
     if fits_share {
         return Admit::All;
     }
+    // The A/B arm: with the reuse policy off, a plan over its share retains
+    // nothing, which is what every gather did before W10.
+    if !scx_format_io::backed::row_group_admit_reuse_enabled() {
+        return Admit::None;
+    }
     Admit::groups(
         keys.iter()
             .copied()
