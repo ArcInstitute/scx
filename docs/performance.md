@@ -2719,6 +2719,83 @@ corner is many files that each carry census-sized shards.
 > was immaterial, but the timed rows above are the manifested ones and the
 > counter tables are diagnostics.
 
+#### Reuse-signal admission (W10)
+
+An over-share plan used to forfeit row-group retention outright — one verdict
+per plan, all or nothing — which is what the `0.000` rows in the table above
+are. It now keeps the groups **another plan of the lookahead window also
+touches**, hottest-first and only while they fit that same
+`budget / (lookahead + 1)` share, and still decode-and-drops its cold tail.
+
+**Same-build A/B**, one build with the arm selected by `SCX_ROW_GROUP_ADMIT`
+(`plan` = the pre-W10 rule, `reuse` = shipped): 12 rounds per dataset, the
+within-pair order flipped on alternate rounds so a first-slot advantage cancels,
+one timed run per invocation, `cellset_gather` driven in process on one host.
+`p` is an exact two-sided sign test over the per-round ratios.
+
+The new `gather_hot_control_cold_tail` arm is 8 control sets repeated verbatim in
+every batch plus 56 drawn fresh, at S=64 under a 256 MB budget. It **does not run
+on pbmc3k**: 56 × 64 draws from 2,700 rows make the "cold" tails overlap 0.55 of
+their own rows, so the arm records `applicable: false` rather than timing a warm
+tail under a cold name.
+
+| tabula_sapiens_100k, 12 rounds | plan | reuse | ratio | reuse wins | p |
+|---|---|---|---|---|---|
+| `cellsets_per_sec__gather_hot_control_cold_tail` | 32.7 | 32.9 | 1.003× | 6/12 | 1.000 |
+| `us_per_cell__gather_hot_control_cold_tail` | 477.3 | 475.5 | 1.002× | 7/12 | 0.774 |
+| `peak_rss_mb__gather_hot_control_cold_tail` | 1,176 | 1,196 | **0.987×** | 0/12 | **0.000** |
+
+| retention, same runs | plan | reuse |
+|---|---|---|
+| `row_group_hit_rate__gather_hot_control_cold_tail` | 0 | **0.0421** |
+| `reuse_admissions__gather_hot_control_cold_tail` | 0 | 11 |
+| `admitted_group_bytes__gather_hot_control_cold_tail` | 0 | 7.42 GB |
+| `rejected_group_bytes__gather_hot_control_cold_tail` | 162.2 GB | 154.7 GB |
+
+**Read the hit rate against the shape's ceiling, which is 0.125.** Only the
+control sets can be served from cache — 8 of 64 — so `0.0421` is 34 % of what
+any admission policy could reach here, not 4 % of a notional 1.0. The arm
+records that ceiling in `metadata.hot_control_cold_tail`.
+
+**Read it beside the rejection.** 154.7 GB of the verdict's lookups are still
+refused, against 7.4 GB admitted: the cold tail is not being let in. A policy
+that raised the hit rate by admitting it would show a higher rate *and* a
+collapsed rejection, and neither number alone separates the two.
+
+**The cost is +20 MB of peak RSS on the arm (1.7 %), and nothing else moved.**
+That RSS row is the only one in the capture with a reliable verdict, at 0/12
+rounds and p = 0.000 — it is the configured budget being used for retention that
+did not previously happen, bounded by the share. Every other metric, on both
+datasets, is "no reliable difference": the four pre-existing `gather_*`
+scenarios and `us_per_cell__collate` on tabula (p 0.146–0.774) and on pbmc3k
+(p 0.146–0.774). Throughput on the arm itself is flat — 1.003× at 6/12 rounds
+and p = 1.000.
+
+> [!WARNING]
+> ⚠️ **An interactive probe said the opposite, and it was wrong.** Three probe
+> pairs on this fixture, one run per arm on a shared node, read 20.7 / 23.1 /
+> 23.0 sets/s for `plan` against 19.0 / 21.9 / 19.1 for `reuse` — a consistent
+> ~10–17 % slowdown that does not survive 12 interleaved rounds. The probes are
+> not in this table and are recorded only as the reason the capture was run
+> before anything was tuned.
+
+> [!NOTE]
+> Manifest entry: `results/raw/phase5_admission/admission_ab.json` (48 rounds,
+> each carrying its full `BenchmarkResult` envelope) beside `provenance.json`,
+> written by the running job from `SLURM_JOB_PARTITION` rather than from the
+> `#SBATCH` directive. SLURM job **2964125**, `cpu_batch_high_mem`, node
+> GPU104C, at `b285ffe2`, via
+> `sbatch --exclude=… benchmarks/scripts/_run_phase5_admission_ab.sh`;
+> summarised by `_phase5_admission_summary.py`. Force-added (`results/raw/` is
+> gitignored). Every figure above was checked programmatically against that
+> file.
+>
+> **Not measured**: census at any scale (a `cellset_gather` census cell does not
+> finish — census_500k was killed at 205 minutes still on run 1 of 3), and any
+> workload whose hot set is a different fraction of its lookups than this arm's
+> 8-of-64. The arm's own numbers bind to that shape and to the 256 MB budget
+> that puts a plan over its share at all.
+
 ### Out-of-core loader — cold-cache measurements and the P-1 premise gate
 
 Every loader number above this subsection is **page-cache-warm**. That matters: annbatch's

@@ -4094,12 +4094,18 @@ absolute_floors:
 #         pbmc3k (2,700 rows) the "cold" tails overlap 0.55 of their rows and
 #         `metadata.hot_control_cold_tail.applicable` comes back false. A floor
 #         on a skipped arm synthesises a "missing metric" violation every run.
-#     (d) ⚠️ **The policy has not been shown to pay.** Interactively on
-#         tabula_sapiens_100k, one run per arm, the `plan` arm (pre-W10) read
-#         20.7 / 23.1 / 23.0 sets/s across three probe pairs and the `reuse`
-#         arm 19.0 / 21.9 / 19.1 — consistently lower, with ~12 % spread inside
-#         each arm, for a recovered `row_group_hit_rate` of 0.039 against this
-#         shape's 0.125 ceiling. A floor authored now could pin a regression.
+#     (d) The A/B (SLURM 2964125, 12 interleaved rounds) shows the arm's own
+#         throughput FLAT — 32.7 -> 32.9 sets/s, 1.003x at 6/12 rounds,
+#         p = 1.000 — so there is no regression to pin, but there is also no
+#         improvement to floor: a `cellsets_per_sec` floor here would gate a
+#         number the policy does not move. The metric worth flooring is
+#         `row_group_hit_rate__*` (0 -> 0.0421), and that one needs a baseline
+#         carrying the arm, which is blocker (b).
+#
+#         ⚠️ An interactive probe said the opposite before that capture — three
+#         pairs at 20.7/23.1/23.0 against 19.0/21.9/19.1 sets/s, a consistent
+#         ~10-17 % slowdown — and it does not survive interleaving. Recorded so
+#         nobody re-derives a floor from a single-run probe on a shared node.
 #
 #     ⚠️ Read `row_group_hit_rate__*` against
 #     `metadata.hot_control_cold_tail.row_group_hit_rate_ceiling`, never against

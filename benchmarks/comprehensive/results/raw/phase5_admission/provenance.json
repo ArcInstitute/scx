@@ -1,0 +1,18 @@
+{
+ "phase": 5,
+ "what": "W10 reuse-signal admission, same-build A/B",
+ "head_sha": "b285ffe2eef3cb5b617098ba9593ff047f403db9",
+ "job_id": "2964125",
+ "partition": "cpu_batch_high_mem",
+ "node": "GPU104C",
+ "cpus": "16",
+ "rounds": 12,
+ "n_runs": 1,
+ "datasets": [
+  "pbmc3k",
+  "tabula_sapiens_100k"
+ ],
+ "design": "one build, two arms selected by SCX_ROW_GROUP_ADMIT; rounds interleaved with the within-pair order flipped on alternate rounds; exact two-sided sign test over per-round ratios",
+ "what_this_is_not": "not a census measurement (a cellset_gather census cell does not finish), and not a claim about any workload whose hot set is a different fraction of its lookups than this arm's 8-of-64",
+ "arms_verified_by": "behaviour (a hot-control plan sequence must retain on reuse and not on plan)"
+}
