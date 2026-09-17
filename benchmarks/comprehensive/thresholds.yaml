@@ -4149,3 +4149,63 @@ absolute_floors:
 #          `_HOT_MAX_MEMORY_MB` is the load-bearing one: it decides whether a
 #          plan is over its budget share at all, and a larger budget makes every
 #          plan fit and the arm measure `Admit::All` under the reuse name.
+#
+# 25. cellset_gather / shared-control arm (W11 multi-set batch executor)
+#     `cellsets_per_sec__gather_shared_control_per_set`, `us_per_cell__*`,
+#     `peak_rss_mb__*`, `ttfb_first_set_s__*` and `unique_row_fraction__*` are
+#     emitted as of the batch-executor PR. NO floor is proposed:
+#
+#     (a) The phase's own gate is two captures before a floor — the sequencing
+#         items 22, 23 and 24 follow.
+#     (b) No baseline carries `cellset_gather` rows at all (item 15).
+#     (c) The arm self-skips when its premise check refuses the shape. Unlike
+#         item 24's, the premise is about DUPLICATION rather than about cold
+#         tails: it raises when the control block is not in every set, or when
+#         more than `_SHARED_MAX_UNIQUE_FRACTION` of the batch's positions name
+#         a distinct row — at which point there is nothing to deduplicate and
+#         the arm would be timing a random gather under a shared-control name.
+#         `metadata.shared_control_per_set.applicable` comes back false and a
+#         floor on a skipped arm synthesises a "missing metric" violation.
+#     (d) The phase merges on parity and allocations, not on a rate. What the
+#         change is known to move is the ALLOCATION COUNT, measured by
+#         `scx-loader/tests/gather_allocation.rs` rather than here: 2,698 ->
+#         101 for a 1,024-row plan, 2.63 -> 0.10 per row, with peak live bytes
+#         flat (421,192 -> 412,480 B). Whether that shows up as sets/s on a
+#         real fixture is what the A/B measures; it is not assumed, and until
+#         it is measured there is no number to floor.
+#
+#     ⚠️ `unique_row_fraction__*` is a property of the PLAN, not of the loader,
+#     and it is emitted so the rate beside it is interpretable at all: the same
+#     `cellsets_per_sec` means different things at 0.53 and at 0.99. It is
+#     computed from the plan list rather than read back from `cache_metrics()`,
+#     because asking the gather how many rows it deduplicated would be asking
+#     the subject under test to certify its own premise.
+#
+#     ⚠️ The existing arms cannot stand in for this one. `gather_random*` draws
+#     with replacement from `n_obs` and collides about ten times in a 1,024-row
+#     batch; `gather_grouped_s512` duplicates heavily but only because
+#     `rng.choice(..., replace=g.size < S)` pads an under-full covariate group,
+#     which is a property of the fixture's group sizes and moves with the
+#     dataset; and item 24's hot-control arm draws its control sets
+#     independently per set, so it shares them across BATCHES (what a cache
+#     reuse signal needs) and is ~1.6 % duplicated within one.
+#
+#     ACTIVATION, once a baseline carries the arm AND the A/B shows a rate the
+#     executor moves:
+#       1. Read the medians from
+#          `<candidate>/raw/cellset_gather__scx_auto__tabula_sapiens_100k.json`,
+#          from runs whose `extra.scenario == "gather_shared_control_per_set"`.
+#       2. Author:
+#              metric: cellsets_per_sec__gather_shared_control_per_set -> min: 0.85 x median
+#          and add the name to `_FROZEN_CELLSET_KEYS` in
+#          `tests/test_dataload_phase0.py`, or
+#          `test_thresholds_yaml_floor_keys_match_frozen_list` fails — that test
+#          is the guard on this file's `cellset_gather` metric names and it is
+#          exact, not a subset.
+#       3. The floor binds only while the shape stays pinned.
+#          `_SHARED_CONTROL_PER_SET`, `_SHARED_PERT_PER_SET`,
+#          `_SHARED_CONTROL_POOL`, `_SHARED_N_BATCHES` and `_SHARED_SEED` are
+#          module constants for exactly that reason and are echoed into
+#          `runs[].extra`. The control/perturbation split is the load-bearing
+#          one: it IS the duplication factor, and a floor authored at 32/32
+#          means nothing at 4/60.

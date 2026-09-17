@@ -693,3 +693,73 @@ def test_hot_control_cold_tail_arm_runs_to_its_summary(phase0_env, monkeypatch):
         "rejected_group_bytes__gather_hot_control_cold_tail",
     ):
         assert key in runs[0].extra, (key, sorted(runs[0].extra))
+
+
+def test_shared_control_arm_runs_to_its_summary(phase0_env, monkeypatch):
+    """The W11 arm, exercised on a fixture where it does NOT skip.
+
+    Same lesson as the W10 test above and the same shape of guard: the arm's
+    summary block is only reached when the premise check passes, so without a
+    test that reaches it a `NameError` there surfaces in a SLURM job rather than
+    in the suite.
+
+    The premise here is about duplication rather than about cold tails, so the
+    shrink is different: `phase0_env`'s fixture is 600 rows, and the shipped
+    32 + 32 shape over 16 sets would draw 512 perturbation rows from it and
+    collide with itself. Nothing is timed, so a smaller shape is safe.
+    """
+    import importlib
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+
+    monkeypatch.setattr(m, "_SHARED_CONTROL_PER_SET", 4)
+    monkeypatch.setattr(m, "_SHARED_PERT_PER_SET", 4)
+    monkeypatch.setattr(m, "_SHARED_SET_SIZE", 8)
+    monkeypatch.setattr(m, "_SHARED_CONTROL_POOL", 64)
+    monkeypatch.setattr(m, "_SHARED_N_BATCHES", 2)
+
+    premises = m._shared_control_premises(phase0_env["ds"].n_obs)
+    assert premises["sets_per_batch"] >= 2, premises
+    assert premises["unique_row_fraction"] <= m._SHARED_MAX_UNIQUE_FRACTION, (
+        "premise: at the shrunk shape the batch really does repeat rows, or the "
+        f"test covers a random gather under this arm's name: {premises}"
+    )
+
+    res = m.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=False)
+    meta = res.metadata.get("shared_control_per_set")
+    assert meta is not None and meta.get("applicable") is True, meta
+    assert "median_cellsets_per_sec" in meta, meta
+    assert "unique_row_fraction" in meta, meta
+
+    runs = [
+        r for r in res.runs if r.extra.get("scenario") == "gather_shared_control_per_set"
+    ]
+    assert runs, "the arm emitted no runs"
+    for key in (
+        "cellsets_per_sec__gather_shared_control_per_set",
+        "us_per_cell__gather_shared_control_per_set",
+        "peak_rss_mb__gather_shared_control_per_set",
+        "unique_row_fraction__gather_shared_control_per_set",
+    ):
+        assert key in runs[0].extra, (key, sorted(runs[0].extra))
+
+
+def test_the_shared_control_premise_refuses_a_shape_with_nothing_to_dedup(monkeypatch):
+    """The premise check must actually discriminate.
+
+    A control block of one row per set leaves ~98 % of the batch's positions
+    naming a distinct row, which is a random gather. Phase 4's lesson is that an
+    intuitive premise can pass on exactly the control it was meant to exclude,
+    so the refusal is asserted rather than assumed.
+    """
+    import importlib
+
+    import pytest
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+
+    monkeypatch.setattr(m, "_SHARED_CONTROL_PER_SET", 1)
+    monkeypatch.setattr(m, "_SHARED_PERT_PER_SET", 63)
+    monkeypatch.setattr(m, "_SHARED_SET_SIZE", 64)
+    with pytest.raises(RuntimeError, match="name a distinct row"):
+        m._shared_control_premises(100_000)

@@ -937,7 +937,10 @@ def _slurm_setup_cmds(env_name: str | None = None, format_key: str | None = None
     # (OPT-FORMATIO-1), the block-index scattered path, the reuse-signal
     # admission policy (W10 — `SCX_ROW_GROUP_ADMIT=plan` restores the pre-W10
     # all-or-nothing verdict) and the serial row-group decode
-    # (`SCX_ROW_GROUP_SERIAL_DECODE=1`, W10's other A/B arm). All four are
+    # (`SCX_ROW_GROUP_SERIAL_DECODE=1`, W10's other A/B arm).
+    # `SCX_CELLSET_EXECUTOR` is the loader-layer one: `=set` restores the
+    # pre-W11 per-set cell-set gather in place of the multi-set batch executor.
+    # All five are
     # `OnceLock`-cached per process, so a same-build
     # A/B (`SCX_ROW_GROUP_CACHE=0 capture_baseline.py ...`) only selects its
     # arm if the value reaches the worker before it imports pyscx. Recorded in
@@ -956,6 +959,7 @@ def _slurm_setup_cmds(env_name: str | None = None, format_key: str | None = None
                 "SCX_SCATTER_BLOCK_INDEX",
                 "SCX_ROW_GROUP_ADMIT",
                 "SCX_ROW_GROUP_SERIAL_DECODE",
+                "SCX_CELLSET_EXECUTOR",
                 "PYTHONPATH"):
         val = os.environ.get(var, "").strip()
         if val:
