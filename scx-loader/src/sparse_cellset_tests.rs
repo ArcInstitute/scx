@@ -3340,3 +3340,64 @@ fn the_unique_row_read_is_charged_only_where_it_can_happen() {
     assert_eq!(bd(&uncharged).batch_buffer_bytes, 0);
     assert_eq!(bd(&uncharged).transient_bytes, 0);
 }
+
+/// Both executors refuse a cross-file **set** without remap tables, with the
+/// same message.
+///
+/// They refuse at different moments and that is deliberate: the per-set walk
+/// discovers it inside the set loop, having already read every earlier set, and
+/// the batch executor checks every set before any read. Same error, same words;
+/// only the wasted I/O differs. Nothing compared the two, and the message is
+/// what `test_gather_raises_the_same_errors_as_the_iterator` asserts on the
+/// Python side.
+#[test]
+fn both_executors_refuse_a_cross_file_set_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("x0.scx");
+    let p1 = dir.path().join("x1.scx");
+    write_ragged_fixture(&p0, 32, 8, 2);
+    write_ragged_fixture(&p1, 32, 8, 2);
+    let mk = || {
+        SparseCellSetLoader::new(
+            vec![open(&p0), open(&p1)],
+            8,
+            None,
+            4,
+            /*remap*/ None,
+            None,
+            false,
+            false,
+            0.0,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    };
+    // Set 0 is single-file and would be gathered before the per-set walk ever
+    // looks at set 1 — which is the moment the two executors differ.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 0, 0, 1],
+        rows: vec![1, 2, 3, 4],
+        role_tags: vec![0; 4],
+        set_offsets: vec![0, 2, 4],
+    };
+    let a = mk();
+    let whole = a
+        .gather_whole_plan(&a.engine, &plan, Some(Admit::All))
+        .unwrap_err()
+        .to_string();
+    let b = mk();
+    let per_set = b
+        .gather_per_set(&b.engine, &plan, Some(Admit::All))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(whole, per_set);
+    assert!(whole.contains("cross-file cell set"), "{whole}");
+
+    // And the batch executor refused before touching a shard, where the
+    // per-set walk had already decoded set 0's.
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    assert_eq!(a.cache_metrics().misses.load(AtomicOrdering::Relaxed), 0);
+    assert!(b.cache_metrics().misses.load(AtomicOrdering::Relaxed) > 0);
+}
