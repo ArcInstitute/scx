@@ -355,7 +355,10 @@ pub(crate) struct SparseCellSetParams {
 ///   existing caller, and on a file where the adaptive cap already binds
 ///   (census_500k affords 22 of the 31 shards it wants) that is throughput
 ///   traded away for an estimate nobody asked for.
-/// * **Not charged**: the batch's transients, and the batch at all when
+/// * **Charged with it**: the batch executor's unique-row read, on the
+///   configurations that cannot avoid it — see
+///   [`SparseCellSetBudgetModel::transient_bytes_for`].
+/// * **Not charged**: the batch's per-row transients, and nothing at all when
 ///   `max_plan_rows` is `None`.
 /// * **Not a hard cap**: `WeightedLruCache::put_with_budget` deliberately keeps
 ///   a single entry that exceeds the byte budget on its own (refusing would
@@ -374,6 +377,10 @@ pub(crate) struct SparseCellSetBudgetModel {
     shard_decoded_bytes: usize,
     /// One gathered batch at the caller's declared `max_plan_rows`, or 0.
     batch_bytes: usize,
+    /// The batch executor's unique-row read, co-resident with the batch while
+    /// it is being assembled, or 0 when this loader's configuration cannot need
+    /// one. See [`SparseCellSetBudgetModel::transient_bytes_for`].
+    transient_bytes: usize,
 }
 
 impl SparseCellSetBudgetModel {
@@ -386,13 +393,42 @@ impl SparseCellSetBudgetModel {
     /// magnitude smaller than the CSR at any realistic density, and a term that
     /// small would lend the estimate a precision it does not have.
     fn batch_bytes_for(max_plan_rows: usize, mean_nnz_per_row: f64) -> usize {
-        // `presize_nnz`, not the raw mean: the gather allocates the biased
-        // figure, so charging the unbiased one would under-report the batch by
-        // exactly the eighth the bias adds — on a term whose whole purpose is
-        // to make `max_memory_mb` mean something.
+        // `presize_nnz`, not the raw mean. It was chosen because the gather
+        // allocated the biased figure and charging the unbiased one would have
+        // under-reported the batch by exactly the eighth the bias adds. W11
+        // allocates exactly, so the eighth is now headroom rather than a model
+        // of the allocation — kept, because a manifest-wide mean is an estimate
+        // and the errors are not symmetric: under-reporting a batch is what
+        // makes `max_memory_mb` mean nothing.
         let nnz = presize_nnz(max_plan_rows, mean_nnz_per_row);
         nnz.saturating_mul(8)
             .saturating_add(max_plan_rows.saturating_add(1).saturating_mul(8))
+    }
+
+    /// Bytes the batch executor's unique-row read holds **beside** the batch.
+    ///
+    /// W11 reads a plan's deduplicated rows into one exactly-sized `ScxCsr` and
+    /// then writes the batch from it, so for the span of a gather two buffers
+    /// are live. Not always, though: a single-file plan with no repeated rows
+    /// and no length-changing transform is handed the read's own buffers as the
+    /// batch, and holds one.
+    ///
+    /// Which of the two a gather takes is decided per *plan* — a repeated row
+    /// forces the general path on any configuration — so the model charges on
+    /// the three facts it knows at construction: a remap or a downsample makes
+    /// every plan take it, and so does a manifest of more than one file. On a
+    /// single-file raw-local loader the term is 0 and a plan that repeats a row
+    /// pays an uncharged transient, which is a **floor rather than a bound** and
+    /// is said here rather than left to be discovered. The charged figure is one
+    /// batch, which is its ceiling: the unique rows of a plan are at most its
+    /// rows, and are fewer exactly when the duplicates that force this path
+    /// exist.
+    fn transient_bytes_for(batch_bytes: usize, general_path: bool) -> usize {
+        if general_path {
+            batch_bytes
+        } else {
+            0
+        }
     }
 }
 
@@ -407,7 +443,7 @@ impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
             // is pinned by `test_every_budget_carries_the_same_breakdown`.
             self.batch_bytes,
             0,
-            0,
+            self.transient_bytes,
             crate::budget::PYTHON_OVERHEAD_BYTES,
         )
     }
@@ -754,6 +790,10 @@ impl SparseCellSetLoader {
         let model = SparseCellSetBudgetModel {
             shard_decoded_bytes,
             batch_bytes,
+            transient_bytes: SparseCellSetBudgetModel::transient_bytes_for(
+                batch_bytes,
+                remap.is_some() || downsample.is_some() || n_files > 1,
+            ),
         };
         let requested = SparseCellSetParams { cache_shards };
         let cache_bytes_budget = match bytes_budget {

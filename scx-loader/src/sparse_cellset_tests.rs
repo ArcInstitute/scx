@@ -1338,6 +1338,7 @@ fn closed_form_agrees_with_the_shared_driver() {
     let model = SparseCellSetBudgetModel {
         shard_decoded_bytes: SHARD,
         batch_bytes: 0,
+        transient_bytes: 0,
     };
     let py = crate::budget::PYTHON_OVERHEAD_BYTES;
     let budgets = [
@@ -1378,6 +1379,7 @@ fn the_sparse_reduction_chain_is_monotone() {
             &SparseCellSetBudgetModel {
                 shard_decoded_bytes,
                 batch_bytes: 0,
+                transient_bytes: 0,
             },
             SparseCellSetParams { cache_shards: 128 },
         );
@@ -3246,4 +3248,92 @@ fn the_occurrence_table_dedups_across_sets_and_within_them() {
     assert_eq!(occ.slots, vec![(1, 9), (0, 4), (0, 9)]);
     assert_eq!(occ.slot_of_pos, vec![0, 1, 2]);
     assert!(occ.identity);
+}
+
+/// W11: the batch executor's unique-row read is charged **only** on the
+/// configurations that must take the general path.
+///
+/// A single-file raw-local loader is handed the read's own buffers as the
+/// batch, so it holds one; a remap, a downsample or a manifest of more than one
+/// file forces the assemble-from-a-second-buffer path on every plan, so those
+/// hold two. The charge is one batch either way, which is the ceiling: a plan's
+/// unique rows are at most its rows.
+#[test]
+fn the_unique_row_read_is_charged_only_where_it_can_happen() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("t0.scx");
+    let p1 = dir.path().join("t1.scx");
+    write_fixture(&p0, 8192, 64, 4);
+    write_fixture(&p1, 8192, 64, 4);
+
+    let build = |paths: Vec<&std::path::Path>,
+                 remap: Option<Vec<Vec<i32>>>,
+                 downsample: Option<crate::downsample::DownsampleConfig>,
+                 max_plan_rows: Option<usize>| {
+        let n = paths.len();
+        SparseCellSetLoader::new(
+            paths.into_iter().map(open).collect(),
+            8,
+            None,
+            4,
+            remap,
+            if n > 1 { Some(64) } else { None },
+            false,
+            false,
+            0.0,
+            downsample,
+            false,
+            max_plan_rows,
+        )
+        .unwrap()
+    };
+
+    let bd = |l: &StdArc<SparseCellSetLoader>| l.budget_breakdown();
+
+    // The fast configuration: one file, raw-local. One buffer, so no transient.
+    let fast = build(vec![&p0], None, None, Some(4096));
+    assert!(
+        bd(&fast).batch_buffer_bytes > 0,
+        "premise: the batch is charged"
+    );
+    assert_eq!(bd(&fast).transient_bytes, 0);
+
+    // Each of the three facts that forces the general path, on its own.
+    let two_files = build(
+        vec![&p0, &p1],
+        Some(vec![(0..64).collect(), (0..64).collect()]),
+        None,
+        Some(4096),
+    );
+    assert_eq!(
+        bd(&two_files).transient_bytes,
+        bd(&two_files).batch_buffer_bytes,
+        "a multi-file manifest assembles from a second buffer"
+    );
+    let remapped = build(vec![&p0], Some(vec![(0..64).collect()]), None, Some(4096));
+    assert_eq!(
+        bd(&remapped).transient_bytes,
+        bd(&remapped).batch_buffer_bytes
+    );
+    let downsampled = build(
+        vec![&p0],
+        None,
+        Some(ds_cfg(
+            100,
+            crate::downsample::DownsampleMethod::Multinomial,
+            1,
+            vec![7],
+        )),
+        Some(4096),
+    );
+    assert_eq!(
+        bd(&downsampled).transient_bytes,
+        bd(&downsampled).batch_buffer_bytes
+    );
+
+    // And nothing is charged at all without `max_plan_rows`, on either shape —
+    // the byte-identity promise the term was added under.
+    let uncharged = build(vec![&p0], Some(vec![(0..64).collect()]), None, None);
+    assert_eq!(bd(&uncharged).batch_buffer_bytes, 0);
+    assert_eq!(bd(&uncharged).transient_bytes, 0);
 }
