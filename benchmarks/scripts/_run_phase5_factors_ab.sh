@@ -189,34 +189,58 @@ print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v)
                   for k, v in out.items() if k != "result"})[:900], flush=True)
 PY
 
+# Export the arm's environment into the CURRENT shell, for a subshell to
+# inherit.
+#
+# ⚠️ Written as plain `export` + `unset`, never as a conditional command prefix
+# (`${chunk:+VAR=$chunk} cmd`). The first version of this driver did that and
+# died on `ARM_NAME=plan: command not found` — an assignment where a command
+# name was expected. `unset` and not "set it to empty": the reader treats any
+# value that is not a positive integer as absent, but leaving a stale value from
+# a previous arm in the environment is how an arm comes to measure its
+# neighbour's policy.
+arm_env() {
+    local name="$1"
+    case "$name" in
+        plan)   export SCX_ROW_GROUP_ADMIT=plan;  unset SCX_ROW_GROUP_DECODE_CHUNK ;;
+        reuse)  export SCX_ROW_GROUP_ADMIT=reuse; unset SCX_ROW_GROUP_DECODE_CHUNK ;;
+        serial) export SCX_ROW_GROUP_ADMIT=reuse; export SCX_ROW_GROUP_DECODE_CHUNK=1 ;;
+        *) echo "unknown arm $name" >&2; return 1 ;;
+    esac
+    export ARM_NAME="$name"
+}
+
+# `IFS` is set and RESTORED around the split, not left as an assignment prefix
+# on `read`: a leaked `IFS='|'` stops `for arm in $ARMS` splitting on spaces,
+# which is the other half of what broke the first version.
+split_cell() {
+    local cell="$1" old_ifs="$IFS"
+    IFS='|'
+    # shellcheck disable=SC2086
+    set -- $cell
+    IFS="$old_ifs"
+    CELL_BENCH="$1"; CELL_DS="$2"; CELL_FK="$3"; CELL_RUNNER="$4"
+}
+
 run_one() {
     local name="$1" round="$2" cell="$3"
-    IFS='|' read -r bench ds fk runner <<< "$cell"
-    export ARM_NAME="$name" ARM_ROUND="$round"
-    export ARM_BENCH="$bench" ARM_DATASET="$ds" ARM_FORMAT_KEY="$fk" ARM_FORMAT_RUNNER="$runner"
-    export ARM_OUT="$OUT/rounds/${bench}__${ds}__${fk}__r$(printf '%02d' "$round")__${name}.json"
+    split_cell "$cell"
+    arm_env "$name"
+    export ARM_ROUND="$round"
+    export ARM_BENCH="$CELL_BENCH" ARM_DATASET="$CELL_DS"
+    export ARM_FORMAT_KEY="$CELL_FK" ARM_FORMAT_RUNNER="$CELL_RUNNER"
+    export ARM_OUT="$OUT/rounds/${CELL_BENCH}__${CELL_DS}__${CELL_FK}__r$(printf '%02d' "$round")__${name}.json"
     export ARM_N_RUNS="$N_RUNS"
-    local admit=reuse chunk=""
-    case "$name" in
-        plan)   admit=plan ;;
-        reuse)  admit=reuse ;;
-        serial) admit=reuse; chunk=1 ;;
-    esac
     ( cd "$REPO" && set -a && . ./.env && set +a \
-      && SCX_ROW_GROUP_ADMIT="$admit" ${chunk:+SCX_ROW_GROUP_DECODE_CHUNK=$chunk} \
-         ARM_NAME="$name" "$VENV/bin/python" "$OUT/preflight.py" >/dev/null \
-      && SCX_ROW_GROUP_ADMIT="$admit" ${chunk:+SCX_ROW_GROUP_DECODE_CHUNK=$chunk} \
-         "$VENV/bin/python" "$OUT/run_one.py" )
+      && "$VENV/bin/python" "$OUT/preflight.py" >/dev/null \
+      && "$VENV/bin/python" "$OUT/run_one.py" )
 }
 
 # Preflight every arm once, loudly, before any timed round.
 for arm in $ARMS; do
-    IFS='|' read -r _b _d _f _r <<< "${CELLS[0]}"
-    admit=reuse; chunk=""
-    case "$arm" in plan) admit=plan ;; serial) chunk=1 ;; esac
+    arm_env "$arm"
     ( cd "$REPO" && set -a && . ./.env && set +a \
-      && SCX_ROW_GROUP_ADMIT="$admit" ${chunk:+SCX_ROW_GROUP_DECODE_CHUNK=$chunk} \
-         ARM_NAME="$arm" "$VENV/bin/python" "$OUT/preflight.py" )
+      && "$VENV/bin/python" "$OUT/preflight.py" )
 done
 
 for cell in "${CELLS[@]}"; do
