@@ -1853,9 +1853,14 @@ impl BackedCsrReader {
         // `gather_latency_ms_p50` 27.96 → 29.17 ms (0.952×, 1 of 12 rounds won,
         // p = 0.006) and p99 29.91 → 31.84 ms (p = 0.039) against the serial
         // arm — a reliable loss, in the phase's own committed A/B, found by
-        // review reading that JSON. The miss-heavy `read_scattered` win
-        // (2.39-2.79×) is real and untouched by this split, because there
-        // almost every run IS a miss.
+        // review reading that JSON.
+        //
+        // ⚠️ The miss-heavy `read_scattered` win (2.39-2.79×) was measured
+        // BEFORE this split and has not been re-captured against it. The split
+        // should be neutral there — almost every run is a miss, and
+        // `row_group_after_probe_miss` keeps the probe from taking the LRU
+        // mutex twice — but "should be neutral" is an argument, not a
+        // measurement, and this comment does not claim otherwise.
         //
         // The probe is free on a miss: `get_cached` counts a hit and touches
         // recency, and counts nothing when absent, so the subsequent
