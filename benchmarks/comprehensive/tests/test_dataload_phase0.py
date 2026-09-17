@@ -633,3 +633,63 @@ def test_scdataset_epoch(phase0_env):
         pytest.skip("scDataset/torch not available")
     r = m._run_scdataset_epoch(str(phase0_env["ds"].h5ad_path), 64, True, True, 42)
     assert r.n_cells == phase0_env["ds"].n_obs
+
+
+def test_hot_control_cold_tail_arm_runs_to_its_summary(phase0_env, monkeypatch):
+    """The W10 arm must be exercised on a fixture where it does NOT skip.
+
+    ⚠️ This test exists because its absence cost a capture. At the shipped shape
+    a batch draws `_HOT_TAIL_SETS * _HOT_SET_SIZE` rows, so on every fixture
+    small enough to run in a test the "cold" tails collide with each other, the
+    arm records `applicable: False` and returns before its summary. The suite
+    therefore ran `cellset_gather.run` happily while that summary block held a
+    `NameError` (`median` instead of `statistics.median`), and it surfaced seven
+    minutes into a SLURM job, on tabula, after twelve rounds of pbmc3k had
+    already been spent.
+
+    Shrinking the shape is the only way to reach that code from a test, and it
+    is safe here precisely because nothing is timed: the assertion is that the
+    arm completes and reports, not how fast it did.
+
+    ⚠️ Driven off `phase0_env`, not off the registered pbmc3k fixture. The first
+    version used `DATASETS["pbmc3k"]` and **skipped** in the full-suite run while
+    passing in isolation — `phase0_env` pops the config module from
+    `sys.modules` so it re-resolves against a `tmp_path` `SCX_DATA_DIR`, and the
+    module stays loaded with that path after the fixture's env is restored. A
+    guard that silently skips is the failure this test was added to prevent,
+    wearing its own name.
+    """
+    import importlib
+
+    m = importlib.import_module("benchmarks.comprehensive.benchmarks.cellset_gather")
+
+    # `phase0_env`'s fixture is 600 rows; shrink the shape so its cold tails do
+    # not collide with each other.
+    monkeypatch.setattr(m, "_HOT_CONTROL_SETS", 2)
+    monkeypatch.setattr(m, "_HOT_TAIL_SETS", 4)
+    monkeypatch.setattr(m, "_HOT_SET_SIZE", 8)
+    monkeypatch.setattr(m, "_HOT_N_BATCHES", 2)
+    monkeypatch.setattr(m, "_HOT_CONTROL_POOL", 128)
+
+    premises = m._hot_cold_premises(phase0_env["ds"].n_obs)
+    assert premises["tail_overlap_fraction"] <= 0.25, (
+        "premise: at the shrunk shape this fixture CAN hold a cold tail apart, "
+        f"or the test skips the branch it exists to cover: {premises}"
+    )
+
+    res = m.run(phase0_env["ds"], phase0_env["scx_fv"], n_runs=1, cold_cache=False)
+    meta = res.metadata.get("hot_control_cold_tail")
+    assert meta is not None and meta.get("applicable") is True, meta
+    # The summary block — the code the NameError lived in.
+    assert "median_cellsets_per_sec" in meta, meta
+    assert "control_set_fraction" in meta, meta
+
+    runs = [r for r in res.runs if r.extra.get("scenario") == "gather_hot_control_cold_tail"]
+    assert runs, "the arm emitted no runs"
+    for key in (
+        "cellsets_per_sec__gather_hot_control_cold_tail",
+        "row_group_hit_rate__gather_hot_control_cold_tail",
+        "reuse_admissions__gather_hot_control_cold_tail",
+        "rejected_group_bytes__gather_hot_control_cold_tail",
+    ):
+        assert key in runs[0].extra, (key, sorted(runs[0].extra))

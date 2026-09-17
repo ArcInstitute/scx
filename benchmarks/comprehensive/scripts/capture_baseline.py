@@ -175,6 +175,10 @@ def capture_environment() -> dict[str, Any]:
             # forwards to every worker; `unset` is the shipped default (on).
             "SCX_ROW_GROUP_CACHE": os.environ.get("SCX_ROW_GROUP_CACHE", "unset"),
             "SCX_SCATTER_BLOCK_INDEX": os.environ.get("SCX_SCATTER_BLOCK_INDEX", "unset"),
+            "SCX_ROW_GROUP_ADMIT": os.environ.get("SCX_ROW_GROUP_ADMIT", "unset"),
+            "SCX_ROW_GROUP_SERIAL_DECODE": os.environ.get(
+                "SCX_ROW_GROUP_SERIAL_DECODE", "unset"
+            ),
         },
     }
     env["system"] = collect_system_info()

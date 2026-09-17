@@ -228,6 +228,20 @@ Two things to know:
   free — before that retention existed the row-group path re-decoded every
   group every batch. `IndexPlanDataset` defaults the other way, so that is its
   normal regime rather than its opt-in.
+- **A plan wider than its share keeps the groups it shares with its
+  neighbours.** Retention is decided once per plan against
+  `budget / (lookahead + 1)`. A plan that fits is retained whole. A plan that
+  does not no longer forfeits everything: it keeps the row groups another plan
+  of the lookahead window also touches — a control pool, shared neighbours, a
+  repeated pair member — hottest-first and only while they fit the room that
+  share leaves after the shards the plan takes whole (those are inserted
+  regardless, so the bound is `share - whole_shard_bytes`),
+  and still drops its cold tail, which is the half an LRU genuinely makes
+  worse. `cache_metrics()["reuse_admissions"]` counts the plans that got a
+  partial verdict; it reads 0 both on a loader whose plans all fit (nothing to
+  recover) and on one whose plans share no group inside a window (nothing to
+  admit), and `row_group_hits` is what tells those apart. Set
+  `SCX_ROW_GROUP_ADMIT=plan` to restore the all-or-nothing rule for an A/B.
 
 Both gather loaders sample their cache counters while iterating and emit a
 one-shot `UserWarning` if the observed miss/eviction pattern indicates the

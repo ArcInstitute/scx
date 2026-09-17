@@ -255,6 +255,41 @@ def test_row_group_cache_kill_switch_is_forwarded_to_workers(monkeypatch):
         c.startswith("export SCX_ROW_GROUP_CACHE=") for c in _slurm_setup_cmds("scx-bench")
     ), "unset on the orchestrator must stay unset (the shipped default) on the worker"
 
+    # W10's reuse-signal admission arm is the same shape and the same trap: the
+    # policy is `OnceLock`-cached on first read, so `SCX_ROW_GROUP_ADMIT=plan`
+    # on the orchestrator only selects the pre-W10 arm if the export reaches the
+    # worker before it imports pyscx.
+    monkeypatch.setenv("SCX_ROW_GROUP_ADMIT", "plan")
+    cmds = _slurm_setup_cmds("scx-bench", "scx_compact_trial_g256")
+    assert "export SCX_ROW_GROUP_ADMIT='plan'" in cmds
+    knob = cmds.index("export SCX_ROW_GROUP_ADMIT='plan'")
+    activate = next(i for i, c in enumerate(cmds) if c.startswith("conda activate"))
+    assert knob < activate
+
+    monkeypatch.delenv("SCX_ROW_GROUP_ADMIT", raising=False)
+    assert not any(
+        c.startswith("export SCX_ROW_GROUP_ADMIT=") for c in _slurm_setup_cmds("scx-bench")
+    ), "unset on the orchestrator must stay unset (reuse, the shipped default)"
+
+    # W10's OTHER arm. Missing from the forward list in the first version of
+    # this work, which is the same "the arm never reached the process that
+    # imported pyscx" artifact the phase had already spent a capture on: the
+    # in-process factor driver inherits the export, but
+    # `SCX_ROW_GROUP_SERIAL_DECODE=1 capture_baseline.py …` would have silently
+    # measured the parallel path on every worker.
+    monkeypatch.setenv("SCX_ROW_GROUP_SERIAL_DECODE", "1")
+    cmds = _slurm_setup_cmds("scx-bench", "scx_compact_trial_g256")
+    assert "export SCX_ROW_GROUP_SERIAL_DECODE='1'" in cmds
+    knob = cmds.index("export SCX_ROW_GROUP_SERIAL_DECODE='1'")
+    activate = next(i for i, c in enumerate(cmds) if c.startswith("conda activate"))
+    assert knob < activate
+
+    monkeypatch.delenv("SCX_ROW_GROUP_SERIAL_DECODE", raising=False)
+    assert not any(
+        c.startswith("export SCX_ROW_GROUP_SERIAL_DECODE=")
+        for c in _slurm_setup_cmds("scx-bench")
+    ), "unset on the orchestrator must stay unset (parallel, the shipped default)"
+
     # The same-build A/B also points the workers at a specific checkout; the
     # `.so` a worker imports is the one the orchestrator's PYTHONPATH names.
     monkeypatch.setenv("PYTHONPATH", "/some/repo/pyscx/python")

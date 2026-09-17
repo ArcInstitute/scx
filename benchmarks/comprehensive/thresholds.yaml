@@ -4077,3 +4077,75 @@ absolute_floors:
 #          reason and are echoed into `runs[].extra`; so is the fixture's
 #          `DatasetConfig.shard_size`, which decides how many shards a batch
 #          touches. Changing any of them invalidates the numbers above.
+#
+# 24. cellset_gather / hot-control cold-tail arm (W10 reuse-signal admission)
+#     `cellsets_per_sec__gather_hot_control_cold_tail`,
+#     `us_per_cell__*`, `row_group_hit_rate__*`, `peak_rss_mb__*`,
+#     `ttfb_first_set_s__*`, `reuse_admissions__*`, `admitted_group_bytes__*`
+#     and `rejected_group_bytes__*` are emitted as of the reuse-signal
+#     admission PR. NO floor is proposed, for four reasons, and the fourth is
+#     the one that matters:
+#
+#     (a) The phase's own gate is two captures before a floor — the sequencing
+#         items 22 and 23 follow.
+#     (b) No baseline carries `cellset_gather` rows at all (item 15).
+#     (c) The arm self-skips on any fixture too small to hold a cold tail apart
+#         from itself: at the pinned shape a batch draws 56 x 64 rows, so on
+#         pbmc3k (2,700 rows) the "cold" tails overlap 0.55 of their rows and
+#         `metadata.hot_control_cold_tail.applicable` comes back false. A floor
+#         on a skipped arm synthesises a "missing metric" violation every run.
+#     (d) The A/B (SLURM 2964125, 12 interleaved rounds) shows the arm's own
+#         throughput FLAT — 32.7 -> 32.9 sets/s, 1.003x at 6/12 rounds,
+#         p = 1.000 — so there is no regression to pin, but there is also no
+#         improvement to floor: a `cellsets_per_sec` floor here would gate a
+#         number the policy does not move. The metric worth flooring is
+#         `row_group_hit_rate__*` (0 -> 0.0421), and that one needs a baseline
+#         carrying the arm, which is blocker (b).
+#
+#         ⚠️ That is a statement about THIS ARM, not about the phase. A
+#         three-arm capture (SLURM 2966558) measured both of W10's factors on
+#         `read_scattered`, where the auto-tuned two-shard budget puts a plan
+#         over its share: the chunked parallel decode is 2.39-2.79x on gather
+#         p50 at 12/12 rounds, and the admission policy is 1.18x fewer
+#         row-group decodes at 12/12 on tabula. The metrics worth flooring are
+#         there, on `read_scattered`, not here.
+#
+#         ⚠️ An interactive probe said the opposite before that capture — three
+#         pairs at 20.7/23.1/23.0 against 19.0/21.9/19.1 sets/s, a consistent
+#         ~10-17 % slowdown — and it does not survive interleaving. Recorded so
+#         nobody re-derives a floor from a single-run probe on a shared node.
+#
+#     ⚠️ `row_group_hit_rate__*` has NO derivable ceiling here, and an earlier
+#     version of this entry claimed one. Its unit is group LOOKUPS;
+#     `metadata.hot_control_cold_tail.control_set_fraction` (0.125) is a
+#     fraction of SETS. How many lookups a control set generates depends on how
+#     many distinct row groups its rows land in — a property of the layout, not
+#     of 8-of-64 — so no "fraction of achievable" follows from it. Record the
+#     rate, read it beside the rejection below, and do not divide the two.
+#
+#     ⚠️ Read it together with `rejected_group_bytes__*`. A policy that
+#     recovered the hit rate by admitting the cold tail too would show a HIGHER
+#     rate and a collapsed rejection, and would reproduce the regime the first
+#     row-group LRU capture measured at 0 % hits, +350-500 MB and 2-4 % slower.
+#     Neither number alone can tell the two apart.
+#
+#     ACTIVATION, once a baseline carries the arm AND the A/B shows the policy
+#     pays on a scheduled dataset:
+#       1. Read the medians from
+#          `<candidate>/raw/cellset_gather__scx_auto__tabula_sapiens_100k.json`,
+#          from runs whose `extra.scenario == "gather_hot_control_cold_tail"`.
+#       2. Author:
+#              metric: cellsets_per_sec__gather_hot_control_cold_tail -> min: 0.85 x median
+#              metric: row_group_hit_rate__gather_hot_control_cold_tail -> min: 0.85 x median
+#          and add BOTH names to `_FROZEN_CELLSET_KEYS` in
+#          `tests/test_dataload_phase0.py`, or
+#          `test_thresholds_yaml_floor_keys_match_frozen_list` fails — that test
+#          is the guard on this file's `cellset_gather` metric names and it is
+#          exact, not a subset.
+#       3. The floors bind only while the shape stays pinned. `_HOT_CONTROL_SETS`,
+#          `_HOT_TAIL_SETS`, `_HOT_SET_SIZE`, `_HOT_CONTROL_POOL`,
+#          `_HOT_N_BATCHES`, `_HOT_SEED` and `_HOT_MAX_MEMORY_MB` are module
+#          constants for exactly that reason and are echoed into `runs[].extra`.
+#          `_HOT_MAX_MEMORY_MB` is the load-bearing one: it decides whether a
+#          plan is over its budget share at all, and a larger budget makes every
+#          plan fit and the arm measure `Admit::All` under the reuse name.

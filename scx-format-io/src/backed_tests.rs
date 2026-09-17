@@ -4382,10 +4382,47 @@ fn second_gather_is_served_from_the_row_group_lru() {
         distinct as usize * RG_GROUP_BYTES
     );
 
+    let admitted_after_cold = m.admitted_group_bytes.load(Ordering::Relaxed);
+    let parallel_after_cold = m.parallel_group_decodes.load(Ordering::Relaxed);
+    assert_eq!(
+        admitted_after_cold as usize,
+        distinct as usize * RG_GROUP_BYTES,
+        "charged once per GROUP lookup — the unit `row_group_hits` counts too — \
+         not once per requested row: one `row_group` consultation serves every \
+         row of its run, so the seven rows here are four lookups"
+    );
+
     let second = rg_gather(&backed, &rows);
     assert_eq!(
         second, first,
         "the cached groups must reproduce the decoded ones exactly"
+    );
+
+    // Two properties of the resident fast path, neither of which the suite could
+    // see before review on #540 asked for them.
+    //
+    // (a) A hit is still a lookup the verdict decided. While the accounting
+    //     lived inside `row_group`, which the fast path bypasses, a warm gather
+    //     charged NEITHER counter and the pair silently stopped describing the
+    //     lookups it documents.
+    assert_eq!(
+        m.admitted_group_bytes.load(Ordering::Relaxed),
+        2 * admitted_after_cold,
+        "warm: the same four group lookups are charged again"
+    );
+    assert_eq!(
+        m.rejected_group_bytes.load(Ordering::Relaxed),
+        0,
+        "nothing was refused: this gather fits its budget"
+    );
+    // (b) A cache hit must never enter rayon. Routing hits through the pool cost
+    //     a measured regression on the 0.99-hit-rate `index_plan` path (p50
+    //     27.96 -> 29.17 ms, 1 of 12 rounds, p = 0.006), and without this
+    //     assertion a change that reintroduced it would go green.
+    assert_eq!(
+        m.parallel_group_decodes.load(Ordering::Relaxed),
+        parallel_after_cold,
+        "warm: every group was resident, so nothing was dispatched to the pool"
     );
     assert_eq!(
         m.row_group_misses.load(Ordering::Relaxed),
@@ -4832,6 +4869,251 @@ fn planned_row_group_bytes_matches_decoded_size_and_warm_feeds_the_gather() {
     assert!(backed.warm_row_groups(0, &[64]).is_err());
 }
 
+/// `touched_row_groups` names the groups `planned_row_group_bytes` sizes, and
+/// both are one walk of the block index.
+///
+/// **The expectation is derived from the fixture's geometry, not from the
+/// subject.** Asking `planned_row_group_bytes` what to expect would make this
+/// test unable to see the two of them agreeing on a wrong answer — which is
+/// precisely the risk created by expressing one in terms of the other.
+///
+/// Fixture: 64 rows over 2 shards of 32, row groups of 4. Shard 1 covers rows
+/// 32..64, so rows 40, 41, 63 are shard-local 8, 9, 31 and fall in groups
+/// 8/4 = 2, 9/4 = 2 and 31/4 = 7.
+#[test]
+fn touched_row_groups_names_the_groups_planned_bytes_sizes() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::Zstd);
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    let m = backed.enable_metrics();
+
+    // Unsorted and duplicated on purpose: the contract is ascending and
+    // deduplicated output whatever the caller passes.
+    let rows = [63u64, 40, 41, 40, 63];
+    let keys = backed.touched_row_groups(1, &rows);
+    assert_eq!(
+        keys.iter().map(|&(g, _)| g).collect::<Vec<_>>(),
+        vec![2usize, 7],
+        "ascending, deduplicated group indices"
+    );
+    for &(g, bytes) in &keys {
+        assert_eq!(bytes, RG_GROUP_BYTES, "group {g} charges one group's bytes");
+    }
+
+    // The fold is the sizing, and the sizing is 2 groups — NOT 5, which is what
+    // a lost `dedup()` would report for these five rows.
+    assert_eq!(
+        backed.planned_row_group_bytes(1, &rows),
+        2 * RG_GROUP_BYTES,
+        "planned bytes == the fold over the named keys"
+    );
+
+    // Neither call decodes anything or touches the LRU.
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 0);
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(backed.cache_bytes_used(), 0);
+
+    // Degenerate inputs name nothing rather than panicking.
+    assert!(backed.touched_row_groups(1, &[]).is_empty());
+    assert!(backed.touched_row_groups(99, &rows).is_empty());
+    assert_eq!(backed.planned_row_group_bytes(99, &rows), 0);
+
+    // And the route gate applies to the key list exactly as it does to the
+    // sizing — a caller must not be able to name keys no gather would retain.
+    let mut off =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    off.set_scatter_block_index(false);
+    assert!(off.touched_row_groups(1, &rows).is_empty());
+    assert_eq!(off.planned_row_group_bytes(1, &rows), 0);
+}
+
+/// The chunked, gather-wide parallel group decode is byte-identical to the
+/// serial walk at every pool width, including the width-1 case that takes the
+/// serial path outright.
+///
+/// The gather decodes its row groups a chunk at a time, one chunk per pool
+/// width, so the pool width changes how the work is batched and must change
+/// nothing else. `parallel_group_decodes` is asserted alongside so the test can
+/// tell "the widths agree" from "no width ever ran in parallel" — three widths
+/// agreeing about a path none of them took would read as coverage.
+///
+/// ⚠️ `#[cfg(feature = "parallel")]`: `set_cpu_pool` and the `rayon` dependency
+/// only exist under that feature, and `--no-default-features` compiles this
+/// file. Un-gated it broke the `Feature matrix (clippy, no-hdf5 legs)` CI leg —
+/// the same regression this file already records ~400 lines above, reintroduced.
+#[test]
+#[cfg(feature = "parallel")]
+fn parallel_group_decode_matches_the_serial_walk_at_every_pool_width() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::Zstd);
+    // Seven rows per shard, one per row group. Seven is the widest request the
+    // block-index route accepts here — `block_index_eligible` needs
+    // `len * ROW_RANGE_WINDOW_DIVISOR < shard_rows`, i.e. `len * 4 < 32` — and
+    // the first version of this test asked for all 64 rows, which fails that
+    // window and took the whole-shard route on both shards, so there was no
+    // group decode to parallelise at all. The premise assertion below is what
+    // caught it.
+    let rows: Vec<u64> = (0..7u64)
+        .map(|i| i * 4)
+        .chain((0..7).map(|i| 32 + i * 4))
+        .collect();
+
+    let mut reference: Option<Vec<(Vec<i32>, Vec<f32>)>> = None;
+    for width in [1usize, 2, 3, 8] {
+        let mut backed =
+            BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+        backed.set_cpu_pool(std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap(),
+        ));
+        let m = backed.enable_metrics();
+
+        let out = rg_gather(&backed, &rows);
+        rg_assert_matches_full(&out, &rows, &full, &format!("width {width}"));
+        match &reference {
+            None => reference = Some(out),
+            Some(want) => assert_eq!(&out, want, "width {width} disagrees with width 1"),
+        }
+
+        let parallel = m.parallel_group_decodes.load(Ordering::Relaxed);
+        if width == 1 {
+            assert_eq!(
+                parallel, 0,
+                "a width-1 pool chunks one group at a time and takes the serial path"
+            );
+        } else {
+            assert!(
+                parallel > 0,
+                "width {width} must actually have decoded a chunk in parallel; \
+                 without this the agreement above is between four serial runs"
+            );
+        }
+    }
+}
+
+/// A gather's own whole shards count against the budget beside its row groups,
+/// because they share one and `read_shard_cached_arc` inserts them whether or
+/// not row groups are admitted.
+///
+/// This is the half of the phase-5 accounting item that is real. The per-gather
+/// rule used to sum only the `use_block_index` groups, while the plan-level rule
+/// (`PrefetchEngine::plan_footprint`) has summed both since review on #528 — so
+/// a mixed gather could admit row groups it was about to evict with its own
+/// whole-shard decode.
+///
+/// Fixture: 64 rows, 2 shards of 32, row groups of 4. Eight rows of shard 0 is
+/// a quarter of the shard, which fails `block_index_eligible`'s
+/// `len * 4 < shard_rows` window and takes the whole-shard path (776 B); two
+/// rows of shard 1 land in one row group (104 B). Budget 400 B sits between the
+/// two sums, so the two rules disagree on exactly this gather.
+///
+/// Mutation: restore `groups.iter().filter(|g| g.use_block_index)` and this
+/// reddens.
+#[test]
+fn the_per_gather_rule_counts_its_own_whole_shards() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let budget = 400usize;
+    assert!(
+        RG_GROUP_BYTES < budget && budget < RG_SHARD_BYTES + RG_GROUP_BYTES,
+        "premise: the budget separates the group-only sum from the mixed sum \
+         ({RG_GROUP_BYTES} < {budget} < {} )",
+        RG_SHARD_BYTES + RG_GROUP_BYTES
+    );
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Eight rows of shard 0 (whole-shard route) + two rows of shard 1 that share
+    // one row group (block-index route).
+    let mixed = [0u64, 1, 2, 3, 4, 5, 6, 7, 40, 41];
+    rg_assert_matches_full(&rg_gather(&backed, &mixed), &mixed, &full, "mixed");
+
+    // Premise: the gather really did split across the two routes. Without this
+    // the assertion below would pass on a gather that never took either.
+    assert_eq!(
+        m.full_shard_groups.load(Ordering::Relaxed),
+        1,
+        "premise: shard 0 took the whole-shard route"
+    );
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        1,
+        "premise: shard 1 took the block-index route"
+    );
+
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "the row group is NOT retained: 776 B of whole shard + 104 B of group is \
+         over the 400 B budget, so retaining it would only have been evicted by \
+         the shard decode on the next repeat"
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        1,
+        "it still decoded — admission governs retention, never correctness"
+    );
+}
+
+/// **The free-bytes falsification.** The phase-5 plan text prescribed comparing
+/// a gather's planned row-group bytes against `bytes_budget() - bytes_used()`.
+/// This test states what that would mean, so the prescription is measured
+/// rather than adopted: a cache sitting *at* its budget — the steady state of
+/// any correctly sized cache — would have zero free bytes, and every subsequent
+/// gather would be refused admission forever, however small.
+///
+/// The LRU already handles the arithmetic the prescription was reaching for:
+/// `evict_bytes_for` makes room by evicting, so a resident entry is displaceable
+/// and is not a claim on the budget. What a gather must fit is its OWN
+/// footprint, which is what the rule compares.
+///
+/// Mutation: change `gather_row_groups_fit_budget`'s comparison to
+/// `bytes_budget().saturating_sub(bytes_used())` and this reddens.
+#[test]
+fn a_full_cache_does_not_refuse_a_small_gather() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    // Exactly three groups fit.
+    let budget = 3 * RG_GROUP_BYTES;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Fill the cache to its budget with three groups of shard 0.
+    let fill = [0u64, 4, 8];
+    rg_assert_matches_full(&rg_gather(&backed, &fill), &fill, &full, "fill");
+    assert_eq!(
+        backed.cache_bytes_used(),
+        budget,
+        "premise: the cache is exactly full"
+    );
+    let inserted_after_fill = m.row_group_bytes_inserted.load(Ordering::Relaxed);
+    assert_eq!(inserted_after_fill as usize, 3 * RG_GROUP_BYTES);
+
+    // A one-group gather elsewhere in the file. Its own footprint is a twelfth
+    // of the budget; there are zero free bytes.
+    let small = [40u64];
+    rg_assert_matches_full(&rg_gather(&backed, &small), &small, &full, "small");
+    assert!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) > inserted_after_fill,
+        "a gather that fits the budget is admitted even against a full cache; \
+         got {} inserted bytes, unchanged from the fill",
+        m.row_group_bytes_inserted.load(Ordering::Relaxed)
+    );
+    assert!(
+        m.row_group_evictions.load(Ordering::Relaxed) > 0,
+        "and it made room by evicting, which is the LRU doing its job"
+    );
+}
+
 /// A non-admitted gather still serves resident groups as hits — admission only
 /// stops *misses* from being inserted — and its misses decode uncached with no
 /// singleflight slot (the leader of a slot that inserts nothing would make
@@ -4979,4 +5261,75 @@ fn planned_row_group_bytes_is_zero_with_the_route_off() {
     // Whole-shard sizing is independent of the route.
     assert_eq!(backed.shard_decoded_bytes(0), RG_SHARD_BYTES);
     let _ = &mut backed;
+}
+
+/// The documented scatter-order contract: on a **mixed** request every
+/// full-shard fallback fires before every block-index row group, so a *later*
+/// row can be handed to the callback before an *earlier* one.
+///
+/// All three reviewers on #540 noted the split was documented and not asserted.
+/// It matters because the pre-split docs promised shard-grouped, sorted-by-row
+/// order, and the only guarantee now is the `orig_pos` argument — so this test
+/// pins both halves: the order really is per-pass, and `orig_pos` really does
+/// still address the request.
+///
+/// Fixture: 256 rows, 4 shards of 64, groups of 16. Row 2 alone in shard 0 is
+/// a sparse request and takes the block-index route; sixteen consecutive rows of
+/// shard 1 are a quarter of it, fail `block_index_eligible`'s window and take
+/// the whole-shard route. Row 2 is the LOWEST row requested, so any sorted-by-row
+/// contract would emit it first.
+#[test]
+fn a_mixed_request_scatters_full_shard_groups_before_block_index_groups() {
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 256, 100, 4, 16, CodecId::None);
+    let backed = BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+
+    let mut rows: Vec<u64> = vec![2];
+    rows.extend(64..80u64);
+    assert_eq!(
+        rows[0], 2,
+        "premise: the block-index row is the lowest row requested"
+    );
+    assert!(
+        !backed.block_index_eligible(1, 16),
+        "premise: sixteen of shard 1's sixty-four rows take the whole-shard route"
+    );
+    assert!(
+        backed.block_index_eligible(0, 1),
+        "premise: one row of shard 0 takes the block-index route"
+    );
+
+    let mut order: Vec<u64> = Vec::new();
+    backed
+        .read_rows_with(&rows, |orig_pos, idx, data| {
+            // `orig_pos` addresses the request — the one guarantee — so the row
+            // it names is read back through the request array, exactly as every
+            // in-tree consumer does.
+            let row = rows[orig_pos];
+            let (lo, hi) = (
+                full.indptr[row as usize] as usize,
+                full.indptr[row as usize + 1] as usize,
+            );
+            assert_eq!(idx, &full.indices[lo..hi], "row {row} indices");
+            assert_eq!(data, &full.data[lo..hi], "row {row} data");
+            order.push(row);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(order.len(), rows.len(), "every requested row was scattered");
+    assert_eq!(
+        *order.last().unwrap(),
+        2,
+        "the block-index row fires LAST despite being the lowest row requested: \
+         pass 1 serves the whole-shard fallback, pass 2 the row groups. If this \
+         ever reads 2 first, the order has become sorted-by-row again and the \
+         docs on `read_rows_with_admission` are the thing to change."
+    );
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_ne!(
+        order, sorted,
+        "premise: the fixture actually exercises out-of-row-order scatter"
+    );
 }

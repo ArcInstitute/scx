@@ -23,6 +23,38 @@ struct RowGroup {
     use_block_index: bool,
 }
 
+/// One **row group** of a scattered gather: `sorted[start..end]` all fall in
+/// row group `g` of shard `shard_idx`, whose first global row is `s_start` and
+/// whose group begins at shard-local row `group_row_start`.
+///
+/// A [`RowGroup`] is one shard's slice of the request; a `GroupRun` is one row
+/// group's slice of that. The split is what lets the gather decode across
+/// shards in parallel: the flat run list is the whole gather's decode work in
+/// one ascending sequence, and the scatter reads straight out of each decoded
+/// group with no intermediate CSR.
+#[derive(Clone, Copy, Debug)]
+struct GroupRun {
+    start: usize,
+    end: usize,
+    shard_idx: usize,
+    s_start: u64,
+    g: usize,
+    group_row_start: usize,
+}
+
+impl GroupRun {
+    fn new(rg: &RowGroup, layout: &FramedShardLayout, g: usize, start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            shard_idx: rg.shard_idx,
+            s_start: rg.s_start,
+            g,
+            group_row_start: layout.span(g).row_start as usize,
+        }
+    }
+}
+
 /// One shard's window of a contiguous row-range read: local rows
 /// `[local_start, local_end)` land at output rows starting at `out_row`, with
 /// exactly `nnz` nonzeros (filled in by the indptr-only prescan).
@@ -858,19 +890,21 @@ impl BackedCsrReader {
         // evict each other on every repeat of the same read (review on #528).
         // Sized from the block index, no decode; `None` layouts (unframed)
         // contribute nothing and take the full-shard path below.
-        let admit_windows = !self.retains_row_groups() || {
-            let bytes = plans
-                .iter()
-                .filter(|p| p.use_row_range)
-                .fold(0usize, |acc, p| {
-                    acc.saturating_add(self.window_group_bytes(
-                        p.shard_idx,
-                        p.local_start,
-                        p.local_end,
-                    ))
-                });
-            bytes <= self.shard_cache.bytes_budget()
-        };
+        let admit_windows: Admit = Admit::from(
+            !self.retains_row_groups() || {
+                let bytes = plans
+                    .iter()
+                    .filter(|p| p.use_row_range)
+                    .fold(0usize, |acc, p| {
+                        acc.saturating_add(self.window_group_bytes(
+                            p.shard_idx,
+                            p.local_start,
+                            p.local_end,
+                        ))
+                    });
+                bytes <= self.shard_cache.bytes_budget()
+            },
+        );
 
         // Phase 2 — copy each window into its pre-carved slot. Row-range plans
         // first (they retain only their touched row groups, never the whole
@@ -883,7 +917,7 @@ impl BackedCsrReader {
                     plan.shard_idx,
                     plan.local_start,
                     plan.local_end,
-                    admit_windows,
+                    &admit_windows,
                 )? {
                     Self::copy_window(
                         &run,
@@ -1057,7 +1091,7 @@ impl BackedCsrReader {
         shard_idx: usize,
         local_start: usize,
         local_end: usize,
-        admit: bool,
+        admit: &Admit,
     ) -> Result<Option<ScxCsr>> {
         let Some(layout) = self.framed_layout(shard_idx) else {
             return Ok(None);
@@ -1096,13 +1130,35 @@ impl BackedCsrReader {
         shard_idx: usize,
         layout: &FramedShardLayout,
         g: usize,
-        admit: bool,
+        admit: &Admit,
+    ) -> Result<Arc<ScxCsr>> {
+        self.row_group_inner(shard_idx, layout, g, admit, /*probed_miss*/ false)
+    }
+
+    /// [`Self::row_group`], with `probed_miss` saying whether the caller has
+    /// already asked the cache for this key and been told no.
+    ///
+    /// One body rather than two near-copies (review on #540): the only
+    /// difference is that a caller which has just probed does not need the
+    /// non-admitted branch to take the LRU mutex a second time — which on the
+    /// miss-heavy scattered path is nearly every run. The admitted branch always
+    /// goes through `get_or_decode`, whose own probe is part of the
+    /// single-flight protocol and cannot be skipped.
+    fn row_group_inner(
+        &self,
+        shard_idx: usize,
+        layout: &FramedShardLayout,
+        g: usize,
+        admit: &Admit,
+        probed_miss: bool,
     ) -> Result<Arc<ScxCsr>> {
         if !self.retains_row_groups() {
             return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
         }
         let key = CacheKey::Group(self.file_id, shard_idx, g);
-        if admit {
+        let admitted = admit.admits(self.file_id, shard_idx, g);
+        self.charge_verdict(admit, shard_idx, layout, g);
+        if admitted {
             let shard_cache = Arc::clone(&self.shard_cache);
             return shard_cache.get_or_decode(key, || {
                 self.reader.decode_framed_row_group(layout, g).map(Arc::new)
@@ -1113,11 +1169,45 @@ impl BackedCsrReader {
         // leader inserts nothing would make every waiter re-decode in turn;
         // concurrent non-admitted decodes of one group run independently
         // instead, which is what "not retained" means).
-        if let Some(rg) = self.shard_cache.get_cached(key) {
-            return Ok(rg);
+        if !probed_miss {
+            if let Some(rg) = self.shard_cache.get_cached(key) {
+                return Ok(rg);
+            }
         }
         self.shard_cache.note_uncached_miss(CacheKind::RowGroup);
         self.reader.decode_framed_row_group(layout, g).map(Arc::new)
+    }
+
+    /// Record what the verdict decided about one row-group **lookup**.
+    ///
+    /// Once per **group lookup** — the same unit `row_group_hits` /
+    /// `row_group_misses` count, i.e. each time this reader is asked for a
+    /// group, not each time a row is requested (one consultation serves every
+    /// row of its run). What survived the byte budget on top of that is
+    /// `row_group_bytes_inserted`.
+    ///
+    /// ⚠️ Extracted so the resident fast path in `decode_group_runs` charges it
+    /// too. That path bypasses [`Self::row_group`], and while the accounting
+    /// lived inline there a hit contributed to NEITHER counter — on a
+    /// 0.99-hit-rate gather the pair described 391 cold lookups instead of
+    /// ~38,900, silently, and reruns would not have been comparable with the
+    /// committed capture. Found by review on #540 (codex and Cursor Agent,
+    /// independently).
+    fn charge_verdict(
+        &self,
+        admit: &Admit,
+        shard_idx: usize,
+        layout: &FramedShardLayout,
+        g: usize,
+    ) {
+        if let Some(m) = self.metrics() {
+            let bytes = layout.group_bytes(g) as u64;
+            if admit.admits(self.file_id, shard_idx, g) {
+                m.admitted_group_bytes.fetch_add(bytes, Ordering::Relaxed);
+            } else {
+                m.rejected_group_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Whether the row groups a gather's block-index groups touch all fit the
@@ -1133,7 +1223,20 @@ impl BackedCsrReader {
             return true;
         }
         let mut planned = 0usize;
-        for g in groups.iter().filter(|g| g.use_block_index) {
+        for g in groups {
+            if !g.use_block_index {
+                // The shards this gather takes WHOLE count too, exactly as the
+                // plan-level rule counts them (`PrefetchEngine::plan_footprint`).
+                // They share one budget with the row groups, and
+                // `read_shard_cached_arc` inserts them whether or not row groups
+                // are admitted — so a mixed gather whose groups fit on their own
+                // but not beside its whole shards would evict one with the other
+                // on every repeat. Counted unconditionally, resident or not, for
+                // the same reason the plan rule does: residency is not stable
+                // between the decision and the read.
+                planned = planned.saturating_add(self.shard_decoded_bytes(g.shard_idx));
+                continue;
+            }
             let Some(layout) = self.framed_layout(g.shard_idx) else {
                 continue;
             };
@@ -1144,6 +1247,14 @@ impl BackedCsrReader {
                 .map(|&(r, _)| (r - g.s_start) as usize);
             planned = planned.saturating_add(Self::planned_bytes_sorted(&layout, locals));
         }
+        // Against the WHOLE budget, not against its free bytes. A resident
+        // entry is displaceable — `evict_bytes_for` makes room — so it is not a
+        // claim on the budget, and subtracting `bytes_used()` would refuse every
+        // gather once the cache reached its budget, which is the steady state of
+        // a correctly sized cache. Falsified rather than assumed: see
+        // `a_full_cache_does_not_refuse_a_small_gather`, and note that the
+        // subtraction also reddens the pre-existing
+        // `row_group_lru_evicts_to_fit_the_budget`.
         planned <= self.shard_cache.bytes_budget()
     }
 
@@ -1193,25 +1304,61 @@ impl BackedCsrReader {
     /// prefetcher sums this over a plan and warms only a plan that fits its
     /// share of the budget; see `scx-loader`'s plan engine.
     pub fn planned_row_group_bytes(&self, shard_idx: usize, rows: &[u64]) -> usize {
-        // Both gates before `framed_layout`: with the route statically off
-        // (the cell-set loader's default) no gather can retain a group, and
-        // resolving every touched shard's layout to size nothing would be new
-        // work on that path (review on #528).
+        // Expressed as a fold over `touched_row_groups` rather than as its own
+        // walk of the block index. Two walks are how a sizing decision and an
+        // admission decision come to disagree about a group boundary: the
+        // prefetcher sizes a plan with this, and the reuse-signal verdict names
+        // the very same groups as cache keys with that. One walk, two answers.
+        self.touched_row_groups(shard_idx, rows)
+            .into_iter()
+            .fold(0usize, |acc, (_, bytes)| acc.saturating_add(bytes))
+    }
+
+    /// Distinct row groups the `rows` of `shard_idx` touch — ascending,
+    /// deduplicated, each paired with the decoded byte size the block index
+    /// stamps for it (`FramedShardLayout::group_bytes`, the same model the LRU
+    /// charges once the group is decoded). No decode, no LRU touch.
+    ///
+    /// Empty under exactly the gates [`Self::planned_row_group_bytes`] applies
+    /// — the block-index route statically or per-reader off, row-group
+    /// retention off, the shard unframed or out of range — so a caller cannot
+    /// derive cache keys for groups no gather would ever retain. That is the
+    /// point of returning the keys and the bytes together: a caller deciding
+    /// *which* groups to admit and a caller deciding *whether* the plan fits
+    /// are answering two questions about one list.
+    ///
+    /// `rows` need not be sorted and may repeat. An out-of-shard row is
+    /// **clamped** into the shard by `find_group`'s saturating search rather
+    /// than rejected, which is `touched_groups`' documented contract; a caller
+    /// that needs the error checks its rows first, as
+    /// [`Self::warm_row_groups`] does.
+    pub fn touched_row_groups(&self, shard_idx: usize, rows: &[u64]) -> Vec<(usize, usize)> {
+        // Both gates before `framed_layout`, for the reason review on #528
+        // gave: with the route statically off (the cell-set loader's default)
+        // no gather can retain a group, and resolving every touched shard's
+        // layout in order to name nothing would be new work on that path.
         if !self.block_index_route_enabled() || !self.retains_row_groups() {
-            return 0;
+            return Vec::new();
         }
         let Some(layout) = self.framed_layout(shard_idx) else {
-            return 0;
+            return Vec::new();
         };
         let Some((s_start, _)) = self.index.shard_range(shard_idx) else {
-            return 0;
+            return Vec::new();
         };
-        let mut locals: Vec<usize> = rows
-            .iter()
-            .map(|&row| row.saturating_sub(s_start) as usize)
-            .collect();
-        locals.sort_unstable();
-        Self::planned_bytes_sorted(&layout, locals.into_iter())
+        let mut groups = Self::touched_groups(&layout, s_start, rows);
+        groups.dedup();
+        groups
+            .into_iter()
+            // `find_group` saturates to `spans.len() - 1`, which underflows to
+            // `0` on a shard with no spans at all (`n_major == 0` tiles
+            // `[0, 0)` with none). Indexing `spans[0]` there would panic, and a
+            // reader returns rather than panics on malformed input. Filtering
+            // is not reachable through `shard_range`, whose empty shard maps no
+            // row — but this is a `pub` fn and the bound is cheap.
+            .filter(|&g| g < layout.spans.len())
+            .map(|g| (g, layout.group_bytes(g)))
+            .collect()
     }
 
     /// Decode the row groups `rows` (global row ids in `shard_idx`) touch into
@@ -1248,7 +1395,7 @@ impl BackedCsrReader {
         // Always admitted: the caller (the L2 prefetcher) has already checked
         // the plan fits its share of the budget before asking for a warm.
         for &g in &groups {
-            self.row_group(shard_idx, &layout, g, true)?;
+            self.row_group(shard_idx, &layout, g, &Admit::All)?;
         }
         Ok(groups.len())
     }
@@ -1355,10 +1502,11 @@ impl BackedCsrReader {
     ///
     /// For each request `rows[i]`, calls `scatter(i, indices, data)` where
     /// `(indices, data)` are slices into the cached shard's CSR for that row.
-    /// Each touched shard is decoded once via the LRU cache; scatter calls
-    /// fire in shard-grouped (sorted-by-row) order, but the `i` argument is
-    /// the original position in `rows`, so callers can write to a dense
-    /// output buffer indexed by request order.
+    /// Each touched shard is decoded once via the LRU cache. The `i` argument
+    /// is the original position in `rows`, so callers write to a dense output
+    /// buffer indexed by request order — **which is the only ordering
+    /// guarantee**. Scatter calls do NOT fire sorted by row: see
+    /// [`Self::read_rows_with_admission`] for the per-pass order and why.
     ///
     /// Allocates no intermediate `ScxCsr` and does no per-row `row_slice`
     /// — the per-shard request sub-slice is found via binary search on the
@@ -1385,12 +1533,23 @@ impl BackedCsrReader {
     /// every gather the plan will make and against the plan's share of the
     /// budget, so the L1 gathers and the L2 warm cannot disagree and a plan of
     /// many individually-fitting gathers whose union does not fit cannot churn
-    /// the LRU. A resident group is served as a hit either way; `Some(false)`
-    /// only stops misses from being inserted.
+    /// the LRU. A resident group is served as a hit either way;
+    /// [`Admit::None`] only stops misses from being inserted, and
+    /// [`Admit::Groups`] stops all but the named keys.
+    /// ⚠️ **Scatter order is per PASS, not sorted by row.** `scatter_groups`
+    /// serves every full-shard fallback first and every block-index row group
+    /// second, so on a MIXED request a later full-shard row fires before an
+    /// earlier block-index one. Every in-tree consumer addresses its output by
+    /// the `orig_pos` this hands it (`index_plan`, `sparse_cellset`,
+    /// `read_row_indices`) and is unaffected; a caller that assumed monotonic
+    /// row order across a mixed gather is not. The contiguous `read_rows` path
+    /// has always been range-first / full-second, so this makes the two
+    /// consistent rather than introducing the split — but it IS a change to
+    /// what the pre-split docs on this method promised. Review on #540.
     pub fn read_rows_with_admission<F>(
         &self,
         rows: &[u64],
-        admit_row_groups: Option<bool>,
+        admit_row_groups: Option<&Admit>,
         scatter: F,
     ) -> Result<()>
     where
@@ -1477,7 +1636,7 @@ impl BackedCsrReader {
         &self,
         sorted_pairs: &[(u64, usize)],
         groups: &[RowGroup],
-        admit_row_groups: Option<bool>,
+        admit_row_groups: Option<&Admit>,
         mut scatter: F,
     ) -> Result<()>
     where
@@ -1503,9 +1662,25 @@ impl BackedCsrReader {
         // alongside — decides once per plan and passes the verdict in
         // (`read_rows_with_admission`); a standalone gather decides for itself
         // against the whole budget. Sized from the block index, no decode.
-        let admit_groups = admit_row_groups
-            .unwrap_or_else(|| self.gather_row_groups_fit_budget(sorted_pairs, groups));
+        let own_verdict: Admit;
+        let admit_groups: &Admit = match admit_row_groups {
+            Some(a) => a,
+            None => {
+                own_verdict = Admit::from(self.gather_row_groups_fit_budget(sorted_pairs, groups));
+                &own_verdict
+            }
+        };
 
+        // Pass 1 — classify, and serve every full-shard fallback in place.
+        //
+        // The block-index groups are only *collected* here, into one flat
+        // ascending list of the distinct row groups the whole gather will
+        // decode. Pass 2 then decodes them a chunk at a time in parallel.
+        // Splitting the passes is what makes the parallelism gather-wide:
+        // a §6-shaped 512-row random plan touches ~480 groups spread across
+        // shards, and decoding them one shard's worth at a time — which is all
+        // the per-shard walk could ever overlap — leaves most of that serial.
+        let mut runs: Vec<GroupRun> = Vec::new();
         for g in groups {
             let group = &sorted_pairs[g.start..g.end];
 
@@ -1514,15 +1689,13 @@ impl BackedCsrReader {
             // otherwise fall back to a full-shard decode.
             let mut handled = false;
             if g.use_block_index {
-                handled = self.scatter_group_via_block_index(
-                    g.shard_idx,
-                    g.s_start,
-                    group,
-                    admit_groups,
-                    &mut scatter,
-                )?;
+                handled = self.collect_group_runs(g, group, &mut runs)?;
             }
 
+            // Counted per SHARD REQUEST GROUP, exactly as before the split —
+            // `block_index_adoption_rate` floors and the codec sweep's
+            // `block_index_groups == 2` then `== 4` are built on that meaning,
+            // not on the number of row groups decoded.
             if let Some(m) = self.metrics() {
                 if handled {
                     m.block_index_groups.fetch_add(1, Ordering::Relaxed);
@@ -1547,40 +1720,27 @@ impl BackedCsrReader {
             }
         }
 
-        Ok(())
+        // Pass 2 — decode the block-index runs in chunks, scatter each chunk.
+        self.scatter_group_runs(sorted_pairs, &runs, admit_groups, &mut scatter)
     }
 
-    /// Scatter one shard's request group directly from the block index, for
-    /// **row-group-framed (v2)** shards: walk the (row-sorted) group, fetch each
-    /// touched row group once through the shard LRU ([`Self::row_group`] —
-    /// a hit, or a decode of that group alone), and scatter every requested
-    /// row straight out of it. Returns `Ok(false)` (nothing scattered) for a
-    /// non-framed shard so the caller falls back to full-shard decode. Output
-    /// is byte-identical to a full decode + slice.
+    /// Split one shard request group into its distinct row groups, appending a
+    /// [`GroupRun`] per group, and validate the request against the shard.
     ///
-    /// Returns `Ok(true)` whether the groups were decoded on this call or
-    /// served from the LRU — both are the block-index route, and
-    /// `block_index_groups` counts both. There is no intermediate run-local
-    /// CSR any more: the pre-OPT-FORMATIO-1 path copied every row into one and
-    /// then scattered it again.
-    fn scatter_group_via_block_index<F>(
+    /// `Ok(false)` — nothing appended — for a shard that is not row-group
+    /// framed, so the caller falls back to a full-shard decode. All-or-nothing,
+    /// the same contract the per-shard walk had.
+    fn collect_group_runs(
         &self,
-        shard_idx: usize,
-        s_start: u64,
+        g: &RowGroup,
         group: &[(u64, usize)],
-        admit: bool,
-        scatter: &mut F,
-    ) -> Result<bool>
-    where
-        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
-    {
-        // `None` ⇒ shard is not row-group-framed ⇒ caller falls back; nothing
-        // scattered yet (all-or-nothing, same contract as the sidecar path).
-        let Some(layout) = self.framed_layout(shard_idx) else {
+        out: &mut Vec<GroupRun>,
+    ) -> Result<bool> {
+        let Some(layout) = self.framed_layout(g.shard_idx) else {
             return Ok(false);
         };
-        // A cache hit never reaches `section_bytes`, so the freshness check
-        // has to be here too — see `read_shard_cached_arc`.
+        // A cache hit never reaches `section_bytes`, so the freshness check has
+        // to be here too — see `read_shard_cached_arc`.
         self.check_fresh()?;
         // Validate the request against the shard's own row count before any
         // group indexing — `group` is built from `ShardStats` ranges, which are
@@ -1588,23 +1748,213 @@ impl BackedCsrReader {
         // `>= s_start` by construction (`plan_row_groups`), so the last one is
         // the only bound that can fail.
         if let Some(&(max_row, _)) = group.last() {
-            layout.check_run((max_row - s_start) as usize, 1)?;
+            layout.check_run((max_row - g.s_start) as usize, 1)?;
         }
 
-        let mut current: Option<(usize, Arc<ScxCsr>)> = None;
-        for &(row, orig_pos) in group {
-            let local = (row - s_start) as usize;
-            let g = layout.find_group(local);
-            if current.as_ref().is_none_or(|(cur_g, _)| *cur_g != g) {
-                current = Some((g, self.row_group(shard_idx, &layout, g, admit)?));
+        // Rows are ascending within the request group and `find_group` is
+        // monotone, so each row group's rows are a contiguous run — one pass,
+        // no sort, no map.
+        let mut run_start = 0usize;
+        let mut current: Option<usize> = None;
+        for (i, &(row, _)) in group.iter().enumerate() {
+            let rg = layout.find_group((row - g.s_start) as usize);
+            match current {
+                Some(cur) if cur == rg => {}
+                Some(cur) => {
+                    out.push(GroupRun::new(
+                        g,
+                        &layout,
+                        cur,
+                        g.start + run_start,
+                        g.start + i,
+                    ));
+                    run_start = i;
+                    current = Some(rg);
+                }
+                None => current = Some(rg),
             }
-            let rg = &current.as_ref().expect("just set").1;
-            let in_group = local - layout.span(g).row_start as usize;
-            let lo = rg.indptr[in_group] as usize;
-            let hi = rg.indptr[in_group + 1] as usize;
-            scatter(orig_pos, &rg.indices[lo..hi], &rg.data[lo..hi])?;
+        }
+        if let Some(cur) = current {
+            out.push(GroupRun::new(
+                g,
+                &layout,
+                cur,
+                g.start + run_start,
+                g.start + group.len(),
+            ));
         }
         Ok(true)
+    }
+
+    /// Decode `runs` a chunk at a time — in parallel on the reader's pool when
+    /// the chunk holds more than one group — and scatter each chunk's rows
+    /// before the next is decoded.
+    ///
+    /// **Chunked, not all-at-once.** A gather whose verdict is [`Admit::All`]
+    /// could hold everything, since admission has just certified the footprint
+    /// fits the budget — but a non-admitted gather is by definition *over* it,
+    /// and that is exactly the gather with the most groups to overlap. Holding
+    /// one chunk bounds peak at `chunk × max group bytes` in both cases.
+    ///
+    /// Decoded groups are held here rather than left to the LRU because a
+    /// non-admitted [`Self::row_group`] inserts nothing: pre-decoding into a
+    /// cache that will not keep them would simply be decoding each group twice.
+    fn scatter_group_runs<F>(
+        &self,
+        sorted_pairs: &[(u64, usize)],
+        runs: &[GroupRun],
+        admit: &Admit,
+        scatter: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
+    {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let chunk = self.group_decode_chunk();
+        for window in runs.chunks(chunk) {
+            let decoded = self.decode_group_runs(window, admit)?;
+            for (run, rg) in window.iter().zip(decoded.iter()) {
+                for &(row, orig_pos) in &sorted_pairs[run.start..run.end] {
+                    let in_group = (row - run.s_start) as usize - run.group_row_start;
+                    let lo = rg.indptr[in_group] as usize;
+                    let hi = rg.indptr[in_group + 1] as usize;
+                    scatter(orig_pos, &rg.indices[lo..hi], &rg.data[lo..hi])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One chunk's decodes. Parallel on the reader's pool (or rayon's registry)
+    /// when the `parallel` feature is on and the chunk holds more than one
+    /// group, else the serial loop verbatim.
+    ///
+    /// The pool is the reader's own, never a fresh one: a caller that may be
+    /// running in a forked child (the ML loader) sets a pool built after the
+    /// fork, whose worker threads actually exist. Same contract as
+    /// [`Self::warm_shards`].
+    fn decode_group_runs(&self, window: &[GroupRun], admit: &Admit) -> Result<Vec<Arc<ScxCsr>>> {
+        // ⚠️ **Serve residents serially; parallelise only the misses.**
+        //
+        // A cache hit is a mutex lookup, and routing every run through rayon
+        // regardless cost a MEASURED regression on the high-hit-rate path: on
+        // `index_plan` / tabula the row-group hit rate is 0.9899 (≈38,500 hits
+        // against 391 misses) and the random-plan scenario read
+        // `gather_latency_ms_p50` 27.96 → 29.17 ms (0.952×, 1 of 12 rounds won,
+        // p = 0.006) and p99 29.91 → 31.84 ms (p = 0.039) against the serial
+        // arm — a reliable loss, in the phase's own committed A/B, found by
+        // review reading that JSON.
+        //
+        // ⚠️ The miss-heavy `read_scattered` win (2.39-2.79×) was measured
+        // BEFORE this split and has not been re-captured against it. The split
+        // should be neutral there — almost every run is a miss, and
+        // `row_group_inner(probed_miss = true)` keeps the probe from taking the LRU
+        // mutex twice — but "should be neutral" is an argument, not a
+        // measurement, and this comment does not claim otherwise.
+        //
+        // The probe is free on a miss: `get_cached` counts a hit and touches
+        // recency, and counts nothing when absent, so the subsequent
+        // `row_group_inner(probed_miss = true)` still records the miss exactly
+        // once — without asking the cache again, which is why the flag exists.
+        let mut out: Vec<Option<Arc<ScxCsr>>> = Vec::with_capacity(window.len());
+        let mut misses: Vec<usize> = Vec::with_capacity(window.len());
+        for (i, run) in window.iter().enumerate() {
+            match self.resident_group(run) {
+                Some(rg) => {
+                    // A hit is still a lookup the verdict decided, and the pair
+                    // is documented per lookup — so charge it here rather than
+                    // leaving the fast path invisible to it.
+                    if let Some(layout) = self.framed_layout(run.shard_idx) {
+                        self.charge_verdict(admit, run.shard_idx, &layout, run.g);
+                    }
+                    out.push(Some(rg));
+                }
+                None => {
+                    out.push(None);
+                    misses.push(i);
+                }
+            }
+        }
+
+        #[cfg(feature = "parallel")]
+        if misses.len() > 1 {
+            let decode_misses = || -> Result<Vec<Arc<ScxCsr>>> {
+                misses
+                    .par_iter()
+                    .map(|&i| self.decode_one_group_run(&window[i], admit))
+                    .collect()
+            };
+            let decoded = match self.cpu_pool.as_ref() {
+                Some(pool) => pool.install(decode_misses),
+                None => decode_misses(),
+            }?;
+            if let Some(m) = self.metrics() {
+                // Counts the groups actually DECODED in parallel, not the
+                // window's length: a chunk of cache hits overlaps nothing.
+                m.parallel_group_decodes
+                    .fetch_add(misses.len() as u64, Ordering::Relaxed);
+            }
+            for (&i, rg) in misses.iter().zip(decoded) {
+                out[i] = Some(rg);
+            }
+            return Ok(out.into_iter().map(|rg| rg.expect("filled")).collect());
+        }
+
+        for &i in &misses {
+            out[i] = Some(self.decode_one_group_run(&window[i], admit)?);
+        }
+        Ok(out.into_iter().map(|rg| rg.expect("filled")).collect())
+    }
+
+    /// The run's row group if it is already resident, without decoding.
+    ///
+    /// `None` when this reader retains no row groups — there is no cache to
+    /// probe, so every run is a "miss" and decodes, which is what the
+    /// `SCX_ROW_GROUP_CACHE=0` arm measures.
+    fn resident_group(&self, run: &GroupRun) -> Option<Arc<ScxCsr>> {
+        if !self.retains_row_groups() {
+            return None;
+        }
+        self.shard_cache
+            .get_cached(CacheKey::Group(self.file_id, run.shard_idx, run.g))
+    }
+
+    /// One run's row group, through the LRU ([`Self::row_group`]) so an
+    /// admitted key is retained and single-flighted exactly as before.
+    fn decode_one_group_run(&self, run: &GroupRun, admit: &Admit) -> Result<Arc<ScxCsr>> {
+        let layout = self
+            .framed_layout(run.shard_idx)
+            .expect("collect_group_runs resolved this layout");
+        self.row_group_inner(
+            run.shard_idx,
+            &layout,
+            run.g,
+            admit,
+            /*probed_miss*/ true,
+        )
+    }
+
+    /// Groups decoded together in one chunk — the reader's pool width, so the
+    /// bound on peak is one decode per worker and no worker idles inside a
+    /// chunk.
+    fn group_decode_chunk(&self) -> usize {
+        // The A/B arm first: `SCX_ROW_GROUP_SERIAL_DECODE=1` forces one group per
+        // chunk and therefore the serial path, which is the pre-change regime.
+        if row_group_serial_decode_enabled() {
+            return 1;
+        }
+        #[cfg(feature = "parallel")]
+        {
+            match self.cpu_pool.as_ref() {
+                Some(pool) => pool.current_num_threads(),
+                None => rayon::current_num_threads(),
+            }
+            .max(1)
+        }
+        #[cfg(not(feature = "parallel"))]
+        1
     }
 
     /// Read all rows — materializes the full matrix.

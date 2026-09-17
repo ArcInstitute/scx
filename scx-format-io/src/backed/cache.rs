@@ -124,6 +124,44 @@ pub struct CacheMetrics {
     /// Admitted row-group lookups that waited on a peer's in-flight decode
     /// (a non-admitted lookup never takes a slot).
     pub row_group_duplicate_waiters: AtomicU64,
+
+    // --- W10: what the reuse-signal verdict actually decided -----------------
+    /// Row groups a gather **dispatched to the pool** after its own cache probe
+    /// missed.
+    ///
+    /// Residents are served serially before any chunk is dispatched, so a group
+    /// resident at probe time is never counted here and never pays rayon's
+    /// per-item cost — routing hits through the pool was a measured regression
+    /// on the 0.99-hit-rate `index_plan` path. A flat zero beside a non-zero
+    /// `block_index_groups` means the gathers were served from cache or were too
+    /// narrow to overlap, not that the pool is missing.
+    ///
+    /// ⚠️ **Dispatched, not necessarily decoded.** The probe establishes only
+    /// that the key was absent at that instant; a concurrent peer can insert it
+    /// before `get_or_decode` runs, and that dispatch is still counted. Under
+    /// concurrent gathers this is an upper bound on decodes, and it is the
+    /// quantity the serial/parallel A/B arm actually differs in. Review on #540
+    /// caught the stronger wording.
+    pub parallel_group_decodes: AtomicU64,
+    /// Bytes of the row groups an admission verdict let a gather retain.
+    ///
+    /// Read beside `rejected_group_bytes`: the pair is the verdict itself,
+    /// where `row_group_bytes_inserted` is what survived the byte budget on
+    /// top of it. All three flat while `row_group_misses` climbs is the
+    /// decode-and-drop regime.
+    pub admitted_group_bytes: AtomicU64,
+    /// Bytes of the row groups a verdict refused to retain — the cold tail a
+    /// partial verdict deliberately leaves out, plus everything under
+    /// `Admit::None`.
+    pub rejected_group_bytes: AtomicU64,
+    /// Plans given a **partial** verdict: over their budget share, so refused
+    /// outright before W10, but holding at least one group another plan of the
+    /// prefetch window also touches.
+    ///
+    /// Zero on a loader whose plans all fit their share (nothing to recover)
+    /// and on one whose plans share no group (nothing to admit) — the two read
+    /// the same here and are told apart by `row_group_hits`.
+    pub reuse_admissions: AtomicU64,
 }
 
 /// The per-kind view of [`CacheMetrics`] the cache bumps through, so the six

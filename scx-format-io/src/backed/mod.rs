@@ -92,12 +92,126 @@ pub fn row_group_cache_enabled() -> bool {
     })
 }
 
+/// Process-wide switch for the **reuse-signal** admission policy (W10).
+///
+/// Default `reuse`: a plan over its `budget / (lookahead + 1)` share keeps the
+/// row groups another plan of the prefetch window also touches.
+/// `SCX_ROW_GROUP_ADMIT=plan` restores the pre-W10 all-or-nothing rule — a plan
+/// over its share retains nothing — which is the same-build A/B arm for the
+/// capture, exactly as `SCX_ROW_GROUP_CACHE=0` is for the row-group LRU itself.
+/// Read once per process.
+///
+/// Anything other than `plan` (case-insensitive) is `reuse`, including an unset
+/// variable and a typo: a misspelled arm must not silently disable the shipped
+/// policy in a capture that then reports it as the default.
+pub fn row_group_admit_reuse_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("SCX_ROW_GROUP_ADMIT").is_ok_and(|v| v.eq_ignore_ascii_case("plan"))
+    })
+}
+
 /// A shard request-group takes the O(rows) block-index path only when the
 /// requested rows are a small fraction of the shard — `group_len * DIVISOR <
 /// shard_rows`. Shared by `read_rows_with`'s `use_block_index` decision and the
 /// plan-prefetch skip ([`BackedCsrReader::block_index_eligible`]) so the two can
 /// never drift.
 pub const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
+
+/// Process-wide switch for the **serial** row-group decode.
+///
+/// Default off: a block-index gather decodes its touched row groups one
+/// pool-width chunk at a time. `SCX_ROW_GROUP_SERIAL_DECODE=1` makes every
+/// chunk one group and so takes the serial path — the pre-change regime, and
+/// the same-build A/B arm for the chunked parallel decode itself. Without it
+/// that change is unmeasurable on one build: it is not gated by
+/// `SCX_ROW_GROUP_ADMIT`, so it is identical in both admission arms and cancels
+/// out of every ratio they produce.
+///
+/// A **boolean**, not a width. An earlier version took any positive integer,
+/// which was a configuration surface no caller set to anything but `1` — and a
+/// large value silently defeated the `chunk × max group bytes` peak bound the
+/// chunking exists to keep. Anything other than `1` is off, so a typo cannot
+/// serialise a capture that then reports itself as the default. Read once per
+/// process.
+pub fn row_group_serial_decode_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("SCX_ROW_GROUP_SERIAL_DECODE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `(file_id, shard_idx, row_group_idx)` — how the shard cache keys a decoded
+/// row group, what [`BackedCsrReader::touched_row_groups`] names, and the unit
+/// the loader's reuse signal counts.
+pub type RowGroupKey = (u32, usize, usize);
+
+/// What a read is allowed to **retain** in the shard LRU's row-group half.
+///
+/// A read's *output* never depends on this — retention is a cache policy, not
+/// a correctness property. What it decides is whether a decoded row group is
+/// inserted under the byte budget (and single-flighted across concurrent
+/// callers) or decoded independently and dropped.
+///
+/// * [`Admit::All`] — retain every group this read touches. What a plan gets
+///   when its whole footprint fits the budget share it was sized against.
+/// * [`Admit::None`] — retain nothing. A working set larger than the cache is
+///   the one pattern an LRU makes strictly worse: every group is inserted and
+///   evicted before the next read could hit it, so residency is spent for zero
+///   hits (measured at 0 hits, +350-500 MB and 2-4 % slower on
+///   tabula_sapiens_100k).
+/// * [`Admit::Groups`] — retain exactly the named keys. The reuse signal: a
+///   plan over its share forfeits its cold tail but keeps the groups several
+///   plans of the prefetch window touch (a control pool, shared neighbours, a
+///   repeated pair member). Strictly between the other two, and the reason the
+///   verdict is a set rather than a `bool`.
+///
+/// Keys are `(file_id, shard_idx, row_group_idx)` — the same triple the cache
+/// is keyed on, and what [`BackedCsrReader::touched_row_groups`] names. `Arc`
+/// because one verdict is consulted by every set of a cell-set plan and, on the
+/// parallel decode path, from several threads at once.
+#[derive(Debug, Clone, Default)]
+pub enum Admit {
+    #[default]
+    All,
+    None,
+    Groups(Arc<HashSet<RowGroupKey>>),
+}
+
+impl Admit {
+    /// Whether group `g` of shard `shard_idx` in file `file_id` may be retained.
+    pub fn admits(&self, file_id: u32, shard_idx: usize, g: usize) -> bool {
+        match self {
+            Admit::All => true,
+            Admit::None => false,
+            Admit::Groups(keys) => keys.contains(&(file_id, shard_idx, g)),
+        }
+    }
+
+    /// `Admit::Groups` of `keys`, collapsing an empty set to [`Admit::None`].
+    ///
+    /// The collapse is not cosmetic. An empty `Groups` and `None` decide every
+    /// lookup identically, so keeping them distinct would let a counter or a
+    /// test read "partial admission happened" off a verdict that admitted
+    /// nothing — which is exactly the claim this phase has to be able to
+    /// measure.
+    pub fn groups(keys: HashSet<RowGroupKey>) -> Self {
+        if keys.is_empty() {
+            Admit::None
+        } else {
+            Admit::Groups(Arc::new(keys))
+        }
+    }
+}
+
+impl From<bool> for Admit {
+    fn from(b: bool) -> Self {
+        if b {
+            Admit::All
+        } else {
+            Admit::None
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests

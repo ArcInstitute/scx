@@ -81,6 +81,25 @@ pub(super) fn cache_metrics_to_pydict<'py>(
         "row_group_duplicate_waiters",
         m.row_group_duplicate_waiters.load(Ordering::Relaxed),
     )?;
+    // W10: what the admission verdict decided, and whether the gather's group
+    // decodes overlapped. `admitted` + `rejected` is the verdict; the
+    // `row_group_*` pair above is what survived the byte budget on top of it.
+    dict.set_item(
+        "admitted_group_bytes",
+        m.admitted_group_bytes.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "rejected_group_bytes",
+        m.rejected_group_bytes.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "reuse_admissions",
+        m.reuse_admissions.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "parallel_group_decodes",
+        m.parallel_group_decodes.load(Ordering::Relaxed),
+    )?;
     Ok(dict)
 }
 

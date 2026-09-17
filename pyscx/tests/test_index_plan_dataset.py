@@ -602,6 +602,12 @@ class TestMetrics:
             "row_group_evictions",
             "row_group_bytes_inserted",
             "row_group_duplicate_waiters",
+            # W10: what the admission verdict decided, and whether the gather's
+            # group decodes overlapped.
+            "admitted_group_bytes",
+            "rejected_group_bytes",
+            "reuse_admissions",
+            "parallel_group_decodes",
         }
         for k, v in m.items():
             assert isinstance(v, int), f"{k} should be int, got {type(v)}"
@@ -666,6 +672,12 @@ class TestMetrics:
             "row_group_evictions",
             "row_group_bytes_inserted",
             "row_group_duplicate_waiters",
+            # W10: what the admission verdict decided, and whether the gather's
+            # group decodes overlapped.
+            "admitted_group_bytes",
+            "rejected_group_bytes",
+            "reuse_admissions",
+            "parallel_group_decodes",
         }
 
     def test_iter_skips_prefetch_after_warmup(self, unframed_scx_path):
@@ -1563,3 +1575,204 @@ class TestRowGroupCache:
         assert cm["block_index_groups"] > 0, cm
         assert cm["row_group_hits"] == 0 and cm["row_group_misses"] == 0, cm
         assert cm["row_group_bytes_inserted"] == 0, cm
+
+
+class TestReuseSignalAdmission:
+    """W10: a plan over its `budget / (lookahead + 1)` share keeps the row
+    groups another plan of the lookahead window also touches, instead of
+    forfeiting retention outright.
+
+    The two arms are selected by `SCX_ROW_GROUP_ADMIT`, which pyscx caches in a
+    `OnceLock` on first read — hence a subprocess per arm, as the
+    `SCX_ROW_GROUP_CACHE` kill-switch test does."""
+
+    N_OBS = 20_000
+    N_VARS = 400
+    # Three controls repeated in every plan, plus a 200-pair cold tail drawn
+    # without replacement — the perturbation-screen shape, and the one the
+    # phase exists to serve.
+    CONTROLS = (5, 1007, 2009)
+    TAIL_PAIRS = 200
+    N_PLANS = 6
+
+    @staticmethod
+    def _write(path):
+        import anndata as ad
+        import scipy.sparse as sp
+
+        X = sp.random(
+            TestReuseSignalAdmission.N_OBS,
+            TestReuseSignalAdmission.N_VARS,
+            density=0.05,
+            format="csr",
+            random_state=0,
+        )
+        X.data = np.round(X.data * 10 + 1).astype(np.float32)
+        adata = ad.AnnData(X=X)
+        adata.obs["cell_id"] = [f"c{i}" for i in range(TestReuseSignalAdmission.N_OBS)]
+        pyscx.from_anndata(
+            adata, path, codec="shufdelta", row_group_rows=16, shard_size=2000
+        )
+
+    @classmethod
+    def _plans(cls):
+        rng = np.random.default_rng(7)
+        out = []
+        for _ in range(cls.N_PLANS):
+            plan = [(c, int(rng.integers(0, cls.N_OBS))) for c in cls.CONTROLS]
+            plan += [
+                (int(rng.integers(0, cls.N_OBS)), int(rng.integers(0, cls.N_OBS)))
+                for _ in range(cls.TAIL_PAIRS)
+            ]
+            out.append(plan)
+        return out
+
+    @staticmethod
+    def _run_arm(path, plans, admit):
+        import json
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        src = textwrap.dedent(
+            f"""
+            import json, pyscx
+            ds = pyscx.IndexPlanDataset(
+                {path!r}, normalize=False, cache_shards=4, sort_by_shard=True,
+                scatter_block_index=True, lookahead=2, max_memory_mb=60,
+                max_plan_size=512)
+            plans = {plans!r}
+            list(ds.iter_with_plans(iter([list(p) for p in plans]), lookahead=2))
+            print(json.dumps(ds.cache_metrics()))
+            """
+        )
+        env = {**os.environ, "SCX_ROW_GROUP_ADMIT": admit}
+        r = subprocess.run(
+            [sys.executable, "-c", src], capture_output=True, text=True, env=env
+        )
+        assert r.returncode == 0, r.stderr[-4000:]
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_reuse_arm_recovers_retention_the_plan_arm_forfeits(self, tmp_path):
+        path = str(tmp_path / "reuse_admission.scx")
+        self._write(path)
+        plans = self._plans()
+
+        plan_arm = self._run_arm(path, plans, "plan")
+        reuse_arm = self._run_arm(path, plans, "reuse")
+
+        # Premise: both arms took the block-index route on the same work, so the
+        # difference below is the admission policy and nothing else.
+        assert plan_arm["block_index_groups"] == reuse_arm["block_index_groups"] > 0
+        total_plan = plan_arm["row_group_hits"] + plan_arm["row_group_misses"]
+        total_reuse = reuse_arm["row_group_hits"] + reuse_arm["row_group_misses"]
+        assert total_plan > 0 and total_reuse > 0
+
+        # The pre-W10 arm: one verdict per plan, all or nothing, and these plans
+        # are over their share — so nothing is retained and nothing can hit.
+        # This is the 0.000 row-group hit rate every multi-shard fixture
+        # measured before this phase.
+        assert plan_arm["row_group_hits"] == 0, plan_arm
+        assert plan_arm["row_group_bytes_inserted"] == 0, plan_arm
+        assert plan_arm["reuse_admissions"] == 0, plan_arm
+        assert plan_arm["admitted_group_bytes"] == 0, plan_arm
+        assert plan_arm["rejected_group_bytes"] > 0, plan_arm
+
+        # The reuse arm keeps the controls every plan touches and still refuses
+        # the cold tail — `rejected_group_bytes` stays substantial, which is
+        # what separates "admit on reuse" from "admit everything".
+        assert reuse_arm["reuse_admissions"] > 0, reuse_arm
+        assert reuse_arm["row_group_hits"] > 0, reuse_arm
+        assert reuse_arm["rejected_group_bytes"] > 0, (
+            "a policy that admitted the cold tail too would read as a win here "
+            f"and cost the residency the share rule exists to bound: {reuse_arm}"
+        )
+        hit_rate = reuse_arm["row_group_hits"] / total_reuse
+        assert hit_rate > 0.2, f"recovered hit rate {hit_rate:.3f}: {reuse_arm}"
+
+
+class TestDecodeChunkKillSwitch:
+    """`SCX_ROW_GROUP_SERIAL_DECODE=1` forces one group per chunk — the serial
+    decode path, and the same-build A/B arm for the chunked parallel decode.
+
+    Without this knob that change cannot be measured on one build: it is not
+    gated by `SCX_ROW_GROUP_ADMIT`, so it is identical in both admission arms
+    and cancels out of every ratio they produce. Read once per process, hence a
+    subprocess per arm.
+
+    ⚠️ Every probe pins `SCX_LOADER_CPU_THREADS`. The default chunk is the
+    reader's pool width, which `scx_loader::pool` resolves from
+    `num_cpus::get_physical()` — **1 on a GitHub `ubuntu-latest` runner** (2
+    vCPUs, one physical core). So the default arm was legitimately serial there,
+    `parallel_group_decodes` stayed 0, and both tests failed CI on their own
+    premise assertion. The premise is now made true rather than skipped: a host
+    that cannot run the shipped decode path must not be the reason CI never
+    exercises it.
+    """
+
+    @staticmethod
+    def _probe(path, chunk):
+        import json
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        src = textwrap.dedent(
+            f"""
+            import json, pyscx
+            ds = pyscx.IndexPlanDataset({path!r}, normalize=False, cache_shards=4,
+                                        sort_by_shard=True, lookahead=0,
+                                        scatter_block_index=True)
+            # 40 unique rows spread over ~11 row groups. Narrow on purpose:
+            # `block_index_eligible` needs `rows * 4 < shard_rows`, so a wider
+            # request takes the WHOLE-SHARD route and there is no group decode
+            # to batch at all — which is what the first version of this test
+            # did (134 rows of 400), and what its premise assertion caught.
+            plan = [(i * 4, i * 4 + 200) for i in range(20)]
+            list(ds.iter_with_plans(iter([list(plan)]), lookahead=0))
+            print(json.dumps(ds.cache_metrics()))
+            """
+        )
+        env = {**os.environ, "SCX_LOADER_CPU_THREADS": "4"}
+        if chunk is not None:
+            env["SCX_ROW_GROUP_SERIAL_DECODE"] = chunk
+        else:
+            env.pop("SCX_ROW_GROUP_SERIAL_DECODE", None)
+        r = subprocess.run(
+            [sys.executable, "-c", src], capture_output=True, text=True, env=env
+        )
+        assert r.returncode == 0, r.stderr[-3000:]
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_chunk_one_takes_the_serial_path_and_default_does_not(self, tmp_path):
+        path = str(tmp_path / "chunk_ab.scx")
+        TestBlockIndexAdoption._write_framed(path, n_obs=400)
+
+        default = self._probe(path, None)
+        serial = self._probe(path, "1")
+        assert default["block_index_groups"] > 0, default
+        assert default["parallel_group_decodes"] > 0, (
+            "premise: the default chunk really does batch this gather's groups, "
+            f"or the arms below are two serial runs: {default}"
+        )
+        assert serial["parallel_group_decodes"] == 0, serial
+        # Output is a cache policy away from identical; the counters that
+        # describe WORK must match, so the arms differ in batching alone.
+        assert serial["block_index_groups"] == default["block_index_groups"]
+        assert serial["row_group_misses"] == default["row_group_misses"]
+
+    def test_a_typo_is_ignored_rather_than_serialising_the_capture(self, tmp_path):
+        path = str(tmp_path / "chunk_typo.scx")
+        TestBlockIndexAdoption._write_framed(path, n_obs=400)
+        # `0` and a non-number must both fall back to the pool width, or a
+        # mistyped arm silently measures the serial path and reports itself as
+        # the default.
+        # A boolean now: only the exact string "1" serialises. Anything else —
+        # a typo, a width left over from when this took an integer — must fall
+        # back to the pool width rather than silently serialising a capture that
+        # then reports itself as the default.
+        for bad in ("0", "yes", "", "-1", "2", "true"):
+            got = self._probe(path, bad)
+            assert got["parallel_group_decodes"] > 0, (bad, got)
