@@ -43,7 +43,9 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
-use scx_format_io::{Admit, BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache};
+use scx_format_io::{
+    Admit, BackedCsrReader, CacheMetrics, RowGroupKey, ScxReader, SharedShardCache,
+};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
@@ -71,6 +73,14 @@ pub(crate) fn clamp_blocking_threads(pool: usize, lookahead: usize) -> usize {
 /// row-group warm (`warm_row_groups`). Both are side effects on the shared
 /// cache; the decoded value itself is never handed back.
 type ShardJoin = JoinHandle<scx_format_io::Result<()>>;
+
+/// `(planned bytes, byte budget, the row-group keys summed)` —
+/// [`PrefetchEngine::plan_footprint_keyed`]'s answer.
+type PlanFootprint = (usize, usize, Vec<RowGroupKey>);
+
+/// `(prefetch handles, whether the plan fits its budget share, its row-group
+/// keys)` — what one refill's `spawn_prefetches` produces.
+type SpawnedPlan = (Vec<ShardJoin>, bool, Vec<RowGroupKey>);
 
 /// A `file_id → reader` map sharing one decoded-shard budget, plus a lazily
 /// built tokio runtime for prefetch. Wrap in `Arc` and call
@@ -278,6 +288,31 @@ impl PrefetchEngine {
         per_shard: &HashMap<(u32, usize), Vec<u64>>,
         held: Option<&HashMap<u32, Arc<BackedCsrReader>>>,
     ) -> Result<(usize, usize)> {
+        let (planned, budget, _) = self.plan_footprint_keyed(per_shard, held, false)?;
+        Ok((planned, budget))
+    }
+
+    /// [`Self::plan_footprint`], optionally also naming the row-group cache keys
+    /// it summed.
+    ///
+    /// One walk of the block index, two answers. The prefetcher needs both — the
+    /// footprint to decide whether the plan fits its share, and the keys to say
+    /// *which* groups a partially-admitted plan may retain — and a second walk
+    /// to collect the keys is how a sizing decision and an admission decision
+    /// come to disagree about a group boundary. Same reasoning as
+    /// `BackedCsrReader::planned_row_group_bytes` folding over
+    /// `touched_row_groups`.
+    ///
+    /// `collect_keys == false` allocates nothing extra, which is what the
+    /// synchronous `gather` path wants: it has no lookahead window, so no key
+    /// can ever be touched by a second plan and the keys would be dead weight.
+    pub(crate) fn plan_footprint_keyed(
+        &self,
+        per_shard: &HashMap<(u32, usize), Vec<u64>>,
+        held: Option<&HashMap<u32, Arc<BackedCsrReader>>>,
+        collect_keys: bool,
+    ) -> Result<PlanFootprint> {
+        let mut keys: Vec<RowGroupKey> = Vec::new();
         let mut planned = 0usize;
         let mut budget = usize::MAX;
         // Regrouped per file so that, with `held` absent, each file's lease is
@@ -297,14 +332,25 @@ impl PrefetchEngine {
                 None => self.registry.lease(fid)?,
             };
             for (sidx, shard_rows) in shards {
-                planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, shard_rows));
+                if collect_keys {
+                    // The keyed walk subsumes the sizing one: `touched_row_groups`
+                    // is what `planned_row_group_bytes` folds over, so summing the
+                    // bytes here gives the identical number without walking twice.
+                    for (g, bytes) in reader.touched_row_groups(sidx, shard_rows) {
+                        planned = planned.saturating_add(bytes);
+                        keys.push((fid, sidx, g));
+                    }
+                } else {
+                    planned =
+                        planned.saturating_add(reader.planned_row_group_bytes(sidx, shard_rows));
+                }
                 if !reader.block_index_eligible(sidx, shard_rows.len()) {
                     planned = planned.saturating_add(reader.shard_decoded_bytes(sidx));
                 }
             }
             budget = budget.min(reader.cache_bytes_budget());
         }
-        Ok((planned, budget))
+        Ok((planned, budget, keys))
     }
 
     /// Shared handle to the readers' one `SharedShardCache` counters. Always
@@ -439,6 +485,7 @@ impl PrefetchEngine {
             plan_rx,
             plan_thread,
             in_flight: VecDeque::with_capacity(cap),
+            window: HashMap::new(),
             lookahead,
             plan_stream_done: false,
             plan_stream_error: None,
@@ -555,9 +602,17 @@ struct InFlight<P> {
     /// Empty when `lookahead == 0`, the plan touches no rows, or every touched
     /// shard is already cached / in flight.
     prefetches: Vec<ShardJoin>,
-    /// The plan's row-group admission verdict (see `spawn_prefetches`), handed
-    /// to `process` so the gather retains exactly what the prefetcher warmed.
-    admit_row_groups: Admit,
+    /// Whether the plan's whole footprint fit its share of the byte budget
+    /// (see `spawn_prefetches`). `true` is a total admission; `false` is where
+    /// the reuse signal below decides.
+    fits_share: bool,
+    /// Every row-group cache key this plan touches, its contribution to the
+    /// iterator's rolling `window`. Carried rather than recomputed on the way
+    /// out so the decrement is exactly the increment — a recomputation could
+    /// differ if the plan's readers were evicted and reopened in between, and a
+    /// key that is incremented once and decremented zero times stays "hot"
+    /// forever.
+    keys: Vec<RowGroupKey>,
 }
 
 /// Iterator returned by [`PrefetchEngine::iter_with_plans`].
@@ -568,6 +623,20 @@ pub struct PlanPrefetchIter<P, T, RowsFn, ProcFn> {
     /// user iterator ends.
     plan_thread: Option<thread::JoinHandle<()>>,
     in_flight: VecDeque<InFlight<P>>,
+    /// How many of the plans currently in flight touch each row-group key.
+    ///
+    /// **The reuse signal** (W10 step 2). A plan whose whole footprint fits its
+    /// share of the budget is admitted outright, as before. A plan over its
+    /// share used to forfeit retention entirely — measured at a 0.000 row-group
+    /// hit rate on every multi-shard fixture — and now keeps exactly the groups
+    /// a second plan of the window also touches: a control pool, shared
+    /// neighbours, a repeated pair member. Its cold tail still decodes and
+    /// drops, which is the part an LRU genuinely makes worse.
+    ///
+    /// Incremented when a plan enters the queue, decremented when it leaves, so
+    /// a count of `>= 2` at the moment a plan is consumed means "some other
+    /// plan still queued also wants this group".
+    window: HashMap<RowGroupKey, u32>,
     lookahead: usize,
     /// Sticky: once the plan stream closes we stop calling `recv`.
     plan_stream_done: bool,
@@ -639,11 +708,15 @@ where
 
             match item {
                 Ok(plan) => match self.spawn_prefetches(&plan) {
-                    Ok((prefetches, admit_row_groups)) => {
+                    Ok((prefetches, fits_share, keys)) => {
+                        for &k in &keys {
+                            *self.window.entry(k).or_insert(0) += 1;
+                        }
                         self.in_flight.push_back(InFlight {
                             plan,
                             prefetches,
-                            admit_row_groups,
+                            fits_share,
+                            keys,
                         });
                     }
                     Err(e) => {
@@ -686,10 +759,10 @@ where
     /// verdict against the full budget let N files (or N sets) each pass while
     /// their union thrashed the LRU — found by review on #528. At
     /// `lookahead == 0` nothing is warmed and the share is the whole budget.
-    fn spawn_prefetches(&self, plan: &P) -> Result<(Vec<ShardJoin>, Admit)> {
+    fn spawn_prefetches(&self, plan: &P) -> Result<SpawnedPlan> {
         let rows = (self.rows_of)(plan);
         if rows.is_empty() {
-            return Ok((Vec::new(), Admit::All));
+            return Ok((Vec::new(), true, Vec::new()));
         }
 
         // Dedup rows and bucket them per (file, shard). The gather passes the
@@ -773,10 +846,16 @@ where
                 .fetch_add(1, Ordering::Relaxed);
         }
         if self.lookahead == 0 || declined_for_reader_limit {
+            // No keys on either of these paths, and neither needs them. At
+            // `lookahead == 0` the queue holds one plan, so no key can ever
+            // reach a count of two; and a plan declined for `reader_limit` is
+            // deliberately not leasing its files, which is what naming its keys
+            // would cost. Both keep today's all-or-nothing verdict.
             let (planned, budget) = self.engine.plan_footprint(&per_shard, None)?;
             return Ok((
                 Vec::new(),
-                Admit::from(planned <= budget / (self.lookahead + 1)),
+                planned <= budget / (self.lookahead + 1),
+                Vec::new(),
             ));
         }
 
@@ -798,7 +877,9 @@ where
         }
         // Sized against the handles already held, so no file is opened twice
         // for one plan.
-        let (planned, budget) = self.engine.plan_footprint(&per_shard, Some(&leased))?;
+        let (planned, budget, keys) =
+            self.engine
+                .plan_footprint_keyed(&per_shard, Some(&leased), true)?;
         // Recomputed here because the prefetcher needs it per bucket to choose
         // which L2 task to launch; `plan_footprint` consumes the same verdict
         // internally to decide whether to add whole-shard bytes.
@@ -879,7 +960,44 @@ where
                 reader.read_shard_cached_arc(sidx).map(|_| ())
             }));
         }
-        Ok((joins, Admit::from(admit_row_groups)))
+        Ok((joins, admit_row_groups, keys))
+    }
+
+    /// The verdict for a plan leaving the queue, read off the rolling window.
+    ///
+    /// A plan that fits its share is admitted whole — unchanged from before this
+    /// phase, and the reason no existing hit-rate floor can move down: the
+    /// change is strictly additive, turning some `None` verdicts into partial
+    /// `Groups` ones and never the reverse.
+    ///
+    /// Called while the leaving plan's own keys are still counted, so the `>= 2`
+    /// test reads as "at least one plan still queued also touches this group".
+    fn admit_for(&self, fits_share: bool, keys: &[RowGroupKey]) -> Admit {
+        if fits_share {
+            return Admit::All;
+        }
+        let hot: HashSet<RowGroupKey> = keys
+            .iter()
+            .copied()
+            .filter(|k| self.window.get(k).is_some_and(|&c| c >= 2))
+            .collect();
+        Admit::groups(hot)
+    }
+
+    /// Undo one plan's contribution to the window. Exactly the increment
+    /// `refill` made, from the plan's own recorded keys — a key left counted
+    /// after its plan is gone would read as hot for the rest of the epoch and
+    /// admit a cold tail the phase exists to keep out.
+    fn release_keys(&mut self, keys: &[RowGroupKey]) {
+        for k in keys {
+            if let std::collections::hash_map::Entry::Occupied(mut e) = self.window.entry(*k) {
+                if *e.get() <= 1 {
+                    e.remove();
+                } else {
+                    *e.get_mut() -= 1;
+                }
+            }
+        }
     }
 
     /// Block on every prefetch handle for the head plan, surfacing the first
@@ -918,7 +1036,8 @@ where
         if let Some(InFlight {
             plan,
             prefetches,
-            admit_row_groups,
+            fits_share,
+            keys,
         }) = self.in_flight.pop_front()
         {
             // Keep the queue warm during the upcoming process call. Strictly
@@ -926,10 +1045,19 @@ where
             // waiting on the batch it produces.
             self.refill(false);
 
+            // AFTER the refill, so the verdict sees every plan the window
+            // actually holds — the most information available at the only
+            // moment it can be used. Taking it in `spawn_prefetches`, where the
+            // pre-change verdict was taken, would ask "do two plans want this
+            // group?" of a window that does not yet contain the plans it would
+            // have to compare against.
+            let admit = self.admit_for(fits_share, &keys);
+            self.release_keys(&keys);
+
             if let Err(e) = self.await_head(prefetches) {
                 return Some(Err(e));
             }
-            return Some((self.process)(&self.engine, plan, admit_row_groups));
+            return Some((self.process)(&self.engine, plan, admit));
         }
 
         // Queue empty — surface a deferred plan-stream error one-shot.

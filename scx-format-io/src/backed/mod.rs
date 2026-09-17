@@ -99,6 +99,11 @@ pub fn row_group_cache_enabled() -> bool {
 /// never drift.
 pub const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
 
+/// `(file_id, shard_idx, row_group_idx)` — how the shard cache keys a decoded
+/// row group, what [`BackedCsrReader::touched_row_groups`] names, and the unit
+/// the loader's reuse signal counts.
+pub type RowGroupKey = (u32, usize, usize);
+
 /// What a read is allowed to **retain** in the shard LRU's row-group half.
 ///
 /// A read's *output* never depends on this — retention is a cache policy, not
@@ -128,7 +133,7 @@ pub enum Admit {
     #[default]
     All,
     None,
-    Groups(Arc<HashSet<(u32, usize, usize)>>),
+    Groups(Arc<HashSet<RowGroupKey>>),
 }
 
 impl Admit {
@@ -148,7 +153,7 @@ impl Admit {
     /// test read "partial admission happened" off a verdict that admitted
     /// nothing — which is exactly the claim this phase has to be able to
     /// measure.
-    pub fn groups(keys: HashSet<(u32, usize, usize)>) -> Self {
+    pub fn groups(keys: HashSet<RowGroupKey>) -> Self {
         if keys.is_empty() {
             Admit::None
         } else {

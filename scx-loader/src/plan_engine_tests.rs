@@ -1410,3 +1410,313 @@ fn plan_admission_counts_the_plans_whole_shards_too() {
     );
     assert_eq!(m.row_group_misses.load(AtomicOrdering::Relaxed), 1);
 }
+
+// ---------------------------------------------------------------------------
+// W10 step 2 — the reuse signal
+// ---------------------------------------------------------------------------
+
+/// Eight plans, each a shared **hot control group** plus a **cold tail** of its
+/// own, at `lookahead = 4` and a budget whose per-plan share is far under one
+/// plan's footprint.
+///
+/// Before this phase such a plan forfeited retention outright — one verdict per
+/// plan, all or nothing — which is why every multi-shard fixture measured a
+/// 0.000 row-group hit rate on random plans. The control group is touched by
+/// every plan in the window, so it is retained and served; the cold tail is
+/// touched by one plan each, so it still decodes and drops, which is the part an
+/// LRU genuinely makes worse.
+///
+/// Fixture: 256 rows, 4 shards of 64, row groups of 16 (4 groups per shard).
+/// Four plans at `lookahead = 2`, so the window spans three plans at the moment
+/// a verdict is taken. Each plan takes one group of shard 0 and one group each
+/// of shards 1 and 2. The shard-1/2 groups are **unique per plan** — twelve
+/// groups exist across those shards and eight are used, one pair per plan — so
+/// the tail can never be hot by accident.
+///
+/// ⚠️ The first version of this fixture rotated the tail modulo four over eight
+/// plans, and the window (four queued plans plus the one leaving) therefore
+/// contained plan `i` and plan `i + 4`, whose tails are *identical*. Every key
+/// read as hot and both arms admitted everything — the test could not see its
+/// own claim. The tail is now unique by construction, and
+/// `without_a_shared_group_the_same_plans_retain_nothing` is what would catch
+/// it happening again.
+fn reuse_plans(shared_control: bool) -> Vec<Plan> {
+    (0..REUSE_N_PLANS as u64)
+        .map(|i| {
+            // The ONLY difference between the arms: one group of shard 0 shared
+            // by every plan, or a different one per plan.
+            let hot_group = if shared_control { 0 } else { i };
+            vec![
+                (0u32, hot_group * 16),
+                (0u32, hot_group * 16 + 1),
+                (0u32, 64 + i * 16),
+                (0u32, 128 + i * 16),
+            ]
+        })
+        .collect()
+}
+
+/// Four plans and four groups per shard: every plan's shard-0 group is distinct
+/// in the control arm, and every plan's tail pair is distinct in both.
+const REUSE_N_PLANS: usize = 4;
+
+/// Lookahead for the reuse tests. At 2 the window holds three plans when a
+/// verdict is taken (two queued plus the one leaving), which is the smallest
+/// window in which "two plans want this group" is a question at all.
+const REUSE_LOOKAHEAD: usize = 2;
+
+const REUSE_BUDGET: usize = 3 * FRAMED_GROUP_BYTES;
+
+fn run_reuse_plans(dir: &std::path::Path, shared_control: bool) -> Arc<PrefetchEngine> {
+    let engine = framed_engine_with_budget(dir, true, REUSE_BUDGET);
+    let plans = reuse_plans(shared_control);
+    let want: Vec<Vec<(i32, f32)>> = plans
+        .iter()
+        .map(|p| p.iter().map(|&(_, r)| framed_expected(r)).collect())
+        .collect();
+    let out: Vec<_> = Arc::clone(&engine)
+        .iter_with_plans(into_iter(plans), REUSE_LOOKAHEAD, rows_of, gather)
+        .map(|r| r.unwrap())
+        .collect();
+    // Output identity first: admission is a cache policy and must not be able
+    // to change a single scattered value.
+    assert_eq!(out, want, "gather output is independent of admission");
+    engine
+}
+
+#[test]
+fn a_group_touched_by_two_plans_in_the_window_is_retained() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let dir = tempfile::tempdir().unwrap();
+
+    // Premise, asserted rather than assumed: one plan's footprint really is
+    // over its share, so this exercises the partial verdict and not `All`.
+    let share = REUSE_BUDGET / (REUSE_LOOKAHEAD + 1);
+    assert!(
+        3 * FRAMED_GROUP_BYTES > share,
+        "premise: a plan's three groups ({}) exceed its share ({share})",
+        3 * FRAMED_GROUP_BYTES
+    );
+
+    let engine = run_reuse_plans(dir.path(), true);
+    let m = engine.cache_metrics();
+    let hits = m.row_group_hits.load(AtomicOrdering::Relaxed);
+    let inserted = m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed) as usize;
+
+    assert!(
+        hits > 0,
+        "the control group is touched by every plan of the window and must be \
+         served from the LRU; got {hits} hits"
+    );
+    assert_eq!(
+        inserted, FRAMED_GROUP_BYTES,
+        "and exactly ONE group is ever retained — the cold tail is still \
+         decode-and-drop, which is what keeps residency bounded"
+    );
+    assert_eq!(
+        m.row_group_evictions.load(AtomicOrdering::Relaxed),
+        0,
+        "nothing churns: one resident group under a three-group budget"
+    );
+}
+
+/// The control for the test above: the **same** plan count, width, budget,
+/// share and lookahead, with the shared group rotated away. Nothing is touched
+/// twice inside a window, so nothing is hot and nothing is retained — which is
+/// exactly the pre-change behaviour, reached without a kill switch.
+///
+/// This is the arm that makes the test above a measurement rather than an
+/// assertion. A rule that admitted on anything other than reuse — plan width,
+/// group size, "the first N groups" — would pass the test above and fail here.
+#[test]
+fn without_a_shared_group_the_same_plans_retain_nothing() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = run_reuse_plans(dir.path(), false);
+    let m = engine.cache_metrics();
+
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "no group is touched by two plans of a window, so none is admitted"
+    );
+    assert_eq!(
+        m.row_group_hits.load(AtomicOrdering::Relaxed),
+        0,
+        "and nothing can be served from a cache nothing was inserted into"
+    );
+    assert!(
+        m.row_group_misses.load(AtomicOrdering::Relaxed) > 0,
+        "premise: the route was taken at all"
+    );
+}
+
+/// A plan whose footprint fits its share is still admitted **whole**, so the
+/// reuse signal can only ever turn a `None` verdict into a partial one and
+/// never the reverse. That is what makes "no existing row-group hit-rate floor
+/// can move down" a structural claim rather than a hope: pbmc3k's 0.99 rate is
+/// this path.
+///
+/// ⚠️ Driven at `lookahead = 0`, which is the only configuration in which this
+/// claim is observable. The first version ran at `lookahead = 4` and passed
+/// under the mutation that deletes the `fits_share` early return — because the
+/// L2 prefetcher's `warm_row_groups` inserts the group with a hard-coded
+/// `Admit::All` before the gather ever asks, so the assertion was measuring the
+/// warm and not the verdict. At `lookahead = 0` nothing is warmed and the
+/// gather's own retention is the only thing that can insert a byte.
+#[test]
+fn a_plan_that_fits_its_share_is_still_admitted_whole() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    // One plan, one group, and a budget that holds it many times over.
+    let plan: Plan = vec![(0u32, 0u64), (0, 1)];
+    let budget = 5 * 4 * FRAMED_GROUP_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, budget);
+
+    // Run it twice so the second pass can hit what the first retained.
+    for _ in 0..2 {
+        let it = Arc::clone(&engine).iter_with_plans(
+            into_iter(vec![plan.clone()]),
+            /*lookahead*/ 0,
+            rows_of,
+            gather,
+        );
+        let iter_metrics = it.iter_metrics();
+        let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+        let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+        assert_eq!(out, vec![want]);
+        assert_eq!(
+            iter_metrics
+                .prefetch_tasks_spawned
+                .load(AtomicOrdering::Relaxed)
+                + iter_metrics
+                    .prefetch_skipped_block_index
+                    .load(AtomicOrdering::Relaxed),
+            0,
+            "premise: lookahead 0 warms nothing, so what follows is the gather's \
+             own retention and not the prefetcher's"
+        );
+    }
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed) as usize,
+        FRAMED_GROUP_BYTES,
+        "a fitting plan retains its group, exactly as before this phase — and a \
+         single plan can never be its own reuse signal, so a rule that admitted \
+         ONLY on reuse would insert nothing here"
+    );
+    assert!(m.row_group_hits.load(AtomicOrdering::Relaxed) > 0);
+}
+
+/// A group two plans touch **outside one window** is not hot, and the window
+/// count must come back down to prove it.
+///
+/// At `lookahead = 1` the window holds two plans when a verdict is taken. Plans
+/// 0 and 3 share a group; plans 1 and 2 sit between them. If a plan's keys were
+/// incremented on the way in and never released on the way out, plan 0's
+/// contribution would still be counted when plan 3 is consumed, the shared group
+/// would read as hot, and the cold tail this phase exists to keep out would be
+/// retained.
+///
+/// Mutation: make `release_keys` a no-op and this reddens. Nothing else in the
+/// suite can see that leak, because every other reuse fixture repeats a group
+/// *inside* the window, where the count is legitimately >= 2 either way.
+#[test]
+fn a_repeat_outside_the_window_is_not_hot() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, REUSE_BUDGET);
+
+    // Four plans, each three groups (over its `budget / 2` share). Plans 0 and 3
+    // share shard 0's group 0; plans 1 and 2 use shard 0's groups 1 and 2. Every
+    // tail group is unique.
+    let plans: Vec<Plan> = (0..4u64)
+        .map(|i| {
+            let hot_group = if i == 3 { 0 } else { i };
+            vec![
+                (0u32, hot_group * 16),
+                (0u32, hot_group * 16 + 1),
+                (0u32, 64 + i * 16),
+                (0u32, 128 + i * 16),
+            ]
+        })
+        .collect();
+    let want: Vec<Vec<(i32, f32)>> = plans
+        .iter()
+        .map(|p| p.iter().map(|&(_, r)| framed_expected(r)).collect())
+        .collect();
+    let out: Vec<_> = Arc::clone(&engine)
+        .iter_with_plans(into_iter(plans), /*lookahead*/ 1, rows_of, gather)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(out, want);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "plans 0 and 3 are never queued together, so their shared group is not \
+         a reuse signal for either of them"
+    );
+    assert_eq!(m.row_group_hits.load(AtomicOrdering::Relaxed), 0);
+    assert!(
+        m.row_group_misses.load(AtomicOrdering::Relaxed) > 0,
+        "premise: the block-index route was taken at all"
+    );
+}
+
+/// **Two** plans are a reuse signal — the leaving plan counts itself.
+///
+/// `admit_for` is called while the leaving plan's own keys are still in the
+/// window, so `count >= 2` reads as "at least one plan *still queued* also wants
+/// this group". Releasing first would silently raise the bar to "two other
+/// plans", which on a two-deep window is unreachable and retains nothing.
+///
+/// At `lookahead = 1` the window holds exactly one queued plan beside the one
+/// leaving, so this is the smallest configuration in which the two readings
+/// differ. Mutation: move `release_keys` above `admit_for` and this reddens
+/// while every other reuse test stays green — their windows hold two *other*
+/// plans and cannot tell the readings apart.
+#[test]
+fn two_plans_are_enough_for_a_reuse_signal() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, REUSE_BUDGET);
+
+    let plans: Vec<Plan> = (0..2u64)
+        .map(|i| {
+            vec![
+                (0u32, 0u64),
+                (0u32, 1),
+                (0u32, 64 + i * 16),
+                (0u32, 128 + i * 16),
+            ]
+        })
+        .collect();
+    let share = REUSE_BUDGET / 2;
+    assert!(
+        3 * FRAMED_GROUP_BYTES > share,
+        "premise: a plan is over its share, so the partial verdict is what decides"
+    );
+    let want: Vec<Vec<(i32, f32)>> = plans
+        .iter()
+        .map(|p| p.iter().map(|&(_, r)| framed_expected(r)).collect())
+        .collect();
+    let out: Vec<_> = Arc::clone(&engine)
+        .iter_with_plans(into_iter(plans), /*lookahead*/ 1, rows_of, gather)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(out, want);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed) as usize,
+        FRAMED_GROUP_BYTES,
+        "the one group both plans touch is retained; their tails are not"
+    );
+    assert!(
+        m.row_group_hits.load(AtomicOrdering::Relaxed) > 0,
+        "and the second plan is served from it"
+    );
+}
