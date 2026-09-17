@@ -2400,9 +2400,9 @@ def run(
             summary["error"] = hot_err
         if hot_rates:
             summary["n_runs"] = len(hot_rates)
-            summary["median_cellsets_per_sec"] = round(median(hot_rates), 1)
+            summary["median_cellsets_per_sec"] = round(statistics.median(hot_rates), 1)
         if hot_hit_rates:
-            summary["median_row_group_hit_rate"] = round(median(hot_hit_rates), 4)
+            summary["median_row_group_hit_rate"] = round(statistics.median(hot_hit_rates), 4)
         result.metadata["hot_control_cold_tail"] = summary
         gc.collect()
 
