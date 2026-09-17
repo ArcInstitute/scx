@@ -165,8 +165,28 @@ def main(root: pathlib.Path) -> int:
             fb = f"{statistics.median(bs):.4g}" if bs else "-"
             fa = f"{statistics.median(as_):.4g}" if as_ else "-"
             print(f"| `{m}` | {fb} | {fa} |")
-        ceil = next((p["reuse"].get("hot_meta") or {}).get("row_group_hit_rate_ceiling")
-                    for _, p in complete if p["reuse"].get("hot_meta"))
+        # `next(..., None)`, with a default: a summariser that raises
+        # StopIteration after a multi-hour capture is a worse failure than a
+        # missing line, and a dataset where the arm skipped every round has no
+        # ceiling to report.
+        ceil = next(
+            (
+                (p["reuse"].get("hot_meta") or {}).get("row_group_hit_rate_ceiling")
+                for _, p in complete
+                if (p["reuse"].get("hot_meta") or {}).get("applicable")
+            ),
+            None,
+        )
+        skipped = next(
+            (
+                (p["reuse"].get("hot_meta") or {}).get("reason")
+                for _, p in complete
+                if (p["reuse"].get("hot_meta") or {}).get("applicable") is False
+            ),
+            None,
+        )
+        if skipped:
+            print(f"\nThe hot-control / cold-tail arm did not run on this dataset: {skipped}")
         if ceil:
             print(f"\nHit-rate ceiling for this arm's shape: **{ceil}** — only the "
                   "control sets can be served from cache, so that is the best any "
