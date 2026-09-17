@@ -1086,6 +1086,16 @@ impl SparseCellSetLoader {
         plan: &SparseCellSetPlan,
         admit_row_groups: Option<Admit>,
     ) -> Result<SparseCellSetBatch> {
+        self.validate_plan(engine, plan)?;
+        self.gather_per_set(engine, plan, admit_row_groups)
+    }
+
+    /// Structural validation of a plan, which arrives straight from (untrusted)
+    /// Python on both public routes. Split out of the gather so every executor
+    /// below runs against a plan already known to be well formed, and so a
+    /// malformed plan is refused before any read rather than panicking on an
+    /// unchecked slice deep inside one.
+    fn validate_plan(&self, engine: &PrefetchEngine, plan: &SparseCellSetPlan) -> Result<()> {
         let total_rows = plan.rows.len();
         // Width is checked by `check_plan_width` on both public routes, before
         // any admission sizing or prefetch I/O — not here, where the work it
@@ -1137,6 +1147,20 @@ impl SparseCellSetLoader {
                 return Err(LoaderError::IndexOutOfRange { idx: row, n_obs });
             }
         }
+        Ok(())
+    }
+
+    /// The per-set walk: one [`scx_format_io::BackedCsrReader::read_rows_with_admission`]
+    /// call per set (and per file within a cross-file set), a per-set
+    /// `Vec<Option<(Vec<i32>, Vec<f32>)>>` holding the gathered rows, and an
+    /// `extend_from_slice` copy of every row into the batch.
+    fn gather_per_set(
+        &self,
+        engine: &PrefetchEngine,
+        plan: &SparseCellSetPlan,
+        admit_row_groups: Option<Admit>,
+    ) -> Result<SparseCellSetBatch> {
+        let total_rows = plan.rows.len();
 
         let n_sets = plan.set_offsets.len().saturating_sub(1);
 
