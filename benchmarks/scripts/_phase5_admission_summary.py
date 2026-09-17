@@ -127,7 +127,9 @@ def main(root: pathlib.Path) -> int:
                 b, a = p["plan"].get(m), p["reuse"].get(m)
                 if not isinstance(b, (int, float)) or not isinstance(a, (int, float)):
                     continue
-                if b == 0 or a == 0:
+                # Both sides strictly positive: a ratio over signed values has
+                # no meaningful direction (same fix as the factors summariser).
+                if b <= 0 or a <= 0:
                     continue
                 befores.append(float(b))
                 afters.append(float(a))
@@ -137,10 +139,23 @@ def main(root: pathlib.Path) -> int:
                 continue
 
             med = statistics.median(ratios)
+            # Ties are DROPPED from the sign test, not counted as losses. The
+            # factors summariser was fixed for this in review on #540 and this
+            # one was not: `r > 1.0` as a win and everything else as a loss made
+            # a metric the two arms agree on EXACTLY read as
+            # "REGRESSED 1x at 0/12, p = 0.000" — which can manufacture a
+            # significant regression out of identical numbers.
             wins = sum(1 for r in ratios if r > 1.0)
-            n = len(ratios)
+            losses = sum(1 for r in ratios if r < 1.0)
+            n = wins + losses
             p = _binom_two_sided(wins, n)
 
+            if n == 0:
+                verdict = f"identical on all {len(ratios)} rounds"
+                print(f"| `{m}` | {statistics.median(befores):.4g} "
+                      f"| {statistics.median(afters):.4g} | {med:.3g}x "
+                      f"| 0/0 | 1.000 | {verdict} |")
+                continue
             if n < 5:
                 verdict = f"too few rounds (n={n})"
             elif p > 0.05:
@@ -174,7 +189,7 @@ def main(root: pathlib.Path) -> int:
         # ceiling to report.
         ceil = next(
             (
-                (p["reuse"].get("hot_meta") or {}).get("row_group_hit_rate_ceiling")
+                (p["reuse"].get("hot_meta") or {}).get("control_set_fraction")
                 for _, p in complete
                 if (p["reuse"].get("hot_meta") or {}).get("applicable")
             ),

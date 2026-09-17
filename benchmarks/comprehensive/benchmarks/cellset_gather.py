@@ -963,18 +963,24 @@ def _hot_cold_premises(n_obs: int) -> dict[str, Any]:
             f"hot/cold arm: the tails overlap {tail_overlap:.2f} of their rows, "
             "so the 'cold' half is warm and the arm cannot separate the two"
         )
-    # The ceiling on `row_group_hit_rate` for this shape, stated so the measured
-    # rate is interpretable: only the control sets can be served from cache, so
-    # the best any admission policy can do here is the control fraction of the
-    # lookups. Reading 0.039 against a 0.125 ceiling is a different fact from
-    # reading it against 1.0, and the arm should not make a reader derive it.
-    ceiling = _HOT_CONTROL_SETS / (_HOT_CONTROL_SETS + _HOT_TAIL_SETS)
+    # The control fraction of the batch's SETS, recorded so the measured hit
+    # rate is interpretable at all.
+    #
+    # ⚠️ This is NOT a ceiling on `row_group_hit_rate`, and an earlier version of
+    # this arm called it one (review on #540 caught it). The hit rate's unit is
+    # **group lookups**, not sets: how many lookups a control set generates
+    # depends on how many distinct row groups its rows land in, which is a
+    # property of the layout and the pool width, not of 8-of-64. The two
+    # quantities are not comparable, so no "fraction of achievable" can be
+    # derived from this number — it says how much of the batch is the reused
+    # population and nothing more.
+    control_set_fraction = _HOT_CONTROL_SETS / (_HOT_CONTROL_SETS + _HOT_TAIL_SETS)
     return {
         "control_rows": len(shared),
         "control_pool": min(n_obs, _HOT_CONTROL_POOL),
         "tail_overlap_fraction": round(tail_overlap, 4),
         "sets_per_batch": _HOT_CONTROL_SETS + _HOT_TAIL_SETS,
-        "row_group_hit_rate_ceiling": round(ceiling, 4),
+        "control_set_fraction": round(control_set_fraction, 4),
     }
 
 

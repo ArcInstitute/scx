@@ -157,7 +157,10 @@ class IndexPlanDataset:
         control pool, shared neighbours, a repeated pair member — and still
         drops its cold tail. `reuse_admissions` counts the plans that got such a
         partial verdict, and `admitted_group_bytes` / `rejected_group_bytes` is
-        the split it decided. A workload whose plans share nothing inside a
+        the split it decided (charged once per GROUP lookup, the unit
+        `row_group_hits` counts, not once per requested row). The room such a
+        verdict may spend is the share **minus the shards the plan takes
+        whole** — those are inserted regardless of any admission decision. A workload whose plans share nothing inside a
         window reads `reuse_admissions == 0`, which is the pre-existing
         behaviour and not a fault."""
         ...

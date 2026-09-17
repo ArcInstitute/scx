@@ -447,9 +447,10 @@ impl IndexPlanDataset {
     ///                       share, but holding a group another plan of the
     ///                       prefetch window also touches
     /// parallel_group_decodes
-    ///                     - row groups decoded inside a parallel chunk; 0 when
-    ///                       every gather was narrow enough to decode one group
-    ///                       at a time
+    ///                     - row groups dispatched to the decode pool after this
+    ///                       reader's own cache probe missed; 0 when the gathers
+    ///                       were served from cache OR were too narrow to
+    ///                       overlap, not when the pool is missing
     /// ```
     ///
     /// All values are `int`. Counters are atomic and read with `Relaxed`

@@ -4115,12 +4115,13 @@ absolute_floors:
 #         ~10-17 % slowdown — and it does not survive interleaving. Recorded so
 #         nobody re-derives a floor from a single-run probe on a shared node.
 #
-#     ⚠️ Read `row_group_hit_rate__*` against
-#     `metadata.hot_control_cold_tail.row_group_hit_rate_ceiling`, never against
-#     1.0. Only the control sets can be served from cache, so at
-#     `_HOT_CONTROL_SETS` of `_HOT_CONTROL_SETS + _HOT_TAIL_SETS` the ceiling is
-#     0.125 and a measured 0.039 is 31 % of what the shape can reach. Against
-#     1.0 the same number reads as a failure.
+#     ⚠️ `row_group_hit_rate__*` has NO derivable ceiling here, and an earlier
+#     version of this entry claimed one. Its unit is group LOOKUPS;
+#     `metadata.hot_control_cold_tail.control_set_fraction` (0.125) is a
+#     fraction of SETS. How many lookups a control set generates depends on how
+#     many distinct row groups its rows land in — a property of the layout, not
+#     of 8-of-64 — so no "fraction of achievable" follows from it. Record the
+#     rate, read it beside the rejection below, and do not divide the two.
 #
 #     ⚠️ Read it together with `rejected_group_bytes__*`. A policy that
 #     recovered the hit rate by admitting the cold tail too would show a HIGHER

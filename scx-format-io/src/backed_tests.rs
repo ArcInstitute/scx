@@ -5262,3 +5262,74 @@ fn planned_row_group_bytes_is_zero_with_the_route_off() {
     assert_eq!(backed.shard_decoded_bytes(0), RG_SHARD_BYTES);
     let _ = &mut backed;
 }
+
+/// The documented scatter-order contract: on a **mixed** request every
+/// full-shard fallback fires before every block-index row group, so a *later*
+/// row can be handed to the callback before an *earlier* one.
+///
+/// All three reviewers on #540 noted the split was documented and not asserted.
+/// It matters because the pre-split docs promised shard-grouped, sorted-by-row
+/// order, and the only guarantee now is the `orig_pos` argument — so this test
+/// pins both halves: the order really is per-pass, and `orig_pos` really does
+/// still address the request.
+///
+/// Fixture: 256 rows, 4 shards of 64, groups of 16. Row 2 alone in shard 0 is
+/// a sparse request and takes the block-index route; sixteen consecutive rows of
+/// shard 1 are a quarter of it, fail `block_index_eligible`'s window and take
+/// the whole-shard route. Row 2 is the LOWEST row requested, so any sorted-by-row
+/// contract would emit it first.
+#[test]
+fn a_mixed_request_scatters_full_shard_groups_before_block_index_groups() {
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 256, 100, 4, 16, CodecId::None);
+    let backed = BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+
+    let mut rows: Vec<u64> = vec![2];
+    rows.extend(64..80u64);
+    assert_eq!(
+        rows[0], 2,
+        "premise: the block-index row is the lowest row requested"
+    );
+    assert!(
+        !backed.block_index_eligible(1, 16),
+        "premise: sixteen of shard 1's sixty-four rows take the whole-shard route"
+    );
+    assert!(
+        backed.block_index_eligible(0, 1),
+        "premise: one row of shard 0 takes the block-index route"
+    );
+
+    let mut order: Vec<u64> = Vec::new();
+    backed
+        .read_rows_with(&rows, |orig_pos, idx, data| {
+            // `orig_pos` addresses the request — the one guarantee — so the row
+            // it names is read back through the request array, exactly as every
+            // in-tree consumer does.
+            let row = rows[orig_pos];
+            let (lo, hi) = (
+                full.indptr[row as usize] as usize,
+                full.indptr[row as usize + 1] as usize,
+            );
+            assert_eq!(idx, &full.indices[lo..hi], "row {row} indices");
+            assert_eq!(data, &full.data[lo..hi], "row {row} data");
+            order.push(row);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(order.len(), rows.len(), "every requested row was scattered");
+    assert_eq!(
+        *order.last().unwrap(),
+        2,
+        "the block-index row fires LAST despite being the lowest row requested: \
+         pass 1 serves the whole-shard fallback, pass 2 the row groups. If this \
+         ever reads 2 first, the order has become sorted-by-row again and the \
+         docs on `read_rows_with_admission` are the thing to change."
+    );
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_ne!(
+        order, sorted,
+        "premise: the fixture actually exercises out-of-row-order scatter"
+    );
+}

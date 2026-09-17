@@ -156,13 +156,11 @@ def main(root: pathlib.Path) -> int:
 
             rows, side = [], []
             for m in ordered:
-                ratios, bs, as_ = [], [], []
+                ratios, bs, as_, signed = [], [], [], []
                 for _, arms in complete:
                     b, a = arms[base_arm].get(m), arms[new_arm].get(m)
                     if not isinstance(b, (int, float)) or not isinstance(a, (int, float)):
                         continue
-                    bs.append(float(b))
-                    as_.append(float(a))
                     # ⚠️ A ratio needs both sides strictly POSITIVE. The
                     # committed artifact carries `estimate_overshoot_mb__*` at
                     # about -8,100, and `-8166 / -8138` is a number near 1 whose
@@ -170,13 +168,27 @@ def main(root: pathlib.Path) -> int:
                     # printed win counts and a verdict for it. Signed
                     # diagnostics fall through to the side-by-side table below.
                     if b <= 0 or a <= 0:
+                        # Recorded for the side-by-side table, which reports
+                        # every round, but NOT paired with a ratio — appending
+                        # to `bs`/`as_` before this check would print an
+                        # all-round median beside a partial-round verdict on any
+                        # metric with mixed signs. (Antigravity, review on #540.)
+                        signed.append((float(b), float(a)))
                         continue
+                    bs.append(float(b))
+                    as_.append(float(a))
                     ratios.append(b / a if _lower_is_better(m) else a / b)
-                if not bs and not as_:
-                    continue
                 if not ratios:
-                    # A metric one arm zeroes on every round: two medians, no ratio.
-                    side.append((m, statistics.median(bs), statistics.median(as_)))
+                    # A metric one arm zeroes on every round, or a signed one:
+                    # two medians over every round it appeared in, no ratio.
+                    pool = [(b, a) for b, a in zip(bs, as_)] + signed
+                    if not pool:
+                        continue
+                    side.append((
+                        m,
+                        statistics.median([b for b, _ in pool]),
+                        statistics.median([a for _, a in pool]),
+                    ))
                     continue
                 med = statistics.median(ratios)
                 # ⚠️ TIES ARE DROPPED from the sign test, not counted as losses.

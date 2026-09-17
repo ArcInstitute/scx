@@ -1132,6 +1132,26 @@ impl BackedCsrReader {
         g: usize,
         admit: &Admit,
     ) -> Result<Arc<ScxCsr>> {
+        self.row_group_inner(shard_idx, layout, g, admit, /*probed_miss*/ false)
+    }
+
+    /// [`Self::row_group`], with `probed_miss` saying whether the caller has
+    /// already asked the cache for this key and been told no.
+    ///
+    /// One body rather than two near-copies (review on #540): the only
+    /// difference is that a caller which has just probed does not need the
+    /// non-admitted branch to take the LRU mutex a second time — which on the
+    /// miss-heavy scattered path is nearly every run. The admitted branch always
+    /// goes through `get_or_decode`, whose own probe is part of the
+    /// single-flight protocol and cannot be skipped.
+    fn row_group_inner(
+        &self,
+        shard_idx: usize,
+        layout: &FramedShardLayout,
+        g: usize,
+        admit: &Admit,
+        probed_miss: bool,
+    ) -> Result<Arc<ScxCsr>> {
         if !self.retains_row_groups() {
             return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
         }
@@ -1149,8 +1169,10 @@ impl BackedCsrReader {
         // leader inserts nothing would make every waiter re-decode in turn;
         // concurrent non-admitted decodes of one group run independently
         // instead, which is what "not retained" means).
-        if let Some(rg) = self.shard_cache.get_cached(key) {
-            return Ok(rg);
+        if !probed_miss {
+            if let Some(rg) = self.shard_cache.get_cached(key) {
+                return Ok(rg);
+            }
         }
         self.shard_cache.note_uncached_miss(CacheKind::RowGroup);
         self.reader.decode_framed_row_group(layout, g).map(Arc::new)
@@ -1186,36 +1208,6 @@ impl BackedCsrReader {
                 m.rejected_group_bytes.fetch_add(bytes, Ordering::Relaxed);
             }
         }
-    }
-
-    /// [`Self::row_group`] for a key whose cache probe has **already missed**.
-    ///
-    /// Skips the redundant `get_cached` on the non-admitted branch: the
-    /// resident probe in `decode_group_runs` just answered that question, and
-    /// re-asking took the LRU mutex a second time on every miss — which is
-    /// nearly every run on the miss-heavy scattered path the chunking exists
-    /// for. The admitted branch still goes through `get_or_decode`, whose own
-    /// probe is part of the single-flight protocol and cannot be skipped.
-    fn row_group_after_probe_miss(
-        &self,
-        shard_idx: usize,
-        layout: &FramedShardLayout,
-        g: usize,
-        admit: &Admit,
-    ) -> Result<Arc<ScxCsr>> {
-        if !self.retains_row_groups() {
-            return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
-        }
-        self.charge_verdict(admit, shard_idx, layout, g);
-        if admit.admits(self.file_id, shard_idx, g) {
-            let key = CacheKey::Group(self.file_id, shard_idx, g);
-            let shard_cache = Arc::clone(&self.shard_cache);
-            return shard_cache.get_or_decode(key, || {
-                self.reader.decode_framed_row_group(layout, g).map(Arc::new)
-            });
-        }
-        self.shard_cache.note_uncached_miss(CacheKind::RowGroup);
-        self.reader.decode_framed_row_group(layout, g).map(Arc::new)
     }
 
     /// Whether the row groups a gather's block-index groups touch all fit the
@@ -1858,13 +1850,14 @@ impl BackedCsrReader {
         // ⚠️ The miss-heavy `read_scattered` win (2.39-2.79×) was measured
         // BEFORE this split and has not been re-captured against it. The split
         // should be neutral there — almost every run is a miss, and
-        // `row_group_after_probe_miss` keeps the probe from taking the LRU
+        // `row_group_inner(probed_miss = true)` keeps the probe from taking the LRU
         // mutex twice — but "should be neutral" is an argument, not a
         // measurement, and this comment does not claim otherwise.
         //
         // The probe is free on a miss: `get_cached` counts a hit and touches
         // recency, and counts nothing when absent, so the subsequent
-        // `row_group` still records the miss exactly once.
+        // `row_group_inner(probed_miss = true)` still records the miss exactly
+        // once — without asking the cache again, which is why the flag exists.
         let mut out: Vec<Option<Arc<ScxCsr>>> = Vec::with_capacity(window.len());
         let mut misses: Vec<usize> = Vec::with_capacity(window.len());
         for (i, run) in window.iter().enumerate() {
@@ -1934,7 +1927,13 @@ impl BackedCsrReader {
         let layout = self
             .framed_layout(run.shard_idx)
             .expect("collect_group_runs resolved this layout");
-        self.row_group_after_probe_miss(run.shard_idx, &layout, run.g, admit)
+        self.row_group_inner(
+            run.shard_idx,
+            &layout,
+            run.g,
+            admit,
+            /*probed_miss*/ true,
+        )
     }
 
     /// Groups decoded together in one chunk — the reader's pool width, so the

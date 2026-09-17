@@ -2752,10 +2752,13 @@ tail under a cold name.
 | `admitted_group_bytes__gather_hot_control_cold_tail` | 0 | 7.42 GB |
 | `rejected_group_bytes__gather_hot_control_cold_tail` | 162.2 GB | 154.7 GB |
 
-**Read the hit rate against the shape's ceiling, which is 0.125.** Only the
-control sets can be served from cache — 8 of 64 — so `0.0421` is 34 % of what
-any admission policy could reach here, not 4 % of a notional 1.0. The arm
-records that ceiling in `metadata.hot_control_cold_tail`.
+**The hit rate has no derivable ceiling here, and an earlier version of this
+section claimed one.** `0.0421` is a fraction of group *lookups*; the arm's
+control population is 8 of 64 *sets*. How many lookups a control set generates
+depends on how many distinct row groups its rows land in — a property of the
+layout, not of 8-of-64 — so "34 % of what any policy could reach" did not
+follow and has been removed. The arm records `control_set_fraction` for context
+and nothing is divided by it.
 
 **Read it beside the rejection.** 154.7 GB of the verdict's lookups are still
 refused, against 7.4 GB admitted: the cold tail is not being let in. A policy

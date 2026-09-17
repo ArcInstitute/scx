@@ -126,14 +126,22 @@ pub struct CacheMetrics {
     pub row_group_duplicate_waiters: AtomicU64,
 
     // --- W10: what the reuse-signal verdict actually decided -----------------
-    /// Row groups a gather actually **decoded** inside a parallel chunk.
+    /// Row groups a gather **dispatched to the pool** after its own cache probe
+    /// missed.
     ///
-    /// Residents are served serially before any chunk is dispatched, so a cache
-    /// hit is never counted here and never pays rayon's per-item cost — routing
-    /// hits through the pool was a measured regression on the 0.99-hit-rate
-    /// `index_plan` path. A flat zero beside a non-zero `block_index_groups`
-    /// therefore means the gathers were served from cache or were too narrow to
-    /// overlap, not that the pool is missing.
+    /// Residents are served serially before any chunk is dispatched, so a group
+    /// resident at probe time is never counted here and never pays rayon's
+    /// per-item cost — routing hits through the pool was a measured regression
+    /// on the 0.99-hit-rate `index_plan` path. A flat zero beside a non-zero
+    /// `block_index_groups` means the gathers were served from cache or were too
+    /// narrow to overlap, not that the pool is missing.
+    ///
+    /// ⚠️ **Dispatched, not necessarily decoded.** The probe establishes only
+    /// that the key was absent at that instant; a concurrent peer can insert it
+    /// before `get_or_decode` runs, and that dispatch is still counted. Under
+    /// concurrent gathers this is an upper bound on decodes, and it is the
+    /// quantity the serial/parallel A/B arm actually differs in. Review on #540
+    /// caught the stronger wording.
     pub parallel_group_decodes: AtomicU64,
     /// Bytes of the row groups an admission verdict let a gather retain.
     ///

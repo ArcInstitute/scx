@@ -682,7 +682,7 @@ def test_hot_control_cold_tail_arm_runs_to_its_summary(phase0_env, monkeypatch):
     assert meta is not None and meta.get("applicable") is True, meta
     # The summary block — the code the NameError lived in.
     assert "median_cellsets_per_sec" in meta, meta
-    assert "row_group_hit_rate_ceiling" in meta, meta
+    assert "control_set_fraction" in meta, meta
 
     runs = [r for r in res.runs if r.extra.get("scenario") == "gather_hot_control_cold_tail"]
     assert runs, "the arm emitted no runs"
