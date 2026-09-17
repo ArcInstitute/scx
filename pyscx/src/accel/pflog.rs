@@ -49,7 +49,6 @@ use scx_sparse::ScxCsr;
 use crate::convert::dtype::UnsFormat;
 use crate::convert::from_anndata::build_output_header;
 use crate::convert::h5ad::extract_scx_overrides;
-use crate::convert::scx_to_scx::{for_each_coo_shard, for_each_dense_shard};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::to_pyerr;
 
@@ -645,42 +644,7 @@ fn stream_pflog_to_scx<S: ShardSource>(
 
     // obsm / varm / obsp / varp / uns (mirror route_scx_lazy_to_scx).
     py.detach(|| -> Result<(), scx_format_io::ScxError> {
-        for (k, b) in &ov.obsm {
-            for_each_dense_shard(
-                b,
-                shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.varm {
-            for_each_dense_shard(
-                b,
-                shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.obsp {
-            for_each_coo_shard(
-                b,
-                shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.varp {
-            for_each_coo_shard(
-                b,
-                shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
+        crate::convert::scx_to_scx::write_mapping_overrides(&mut writer, &ov, shard_rows)?;
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
         }

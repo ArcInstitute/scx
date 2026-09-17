@@ -1217,8 +1217,11 @@ def neighborhood_plans_from_graph(
     Each set is **the centre first**, with `role_tag` 0, then its neighbours
     with `role_tag` 1. The graph is read one row range at a time, so peak memory
     is one obsp shard plus one chunk — except on a graph stored as a single
-    unsharded section, which has to be decoded whole. `scx sort` writes obsp
-    back that way, so a sorted file is always the unbounded case.
+    unsharded section, which has to be decoded whole. Every path that writes an
+    obsp emits shards — `scx sort` / `scx compact` since phase 9, the h5ad and
+    ``from_anndata`` paths always — so that shape means a file written before
+    phase 9, or a graph written through the low-level ``write_obsp`` and then
+    carried by ``scx optimize``.
 
     Rows are **physical** file rows, which is what the gather wants. Deleted
     cells are dropped rather than renumbered: a deleted centre produces no set

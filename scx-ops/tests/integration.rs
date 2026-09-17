@@ -4916,3 +4916,238 @@ fn modify_metadata_keeps_the_ordered_categorical_flag() {
         ["low", "high", "low", "high"]
     );
 }
+
+// --- Phase 9: compact re-emits all four mapping families as row-shards -----
+//
+// `sort`'s half of this lives in `scx-ops/src/sort_engine_tests.rs`. Four
+// independent call sites means four tests: neither op implies the other, and
+// within each op the unimodal tail and the multimodal modality-0 block are
+// separate code.
+//
+// These assert on the catalog because nothing else can: `scx-ops`' carry table
+// folds `ObsmEmbedding` and `ObsmEmbeddingShard` into one `SectionFamily`, so
+// every `*_matches_the_table` test is blind to the collapse, and every other
+// mapping test here reads through `read_all_obsp` / `read_all_obsm`, which
+// assemble either layout transparently.
+
+/// Every modality-0 `obsm/`/`varm/`/`obsp/`/`varp/` entry as `(name, type)`.
+fn phase9_mapping_sections(
+    path: &std::path::Path,
+) -> Vec<(String, scx_format_io::section::SectionType)> {
+    let reader = ScxReader::open(path).unwrap();
+    let mut v: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| {
+            e.modality_id == 0
+                && ["obsm/", "varm/", "obsp/", "varp/"]
+                    .iter()
+                    .any(|p| e.name.starts_with(p))
+        })
+        .map(|e| (e.name.clone(), e.section_type))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+fn phase9_assert_all_four_sharded(path: &std::path::Path) {
+    use scx_format_io::section::SectionType;
+    let got = phase9_mapping_sections(path);
+    for prefix in ["obsm/", "varm/", "obsp/", "varp/"] {
+        assert!(
+            got.iter().any(|(n, _)| n.starts_with(prefix)),
+            "no {prefix} section in the output at all; got {got:?}"
+        );
+    }
+    for (name, ty) in &got {
+        assert!(
+            matches!(
+                ty,
+                SectionType::ObsmEmbeddingShard
+                    | SectionType::VarmEmbeddingShard
+                    | SectionType::ObspEmbeddingShard
+                    | SectionType::VarpEmbeddingShard
+            ),
+            "{name} came back as {ty:?}, not a row-sharded section"
+        );
+        assert!(
+            name.contains("_shard_"),
+            "{name} has a sharded section type but an unsharded section name"
+        );
+    }
+}
+
+#[test]
+fn compact_emits_all_four_mapping_families_as_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    // The fixture writes all four through the UNSHARDED writers, so this also
+    // pins that the emit rule is the op's and not inherited from the input.
+    let path = write_test_file_with_all_mappings(&dir, "maps.scx", 6, 10);
+    let before = phase9_mapping_sections(&path);
+    assert!(
+        before.iter().all(|(n, _)| !n.contains("_shard_")),
+        "premise: the input must be unsharded, got {before:?}"
+    );
+    let out = dir.path().join("maps_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+    phase9_assert_all_four_sharded(&out);
+}
+
+#[test]
+fn compact_multimodal_emits_all_four_global_families_as_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multimodal_with_global_and_per_modality_mappings(&dir, "mm_glob.scx", 6, 8);
+    let out = dir.path().join("mm_glob_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    assert!(reader.is_multimodal());
+    phase9_assert_all_four_sharded(&out);
+    // Per-modality obsm is a different call site, deliberately left on
+    // `write_obsm_for`, and must not have been swept into the globals.
+    assert_eq!(reader.read_obsm_for(1, "X_umap").unwrap().num_rows(), 6);
+    assert_eq!(spurious_global_under(&reader, "obsm/rna/"), 0);
+}
+
+#[test]
+fn compact_shards_the_output_row_space_not_the_input_one() {
+    // Under deletions the keep mask has already been applied when the emitter
+    // sees the batch, so shard boundaries are over the OUTPUT rows — the same
+    // rule `write_obs_section` follows for obs. With 12 obs, 4 deleted and a
+    // target of 4, that is 8 output rows in 2 shards, not 12 rows in 3.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file_with_all_mappings_at_target(&dir, "small.scx", 12, 6, 4);
+    scx_ops::mark_deleted(&path, &[1, 4, 7, 10]).unwrap();
+    let out = dir.path().join("small_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    phase9_assert_all_four_sharded(&out);
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.n_obs(), 8, "premise: 12 obs less 4 deleted");
+    let count = |prefix: &str| {
+        phase9_mapping_sections(&out)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with(prefix))
+            .count()
+    };
+    // Both obs-axis families, not just obsm. Counting only obsm would pass for a
+    // compact that still bucketed the *graph* over the input axis, or that lost
+    // `remap_obsp_coo`'s rewritten `n_rows` — and the graph is the family the
+    // bounded read depends on.
+    assert_eq!(
+        count("obsm/"),
+        2,
+        "8 output rows at a target of 4 is 2 obsm shards; 3 would mean the \
+         input's 12 rows decided the boundaries"
+    );
+    assert_eq!(
+        count("obsp/"),
+        2,
+        "same for the graph: 2 obsp shards over the output axis, not 3 over the input's"
+    );
+    // The var-axis families are cut by n_vars (6 at a target of 4 -> 2), and
+    // must not have followed the obs keep mask.
+    assert_eq!(count("varm/"), 2, "varm is cut by n_vars, unfiltered");
+    assert_eq!(count("varp/"), 2, "varp is cut by n_vars, unfiltered");
+
+    // The assembled mappings must report the output's own row count, which is
+    // also what `BackedPairwiseReader::new_obsp` requires of the graph.
+    assert_eq!(reader.read_all_obsm().unwrap()["X_pca"].num_rows(), 8);
+    let obsp = reader.read_all_obsp().unwrap();
+    let declared: usize = obsp["connectivities"]
+        .schema_ref()
+        .metadata()
+        .get("n_rows")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        declared,
+        reader.n_obs() as usize,
+        "the graph's declared extent must equal the compacted obs axis"
+    );
+}
+
+/// `write_test_file_with_all_mappings` with a caller-chosen
+/// `shard_target_rows`, so a small fixture can still produce several shards.
+fn write_test_file_with_all_mappings_at_target(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    shard_target_rows: u32,
+) -> PathBuf {
+    use std::collections::HashMap;
+    let path = dir.path().join(filename);
+    let header =
+        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, shard_target_rows, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    let dense = |n: usize| {
+        let schema = Schema::new(vec![
+            Field::new("c0", DataType::Float32, false),
+            Field::new("c1", DataType::Float32, false),
+        ]);
+        arrow::array::RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(arrow::array::Float32Array::from(
+                    (0..n).map(|i| i as f32).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow::array::Float32Array::from(
+                    (0..n).map(|i| (i + n) as f32).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    writer.write_obsm("X_pca", &dense(n_obs)).unwrap();
+    writer.write_varm("PCs", &dense(n_vars)).unwrap();
+    // A self-loop per row, so every surviving row keeps exactly one edge and a
+    // shard's triple count is its surviving row count.
+    let ring = |n: usize| {
+        let schema = Schema::new_with_metadata(
+            vec![
+                Field::new("row", DataType::Int32, false),
+                Field::new("col", DataType::Int32, false),
+                Field::new("data", DataType::Float32, false),
+            ],
+            HashMap::from([
+                ("n_rows".to_string(), n.to_string()),
+                ("n_cols".to_string(), n.to_string()),
+            ]),
+        );
+        arrow::array::RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(
+                    (0..n as i32).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow::array::Int32Array::from(
+                    (0..n as i32).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow::array::Float32Array::from(
+                    (0..n).map(|i| (i + 1) as f32).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    writer.write_obsp("connectivities", &ring(n_obs)).unwrap();
+    writer.write_varp("corr", &ring(n_vars)).unwrap();
+    writer.finish().unwrap();
+    path
+}

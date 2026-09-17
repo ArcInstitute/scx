@@ -5,7 +5,6 @@
 use arrow::array::RecordBatch;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use std::sync::Arc;
 
 use scx_codec::CodecId;
 use scx_format_io::section::SectionType;
@@ -441,42 +440,7 @@ pub(crate) fn route_scx_backed_to_scx(
     // matches what the streaming pipeline produces (readers handle
     // both sharded and legacy single-section layouts transparently).
     py.detach(|| -> Result<(), scx_format_io::ScxError> {
-        for (k, b) in &ov.obsm {
-            for_each_dense_shard(
-                b,
-                out_shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.varm {
-            for_each_dense_shard(
-                b,
-                out_shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.obsp {
-            for_each_coo_shard(
-                b,
-                out_shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.varp {
-            for_each_coo_shard(
-                b,
-                out_shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
+        write_mapping_overrides(&mut writer, &ov, out_shard_rows)?;
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
         }
@@ -657,42 +621,7 @@ pub(crate) fn route_scx_lazy_to_scx(
     )?;
 
     py.detach(|| -> Result<(), scx_format_io::ScxError> {
-        for (k, b) in &ov.obsm {
-            for_each_dense_shard(
-                b,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.varm {
-            for_each_dense_shard(
-                b,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.obsp {
-            for_each_coo_shard(
-                b,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (k, b) in &ov.varp {
-            for_each_coo_shard(
-                b,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
+        write_mapping_overrides(&mut writer, &ov, shard_target_rows)?;
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
         }
@@ -954,190 +883,6 @@ pub(crate) fn section_keys_match(
     let disk_set: std::collections::BTreeSet<&String> = disk_keys.iter().collect();
     Ok(py_set == disk_set)
 }
-
-/// Slice a dense obsm/varm `RecordBatch` into row-aligned shards and
-/// emit each via `f`. Used by the SCX-backed / lazy / in-memory
-/// `from_anndata` paths so all pyscx-produced SCX files share the
-/// sharded on-disk layout the streaming pipeline emits.
-///
-/// The callback signature is `(shard_idx, row_start, n_shard_rows,
-/// n_rows_total, batch)`; `n_shard_rows == batch.num_rows()` for dense
-/// but the parameter is passed explicitly so the writer's contiguity
-/// metadata is sourced from one place.
-pub(crate) fn for_each_dense_shard<F>(
-    batch: &RecordBatch,
-    shard_target_rows: u32,
-    mut f: F,
-) -> std::result::Result<(), scx_format_io::ScxError>
-where
-    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format_io::ScxError>,
-{
-    let n_rows = batch.num_rows();
-    let n_total = n_rows as u64;
-    if n_rows == 0 {
-        return f(0, 0, 0, 0, batch);
-    }
-    let step = shard_target_rows.max(1) as usize;
-    let mut shard_idx = 0u32;
-    let mut row_start = 0usize;
-    while row_start < n_rows {
-        let n = (n_rows - row_start).min(step);
-        let shard = batch.slice(row_start, n);
-        f(shard_idx, row_start as u64, n as u64, n_total, &shard)?;
-        row_start += n;
-        shard_idx += 1;
-    }
-    Ok(())
-}
-
-/// Slice a COO obsp/varp `RecordBatch` into row-shards keyed by the
-/// `row` column. Buckets non-zero triples by `row / shard_target_rows`
-/// then emits one shard per non-empty bucket. Used by the in-Python
-/// override paths to keep on-disk obsp/varp layout symmetric with the
-/// streaming pipeline. Returns `ScxError` (not `PyResult`) so callers
-/// can drive it from inside `py.detach(...)`.
-pub(crate) fn for_each_coo_shard<F>(
-    batch: &RecordBatch,
-    shard_target_rows: u32,
-    mut f: F,
-) -> std::result::Result<(), scx_format_io::ScxError>
-where
-    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format_io::ScxError>,
-{
-    use arrow::array::{Array, Float32Array, Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    let invalid = |msg: String| {
-        scx_format_io::ScxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-    };
-
-    // Width-generic: accept both v1 (Int32) and v2 (Int64) row/col columns,
-    // and emit shards with the same coord dtype as the input. Reuse
-    // `coo_coords_from_batch` so the inner bucketing loop dispatches on
-    // `CooCoordsRef` (static match) rather than `Box<dyn Fn>` (per-element
-    // vtable call + heap alloc).
-    let coords = coo_coords_from_batch(batch).map_err(|e| invalid(e.to_string()))?;
-    let coord_dt = match &coords {
-        CooCoordsRef::Int32(_, _) => DataType::Int32,
-        CooCoordsRef::Int64(_, _) => DataType::Int64,
-    };
-    let data_arr = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| invalid("sparse override: column 2 must be Float32".into()))?;
-    let nnz = coords.len();
-
-    let metadata = batch.schema_ref().metadata().clone();
-    let n_rows: usize = metadata
-        .get("n_rows")
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| invalid("sparse override: missing 'n_rows' metadata".into()))?;
-    let n_cols: usize = metadata
-        .get("n_cols")
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| invalid("sparse override: missing 'n_cols' metadata".into()))?;
-
-    let step = shard_target_rows.max(1) as usize;
-    if n_rows == 0 {
-        return f(0, 0, 0, 0, batch);
-    }
-
-    // Bucket count scales with the logical row axis. For atlas-scale v2
-    // obsp (axis ≥ 2^31) this would allocate hundreds of thousands of
-    // empty `Vec`s up-front — fail fast with a clear message rather than
-    // silently OOM. Real callers either route through the streaming
-    // converter (which writes shards incrementally without this bucket
-    // table) or use Phase 6's dedicated huge-obsp path.
-    let n_shards = n_rows.div_ceil(step);
-    const MAX_BUCKETS: usize = 1_000_000;
-    if n_shards > MAX_BUCKETS {
-        return Err(invalid(format!(
-            "for_each_coo_shard: logical n_rows={n_rows} would require {n_shards} shard buckets \
-             (cap {MAX_BUCKETS}). Route this obsp / varp through the streaming converter \
-             or pre-split it into row bands before re-shading."
-        )));
-    }
-    let mut bucket_row: Vec<Vec<i64>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut bucket_col: Vec<Vec<i64>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut bucket_data: Vec<Vec<f32>> = (0..n_shards).map(|_| Vec::new()).collect();
-    for i in 0..nnz {
-        let r = coords.row_i64(i);
-        if r < 0 {
-            return Err(invalid(format!("sparse override: negative row index {r}")));
-        }
-        let r_us = r as usize;
-        let shard = r_us / step;
-        if shard >= n_shards {
-            return Err(invalid(format!(
-                "sparse override: row {r} exceeds n_rows={n_rows}"
-            )));
-        }
-        bucket_row[shard].push(r);
-        bucket_col[shard].push(coords.col_i64(i));
-        bucket_data[shard].push(data_arr.value(i));
-    }
-
-    let n_total = n_rows as u64;
-    for shard_idx in 0..n_shards {
-        let row_start = shard_idx * step;
-        let n_shard_rows = step.min(n_rows - row_start);
-        let schema = Arc::new(Schema::new_with_metadata(
-            vec![
-                Field::new("row", coord_dt.clone(), false),
-                Field::new("col", coord_dt.clone(), false),
-                Field::new("data", DataType::Float32, false),
-            ],
-            std::collections::HashMap::from([
-                ("n_rows".to_string(), n_rows.to_string()),
-                ("n_cols".to_string(), n_cols.to_string()),
-            ]),
-        ));
-        let row_i64_taken = std::mem::take(&mut bucket_row[shard_idx]);
-        let col_i64_taken = std::mem::take(&mut bucket_col[shard_idx]);
-        let (row_array, col_array): (Arc<dyn Array>, Arc<dyn Array>) = match &coord_dt {
-            DataType::Int32 => (
-                Arc::new(Int32Array::from(
-                    row_i64_taken
-                        .into_iter()
-                        .map(|v| v as i32)
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(Int32Array::from(
-                    col_i64_taken
-                        .into_iter()
-                        .map(|v| v as i32)
-                        .collect::<Vec<_>>(),
-                )),
-            ),
-            DataType::Int64 => (
-                Arc::new(Int64Array::from(row_i64_taken)),
-                Arc::new(Int64Array::from(col_i64_taken)),
-            ),
-            _ => unreachable!(),
-        };
-        let shard_batch = RecordBatch::try_new(
-            schema,
-            vec![
-                row_array,
-                col_array,
-                Arc::new(Float32Array::from(std::mem::take(
-                    &mut bucket_data[shard_idx],
-                ))),
-            ],
-        )
-        .map_err(scx_format_io::ScxError::Arrow)?;
-        f(
-            shard_idx as u32,
-            row_start as u64,
-            n_shard_rows as u64,
-            n_total,
-            &shard_batch,
-        )?;
-    }
-    Ok(())
-}
-
 /// Helper for the backed-routing path. Reads a dense mapping
 /// (`obsm` / `varm`) from a Python AnnData and returns
 /// `Vec<(name, RecordBatch)>`. Missing groups → empty Vec.
@@ -1207,4 +952,75 @@ pub(crate) fn extract_uns_value(
     let np_ndarray = np.getattr("ndarray")?;
     let mut ctx = UnsWriteCtx::new(uns_format_parsed, &np_generic, &np_ndarray);
     Ok(Some(normalize_uns_value(&uns, "uns", &mut ctx)?))
+}
+
+/// Write an [`ScxOverrides`]' four mapping families as row-shards.
+///
+/// Three call sites want exactly this — the backed and lazy `from_anndata`
+/// rewrites and PFlog's materialise — differing only in the shard target, so it
+/// is one function rather than three copies of the same four loops.
+pub(crate) fn write_mapping_overrides(
+    writer: &mut ScxWriter,
+    ov: &crate::convert::h5ad::ScxOverrides,
+    shard_target_rows: u32,
+) -> std::result::Result<(), scx_format_io::ScxError> {
+    for (k, b) in &ov.obsm {
+        scx_format_io::for_each_dense_mapping_shard(b, shard_target_rows, |m, shard| {
+            writer.write_obsm_shard(
+                k,
+                m.shard_idx,
+                m.row_start,
+                m.n_shard_rows,
+                m.n_rows_total,
+                shard,
+            )
+        })?;
+    }
+    for (k, b) in &ov.varm {
+        scx_format_io::for_each_dense_mapping_shard(b, shard_target_rows, |m, shard| {
+            writer.write_varm_shard(
+                k,
+                m.shard_idx,
+                m.row_start,
+                m.n_shard_rows,
+                m.n_rows_total,
+                shard,
+            )
+        })?;
+    }
+    for (k, b) in &ov.obsp {
+        scx_format_io::for_each_coo_mapping_shard(
+            &format!("obsp/{k}"),
+            b,
+            shard_target_rows,
+            |m, shard| {
+                writer.write_obsp_shard_coo(
+                    k,
+                    m.shard_idx,
+                    m.row_start,
+                    m.n_shard_rows,
+                    m.n_rows_total,
+                    shard,
+                )
+            },
+        )?;
+    }
+    for (k, b) in &ov.varp {
+        scx_format_io::for_each_coo_mapping_shard(
+            &format!("varp/{k}"),
+            b,
+            shard_target_rows,
+            |m, shard| {
+                writer.write_varp_shard_coo(
+                    k,
+                    m.shard_idx,
+                    m.row_start,
+                    m.n_shard_rows,
+                    m.n_rows_total,
+                    shard,
+                )
+            },
+        )?;
+    }
+    Ok(())
 }

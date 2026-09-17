@@ -3,6 +3,7 @@
 // Used by build_csc and upgrade to avoid duplicating layer/obsm/uns/
 // predicate-index/provenance copy logic.
 
+use arrow::array::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::catalog::{FullCatalogEntry, ShardStats};
 use scx_format_io::provenance::ProvenanceEntry;
@@ -918,6 +919,136 @@ pub(crate) fn append_provenance(
         input_checksums: vec![],
     });
     writer.write_provenance(prov_entries)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sharded emit for the four auxiliary mapping families
+// ---------------------------------------------------------------------------
+
+// Emit a dense `obsm` / `varm` batch, or a pairwise `obsp` / `varp` COO
+// batch, as row-shards rather than one legacy section.
+//
+// # Why `sort` and `compact` go through these
+//
+// Both ops used to re-emit all four families through the *unsharded* writers,
+// collapsing whatever layout the input had into one section. That defeats
+// every bounded read: `BackedPairwiseReader` resolves a single-entry layout
+// spanning the whole row axis, so `read_obsp_rows` (and the neighbourhood
+// plan builder over it) decodes the entire graph for any range. It also made
+// the two ops *downgrade* a layout `pyscx.from_anndata` had produced, since
+// that writer has emitted all four sharded since pyscx-v0.4.4.
+//
+// # The shard target
+//
+// The caller passes the same target its X and obs shards use — `sort` takes
+// `SortOptions::shard_target_rows`, `compact` inherits
+// `in_header.shard_target_rows` (it has no option of its own) — so one file's
+// families agree on a boundary.
+//
+// Boundaries are over the **output** row space, always. For `sort` that is
+// forced: a global permutation makes the input's boundaries meaningless, so
+// there is nothing to preserve. For `compact` the keep mask has already been
+// applied to the batch, so its rows are output rows too.
+//
+// A mapping at or below the target becomes exactly one shard
+// (`…_shard_0`) — still the sharded section type, and still bounded-readable.
+/// `obsm/<name>` as [`SectionType::ObsmEmbeddingShard`] sections.
+pub(crate) fn write_obsm_sharded(
+    writer: &mut ScxWriter,
+    name: &str,
+    batch: &RecordBatch,
+    shard_target_rows: u32,
+) -> OpsResult<()> {
+    scx_format_io::for_each_dense_mapping_shard(batch, shard_target_rows, |m, shard| {
+        writer.write_obsm_shard(
+            name,
+            m.shard_idx,
+            m.row_start,
+            m.n_shard_rows,
+            m.n_rows_total,
+            shard,
+        )
+    })?;
+    Ok(())
+}
+
+/// `varm/<name>` as [`SectionType::VarmEmbeddingShard`] sections.
+///
+/// Sharded along the **var** axis, at the same target. `varm` is passthrough
+/// in both ops (vars are neither deleted nor permuted), so this is a pure
+/// layout change.
+pub(crate) fn write_varm_sharded(
+    writer: &mut ScxWriter,
+    name: &str,
+    batch: &RecordBatch,
+    shard_target_rows: u32,
+) -> OpsResult<()> {
+    scx_format_io::for_each_dense_mapping_shard(batch, shard_target_rows, |m, shard| {
+        writer.write_varm_shard(
+            name,
+            m.shard_idx,
+            m.row_start,
+            m.n_shard_rows,
+            m.n_rows_total,
+            shard,
+        )
+    })?;
+    Ok(())
+}
+
+/// `obsp/<name>` as [`SectionType::ObspEmbeddingShard`] sections.
+///
+/// Note this also flips the output header's `has_obsp` flag on, which
+/// `write_obsp` never set (`scx-format/src/header.rs` derives it from the
+/// shard and CSR forms only) — so `scx info` reports an obsp that a sorted or
+/// compacted file has always carried but never advertised.
+pub(crate) fn write_obsp_sharded(
+    writer: &mut ScxWriter,
+    name: &str,
+    batch: &RecordBatch,
+    shard_target_rows: u32,
+) -> OpsResult<()> {
+    scx_format_io::for_each_coo_mapping_shard(
+        &format!("obsp/{name}"),
+        batch,
+        shard_target_rows,
+        |m, shard| {
+            writer.write_obsp_shard_coo(
+                name,
+                m.shard_idx,
+                m.row_start,
+                m.n_shard_rows,
+                m.n_rows_total,
+                shard,
+            )
+        },
+    )?;
+    Ok(())
+}
+
+/// `varp/<name>` as [`SectionType::VarpEmbeddingShard`] sections.
+pub(crate) fn write_varp_sharded(
+    writer: &mut ScxWriter,
+    name: &str,
+    batch: &RecordBatch,
+    shard_target_rows: u32,
+) -> OpsResult<()> {
+    scx_format_io::for_each_coo_mapping_shard(
+        &format!("varp/{name}"),
+        batch,
+        shard_target_rows,
+        |m, shard| {
+            writer.write_varp_shard_coo(
+                name,
+                m.shard_idx,
+                m.row_start,
+                m.n_shard_rows,
+                m.n_rows_total,
+                shard,
+            )
+        },
+    )?;
     Ok(())
 }
 

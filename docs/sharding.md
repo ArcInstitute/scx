@@ -712,7 +712,8 @@ Convert-time grouping (`scx convert --group-by`) picks a one-pass or two-pass
 route: `--group-pass auto` (default) streams CSR X in one pass and routes dense
 X — **or any input that carries `obsp`** — through the two-pass path (plain
 convert then `scx sort --group-by`) so `obsp` is remapped and preserved rather
-than dropped. This means a CSR h5ad that carries `obsp` (e.g. `connectivities`)
+than dropped — and, since phase 9, re-emitted as row-shards, so the grouped
+output still supports a bounded `read_obsp_rows`. This means a CSR h5ad that carries `obsp` (e.g. `connectivities`)
 takes the heavier two-pass route (a transient temp file) by default; forcing
 `--group-pass one` on such an input errors and points at `--group-pass two`.
 
@@ -888,6 +889,84 @@ shard per obs/var column, even at multi-million-row scale. A legacy
 single-section obs/var source goes through the whole-batch driver
 `write_dataframe_group_at`, which is the same writer over a one-shard
 iterator — not a separate implementation.
+
+## Obsm / varm / obsp / varp sharding
+
+The four auxiliary mapping families shard on the **row axis of their own
+matrix**: `obsm` / `obsp` along obs, `varm` / `varp` along var. Section names
+are `<family>/<key>_shard_<idx>` (section types 20–23), and the Arrow schema
+metadata carries `shard_idx` / `row_start` / `n_shard_rows` / `n_rows_total`
+exactly as an obs shard does, so the reader can check that the entries form a
+contiguous ordered cover and reassemble them.
+
+This is decided separately from obs/var metadata sharding, and by a different
+rule: there is **no policy knob** — a writer that shards does so
+unconditionally, at the file's `shard_target_rows`. But **not every writer
+shards**, so the producer matters:
+
+**Which families a producer touches matters as much as its layout**, because
+the unsharded producers are all on the `obsm` side. Every path that writes an
+`obsp` emits shards, so a bounded graph read has no live producer to worry
+about; a bounded *embedding* read does.
+
+| Producer | Families it writes | Layout |
+|---|---|---|
+| `scx convert --from h5ad` / `--from 10x`, `pyscx.from_h5ad` | all four | sharded, at `--shard-size` |
+| `pyscx.from_anndata` (in-memory, backed, lazy) | all four | sharded, at the target `shard_size` |
+| `pyscx.accel.pflog(store=…)` materialise | all four | sharded, at the target `shard_size` |
+| `scx sort` (since phase 9) | all four | sharded, at `SortOptions::shard_target_rows` |
+| `scx compact` (since phase 9) | all four | sharded, at the **input header's** `shard_target_rows` |
+| `scx merge` | all four | sharded — one output shard per input section |
+| `scx optimize` | all four | copies the section verbatim, preserving whatever it finds |
+| **`scx convert --from h5mu`, `pyscx.from_h5mu`, `pyscx.from_mudata`** | **`obsm` only** | ⚠️ **one unsharded section** — global via `write_obsm`, per-modality via `write_obsm_for`. Writes no `obsp`/`varp` at all |
+| **`modify_metadata`, `obs_import` / `var_import`, `attach_external_layer`** | **`obsm` only** | ⚠️ **one unsharded section** — they re-emit `obsm` whole; existing `obsp`/`varp` sections pass through untouched |
+| **`scx-engine`'s fused ops** (`fused_ops.rs`) | **`obsm` only** | ⚠️ **one unsharded section** — `write_obsm` |
+| **`scx subset`** | — | ⚠️ drops all four families |
+
+The low-level `ScxWriter::write_obsp` / `write_obsm` are still there and still
+write one section; nothing above calls them for a graph, but `scx optimize`
+will carry one forward verbatim if it finds it.
+
+A mapping at or below the target becomes a single `…_shard_0` — still the
+sharded section type, and still bounded-readable. Boundaries are always over
+the **output** row space, so a compacted mapping is cut by its surviving rows.
+The rows marked ⚠️ are the remaining unsharded producers; a freshly converted
+**MuData** file's global `obsm` in particular is still one section, so a
+bounded read over it is unbounded until the file has been through `sort` or
+`compact`.
+
+Most of the sharding writers go through one emitter pair
+(`scx_format_io::for_each_dense_mapping_shard` / `for_each_coo_mapping_shard`),
+which is what keeps them from disagreeing about a boundary: the h5ad override
+path, every `pyscx.from_anndata` route, PFlog's materialise, and all eight
+`sort` / `compact` sites.
+
+Two writers decide boundaries themselves, and neither is a disagreement:
+
+- the **disk-streaming h5ad** path cuts by HDF5 hyperslab as it reads, so it
+  never holds the whole mapping — it stamps the same cover contract from a
+  different loop;
+- **`scx merge`** emits one output shard per *input* section
+  (`scx-ops/src/merge_pairwise.rs`, `merge.rs`), shifting each input's stamped
+  span into the concatenated axis. It has no target to cut at, because it is
+  concatenating covers rather than building one.
+
+Note this does **not** contradict the obs rule above that "optimize never
+collapses or re-sizes existing obs shards": that is a statement about `obs`,
+which has a tri-state policy and can legitimately be left alone. Mappings have
+no policy, and `optimize` leaves them alone too — by copying their bytes.
+
+**What it buys.** `Experiment.read_obsp_rows(key, start, stop)` and the
+neighbourhood plan builders decode only the shards a row range covers. On a
+single-section graph they have to decode the whole thing, which is why phase 9
+moved `sort` and `compact` off the unsharded writers: `scx sort` on a
+position-tracking key is the lever for spatial shard locality, and pulling it
+used to cost the bounded read.
+
+**Reading a pre-phase-9 file.** `read_obsp` / `read_obsm` prefer the sharded
+layout and fall back to the single section, so a file written before phase 9 —
+or by one of the ⚠️ producers above — reads unchanged, just unbounded. The
+sharded layout itself is not new; it has been readable since pyscx-v0.4.4.
 
 ## CSC sharding
 

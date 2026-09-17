@@ -111,14 +111,19 @@ pub(super) fn write_dense_mapping_section(
     row_perm: Option<&[u64]>,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    let emit = |w: &mut ScxWriter,
-                name: &str,
-                shard_idx: u32,
-                row_start: u64,
-                n_shard_rows: u64,
-                n_total: u64,
-                batch: &RecordBatch|
-     -> Result<(), ConvertError> {
+    // One dispatch for both shard writers, at `ScxError` — the error type the
+    // shared emitters' callback takes. Every caller here is inside a
+    // `Result<(), ConvertError>` fn, so `?` widens it via the existing
+    // `ConvertError: From<ScxError>`; a second `ConvertError`-typed copy of
+    // this match would be the same four arms for no decision.
+    let emit_io = |w: &mut ScxWriter,
+                   name: &str,
+                   shard_idx: u32,
+                   row_start: u64,
+                   n_shard_rows: u64,
+                   n_total: u64,
+                   batch: &RecordBatch|
+     -> scx_format_io::Result<()> {
         match kind {
             DenseMappingKind::Obsm => {
                 w.write_obsm_shard(name, shard_idx, row_start, n_shard_rows, n_total, batch)
@@ -127,7 +132,6 @@ pub(super) fn write_dense_mapping_section(
                 w.write_varm_shard(name, shard_idx, row_start, n_shard_rows, n_total, batch)
             }
         }
-        .map_err(ConvertError::from)
     };
 
     if let Some(entries) = override_entries {
@@ -141,30 +145,17 @@ pub(super) fn write_dense_mapping_section(
                 }
                 None => batch,
             };
-            let n_rows = batch.num_rows();
-            let n_total = n_rows as u64;
-            if n_rows == 0 {
-                emit(writer, name, 0, 0, 0, 0, batch)?;
-                continue;
-            }
-            let step = shard_target_rows.max(1) as usize;
-            let mut shard_idx = 0u32;
-            let mut row_start = 0usize;
-            while row_start < n_rows {
-                let n = (n_rows - row_start).min(step);
-                let shard = batch.slice(row_start, n);
-                emit(
+            scx_format_io::for_each_dense_mapping_shard(batch, shard_target_rows, |m, shard| {
+                emit_io(
                     writer,
                     name,
-                    shard_idx,
-                    row_start as u64,
-                    n as u64,
-                    n_total,
-                    &shard,
-                )?;
-                row_start += n;
-                shard_idx += 1;
-            }
+                    m.shard_idx,
+                    m.row_start,
+                    m.n_shard_rows,
+                    m.n_rows_total,
+                    shard,
+                )
+            })?;
         }
         return Ok(());
     }
@@ -203,7 +194,7 @@ pub(super) fn write_dense_mapping_section(
         // survives round-trip (mirrors the override-path special case).
         if info.n_rows == 0 {
             let batch = read_dense_mapping_shard(file, group_path, &info.name, 0, 0)?;
-            emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            emit_io(writer, &info.name, 0, 0, 0, 0, &batch)?;
             continue;
         }
         // Sort-on-convert (obsm): gather each output shard in permuted order
@@ -236,7 +227,7 @@ pub(super) fn write_dense_mapping_section(
                     &info.name,
                     &perm[row_start..row_start + n],
                 )?;
-                emit(
+                emit_io(
                     writer,
                     &info.name,
                     shard_idx,
@@ -257,7 +248,7 @@ pub(super) fn write_dense_mapping_section(
             let row_end = (row_start + step).min(info.n_rows);
             let batch = read_dense_mapping_shard(file, group_path, &info.name, row_start, row_end)?;
             let n_shard_rows = (row_end - row_start) as u64;
-            emit(
+            emit_io(
                 writer,
                 &info.name,
                 shard_idx,
@@ -286,14 +277,16 @@ pub(super) fn write_sparse_mapping_section(
     kind: SparseMappingKind,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    let emit = |w: &mut ScxWriter,
-                name: &str,
-                shard_idx: u32,
-                row_start: u64,
-                n_shard_rows: u64,
-                n_total: u64,
-                batch: &RecordBatch|
-     -> Result<(), ConvertError> {
+    // As in `write_dense_mapping_section`: one dispatch, at the error type the
+    // shared emitter's callback takes; `?` widens it at each call site.
+    let emit_io = |w: &mut ScxWriter,
+                   name: &str,
+                   shard_idx: u32,
+                   row_start: u64,
+                   n_shard_rows: u64,
+                   n_total: u64,
+                   batch: &RecordBatch|
+     -> scx_format_io::Result<()> {
         match kind {
             SparseMappingKind::Obsp => {
                 w.write_obsp_shard_coo(name, shard_idx, row_start, n_shard_rows, n_total, batch)
@@ -302,22 +295,26 @@ pub(super) fn write_sparse_mapping_section(
                 w.write_varp_shard_coo(name, shard_idx, row_start, n_shard_rows, n_total, batch)
             }
         }
-        .map_err(ConvertError::from)
     };
 
     if let Some(entries) = override_entries {
         for (name, batch) in entries {
-            partition_coo_to_shards(
+            let logical = match kind {
+                SparseMappingKind::Obsp => format!("obsp/{name}"),
+                SparseMappingKind::Varp => format!("varp/{name}"),
+            };
+            scx_format_io::for_each_coo_mapping_shard(
+                &logical,
                 batch,
                 shard_target_rows,
-                |shard_idx, row_start, n_shard_rows, n_total, sub| {
-                    emit(
+                |m, sub| {
+                    emit_io(
                         writer,
                         name,
-                        shard_idx,
-                        row_start,
-                        n_shard_rows,
-                        n_total,
+                        m.shard_idx,
+                        m.row_start,
+                        m.n_shard_rows,
+                        m.n_rows_total,
                         sub,
                     )
                 },
@@ -363,11 +360,11 @@ pub(super) fn write_sparse_mapping_section(
     for info in &sparse_infos {
         let n_total = info.n_rows as u64;
         // Zero-row sparse mappings: emit a single empty shard so the
-        // key survives round-trip (mirrors the override-path special
-        // case in `partition_coo_to_shards`).
+        // key survives round-trip (mirrors the override path, which gets the
+        // same arm from `scx_format_io::for_each_coo_mapping_shard`).
         if info.n_rows == 0 {
             let batch = read_sparse_mapping_shard(file, group_path, info, 0, 0)?;
-            emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            emit_io(writer, &info.name, 0, 0, 0, 0, &batch)?;
             continue;
         }
         let step = shard_target_rows.max(1) as usize;
@@ -377,7 +374,7 @@ pub(super) fn write_sparse_mapping_section(
             let row_end = (row_start + step).min(info.n_rows);
             let batch = read_sparse_mapping_shard(file, group_path, info, row_start, row_end)?;
             let n_shard_rows = (row_end - row_start) as u64;
-            emit(
+            emit_io(
                 writer,
                 &info.name,
                 shard_idx,
@@ -402,7 +399,7 @@ pub(super) fn write_sparse_mapping_section(
         if info.n_rows == 0 {
             let batch = read_dense_mapping_shard(file, group_path, &info.name, 0, 0)?;
             let coo = dense_shard_to_coo(&batch, 0, 0)?;
-            emit(writer, &info.name, 0, 0, 0, 0, &coo)?;
+            emit_io(writer, &info.name, 0, 0, 0, 0, &coo)?;
             continue;
         }
         let step = shard_target_rows.max(1) as usize;
@@ -413,7 +410,7 @@ pub(super) fn write_sparse_mapping_section(
             let batch = read_dense_mapping_shard(file, group_path, &info.name, row_start, row_end)?;
             let coo = dense_shard_to_coo(&batch, row_start as u64, info.n_rows)?;
             let n_shard_rows = (row_end - row_start) as u64;
-            emit(
+            emit_io(
                 writer,
                 &info.name,
                 shard_idx,
@@ -504,126 +501,4 @@ fn dense_shard_to_coo(
             Arc::new(Float32Array::from(data)),
         ],
     )?)
-}
-
-/// Slice an in-memory COO `RecordBatch` into row-aligned shards and
-/// invoke `f` once per shard. Used only on the override path — the
-/// disk-streaming path reads pre-sliced shards directly.
-fn partition_coo_to_shards<F>(
-    batch: &RecordBatch,
-    shard_target_rows: u32,
-    mut f: F,
-) -> Result<(), ConvertError>
-where
-    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> Result<(), ConvertError>,
-{
-    use arrow::array::{Float32Array, Int32Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    let row_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| ConvertError::Other("sparse override: column 0 must be Int32".into()))?;
-    let col_arr = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| ConvertError::Other("sparse override: column 1 must be Int32".into()))?;
-    let data_arr = batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| ConvertError::Other("sparse override: column 2 must be Float32".into()))?;
-
-    let metadata = batch.schema_ref().metadata().clone();
-    let n_rows: usize = metadata
-        .get("n_rows")
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| {
-            ConvertError::Other("sparse override: schema metadata missing 'n_rows'".into())
-        })?;
-    let n_cols: usize = metadata
-        .get("n_cols")
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| {
-            ConvertError::Other("sparse override: schema metadata missing 'n_cols'".into())
-        })?;
-
-    let step = shard_target_rows.max(1) as usize;
-    if n_rows == 0 {
-        let sub = batch.slice(0, 0);
-        f(0, 0, 0, 0, &sub)?;
-        return Ok(());
-    }
-
-    let nnz = row_arr.len();
-    let row_values = row_arr.values();
-    let col_values = col_arr.values();
-    let data_values = data_arr.values();
-
-    // Group COO triples by shard via a single linear pass; the override
-    // batch may be unsorted by row, so we bucket into per-shard Vecs.
-    let n_shards = n_rows.div_ceil(step);
-    let mut buckets_row: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut buckets_col: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut buckets_data: Vec<Vec<f32>> = (0..n_shards).map(|_| Vec::new()).collect();
-    for i in 0..nnz {
-        let r = row_values[i];
-        if r < 0 {
-            return Err(ConvertError::Other(format!(
-                "sparse override: negative row index {r}"
-            )));
-        }
-        let shard = (r as usize) / step;
-        if shard >= n_shards {
-            return Err(ConvertError::Other(format!(
-                "sparse override: row {r} exceeds n_rows={n_rows}"
-            )));
-        }
-        buckets_row[shard].push(r);
-        buckets_col[shard].push(col_values[i]);
-        buckets_data[shard].push(data_values[i]);
-    }
-
-    let n_total = n_rows as u64;
-    for shard_idx in 0..n_shards {
-        let row_start = shard_idx * step;
-        let n_shard_rows = step.min(n_rows - row_start);
-        let schema = Arc::new(Schema::new_with_metadata(
-            vec![
-                Field::new("row", DataType::Int32, false),
-                Field::new("col", DataType::Int32, false),
-                Field::new("data", DataType::Float32, false),
-            ],
-            HashMap::from([
-                ("n_rows".to_string(), n_rows.to_string()),
-                ("n_cols".to_string(), n_cols.to_string()),
-            ]),
-        ));
-        let shard_batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(std::mem::take(
-                    &mut buckets_row[shard_idx],
-                ))),
-                Arc::new(Int32Array::from(std::mem::take(
-                    &mut buckets_col[shard_idx],
-                ))),
-                Arc::new(Float32Array::from(std::mem::take(
-                    &mut buckets_data[shard_idx],
-                ))),
-            ],
-        )?;
-        f(
-            shard_idx as u32,
-            row_start as u64,
-            n_shard_rows as u64,
-            n_total,
-            &shard_batch,
-        )?;
-    }
-    Ok(())
 }

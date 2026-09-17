@@ -56,6 +56,9 @@ pub use csr::BackedCsrReader;
 pub use dense::BackedDenseReader;
 pub use index::BackedCsrIndex;
 pub use pairwise::{BackedPairwiseReader, PairwiseRows};
+// Shared with `crate::mapping_shards`, which needs a width-generic read of a
+// COO batch's `row` column and should not hand-roll a second one.
+pub(crate) use pairwise::coo_coord_borrow;
 
 /// Process-wide switch for the codec-agnostic **block-index** scattered read
 /// path (F5 Phase 1). Default on; `SCX_SCATTER_BLOCK_INDEX=0` (or `false`)

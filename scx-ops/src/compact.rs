@@ -410,7 +410,10 @@ pub fn compact_with_options(
         output_shard_row_ranges.push((shard_row_start, emitted_rows));
     }
 
-    // Copy obsm (row-filtered)
+    // Copy obsm (row-filtered), as row-shards at the input's shard target —
+    // the same one this op's X shards use. The keep mask has already been
+    // applied, so the boundaries are over the OUTPUT row space, which is the
+    // rule `write_obs_section` follows for obs.
     if has_obsm {
         let all_obsm = reader.read_all_obsm()?;
         for (name, batch) in &all_obsm {
@@ -420,7 +423,12 @@ pub fn compact_with_options(
             } else {
                 batch.clone()
             };
-            writer.write_obsm(name, &filtered_batch)?;
+            crate::rewrite_helpers::write_obsm_sharded(
+                &mut writer,
+                name,
+                &filtered_batch,
+                shard_target,
+            )?;
         }
     }
 
@@ -521,14 +529,14 @@ pub fn compact_with_options(
     let mut varm: Vec<_> = reader.read_all_varm()?.into_iter().collect();
     varm.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, batch) in &varm {
-        writer.write_varm(name, batch)?;
+        crate::rewrite_helpers::write_varm_sharded(&mut writer, name, batch, shard_target)?;
     }
 
     // Copy varp (var×var; var-axis on both dimensions → unfiltered).
     let mut varp: Vec<_> = reader.read_all_varp()?.into_iter().collect();
     varp.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, batch) in &varp {
-        writer.write_varp(name, batch)?;
+        crate::rewrite_helpers::write_varp_sharded(&mut writer, name, batch, shard_target)?;
     }
 
     // Copy obsp (obs×obs COO). Under deletions both COO axes are remapped
@@ -540,7 +548,7 @@ pub fn compact_with_options(
             Some(ref mask) => filter_obsp_coo(batch, mask)?,
             None => batch.clone(),
         };
-        writer.write_obsp(name, &out)?;
+        crate::rewrite_helpers::write_obsp_sharded(&mut writer, name, &out, shard_target)?;
     }
 
     // Predicate indexes: rebuild against the post-deletion obs + the
@@ -1525,7 +1533,7 @@ fn compact_multimodal(
         } else {
             batch
         };
-        writer.write_obsm(&key, &filtered)?;
+        crate::rewrite_helpers::write_obsm_sharded(&mut writer, &key, &filtered, shard_target)?;
     }
 
     // Global varm (var-axis → unfiltered).
@@ -1537,7 +1545,7 @@ fn compact_multimodal(
         SectionType::VarmEmbeddingShard,
     ) {
         let batch = reader.read_varm(&key)?;
-        writer.write_varm(&key, &batch)?;
+        crate::rewrite_helpers::write_varm_sharded(&mut writer, &key, &batch, shard_target)?;
     }
 
     // Global varp (var×var → unfiltered).
@@ -1549,7 +1557,7 @@ fn compact_multimodal(
         SectionType::VarpEmbeddingShard,
     ) {
         let batch = reader.read_varp(&key)?;
-        writer.write_varp(&key, &batch)?;
+        crate::rewrite_helpers::write_varp_sharded(&mut writer, &key, &batch, shard_target)?;
     }
 
     // Global obsp (obs×obs COO → remap both axes under deletions).
@@ -1565,7 +1573,7 @@ fn compact_multimodal(
             Some(ref mask) => filter_obsp_coo(&batch, mask)?,
             None => batch,
         };
-        writer.write_obsp(&key, &out)?;
+        crate::rewrite_helpers::write_obsp_sharded(&mut writer, &key, &out, shard_target)?;
     }
 
     // Global uns.

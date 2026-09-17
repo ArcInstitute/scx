@@ -478,8 +478,9 @@ Five, and each has bitten something:
    than defaulting to `0`.
 3. **Row order survives, plan caches do not.** `scx sort` permutes `obsm` and
    remaps `obsp` in lockstep with obs, so plans *rebuilt* from a sorted file
-   name the same cells. A plan list cached outside the file does not follow the
-   permutation and must be rebuilt.
+   name the same cells — and since phase 9 it re-emits both as shards, so the
+   sorted file is still bounded-readable. A plan list cached outside the file
+   does not follow the permutation and must be rebuilt.
 4. **Coordinates must be finite, and at most 3-D.** A NaN or infinite
    coordinate on a live cell is refused rather than bucketed, because a point
    with no defensible grid cell would otherwise land in some neighbourhood it
@@ -502,8 +503,36 @@ Five, and each has bitten something:
   conversion path writes COO.
 - **A bounded read needs a sharded graph.** `read_obsp_rows` decodes only the
   shards a range covers, but a graph written as one unsharded section is a
-  single Arrow batch and must be decoded whole. `scx sort` re-emits `obsp`
-  through the unsharded writer, so a sorted file's graph is always that case.
+  single Arrow batch and must be decoded whole.
+
+  Since **phase 9** `scx sort` and `scx compact` emit all four of `obsm` /
+  `varm` / `obsp` / `varp` as shards, at the same `shard_target_rows` the
+  file's X shards use; the h5ad and `from_anndata` paths always did. Before
+  phase 9 both ops re-emitted the graph through the unsharded writer, so a
+  sorted file's graph was always the unbounded case — **files written then
+  still are**, and they stay readable; the bounded read simply falls back to
+  decoding the one section.
+
+  ⚠️ **The h5mu path is not among them.** `scx convert --from h5mu` /
+  `pyscx.from_h5mu` still write a global `obsm` through the unsharded
+  `write_obsm` and a per-modality one through `write_obsm_for`, so a freshly
+  converted **MuData** file — the likely shape for spatial multi-omics — has an
+  unbounded `obsm` until it has been through `sort` or `compact`.
+  `scx optimize` copies a mapping section verbatim, so it preserves whichever
+  form it finds, and `scx subset` drops all four families outright. The
+  producer table in [sharding.md](sharding.md) lists the producers family by
+  family.
+
+  Two side effects of the phase-9 change worth knowing. A sorted or compacted
+  file's header now reports `has_obsp` (the unsharded `write_obsp` never set
+  the flag, so `scx info` under-reported a graph the file did carry). And the
+  COO triples come back in a different **order** than before — bucketing groups
+  them by row band, where the unsharded writer kept the remap's input order —
+  which is the same set of edges. No reader's *matrix semantics* depend on it —
+  `read_obsp_rows` counting-sorts into CSR, the h5ad exporter sorts by
+  `(row, col)`, and scipy's `coo_matrix` imposes no order. A caller that reads
+  the raw triples through `ScxReader::read_obsp` and relies on their sequence
+  (or hashes the COO bytes) does see the change.
 
 ### Layout is what decides the cost
 
@@ -513,6 +542,10 @@ nothing to do with position — measured on a 4,035-spot Visium sample, a 7-cell
 neighbourhood spans a median of 3,024 row indices and every batch touches every
 shard. `scx sort` on a key that tracks position (a grid bin, a niche label) is
 the lever that turns those into contiguous reads. SCX does not sort for you.
+
+Pulling that lever used to cost the bounded read, because `sort` collapsed the
+graph to one section on the way out. Since phase 9 it does not, so the two are
+no longer a trade-off.
 
 ### Deferred: the on-disk spatial index
 

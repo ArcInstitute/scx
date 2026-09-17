@@ -303,6 +303,166 @@ pub fn fixture_multimodal(dir: &tempfile::TempDir) -> PathBuf {
     path
 }
 
+/// (f) Single-modality fixture carrying all four mapping families.
+///
+/// `fixture_obsp_layers` carries only `obsp`, so it cannot see what an op does
+/// to the other three. All four are written through the **unsharded** writers,
+/// so an output's layout is the op's decision rather than the input's.
+#[allow(dead_code)]
+pub fn fixture_all_mapping_families(dir: &tempfile::TempDir) -> PathBuf {
+    let (n_obs, n_vars) = (8usize, 6usize);
+    let path = dir.path().join("sort_all_mappings.scx");
+    let mut writer = ScxWriter::new(&path, sample_header(n_obs as u64, n_vars as u64)).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    write_csr_single_shard(&mut writer, n_obs, n_vars);
+    writer
+        .write_obsm("X_pca", &sample_dense_mapping(n_obs, 2))
+        .unwrap();
+    writer
+        .write_varm("PCs", &sample_dense_mapping(n_vars, 2))
+        .unwrap();
+    writer.write_obsp("conn", &sample_coo_ring(n_obs)).unwrap();
+    writer.write_varp("corr", &sample_coo_ring(n_vars)).unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// (e'') Multimodal fixture carrying all four **global** (`modality_id == 0`)
+/// mapping families alongside the per-modality ones.
+///
+/// `fixture_multimodal` has no mappings at all, so it cannot see what
+/// `sort_multimodal`'s global-mapping block does. The per-modality entries are
+/// here too, so a test can tell a global re-emit from a per-modality one
+/// leaking into the global namespace.
+#[allow(dead_code)]
+pub fn fixture_multimodal_global_mappings(dir: &tempfile::TempDir) -> PathBuf {
+    let n_obs = 12usize;
+    let (rna_vars, adt_vars) = (8usize, 4usize);
+    let path = dir.path().join("sort_mm_global_mappings.scx");
+    let mut writer = ScxWriter::new(&path, sample_header(n_obs as u64, rna_vars as u64)).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(rna_vars)).unwrap();
+    writer.set_modality_n_vars(rna_id, rna_vars as u64).unwrap();
+    writer.write_var_for(adt_id, &sample_var(adt_vars)).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_vars as u64).unwrap();
+
+    for (mod_id, n_vars) in [(rna_id, rna_vars), (adt_id, adt_vars)] {
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            indices.push(((row * 2) % n_vars) as u32);
+            indices.push(((row * 2 + 1) % n_vars) as u32);
+            values.push(((row + 1) % 256) as u8);
+            values.push(((row + 2) % 256) as u8);
+            indptr.push(indptr.last().unwrap() + 2);
+        }
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(mod_id, 0, shard).unwrap();
+    }
+
+    // Global obsm / varm: written UNSHARDED, so the output's layout is the
+    // op's decision and not inherited from the input.
+    writer
+        .write_obsm("X_pca_g", &sample_dense_mapping(n_obs, 2))
+        .unwrap();
+    writer
+        .write_varm("PCs_g", &sample_dense_mapping(rna_vars, 2))
+        .unwrap();
+    // Global obsp: cell r linked to cell (r + 1) % n_obs, value r + 1.
+    writer
+        .write_obsp("conn_g", &sample_coo_ring(n_obs))
+        .unwrap();
+    writer
+        .write_varp("corr_g", &sample_coo_ring(rna_vars))
+        .unwrap();
+
+    // Per-modality obsm, to catch a global re-emit picking these up.
+    writer
+        .write_obsm_for(rna_id, "X_umap", &sample_dense_mapping(n_obs, 2))
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
+/// An `n_rows x n_cols` dense f32 mapping batch (`obsm` / `varm` shaped).
+#[allow(dead_code)]
+pub fn sample_dense_mapping(n_rows: usize, n_cols: usize) -> RecordBatch {
+    let fields: Vec<Field> = (0..n_cols)
+        .map(|c| Field::new(format!("c{c}"), DataType::Float32, false))
+        .collect();
+    let cols: Vec<Arc<dyn arrow::array::Array>> = (0..n_cols)
+        .map(|c| {
+            Arc::new(Float32Array::from(
+                (0..n_rows)
+                    .map(|r| (r * n_cols + c) as f32)
+                    .collect::<Vec<_>>(),
+            )) as Arc<dyn arrow::array::Array>
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+}
+
+/// A square COO ring: row `r` -> col `(r + 1) % n`, value `r + 1`.
+///
+/// `Int64` coordinates and `Float32` values, i.e. the v2 wide-axis coordinate
+/// form, so a bucketer that only handled `Int32` would fail on it.
+#[allow(dead_code)]
+pub fn sample_coo_ring(n: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int64, false),
+            Field::new("col", DataType::Int64, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        HashMap::from([
+            ("n_rows".to_string(), n.to_string()),
+            ("n_cols".to_string(), n.to_string()),
+        ]),
+    ));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (0..n as i64)
+                    .map(|r| (r + 1) % n as i64)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float32Array::from(
+                (0..n).map(|i| (i + 1) as f32).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
 /// (e') Multimodal fixture with MULTIPLE CSR shards per modality, arranged so
 /// the flattened `csr_shards_sorted()` list has non-monotonic row-ranges — the
 /// layout that exercises the `mark_deleted` positional-shard mapping across
