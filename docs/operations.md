@@ -93,8 +93,10 @@ Three consequences:
   `write_obsp` never set that flag, so `scx info` used to under-report a graph
   the file did carry.
 - `obsp` / `varp` triples come back in a different **order** (grouped by row
-  band rather than in the remap's input order). Same edges; no reader depends
-  on the order, since each imposes its own.
+  band rather than in the remap's input order). Same edges, and no reader's
+  matrix semantics depend on the order — each imposes its own. A caller reading
+  raw triples through `ScxReader::read_obsp`, or hashing the COO bytes, does
+  see it.
 
 `scx optimize` copies mapping sections verbatim, so it preserves whichever
 layout it finds. `scx subset` still drops all four families.

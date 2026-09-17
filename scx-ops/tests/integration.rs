@@ -5024,17 +5024,48 @@ fn compact_shards_the_output_row_space_not_the_input_one() {
     phase9_assert_all_four_sharded(&out);
     let reader = ScxReader::open(&out).unwrap();
     assert_eq!(reader.n_obs(), 8, "premise: 12 obs less 4 deleted");
-    let obsm_shards = phase9_mapping_sections(&out)
-        .into_iter()
-        .filter(|(n, _)| n.starts_with("obsm/"))
-        .count();
+    let count = |prefix: &str| {
+        phase9_mapping_sections(&out)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with(prefix))
+            .count()
+    };
+    // Both obs-axis families, not just obsm. Counting only obsm would pass for a
+    // compact that still bucketed the *graph* over the input axis, or that lost
+    // `remap_obsp_coo`'s rewritten `n_rows` — and the graph is the family the
+    // bounded read depends on.
     assert_eq!(
-        obsm_shards, 2,
-        "8 output rows at a target of 4 is 2 shards; 3 would mean the input's \
-         12 rows decided the boundaries"
+        count("obsm/"),
+        2,
+        "8 output rows at a target of 4 is 2 obsm shards; 3 would mean the \
+         input's 12 rows decided the boundaries"
     );
-    // The assembled obsm must still be the output's own row count.
+    assert_eq!(
+        count("obsp/"),
+        2,
+        "same for the graph: 2 obsp shards over the output axis, not 3 over the input's"
+    );
+    // The var-axis families are cut by n_vars (6 at a target of 4 -> 2), and
+    // must not have followed the obs keep mask.
+    assert_eq!(count("varm/"), 2, "varm is cut by n_vars, unfiltered");
+    assert_eq!(count("varp/"), 2, "varp is cut by n_vars, unfiltered");
+
+    // The assembled mappings must report the output's own row count, which is
+    // also what `BackedPairwiseReader::new_obsp` requires of the graph.
     assert_eq!(reader.read_all_obsm().unwrap()["X_pca"].num_rows(), 8);
+    let obsp = reader.read_all_obsp().unwrap();
+    let declared: usize = obsp["connectivities"]
+        .schema_ref()
+        .metadata()
+        .get("n_rows")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        declared,
+        reader.n_obs() as usize,
+        "the graph's declared extent must equal the compacted obs axis"
+    );
 }
 
 /// `write_test_file_with_all_mappings` with a caller-chosen

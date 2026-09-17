@@ -77,12 +77,23 @@ fn coo(
             )),
         )
     };
-    let vals: Vec<f64> = triples.iter().map(|t| t.2).collect();
+    // On the nullable arm the LAST value is actually null. Flipping the field's
+    // nullable bit alone proves nothing: `Float32Array::from(Vec<f32>)` has
+    // `null_count == 0`, so schema equality would still hold if `take` dropped
+    // the null bitmap. The bitmap has to be there to be preserved.
+    let mut vals: Vec<Option<f64>> = triples.iter().map(|t| Some(t.2)).collect();
+    if nullable_values {
+        if let Some(last) = vals.last_mut() {
+            *last = None;
+        }
+    }
     let val_arr: Arc<dyn Array> = if wide_values {
         Arc::new(Float64Array::from(vals))
     } else {
         Arc::new(Float32Array::from(
-            vals.into_iter().map(|v| v as f32).collect::<Vec<_>>(),
+            vals.into_iter()
+                .map(|v| v.map(|x| x as f32))
+                .collect::<Vec<_>>(),
         ))
     };
     RecordBatch::try_new(schema, vec![row_arr, col_arr, val_arr]).unwrap()
@@ -112,20 +123,22 @@ fn run_dense(batch: &RecordBatch, target: u32) -> (Stamps, Vec<RecordBatch>) {
 
 /// The triples a shard carries, as a sortable multiset.
 fn triples_of(b: &RecordBatch) -> Vec<(i64, i64, String)> {
-    let rows = crate::backed::coo_coord_column(b, 0, "obsp/g").unwrap();
-    let cols = crate::backed::coo_coord_column(b, 1, "obsp/g").unwrap();
+    let rows = crate::backed::coo_coord_borrow(b, 0, "obsp/g").unwrap();
+    let cols = crate::backed::coo_coord_borrow(b, 1, "obsp/g").unwrap();
     let data = b.column(2);
     (0..b.num_rows())
         .map(|i| {
             // Formatted rather than cast so an f64 value is compared at its
             // own width; a lossy narrow here would hide a lossy narrow there.
-            let v = if let Some(a) = data.as_any().downcast_ref::<Float64Array>() {
+            let v = if data.is_null(i) {
+                "null".to_string()
+            } else if let Some(a) = data.as_any().downcast_ref::<Float64Array>() {
                 format!("{:?}", a.value(i))
             } else {
                 let a = data.as_any().downcast_ref::<Float32Array>().unwrap();
                 format!("{:?}", a.value(i))
             };
-            (rows[i], cols[i], v)
+            (rows.at(i), cols.at(i), v)
         })
         .collect()
 }
@@ -229,6 +242,16 @@ fn coo_preserves_every_dtype_the_ops_can_produce() {
                     sorted_triples(std::slice::from_ref(&b)),
                     "triples changed (coords_i64={wide_coords} values_f64={wide_values} nullable={nullable})"
                 );
+                // The null bitmap itself, not just the field's nullable bit.
+                let nulls: usize = shards.iter().map(|s| s.column(2).null_count()).sum();
+                assert_eq!(
+                    nulls,
+                    b.column(2).null_count(),
+                    "null count changed (coords_i64={wide_coords} values_f64={wide_values} nullable={nullable})"
+                );
+                if nullable {
+                    assert_eq!(nulls, 1, "the nullable arm must actually carry a null");
+                }
             }
         }
     }
@@ -308,6 +331,35 @@ fn coo_rejects_a_row_outside_the_declared_extent() {
 }
 
 #[test]
+fn coo_rejects_a_row_in_the_last_shards_slack() {
+    // The case the test above **cannot** see, because `n_rows == step` leaves no
+    // slack. When `n_rows` is not a multiple of the target, the last bucket's
+    // arithmetic range runs to `n_shards * step` while its stamp stops at
+    // `n_rows`, so a bounds check written against the derived *bucket* rather
+    // than the row admits every coordinate in between.
+    //
+    // n_rows=5, step=4 -> n_shards=2, so rows 5, 6 and 7 all divide into bucket
+    // 1 and pass a `shard < n_shards` test, then land in a shard stamped [4, 5).
+    for bad in [5i64, 6, 7] {
+        let err = run_coo(
+            &coo(5, &[(0, 0, 1.0), (bad, 0, 2.0)], false, false, false),
+            4,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the declared n_rows=5"),
+            "row {bad} was accepted into the last shard's slack: {err}"
+        );
+    }
+    // And the one-row-of-slack shape, where only the single value n_rows is bad.
+    let err = run_coo(&coo(5, &[(4, 0, 1.0), (5, 0, 2.0)], false, false, false), 2).unwrap_err();
+    assert!(
+        err.to_string().contains("outside the declared n_rows=5"),
+        "{err}"
+    );
+}
+
+#[test]
 fn coo_requires_the_extent_declaration() {
     // Without `n_rows` the logical extent is unknowable: the batch's own row
     // count is nnz. Name the missing key rather than guessing.
@@ -343,3 +395,69 @@ fn coo_refuses_a_bucket_table_it_cannot_afford() {
     let err = run_coo(&wide, 1).unwrap_err();
     assert!(err.to_string().contains("shard buckets"), "{err}");
 }
+
+#[test]
+fn coo_rejects_a_schema_its_own_reader_would_refuse() {
+    // The emitter is `pub`, so a caller can hand it anything. Writing a file
+    // that `BackedPairwiseReader::from_layout` then refuses to open is worse
+    // than refusing the write: the failure surfaces later, elsewhere.
+    let b = coo(8, &[(0, 1, 1.0)], false, false, false);
+
+    // A fourth column.
+    let mut fields: Vec<Field> = b.schema().fields().iter().map(|f| (**f).clone()).collect();
+    fields.push(Field::new("extra", DataType::Float32, false));
+    let mut cols = b.columns().to_vec();
+    cols.push(Arc::new(Float32Array::from(vec![0.0f32])) as Arc<dyn Array>);
+    let wide = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            b.schema_ref().metadata().clone(),
+        )),
+        cols,
+    )
+    .unwrap();
+    let err = run_coo(&wide, 4).unwrap_err();
+    assert!(err.to_string().contains("expected exactly"), "{err}");
+
+    // Right count, wrong names.
+    let renamed = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("i", DataType::Int32, false),
+                Field::new("j", DataType::Int32, false),
+                Field::new("v", DataType::Float32, false),
+            ],
+            b.schema_ref().metadata().clone(),
+        )),
+        b.columns().to_vec(),
+    )
+    .unwrap();
+    let err = run_coo(&renamed, 4).unwrap_err();
+    assert!(err.to_string().contains("expected exactly"), "{err}");
+
+    // Coordinate columns at different widths — accepted before, and a file
+    // `coo_coord_borrow` would then read inconsistently.
+    let mixed = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("row", DataType::Int32, false),
+                Field::new("col", DataType::Int64, false),
+                Field::new("data", DataType::Float32, false),
+            ],
+            b.schema_ref().metadata().clone(),
+        )),
+        vec![
+            b.column(0).clone(),
+            Arc::new(Int64Array::from(vec![1i64])) as Arc<dyn Array>,
+            b.column(2).clone(),
+        ],
+    )
+    .unwrap();
+    let err = run_coo(&mixed, 4).unwrap_err();
+    assert!(err.to_string().contains("same width"), "{err}");
+}
+
+// The `nnz > u32::MAX` ceiling in `for_each_coo_mapping_shard` has no test:
+// constructing a batch with 4.3e9 triples is not possible here, and asserting on
+// the source text of the error would be a grep dressed up as coverage. The
+// guard's justification lives with the guard.

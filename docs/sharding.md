@@ -900,24 +900,37 @@ exactly as an obs shard does, so the reader can check that the entries form a
 contiguous ordered cover and reassemble them.
 
 This is decided separately from obs/var metadata sharding, and by a different
-rule: there is **no policy knob**. Every writer emits shards unconditionally,
-at the file's `shard_target_rows`:
+rule: there is **no policy knob** — a writer that shards does so
+unconditionally, at the file's `shard_target_rows`. But **not every writer
+shards**, so the producer matters:
 
-| Producer | Target |
+| Producer | Mapping layout it writes |
 |---|---|
-| `scx convert` (h5ad / h5mu / 10x), `pyscx.from_h5ad` / `from_h5mu` | `--shard-size` |
-| `pyscx.from_anndata` (in-memory, backed, lazy) | the target `shard_size` |
-| `scx sort` (since phase 9) | `SortOptions::shard_target_rows` |
-| `scx compact` (since phase 9) | the **input header's** `shard_target_rows` |
-| `scx merge` | one output shard per input section |
+| `scx convert --from h5ad` / `--from 10x`, `pyscx.from_h5ad` | sharded, at `--shard-size` |
+| `pyscx.from_anndata` (in-memory, backed, lazy) | sharded, at the target `shard_size` |
+| `pyscx.accel.pflog(store=…)` materialise | sharded, at the target `shard_size` |
+| `scx sort` (since phase 9) | sharded, at `SortOptions::shard_target_rows` |
+| `scx compact` (since phase 9) | sharded, at the **input header's** `shard_target_rows` |
+| `scx merge` | sharded — one output shard per input section |
 | `scx optimize` | copies the section verbatim, preserving whatever it finds |
+| **`scx convert --from h5mu`, `pyscx.from_h5mu`, `pyscx.to_mudata` writeback** | ⚠️ **one unsharded section** — global `obsm` via `write_obsm`, per-modality via `write_obsm_for` |
+| **`modify_metadata`, `obs_import` / `var_import`, `attach_external_layer`** | ⚠️ **one unsharded section** — they re-emit `obsm` whole |
+| **`scx subset`** | ⚠️ drops all four families |
 
 A mapping at or below the target becomes a single `…_shard_0` — still the
 sharded section type, and still bounded-readable. Boundaries are always over
 the **output** row space, so a compacted mapping is cut by its surviving rows.
-One emitter pair decides every boundary above
+The rows marked ⚠️ are the remaining unsharded producers; a freshly converted
+**MuData** file's global `obsm` in particular is still one section, so a
+bounded read over it is unbounded until the file has been through `sort` or
+`compact`.
+
+Every writer that *does* shard goes through one emitter pair
 (`scx_format_io::for_each_dense_mapping_shard` / `for_each_coo_mapping_shard`),
-which is what keeps the producers from disagreeing about one.
+which is what keeps those producers from disagreeing about a boundary. The
+disk-streaming h5ad path is the exception that is not a disagreement: it cuts
+by HDF5 hyperslab as it reads, never holding the whole mapping, and stamps the
+same cover contract.
 
 Note this does **not** contradict the obs rule above that "optimize never
 collapses or re-sizes existing obs shards": that is a statement about `obs`,

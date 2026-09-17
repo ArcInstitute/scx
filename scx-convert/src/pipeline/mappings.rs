@@ -111,27 +111,11 @@ pub(super) fn write_dense_mapping_section(
     row_perm: Option<&[u64]>,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    let emit = |w: &mut ScxWriter,
-                name: &str,
-                shard_idx: u32,
-                row_start: u64,
-                n_shard_rows: u64,
-                n_total: u64,
-                batch: &RecordBatch|
-     -> Result<(), ConvertError> {
-        match kind {
-            DenseMappingKind::Obsm => {
-                w.write_obsm_shard(name, shard_idx, row_start, n_shard_rows, n_total, batch)
-            }
-            DenseMappingKind::Varm => {
-                w.write_varm_shard(name, shard_idx, row_start, n_shard_rows, n_total, batch)
-            }
-        }
-        .map_err(ConvertError::from)
-    };
-    // Same dispatch, left at `ScxError`: the shared shard emitters below take a
-    // callback in the format crate's error type, and widening at the `?` is
-    // what `ConvertError: From<ScxError>` is for.
+    // One dispatch for both shard writers, at `ScxError` — the error type the
+    // shared emitters' callback takes. Every caller here is inside a
+    // `Result<(), ConvertError>` fn, so `?` widens it via the existing
+    // `ConvertError: From<ScxError>`; a second `ConvertError`-typed copy of
+    // this match would be the same four arms for no decision.
     let emit_io = |w: &mut ScxWriter,
                    name: &str,
                    shard_idx: u32,
@@ -210,7 +194,7 @@ pub(super) fn write_dense_mapping_section(
         // survives round-trip (mirrors the override-path special case).
         if info.n_rows == 0 {
             let batch = read_dense_mapping_shard(file, group_path, &info.name, 0, 0)?;
-            emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            emit_io(writer, &info.name, 0, 0, 0, 0, &batch)?;
             continue;
         }
         // Sort-on-convert (obsm): gather each output shard in permuted order
@@ -243,7 +227,7 @@ pub(super) fn write_dense_mapping_section(
                     &info.name,
                     &perm[row_start..row_start + n],
                 )?;
-                emit(
+                emit_io(
                     writer,
                     &info.name,
                     shard_idx,
@@ -264,7 +248,7 @@ pub(super) fn write_dense_mapping_section(
             let row_end = (row_start + step).min(info.n_rows);
             let batch = read_dense_mapping_shard(file, group_path, &info.name, row_start, row_end)?;
             let n_shard_rows = (row_end - row_start) as u64;
-            emit(
+            emit_io(
                 writer,
                 &info.name,
                 shard_idx,
@@ -293,26 +277,8 @@ pub(super) fn write_sparse_mapping_section(
     kind: SparseMappingKind,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    let emit = |w: &mut ScxWriter,
-                name: &str,
-                shard_idx: u32,
-                row_start: u64,
-                n_shard_rows: u64,
-                n_total: u64,
-                batch: &RecordBatch|
-     -> Result<(), ConvertError> {
-        match kind {
-            SparseMappingKind::Obsp => {
-                w.write_obsp_shard_coo(name, shard_idx, row_start, n_shard_rows, n_total, batch)
-            }
-            SparseMappingKind::Varp => {
-                w.write_varp_shard_coo(name, shard_idx, row_start, n_shard_rows, n_total, batch)
-            }
-        }
-        .map_err(ConvertError::from)
-    };
-    // As in `write_dense_mapping_section`: the `ScxError`-typed sibling, for
-    // the shared emitter's callback.
+    // As in `write_dense_mapping_section`: one dispatch, at the error type the
+    // shared emitter's callback takes; `?` widens it at each call site.
     let emit_io = |w: &mut ScxWriter,
                    name: &str,
                    shard_idx: u32,
@@ -398,7 +364,7 @@ pub(super) fn write_sparse_mapping_section(
         // same arm from `scx_format_io::for_each_coo_mapping_shard`).
         if info.n_rows == 0 {
             let batch = read_sparse_mapping_shard(file, group_path, info, 0, 0)?;
-            emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            emit_io(writer, &info.name, 0, 0, 0, 0, &batch)?;
             continue;
         }
         let step = shard_target_rows.max(1) as usize;
@@ -408,7 +374,7 @@ pub(super) fn write_sparse_mapping_section(
             let row_end = (row_start + step).min(info.n_rows);
             let batch = read_sparse_mapping_shard(file, group_path, info, row_start, row_end)?;
             let n_shard_rows = (row_end - row_start) as u64;
-            emit(
+            emit_io(
                 writer,
                 &info.name,
                 shard_idx,
@@ -433,7 +399,7 @@ pub(super) fn write_sparse_mapping_section(
         if info.n_rows == 0 {
             let batch = read_dense_mapping_shard(file, group_path, &info.name, 0, 0)?;
             let coo = dense_shard_to_coo(&batch, 0, 0)?;
-            emit(writer, &info.name, 0, 0, 0, 0, &coo)?;
+            emit_io(writer, &info.name, 0, 0, 0, 0, &coo)?;
             continue;
         }
         let step = shard_target_rows.max(1) as usize;
@@ -444,7 +410,7 @@ pub(super) fn write_sparse_mapping_section(
             let batch = read_dense_mapping_shard(file, group_path, &info.name, row_start, row_end)?;
             let coo = dense_shard_to_coo(&batch, row_start as u64, info.n_rows)?;
             let n_shard_rows = (row_end - row_start) as u64;
-            emit(
+            emit_io(
                 writer,
                 &info.name,
                 shard_idx,

@@ -449,17 +449,48 @@ impl BackedPairwiseReader {
     }
 }
 
-/// Read COO coordinate column `col_idx` as `i64`, accepting both the `Int32`
-/// (v1) and `Int64` (v2 wide-axis) forms the writer picks between.
+/// A **borrowed** view of one COO coordinate column, over either the `Int32`
+/// (v1) or `Int64` (v2 wide-axis) form the writer picks between.
+///
+/// Exists so a caller that only needs to *scan* the column does not have to
+/// materialise it. [`crate::mapping_shards`] buckets by row, one pass, on
+/// batches that can carry hundreds of millions of triples — at 8 B per
+/// coordinate a copy there is gigabytes for nothing.
+pub(crate) enum CooCoordColumn<'a> {
+    I32(&'a arrow::array::Int32Array),
+    I64(&'a arrow::array::Int64Array),
+}
+
+impl CooCoordColumn<'_> {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        use arrow::array::Array;
+        match self {
+            Self::I32(a) => a.len(),
+            Self::I64(a) => a.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn at(&self, i: usize) -> i64 {
+        match self {
+            Self::I32(a) => a.values()[i] as i64,
+            Self::I64(a) => a.values()[i],
+        }
+    }
+}
+
+/// Borrow COO coordinate column `col_idx`, accepting both the `Int32` (v1) and
+/// `Int64` (v2 wide-axis) forms.
 ///
 /// `logical` is the fully qualified section label (`"obsp/connectivities"`),
 /// not the bare key: this is shared with [`crate::mapping_shards`], which
 /// buckets `varp` too, so the family cannot be assumed here.
-pub(crate) fn coo_coord_column(
-    batch: &arrow::array::RecordBatch,
+pub(crate) fn coo_coord_borrow<'a>(
+    batch: &'a arrow::array::RecordBatch,
     col_idx: usize,
     logical: &str,
-) -> Result<Vec<i64>> {
+) -> Result<CooCoordColumn<'a>> {
     use arrow::array::{Int32Array, Int64Array};
     let col = batch.column(col_idx);
     // `values()` returns the raw buffer, so a null slot reads back as whatever
@@ -474,15 +505,29 @@ pub(crate) fn coo_coord_column(
         )));
     }
     if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        return Ok(a.values().iter().map(|&v| v as i64).collect());
+        return Ok(CooCoordColumn::I32(a));
     }
     if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        return Ok(a.values().to_vec());
+        return Ok(CooCoordColumn::I64(a));
     }
     Err(ScxError::InvalidCatalog(format!(
         "{logical}: COO coordinate column {col_idx} has dtype {:?}, expected Int32 or Int64",
         col.data_type()
     )))
+}
+
+/// [`coo_coord_borrow`] materialised. The reader wants an owned `Vec<i64>`
+/// (it keeps decoded shards in the memo); the emitter does not.
+pub(crate) fn coo_coord_column(
+    batch: &arrow::array::RecordBatch,
+    col_idx: usize,
+    logical: &str,
+) -> Result<Vec<i64>> {
+    let col = coo_coord_borrow(batch, col_idx, logical)?;
+    Ok(match col {
+        CooCoordColumn::I32(a) => a.values().iter().map(|&v| v as i64).collect(),
+        CooCoordColumn::I64(a) => a.values().to_vec(),
+    })
 }
 
 /// Read the COO `data` column as `f32`. `Float64` is accepted because

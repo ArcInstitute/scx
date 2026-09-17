@@ -54,7 +54,7 @@
 //! it would put a gap in the cover and the reader would reject the file.
 
 use crate::writer::DenseShardMetadata;
-use arrow::array::{RecordBatch, UInt64Array};
+use arrow::array::{RecordBatch, UInt32Array};
 use scx_format::{Result, ScxError};
 
 /// Bucket-count ceiling for the COO emitter.
@@ -71,24 +71,51 @@ const MAX_BUCKETS: usize = 1_000_000;
 /// of `(row, col, data)` triples, so a graph with an empty trailing row band
 /// cannot be distinguished from a smaller matrix without the declaration.
 fn coo_dims(logical: &str, batch: &RecordBatch) -> Result<(usize, usize)> {
-    let md = batch.schema_ref().metadata().clone();
+    let md = batch.schema_ref().metadata();
     let get = |key: &str| -> Result<usize> {
-        md.get(key)
-            .ok_or_else(|| {
-                ScxError::InvalidCatalog(format!(
-                    "{logical}: pairwise COO batch has no '{key}' schema metadata, so its \
-                     logical extent is unknown"
-                ))
-            })?
-            .parse::<usize>()
-            .map_err(|_| {
-                ScxError::InvalidCatalog(format!(
-                    "{logical}: pairwise COO batch has '{key}'='{}', which is not a row count",
-                    md.get(key).map(String::as_str).unwrap_or("")
-                ))
-            })
+        let raw = md.get(key).ok_or_else(|| {
+            ScxError::InvalidCatalog(format!(
+                "{logical}: pairwise COO batch has no '{key}' schema metadata, so its \
+                 logical extent is unknown"
+            ))
+        })?;
+        raw.parse::<usize>().map_err(|_| {
+            ScxError::InvalidCatalog(format!(
+                "{logical}: pairwise COO batch has '{key}'='{raw}', which is not a \
+                 non-negative integer extent"
+            ))
+        })
     };
     Ok((get("n_rows")?, get("n_cols")?))
+}
+
+/// The COO wire schema every reader in this crate requires: exactly three
+/// columns named `row` / `col` / `data`, with the two coordinate columns at the
+/// same width.
+///
+/// Checked at **write** time because the emitter is `pub`: without it a caller
+/// could hand over a four-column batch, or one whose coordinate columns
+/// disagree in width, and get a file written that `BackedPairwiseReader`'s own
+/// `from_layout` then refuses to open. A write that succeeds into an unreadable
+/// file is the worst of the available failures — it is discovered later, by
+/// someone else, on a different machine.
+fn validate_coo_schema(logical: &str, batch: &RecordBatch) -> Result<()> {
+    let fields = batch.schema_ref().fields().clone();
+    let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+    if names != ["row", "col", "data"] {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{logical}: pairwise COO batch has columns {names:?}, expected exactly \
+             [\"row\", \"col\", \"data\"]"
+        )));
+    }
+    let (r, c) = (fields[0].data_type(), fields[1].data_type());
+    if r != c {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{logical}: pairwise COO batch has row dtype {r:?} and col dtype {c:?}; both \
+             coordinate columns must be the same width"
+        )));
+    }
+    Ok(())
 }
 
 /// Slice a dense `obsm` / `varm` batch into row-aligned shards and hand each
@@ -151,12 +178,7 @@ pub fn for_each_coo_mapping_shard<F>(
 where
     F: FnMut(DenseShardMetadata, &RecordBatch) -> Result<()>,
 {
-    if batch.num_columns() < 3 {
-        return Err(ScxError::InvalidCatalog(format!(
-            "{logical}: pairwise COO batch has {} columns, expected at least 3 (row/col/data)",
-            batch.num_columns()
-        )));
-    }
+    validate_coo_schema(logical, batch)?;
     let (n_rows, _n_cols) = coo_dims(logical, batch)?;
     let nnz = batch.num_rows();
 
@@ -183,31 +205,75 @@ where
         )));
     }
 
-    // Row coordinates as i64 regardless of the on-disk width. This is the one
-    // column the emitter has to interpret; `take` handles the rest.
-    let rows = crate::backed::coo_coord_column(batch, 0, logical)?;
+    // A gather needs one index per triple, so the partition costs `nnz`
+    // positions however it is written. `u32` rather than `u64` halves that, and
+    // the ceiling it imposes is not a real restriction: a batch with more than
+    // `u32::MAX` triples is one every reader in this crate already cannot
+    // handle, since decoding a COO shard materialises `Vec<i64>` coordinates
+    // (34 GB at that size) before it does anything else.
+    if nnz > u32::MAX as usize {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{logical}: pairwise COO batch has {nnz} triples, above the {} this emitter \
+             partitions; split the mapping into row bands first",
+            u32::MAX
+        )));
+    }
 
-    let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); n_shards];
-    for (i, &r) in rows.iter().enumerate() {
+    // Row coordinates are **borrowed**, not materialised: this is a single
+    // scan, and a copy would cost 8 B per triple for the duration.
+    let rows = crate::backed::coo_coord_borrow(batch, 0, logical)?;
+
+    // Counting sort into one contiguous position array, rather than a
+    // `Vec<Vec<_>>` per bucket. Same O(nnz), but 4 B per triple with no
+    // per-bucket allocation or growth slack — `sort` and `compact` run this on
+    // a graph they are already holding a full remapped copy of, so the
+    // partition's own footprint is the part worth not doubling.
+    //
+    // Pass 1 counts, and is where a row coordinate is validated.
+    let mut counts = vec![0u32; n_shards + 1];
+    for i in 0..rows.len() {
+        let r = rows.at(i);
         if r < 0 {
             return Err(ScxError::InvalidCatalog(format!(
                 "{logical}: pairwise COO row index {r} is negative"
             )));
         }
-        let shard = (r as usize) / step;
-        if shard >= n_shards {
+        // Against `n_rows`, NOT against the bucket it divides into. The last
+        // bucket's arithmetic range runs to `n_shards * step` while its stamp
+        // stops at `n_rows`, so whenever `n_rows` is not a multiple of the
+        // target there is slack in between that a `shard < n_shards` test
+        // admits — and the triple then lands in a shard whose stamped span
+        // excludes it, producing a file `BackedPairwiseReader::decode_shard`
+        // refuses to read. Checking the coordinate makes `shard < n_shards`
+        // hold by construction.
+        if r as usize >= n_rows {
             return Err(ScxError::InvalidCatalog(format!(
                 "{logical}: pairwise COO row index {r} is outside the declared n_rows={n_rows}"
             )));
         }
-        buckets[shard].push(i as u64);
+        counts[(r as usize) / step + 1] += 1;
+    }
+    // Prefix-sum the counts into bucket start offsets.
+    for i in 0..n_shards {
+        counts[i + 1] += counts[i];
+    }
+    let starts = counts.clone();
+    // Pass 2 scatters each triple's position into its bucket's run, preserving
+    // input order within a bucket (a stable partition, as documented above).
+    let mut positions = vec![0u32; nnz];
+    let mut cursor = counts;
+    for i in 0..rows.len() {
+        let shard = (rows.at(i) as usize) / step;
+        positions[cursor[shard] as usize] = i as u32;
+        cursor[shard] += 1;
     }
 
     let total = n_rows as u64;
-    for (shard_idx, bucket) in buckets.into_iter().enumerate() {
+    for shard_idx in 0..n_shards {
         let row_start = shard_idx * step;
         let n_shard_rows = step.min(n_rows - row_start);
-        let indices = UInt64Array::from(bucket);
+        let (lo, hi) = (starts[shard_idx] as usize, starts[shard_idx + 1] as usize);
+        let indices = UInt32Array::from(positions[lo..hi].to_vec());
         // Reuses `batch.schema()`, so field dtypes, field nullability and the
         // `n_rows` / `n_cols` metadata all survive verbatim.
         let shard = arrow::compute::take_record_batch(batch, &indices)?;

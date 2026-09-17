@@ -440,64 +440,7 @@ pub(crate) fn route_scx_backed_to_scx(
     // matches what the streaming pipeline produces (readers handle
     // both sharded and legacy single-section layouts transparently).
     py.detach(|| -> Result<(), scx_format_io::ScxError> {
-        for (k, b) in &ov.obsm {
-            scx_format_io::for_each_dense_mapping_shard(b, out_shard_rows, |m, shard| {
-                writer.write_obsm_shard(
-                    k,
-                    m.shard_idx,
-                    m.row_start,
-                    m.n_shard_rows,
-                    m.n_rows_total,
-                    shard,
-                )
-            })?;
-        }
-        for (k, b) in &ov.varm {
-            scx_format_io::for_each_dense_mapping_shard(b, out_shard_rows, |m, shard| {
-                writer.write_varm_shard(
-                    k,
-                    m.shard_idx,
-                    m.row_start,
-                    m.n_shard_rows,
-                    m.n_rows_total,
-                    shard,
-                )
-            })?;
-        }
-        for (k, b) in &ov.obsp {
-            scx_format_io::for_each_coo_mapping_shard(
-                &format!("obsp/{k}"),
-                b,
-                out_shard_rows,
-                |m, shard| {
-                    writer.write_obsp_shard_coo(
-                        k,
-                        m.shard_idx,
-                        m.row_start,
-                        m.n_shard_rows,
-                        m.n_rows_total,
-                        shard,
-                    )
-                },
-            )?;
-        }
-        for (k, b) in &ov.varp {
-            scx_format_io::for_each_coo_mapping_shard(
-                &format!("varp/{k}"),
-                b,
-                out_shard_rows,
-                |m, shard| {
-                    writer.write_varp_shard_coo(
-                        k,
-                        m.shard_idx,
-                        m.row_start,
-                        m.n_shard_rows,
-                        m.n_rows_total,
-                        shard,
-                    )
-                },
-            )?;
-        }
+        write_mapping_overrides(&mut writer, &ov, out_shard_rows)?;
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
         }
@@ -678,64 +621,7 @@ pub(crate) fn route_scx_lazy_to_scx(
     )?;
 
     py.detach(|| -> Result<(), scx_format_io::ScxError> {
-        for (k, b) in &ov.obsm {
-            scx_format_io::for_each_dense_mapping_shard(b, shard_target_rows, |m, shard| {
-                writer.write_obsm_shard(
-                    k,
-                    m.shard_idx,
-                    m.row_start,
-                    m.n_shard_rows,
-                    m.n_rows_total,
-                    shard,
-                )
-            })?;
-        }
-        for (k, b) in &ov.varm {
-            scx_format_io::for_each_dense_mapping_shard(b, shard_target_rows, |m, shard| {
-                writer.write_varm_shard(
-                    k,
-                    m.shard_idx,
-                    m.row_start,
-                    m.n_shard_rows,
-                    m.n_rows_total,
-                    shard,
-                )
-            })?;
-        }
-        for (k, b) in &ov.obsp {
-            scx_format_io::for_each_coo_mapping_shard(
-                &format!("obsp/{k}"),
-                b,
-                shard_target_rows,
-                |m, shard| {
-                    writer.write_obsp_shard_coo(
-                        k,
-                        m.shard_idx,
-                        m.row_start,
-                        m.n_shard_rows,
-                        m.n_rows_total,
-                        shard,
-                    )
-                },
-            )?;
-        }
-        for (k, b) in &ov.varp {
-            scx_format_io::for_each_coo_mapping_shard(
-                &format!("varp/{k}"),
-                b,
-                shard_target_rows,
-                |m, shard| {
-                    writer.write_varp_shard_coo(
-                        k,
-                        m.shard_idx,
-                        m.row_start,
-                        m.n_shard_rows,
-                        m.n_rows_total,
-                        shard,
-                    )
-                },
-            )?;
-        }
+        write_mapping_overrides(&mut writer, &ov, shard_target_rows)?;
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
         }
@@ -1066,4 +952,75 @@ pub(crate) fn extract_uns_value(
     let np_ndarray = np.getattr("ndarray")?;
     let mut ctx = UnsWriteCtx::new(uns_format_parsed, &np_generic, &np_ndarray);
     Ok(Some(normalize_uns_value(&uns, "uns", &mut ctx)?))
+}
+
+/// Write an [`ScxOverrides`]' four mapping families as row-shards.
+///
+/// Three call sites want exactly this — the backed and lazy `from_anndata`
+/// rewrites and PFlog's materialise — differing only in the shard target, so it
+/// is one function rather than three copies of the same four loops.
+pub(crate) fn write_mapping_overrides(
+    writer: &mut ScxWriter,
+    ov: &crate::convert::h5ad::ScxOverrides,
+    shard_target_rows: u32,
+) -> std::result::Result<(), scx_format_io::ScxError> {
+    for (k, b) in &ov.obsm {
+        scx_format_io::for_each_dense_mapping_shard(b, shard_target_rows, |m, shard| {
+            writer.write_obsm_shard(
+                k,
+                m.shard_idx,
+                m.row_start,
+                m.n_shard_rows,
+                m.n_rows_total,
+                shard,
+            )
+        })?;
+    }
+    for (k, b) in &ov.varm {
+        scx_format_io::for_each_dense_mapping_shard(b, shard_target_rows, |m, shard| {
+            writer.write_varm_shard(
+                k,
+                m.shard_idx,
+                m.row_start,
+                m.n_shard_rows,
+                m.n_rows_total,
+                shard,
+            )
+        })?;
+    }
+    for (k, b) in &ov.obsp {
+        scx_format_io::for_each_coo_mapping_shard(
+            &format!("obsp/{k}"),
+            b,
+            shard_target_rows,
+            |m, shard| {
+                writer.write_obsp_shard_coo(
+                    k,
+                    m.shard_idx,
+                    m.row_start,
+                    m.n_shard_rows,
+                    m.n_rows_total,
+                    shard,
+                )
+            },
+        )?;
+    }
+    for (k, b) in &ov.varp {
+        scx_format_io::for_each_coo_mapping_shard(
+            &format!("varp/{k}"),
+            b,
+            shard_target_rows,
+            |m, shard| {
+                writer.write_varp_shard_coo(
+                    k,
+                    m.shard_idx,
+                    m.row_start,
+                    m.n_shard_rows,
+                    m.n_rows_total,
+                    shard,
+                )
+            },
+        )?;
+    }
+    Ok(())
 }

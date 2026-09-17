@@ -644,64 +644,7 @@ fn stream_pflog_to_scx<S: ShardSource>(
 
     // obsm / varm / obsp / varp / uns (mirror route_scx_lazy_to_scx).
     py.detach(|| -> Result<(), scx_format_io::ScxError> {
-        for (k, b) in &ov.obsm {
-            scx_format_io::for_each_dense_mapping_shard(b, shard_rows, |m, shard| {
-                writer.write_obsm_shard(
-                    k,
-                    m.shard_idx,
-                    m.row_start,
-                    m.n_shard_rows,
-                    m.n_rows_total,
-                    shard,
-                )
-            })?;
-        }
-        for (k, b) in &ov.varm {
-            scx_format_io::for_each_dense_mapping_shard(b, shard_rows, |m, shard| {
-                writer.write_varm_shard(
-                    k,
-                    m.shard_idx,
-                    m.row_start,
-                    m.n_shard_rows,
-                    m.n_rows_total,
-                    shard,
-                )
-            })?;
-        }
-        for (k, b) in &ov.obsp {
-            scx_format_io::for_each_coo_mapping_shard(
-                &format!("obsp/{k}"),
-                b,
-                shard_rows,
-                |m, shard| {
-                    writer.write_obsp_shard_coo(
-                        k,
-                        m.shard_idx,
-                        m.row_start,
-                        m.n_shard_rows,
-                        m.n_rows_total,
-                        shard,
-                    )
-                },
-            )?;
-        }
-        for (k, b) in &ov.varp {
-            scx_format_io::for_each_coo_mapping_shard(
-                &format!("varp/{k}"),
-                b,
-                shard_rows,
-                |m, shard| {
-                    writer.write_varp_shard_coo(
-                        k,
-                        m.shard_idx,
-                        m.row_start,
-                        m.n_shard_rows,
-                        m.n_rows_total,
-                        shard,
-                    )
-                },
-            )?;
-        }
+        crate::convert::scx_to_scx::write_mapping_overrides(&mut writer, &ov, shard_rows)?;
         if let Some(ref uns_json) = ov.uns {
             writer.write_uns(uns_json)?;
         }
