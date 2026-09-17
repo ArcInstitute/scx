@@ -486,6 +486,8 @@ impl PrefetchEngine {
             plan_thread,
             in_flight: VecDeque::with_capacity(cap),
             window: HashMap::new(),
+            #[cfg(test)]
+            block_until_full: false,
             lookahead,
             plan_stream_done: false,
             plan_stream_error: None,
@@ -597,6 +599,33 @@ impl PrefetchGate {
     }
 }
 
+/// The admission verdict for a plan leaving the queue, as a pure function of
+/// its own `keys`, whether it fit its budget share, and the window.
+///
+/// Free-standing so the threshold can be tested without driving an iterator:
+/// end to end, whether a peer plan is queued when a verdict is taken depends on
+/// how promptly the pull worker was scheduled, and a test asserting the
+/// *positive* case that way is flaky by construction (measured at roughly one
+/// failure in six under a loaded `cargo test`).
+///
+/// `count >= 2` is evaluated with the leaving plan's own keys still counted, so
+/// it reads as "at least one plan **still queued** also wants this group".
+fn verdict_from_window(
+    fits_share: bool,
+    keys: &[RowGroupKey],
+    window: &HashMap<RowGroupKey, u32>,
+) -> Admit {
+    if fits_share {
+        return Admit::All;
+    }
+    Admit::groups(
+        keys.iter()
+            .copied()
+            .filter(|k| window.get(k).is_some_and(|&c| c >= 2))
+            .collect(),
+    )
+}
+
 struct InFlight<P> {
     plan: P,
     /// Empty when `lookahead == 0`, the plan touches no rows, or every touched
@@ -637,6 +666,16 @@ pub struct PlanPrefetchIter<P, T, RowsFn, ProcFn> {
     /// a count of `>= 2` at the moment a plan is consumed means "some other
     /// plan still queued also wants this group".
     window: HashMap<RowGroupKey, u32>,
+    /// Test-only rendezvous: make `refill(true)` fill the queue to `lookahead`
+    /// instead of returning as soon as it holds one plan.
+    ///
+    /// The production rule is deliberately opportunistic — "prefetch depth is
+    /// never an obligation on the plan generator" — so how many plans are
+    /// queued when a verdict is taken depends on scheduling. A test that needs
+    /// a *populated* window has to pin that, exactly as `PrefetchGate` pins
+    /// "a prefetch task is running" rather than racing a sleep against it.
+    #[cfg(test)]
+    pub(crate) block_until_full: bool,
     lookahead: usize,
     /// Sticky: once the plan stream closes we stop calling `recv`.
     plan_stream_done: bool,
@@ -683,7 +722,11 @@ where
             && !self.plan_stream_done
             && self.plan_stream_error.is_none()
         {
-            let item = if may_block && self.in_flight.is_empty() {
+            #[cfg(test)]
+            let may_block = may_block && (self.block_until_full || self.in_flight.is_empty());
+            #[cfg(not(test))]
+            let may_block = may_block && self.in_flight.is_empty();
+            let item = if may_block {
                 match self.plan_rx.recv() {
                     Ok(item) => item,
                     Err(_) => {
@@ -973,15 +1016,14 @@ where
     /// Called while the leaving plan's own keys are still counted, so the `>= 2`
     /// test reads as "at least one plan still queued also touches this group".
     fn admit_for(&self, fits_share: bool, keys: &[RowGroupKey]) -> Admit {
-        if fits_share {
-            return Admit::All;
+        let verdict = verdict_from_window(fits_share, keys, &self.window);
+        if verdict.named_keys() > 0 {
+            self.engine
+                .cache_metrics
+                .reuse_admissions
+                .fetch_add(1, Ordering::Relaxed);
         }
-        let hot: HashSet<RowGroupKey> = keys
-            .iter()
-            .copied()
-            .filter(|k| self.window.get(k).is_some_and(|&c| c >= 2))
-            .collect();
-        Admit::groups(hot)
+        verdict
     }
 
     /// Undo one plan's contribution to the window. Exactly the increment

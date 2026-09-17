@@ -23,6 +23,38 @@ struct RowGroup {
     use_block_index: bool,
 }
 
+/// One **row group** of a scattered gather: `sorted[start..end]` all fall in
+/// row group `g` of shard `shard_idx`, whose first global row is `s_start` and
+/// whose group begins at shard-local row `group_row_start`.
+///
+/// A [`RowGroup`] is one shard's slice of the request; a `GroupRun` is one row
+/// group's slice of that. The split is what lets the gather decode across
+/// shards in parallel: the flat run list is the whole gather's decode work in
+/// one ascending sequence, and the scatter reads straight out of each decoded
+/// group with no intermediate CSR.
+#[derive(Clone, Copy, Debug)]
+struct GroupRun {
+    start: usize,
+    end: usize,
+    shard_idx: usize,
+    s_start: u64,
+    g: usize,
+    group_row_start: usize,
+}
+
+impl GroupRun {
+    fn new(rg: &RowGroup, layout: &FramedShardLayout, g: usize, start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            shard_idx: rg.shard_idx,
+            s_start: rg.s_start,
+            g,
+            group_row_start: layout.span(g).row_start as usize,
+        }
+    }
+}
+
 /// One shard's window of a contiguous row-range read: local rows
 /// `[local_start, local_end)` land at output rows starting at `out_row`, with
 /// exactly `nnz` nonzeros (filled in by the indptr-only prescan).
@@ -1104,7 +1136,20 @@ impl BackedCsrReader {
             return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
         }
         let key = CacheKey::Group(self.file_id, shard_idx, g);
-        if admit.admits(self.file_id, shard_idx, g) {
+        let admitted = admit.admits(self.file_id, shard_idx, g);
+        // Counted per LOOKUP, not per distinct group: the pair measures what the
+        // verdict decided each time it was consulted, which is what a partial
+        // verdict's recovery is read off. What survived the byte budget on top
+        // of that is `row_group_bytes_inserted`.
+        if let Some(m) = self.metrics() {
+            let bytes = layout.group_bytes(g) as u64;
+            if admitted {
+                m.admitted_group_bytes.fetch_add(bytes, Ordering::Relaxed);
+            } else {
+                m.rejected_group_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+        if admitted {
             let shard_cache = Arc::clone(&self.shard_cache);
             return shard_cache.get_or_decode(key, || {
                 self.reader.decode_framed_row_group(layout, g).map(Arc::new)
@@ -1571,6 +1616,16 @@ impl BackedCsrReader {
             }
         };
 
+        // Pass 1 — classify, and serve every full-shard fallback in place.
+        //
+        // The block-index groups are only *collected* here, into one flat
+        // ascending list of the distinct row groups the whole gather will
+        // decode. Pass 2 then decodes them a chunk at a time in parallel.
+        // Splitting the passes is what makes the parallelism gather-wide:
+        // a §6-shaped 512-row random plan touches ~480 groups spread across
+        // shards, and decoding them one shard's worth at a time — which is all
+        // the per-shard walk could ever overlap — leaves most of that serial.
+        let mut runs: Vec<GroupRun> = Vec::new();
         for g in groups {
             let group = &sorted_pairs[g.start..g.end];
 
@@ -1579,15 +1634,13 @@ impl BackedCsrReader {
             // otherwise fall back to a full-shard decode.
             let mut handled = false;
             if g.use_block_index {
-                handled = self.scatter_group_via_block_index(
-                    g.shard_idx,
-                    g.s_start,
-                    group,
-                    admit_groups,
-                    &mut scatter,
-                )?;
+                handled = self.collect_group_runs(g, group, &mut runs)?;
             }
 
+            // Counted per SHARD REQUEST GROUP, exactly as before the split —
+            // `block_index_adoption_rate` floors and the codec sweep's
+            // `block_index_groups == 2` then `== 4` are built on that meaning,
+            // not on the number of row groups decoded.
             if let Some(m) = self.metrics() {
                 if handled {
                     m.block_index_groups.fetch_add(1, Ordering::Relaxed);
@@ -1612,40 +1665,27 @@ impl BackedCsrReader {
             }
         }
 
-        Ok(())
+        // Pass 2 — decode the block-index runs in chunks, scatter each chunk.
+        self.scatter_group_runs(sorted_pairs, &runs, admit_groups, &mut scatter)
     }
 
-    /// Scatter one shard's request group directly from the block index, for
-    /// **row-group-framed (v2)** shards: walk the (row-sorted) group, fetch each
-    /// touched row group once through the shard LRU ([`Self::row_group`] —
-    /// a hit, or a decode of that group alone), and scatter every requested
-    /// row straight out of it. Returns `Ok(false)` (nothing scattered) for a
-    /// non-framed shard so the caller falls back to full-shard decode. Output
-    /// is byte-identical to a full decode + slice.
+    /// Split one shard request group into its distinct row groups, appending a
+    /// [`GroupRun`] per group, and validate the request against the shard.
     ///
-    /// Returns `Ok(true)` whether the groups were decoded on this call or
-    /// served from the LRU — both are the block-index route, and
-    /// `block_index_groups` counts both. There is no intermediate run-local
-    /// CSR any more: the pre-OPT-FORMATIO-1 path copied every row into one and
-    /// then scattered it again.
-    fn scatter_group_via_block_index<F>(
+    /// `Ok(false)` — nothing appended — for a shard that is not row-group
+    /// framed, so the caller falls back to a full-shard decode. All-or-nothing,
+    /// the same contract the per-shard walk had.
+    fn collect_group_runs(
         &self,
-        shard_idx: usize,
-        s_start: u64,
+        g: &RowGroup,
         group: &[(u64, usize)],
-        admit: &Admit,
-        scatter: &mut F,
-    ) -> Result<bool>
-    where
-        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
-    {
-        // `None` ⇒ shard is not row-group-framed ⇒ caller falls back; nothing
-        // scattered yet (all-or-nothing, same contract as the sidecar path).
-        let Some(layout) = self.framed_layout(shard_idx) else {
+        out: &mut Vec<GroupRun>,
+    ) -> Result<bool> {
+        let Some(layout) = self.framed_layout(g.shard_idx) else {
             return Ok(false);
         };
-        // A cache hit never reaches `section_bytes`, so the freshness check
-        // has to be here too — see `read_shard_cached_arc`.
+        // A cache hit never reaches `section_bytes`, so the freshness check has
+        // to be here too — see `read_shard_cached_arc`.
         self.check_fresh()?;
         // Validate the request against the shard's own row count before any
         // group indexing — `group` is built from `ShardStats` ranges, which are
@@ -1653,23 +1693,143 @@ impl BackedCsrReader {
         // `>= s_start` by construction (`plan_row_groups`), so the last one is
         // the only bound that can fail.
         if let Some(&(max_row, _)) = group.last() {
-            layout.check_run((max_row - s_start) as usize, 1)?;
+            layout.check_run((max_row - g.s_start) as usize, 1)?;
         }
 
-        let mut current: Option<(usize, Arc<ScxCsr>)> = None;
-        for &(row, orig_pos) in group {
-            let local = (row - s_start) as usize;
-            let g = layout.find_group(local);
-            if current.as_ref().is_none_or(|(cur_g, _)| *cur_g != g) {
-                current = Some((g, self.row_group(shard_idx, &layout, g, admit)?));
+        // Rows are ascending within the request group and `find_group` is
+        // monotone, so each row group's rows are a contiguous run — one pass,
+        // no sort, no map.
+        let mut run_start = 0usize;
+        let mut current: Option<usize> = None;
+        for (i, &(row, _)) in group.iter().enumerate() {
+            let rg = layout.find_group((row - g.s_start) as usize);
+            match current {
+                Some(cur) if cur == rg => {}
+                Some(cur) => {
+                    out.push(GroupRun::new(
+                        g,
+                        &layout,
+                        cur,
+                        g.start + run_start,
+                        g.start + i,
+                    ));
+                    run_start = i;
+                    current = Some(rg);
+                }
+                None => current = Some(rg),
             }
-            let rg = &current.as_ref().expect("just set").1;
-            let in_group = local - layout.span(g).row_start as usize;
-            let lo = rg.indptr[in_group] as usize;
-            let hi = rg.indptr[in_group + 1] as usize;
-            scatter(orig_pos, &rg.indices[lo..hi], &rg.data[lo..hi])?;
+        }
+        if let Some(cur) = current {
+            out.push(GroupRun::new(
+                g,
+                &layout,
+                cur,
+                g.start + run_start,
+                g.start + group.len(),
+            ));
         }
         Ok(true)
+    }
+
+    /// Decode `runs` a chunk at a time — in parallel on the reader's pool when
+    /// the chunk holds more than one group — and scatter each chunk's rows
+    /// before the next is decoded.
+    ///
+    /// **Chunked, not all-at-once.** A gather whose verdict is [`Admit::All`]
+    /// could hold everything, since admission has just certified the footprint
+    /// fits the budget — but a non-admitted gather is by definition *over* it,
+    /// and that is exactly the gather with the most groups to overlap. Holding
+    /// one chunk bounds peak at `chunk × max group bytes` in both cases.
+    ///
+    /// Decoded groups are held here rather than left to the LRU because a
+    /// non-admitted [`Self::row_group`] inserts nothing: pre-decoding into a
+    /// cache that will not keep them would simply be decoding each group twice.
+    fn scatter_group_runs<F>(
+        &self,
+        sorted_pairs: &[(u64, usize)],
+        runs: &[GroupRun],
+        admit: &Admit,
+        scatter: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
+    {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let chunk = self.group_decode_chunk();
+        for window in runs.chunks(chunk) {
+            let decoded = self.decode_group_runs(window, admit)?;
+            for (run, rg) in window.iter().zip(decoded.iter()) {
+                for &(row, orig_pos) in &sorted_pairs[run.start..run.end] {
+                    let in_group = (row - run.s_start) as usize - run.group_row_start;
+                    let lo = rg.indptr[in_group] as usize;
+                    let hi = rg.indptr[in_group + 1] as usize;
+                    scatter(orig_pos, &rg.indices[lo..hi], &rg.data[lo..hi])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One chunk's decodes. Parallel on the reader's pool (or rayon's registry)
+    /// when the `parallel` feature is on and the chunk holds more than one
+    /// group, else the serial loop verbatim.
+    ///
+    /// The pool is the reader's own, never a fresh one: a caller that may be
+    /// running in a forked child (the ML loader) sets a pool built after the
+    /// fork, whose worker threads actually exist. Same contract as
+    /// [`Self::warm_shards`].
+    fn decode_group_runs(&self, window: &[GroupRun], admit: &Admit) -> Result<Vec<Arc<ScxCsr>>> {
+        #[cfg(feature = "parallel")]
+        {
+            if window.len() > 1 {
+                let decode_all = || -> Result<Vec<Arc<ScxCsr>>> {
+                    window
+                        .par_iter()
+                        .map(|run| self.decode_one_group_run(run, admit))
+                        .collect()
+                };
+                let out = match self.cpu_pool.as_ref() {
+                    Some(pool) => pool.install(decode_all),
+                    None => decode_all(),
+                }?;
+                if let Some(m) = self.metrics() {
+                    m.parallel_group_decodes
+                        .fetch_add(window.len() as u64, Ordering::Relaxed);
+                }
+                return Ok(out);
+            }
+        }
+        window
+            .iter()
+            .map(|run| self.decode_one_group_run(run, admit))
+            .collect()
+    }
+
+    /// One run's row group, through the LRU ([`Self::row_group`]) so an
+    /// admitted key is retained and single-flighted exactly as before.
+    fn decode_one_group_run(&self, run: &GroupRun, admit: &Admit) -> Result<Arc<ScxCsr>> {
+        let layout = self
+            .framed_layout(run.shard_idx)
+            .expect("collect_group_runs resolved this layout");
+        self.row_group(run.shard_idx, &layout, run.g, admit)
+    }
+
+    /// Groups decoded together in one chunk — the reader's pool width, so the
+    /// bound on peak is one decode per worker and no worker idles inside a
+    /// chunk.
+    fn group_decode_chunk(&self) -> usize {
+        #[cfg(feature = "parallel")]
+        {
+            match self.cpu_pool.as_ref() {
+                Some(pool) => pool.current_num_threads(),
+                None => rayon::current_num_threads(),
+            }
+            .max(1)
+        }
+        #[cfg(not(feature = "parallel"))]
+        1
     }
 
     /// Read all rows — materializes the full matrix.

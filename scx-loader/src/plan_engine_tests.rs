@@ -1467,6 +1467,17 @@ const REUSE_LOOKAHEAD: usize = 2;
 
 const REUSE_BUDGET: usize = 3 * FRAMED_GROUP_BYTES;
 
+// The premise every reuse test rests on: a plan's three groups do not fit its
+// `budget / (lookahead + 1)` share at any lookahead used below, so the partial
+// verdict is what decides and not `Admit::All`.
+//
+// Asserted at COMPILE time. Written as a runtime `assert!` these are constant
+// expressions — clippy's `assertions_on_constants` said so — so they would read
+// as guards while being incapable of failing, and a later edit to `REUSE_BUDGET`
+// would silently turn every test below into an assertion about `Admit::All`.
+const _: () = assert!(3 * FRAMED_GROUP_BYTES > REUSE_BUDGET / (REUSE_LOOKAHEAD + 1));
+const _: () = assert!(3 * FRAMED_GROUP_BYTES > REUSE_BUDGET / 2);
+
 fn run_reuse_plans(dir: &std::path::Path, shared_control: bool) -> Arc<PrefetchEngine> {
     let engine = framed_engine_with_budget(dir, true, REUSE_BUDGET);
     let plans = reuse_plans(shared_control);
@@ -1474,10 +1485,15 @@ fn run_reuse_plans(dir: &std::path::Path, shared_control: bool) -> Arc<PrefetchE
         .iter()
         .map(|p| p.iter().map(|&(_, r)| framed_expected(r)).collect())
         .collect();
-    let out: Vec<_> = Arc::clone(&engine)
-        .iter_with_plans(into_iter(plans), REUSE_LOOKAHEAD, rows_of, gather)
-        .map(|r| r.unwrap())
-        .collect();
+    let mut it =
+        Arc::clone(&engine).iter_with_plans(into_iter(plans), REUSE_LOOKAHEAD, rows_of, gather);
+    // Pin the queue depth. Production `refill` stops as soon as it holds one
+    // plan — depth is opportunistic, never an obligation on the generator — so
+    // without this the window at a verdict depends on whether the pull worker
+    // was scheduled, and the positive assertion below fails roughly one run in
+    // six under a loaded `cargo test`. Measured, not guessed.
+    it.block_until_full = true;
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
     // Output identity first: admission is a cache policy and must not be able
     // to change a single scattered value.
     assert_eq!(out, want, "gather output is independent of admission");
@@ -1488,15 +1504,6 @@ fn run_reuse_plans(dir: &std::path::Path, shared_control: bool) -> Arc<PrefetchE
 fn a_group_touched_by_two_plans_in_the_window_is_retained() {
     use std::sync::atomic::Ordering as AtomicOrdering;
     let dir = tempfile::tempdir().unwrap();
-
-    // Premise, asserted rather than assumed: one plan's footprint really is
-    // over its share, so this exercises the partial verdict and not `All`.
-    let share = REUSE_BUDGET / (REUSE_LOOKAHEAD + 1);
-    assert!(
-        3 * FRAMED_GROUP_BYTES > share,
-        "premise: a plan's three groups ({}) exceed its share ({share})",
-        3 * FRAMED_GROUP_BYTES
-    );
 
     let engine = run_reuse_plans(dir.path(), true);
     let m = engine.cache_metrics();
@@ -1646,10 +1653,14 @@ fn a_repeat_outside_the_window_is_not_hot() {
         .iter()
         .map(|p| p.iter().map(|&(_, r)| framed_expected(r)).collect())
         .collect();
-    let out: Vec<_> = Arc::clone(&engine)
-        .iter_with_plans(into_iter(plans), /*lookahead*/ 1, rows_of, gather)
-        .map(|r| r.unwrap())
-        .collect();
+    let mut it = Arc::clone(&engine).iter_with_plans(
+        into_iter(plans),
+        /*lookahead*/ 1,
+        rows_of,
+        gather,
+    );
+    it.block_until_full = true;
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
     assert_eq!(out, want);
 
     let m = engine.cache_metrics();
@@ -1668,22 +1679,75 @@ fn a_repeat_outside_the_window_is_not_hot() {
 
 /// **Two** plans are a reuse signal — the leaving plan counts itself.
 ///
-/// `admit_for` is called while the leaving plan's own keys are still in the
-/// window, so `count >= 2` reads as "at least one plan *still queued* also wants
-/// this group". Releasing first would silently raise the bar to "two other
-/// plans", which on a two-deep window is unreachable and retains nothing.
+/// `verdict_from_window` is evaluated while the leaving plan's own keys are
+/// still in the window, so `count >= 2` reads as "at least one plan *still
+/// queued* also wants this group". Releasing first would silently raise the bar
+/// to "two other plans", which on a two-deep window is unreachable and retains
+/// nothing.
 ///
-/// At `lookahead = 1` the window holds exactly one queued plan beside the one
-/// leaving, so this is the smallest configuration in which the two readings
-/// differ. Mutation: move `release_keys` above `admit_for` and this reddens
-/// while every other reuse test stays green — their windows hold two *other*
-/// plans and cannot tell the readings apart.
+/// ⚠️ **Asserted against the pure function, not through the iterator.** The
+/// end-to-end version of this test was flaky by construction — at `lookahead 1`
+/// the peer plan only reaches the queue through the post-pop opportunistic
+/// `refill(false)`, so whether the window holds it depends on how promptly the
+/// pull worker was scheduled. Measured at roughly one failure in six under a
+/// loaded `cargo test`, and it passed 25/25 in isolation, which is exactly the
+/// shape of flake that survives review. The threshold is the claim; the
+/// scheduling is not.
+///
+/// Mutation: move `release_keys` above `admit_for` in `next`, or change the
+/// threshold to `>= 3`, and this reddens.
 #[test]
 fn two_plans_are_enough_for_a_reuse_signal() {
+    let shared: RowGroupKey = (0, 1, 2);
+    let mine: RowGroupKey = (0, 3, 4);
+    let keys = vec![shared, mine];
+
+    // The leaving plan (1) plus one peer still queued (1) — the group is hot.
+    let window: HashMap<RowGroupKey, u32> = [(shared, 2), (mine, 1)].into_iter().collect();
+    let verdict = verdict_from_window(false, &keys, &window);
+    assert!(verdict.admits(0, 1, 2), "two plans want the shared group");
+    assert!(!verdict.admits(0, 3, 4), "nobody else wants the tail");
+    assert_eq!(verdict.named_keys(), 1);
+
+    // Only the leaving plan itself — not a reuse signal, and the empty set
+    // collapses to `None` rather than an empty `Groups`.
+    let alone: HashMap<RowGroupKey, u32> = [(shared, 1), (mine, 1)].into_iter().collect();
+    let verdict = verdict_from_window(false, &keys, &alone);
+    assert!(matches!(verdict, Admit::None));
+    assert!(!verdict.admits(0, 1, 2));
+
+    // A plan that fits its share is admitted whole whatever the window says,
+    // which is what keeps this change strictly additive.
+    assert!(matches!(
+        verdict_from_window(true, &keys, &alone),
+        Admit::All
+    ));
+
+    // A key absent from the window is never hot — a plan cannot vouch for a
+    // group it did not declare.
+    assert!(matches!(
+        verdict_from_window(false, &keys, &HashMap::new()),
+        Admit::None
+    ));
+}
+
+/// The same claim as above, driven through the iterator: the verdict is taken
+/// **before** the leaving plan's keys are released, so one queued peer is
+/// enough.
+///
+/// Exactly two plans at `lookahead = 2` with the queue pinned full, which is
+/// the only shape in which the two orderings differ deterministically: the
+/// blocking fill guarantees the peer is queued, and the stream ending after it
+/// guarantees no *third* plan wanders in to make the shared key hot under both
+/// orderings. Mutation: move `release_keys` above `admit_for` in `next` and
+/// this reddens while the four other reuse tests stay green.
+#[test]
+fn the_leaving_plan_counts_itself_end_to_end() {
     use std::sync::atomic::Ordering as AtomicOrdering;
     let dir = tempfile::tempdir().unwrap();
     let engine = framed_engine_with_budget(dir.path(), true, REUSE_BUDGET);
 
+    // Two plans sharing shard 0's group 0, each with a tail of its own.
     let plans: Vec<Plan> = (0..2u64)
         .map(|i| {
             vec![
@@ -1694,19 +1758,13 @@ fn two_plans_are_enough_for_a_reuse_signal() {
             ]
         })
         .collect();
-    let share = REUSE_BUDGET / 2;
-    assert!(
-        3 * FRAMED_GROUP_BYTES > share,
-        "premise: a plan is over its share, so the partial verdict is what decides"
-    );
     let want: Vec<Vec<(i32, f32)>> = plans
         .iter()
         .map(|p| p.iter().map(|&(_, r)| framed_expected(r)).collect())
         .collect();
-    let out: Vec<_> = Arc::clone(&engine)
-        .iter_with_plans(into_iter(plans), /*lookahead*/ 1, rows_of, gather)
-        .map(|r| r.unwrap())
-        .collect();
+    let mut it = Arc::clone(&engine).iter_with_plans(into_iter(plans), 2, rows_of, gather);
+    it.block_until_full = true;
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
     assert_eq!(out, want);
 
     let m = engine.cache_metrics();
@@ -1718,5 +1776,11 @@ fn two_plans_are_enough_for_a_reuse_signal() {
     assert!(
         m.row_group_hits.load(AtomicOrdering::Relaxed) > 0,
         "and the second plan is served from it"
+    );
+    assert_eq!(
+        m.reuse_admissions.load(AtomicOrdering::Relaxed),
+        1,
+        "exactly one plan got a partial verdict — the second is left alone in \
+         the window and correctly gets none"
     );
 }

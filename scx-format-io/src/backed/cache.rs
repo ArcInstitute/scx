@@ -124,6 +124,33 @@ pub struct CacheMetrics {
     /// Admitted row-group lookups that waited on a peer's in-flight decode
     /// (a non-admitted lookup never takes a slot).
     pub row_group_duplicate_waiters: AtomicU64,
+
+    // --- W10: what the reuse-signal verdict actually decided -----------------
+    /// Row groups a gather decoded inside a parallel chunk. Zero when the
+    /// gather decoded one group, when the `parallel` feature is off, or when
+    /// nothing took the block-index route — so a flat zero beside a non-zero
+    /// `block_index_groups` says the gathers are too narrow to overlap, not
+    /// that the pool is missing.
+    pub parallel_group_decodes: AtomicU64,
+    /// Bytes of the row groups an admission verdict let a gather retain.
+    ///
+    /// Read beside `rejected_group_bytes`: the pair is the verdict itself,
+    /// where `row_group_bytes_inserted` is what survived the byte budget on
+    /// top of it. All three flat while `row_group_misses` climbs is the
+    /// decode-and-drop regime.
+    pub admitted_group_bytes: AtomicU64,
+    /// Bytes of the row groups a verdict refused to retain — the cold tail a
+    /// partial verdict deliberately leaves out, plus everything under
+    /// `Admit::None`.
+    pub rejected_group_bytes: AtomicU64,
+    /// Plans given a **partial** verdict: over their budget share, so refused
+    /// outright before W10, but holding at least one group another plan of the
+    /// prefetch window also touches.
+    ///
+    /// Zero on a loader whose plans all fit their share (nothing to recover)
+    /// and on one whose plans share no group (nothing to admit) — the two read
+    /// the same here and are told apart by `row_group_hits`.
+    pub reuse_admissions: AtomicU64,
 }
 
 /// The per-kind view of [`CacheMetrics`] the cache bumps through, so the six

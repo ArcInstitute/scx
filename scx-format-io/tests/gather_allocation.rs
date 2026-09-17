@@ -117,6 +117,15 @@ const N_VARS: usize = 512;
 const NNZ_PER_ROW: usize = 64;
 const ROW_GROUP_ROWS: u32 = 8;
 const CACHE_SHARDS: usize = 4;
+/// Decode-pool width pinned on every measured reader.
+///
+/// Since the block-index gather decodes its row groups a **chunk** at a time,
+/// the chunk is the pool's width and the transient it holds is
+/// `GROUP_DECODE_WIDTH × group bytes`. Left to rayon's global registry that
+/// width is the machine's core count, so the budget below would be a different
+/// number on a laptop and on a 184-core node — the bound would still hold and
+/// the test would still pass, but it would have stopped measuring anything.
+const GROUP_DECODE_WIDTH: usize = 4;
 
 fn shard_data(shard: usize) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
     let mut indptr = vec![0u64];
@@ -225,7 +234,14 @@ fn write_fixture(dir: &TempDir, framed: bool) -> std::path::PathBuf {
 }
 
 fn open(path: &std::path::Path) -> BackedCsrReader {
-    BackedCsrReader::new(ScxReader::open(path).unwrap(), CACHE_SHARDS)
+    let mut backed = BackedCsrReader::new(ScxReader::open(path).unwrap(), CACHE_SHARDS);
+    backed.set_cpu_pool(std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(GROUP_DECODE_WIDTH)
+            .build()
+            .unwrap(),
+    ));
+    backed
 }
 
 /// Decoded byte size of a CSR as the shard cache accounts for it.
@@ -285,10 +301,21 @@ fn gather_paths_assemble_once_within_the_cache_bound() {
         // Exact output + the LRU (warm fills up to `cache_shards`; the
         // sequential tail decodes one shard into the cache at a time, so at
         // most one extra is alive during an insert) + the block-index
-        // transient on a framed file (the touched row groups of one shard plus
-        // one small triple per single-row run) + 10 % for bookkeeping.
-        let budget =
-            result + (CACHE_SHARDS + 1) * shard + shard + shard / 4 + eighth.len() * 3 * 32;
+        // transient on a framed file + 10 % for bookkeeping.
+        //
+        // That transient is `GROUP_DECODE_WIDTH` row groups, not the gather's
+        // whole set of them: the chunked decode holds one chunk and drops it
+        // before decoding the next, which is what keeps an over-budget gather —
+        // the one with the most groups to overlap — from holding all of them.
+        // Generously over-counted as a quarter shard here (a group is
+        // `ROW_GROUP_ROWS / ROWS_PER_SHARD` = 1/32 of a shard, so four of them
+        // are an eighth), plus one small triple per single-row run.
+        let budget = result
+            + (CACHE_SHARDS + 1) * shard
+            + shard
+            + shard / 4
+            + GROUP_DECODE_WIDTH * (shard / 32)
+            + eighth.len() * 3 * 32;
         let budget = budget + budget / 10;
         eprintln!(
             "framed={framed} read_row_indices(eighth): result={result} peak={peak} budget={budget} ({:.2}× result)",

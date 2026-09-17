@@ -602,6 +602,12 @@ class TestMetrics:
             "row_group_evictions",
             "row_group_bytes_inserted",
             "row_group_duplicate_waiters",
+            # W10: what the admission verdict decided, and whether the gather's
+            # group decodes overlapped.
+            "admitted_group_bytes",
+            "rejected_group_bytes",
+            "reuse_admissions",
+            "parallel_group_decodes",
         }
         for k, v in m.items():
             assert isinstance(v, int), f"{k} should be int, got {type(v)}"
@@ -666,6 +672,12 @@ class TestMetrics:
             "row_group_evictions",
             "row_group_bytes_inserted",
             "row_group_duplicate_waiters",
+            # W10: what the admission verdict decided, and whether the gather's
+            # group decodes overlapped.
+            "admitted_group_bytes",
+            "rejected_group_bytes",
+            "reuse_admissions",
+            "parallel_group_decodes",
         }
 
     def test_iter_skips_prefetch_after_warmup(self, unframed_scx_path):

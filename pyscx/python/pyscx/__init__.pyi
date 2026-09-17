@@ -131,7 +131,9 @@ class IndexPlanDataset:
         `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`,
         `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups`,
         `row_group_hits`, `row_group_misses`, `row_group_evictions`,
-        `row_group_bytes_inserted`, `row_group_duplicate_waiters`.
+        `row_group_bytes_inserted`, `row_group_duplicate_waiters`,
+        `admitted_group_bytes`, `rejected_group_bytes`, `reuse_admissions`,
+        `parallel_group_decodes`.
 
         `hits` … `duplicate_waiters` describe **whole-shard** entries; the
         `row_group_*` set describes the decoded **row groups** a framed
@@ -148,7 +150,16 @@ class IndexPlanDataset:
         groups of exactly the admitted plans. So `row_group_misses` growing while
         `row_group_bytes_inserted` stays flat means the working set is over
         budget (raise `max_memory_mb`), not that the cache is off.
-        `SCX_ROW_GROUP_CACHE=0` disables row-group retention process-wide."""
+        `SCX_ROW_GROUP_CACHE=0` disables row-group retention process-wide.
+
+        A plan **over** that share no longer forfeits retention outright: it
+        keeps the groups another plan of the lookahead window also touches — a
+        control pool, shared neighbours, a repeated pair member — and still
+        drops its cold tail. `reuse_admissions` counts the plans that got such a
+        partial verdict, and `admitted_group_bytes` / `rejected_group_bytes` is
+        the split it decided. A workload whose plans share nothing inside a
+        window reads `reuse_admissions == 0`, which is the pre-existing
+        behaviour and not a fault."""
         ...
 
     def memory_budget(self) -> dict[str, Any]:

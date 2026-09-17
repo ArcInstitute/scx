@@ -439,6 +439,17 @@ impl IndexPlanDataset {
     ///                     - the same five counters for the decoded row groups a
     ///                       framed gather retains (the counters above keep
     ///                       meaning whole shards)
+    /// admitted_group_bytes / rejected_group_bytes
+    ///                     - what the admission verdict decided, per lookup. The
+    ///                       `row_group_*` pair above is what survived the byte
+    ///                       budget on top of that
+    /// reuse_admissions    - plans given a PARTIAL verdict: over their budget
+    ///                       share, but holding a group another plan of the
+    ///                       prefetch window also touches
+    /// parallel_group_decodes
+    ///                     - row groups decoded inside a parallel chunk; 0 when
+    ///                       every gather was narrow enough to decode one group
+    ///                       at a time
     /// ```
     ///
     /// All values are `int`. Counters are atomic and read with `Relaxed`
@@ -623,7 +634,9 @@ impl IndexPlanBatchIter {
     /// {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters,
     ///            peak_bytes_in_cache, full_shard_groups, block_index_groups,
     ///            row_group_hits, row_group_misses, row_group_evictions,
-    ///            row_group_bytes_inserted, row_group_duplicate_waiters},
+    ///            row_group_bytes_inserted, row_group_duplicate_waiters,
+    ///            admitted_group_bytes, rejected_group_bytes, reuse_admissions,
+    ///            parallel_group_decodes},
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
     ///               prefetch_skipped_in_flight,

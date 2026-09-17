@@ -4892,6 +4892,67 @@ fn touched_row_groups_names_the_groups_planned_bytes_sizes() {
     assert_eq!(off.planned_row_group_bytes(1, &rows), 0);
 }
 
+/// The chunked, gather-wide parallel group decode is byte-identical to the
+/// serial walk at every pool width, including the width-1 case that takes the
+/// serial path outright.
+///
+/// The gather decodes its row groups a chunk at a time, one chunk per pool
+/// width, so the pool width changes how the work is batched and must change
+/// nothing else. `parallel_group_decodes` is asserted alongside so the test can
+/// tell "the widths agree" from "no width ever ran in parallel" — three widths
+/// agreeing about a path none of them took would read as coverage.
+#[test]
+fn parallel_group_decode_matches_the_serial_walk_at_every_pool_width() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::Zstd);
+    // Seven rows per shard, one per row group. Seven is the widest request the
+    // block-index route accepts here — `block_index_eligible` needs
+    // `len * ROW_RANGE_WINDOW_DIVISOR < shard_rows`, i.e. `len * 4 < 32` — and
+    // the first version of this test asked for all 64 rows, which fails that
+    // window and took the whole-shard route on both shards, so there was no
+    // group decode to parallelise at all. The premise assertion below is what
+    // caught it.
+    let rows: Vec<u64> = (0..7u64)
+        .map(|i| i * 4)
+        .chain((0..7).map(|i| 32 + i * 4))
+        .collect();
+
+    let mut reference: Option<Vec<(Vec<i32>, Vec<f32>)>> = None;
+    for width in [1usize, 2, 3, 8] {
+        let mut backed =
+            BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+        backed.set_cpu_pool(std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap(),
+        ));
+        let m = backed.enable_metrics();
+
+        let out = rg_gather(&backed, &rows);
+        rg_assert_matches_full(&out, &rows, &full, &format!("width {width}"));
+        match &reference {
+            None => reference = Some(out),
+            Some(want) => assert_eq!(&out, want, "width {width} disagrees with width 1"),
+        }
+
+        let parallel = m.parallel_group_decodes.load(Ordering::Relaxed);
+        if width == 1 {
+            assert_eq!(
+                parallel, 0,
+                "a width-1 pool chunks one group at a time and takes the serial path"
+            );
+        } else {
+            assert!(
+                parallel > 0,
+                "width {width} must actually have decoded a chunk in parallel; \
+                 without this the agreement above is between four serial runs"
+            );
+        }
+    }
+}
+
 /// A gather's own whole shards count against the budget beside its row groups,
 /// because they share one and `read_shard_cached_arc` inserts them whether or
 /// not row groups are admitted.
