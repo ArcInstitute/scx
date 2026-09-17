@@ -1194,6 +1194,35 @@ impl SparseCellSetLoader {
         Ok(())
     }
 
+    /// Whether this plan's batch has to be **assembled** from a separate read,
+    /// rather than being the read.
+    ///
+    /// True when the plan spans more than one file, or when a transform stage
+    /// can change a row's length (`remap_row` drops `-1` sentinels and
+    /// coalesces; `downsample_row` truncates). Either way the rows cannot be
+    /// handed out where they landed, so the gather deduplicates `(file, row)`
+    /// first — which is worth doing precisely there, because the work it saves
+    /// per repeat is a real transform rather than a memcpy.
+    ///
+    /// False is the raw-local single-file case, and it is deliberately taken
+    /// **without** deduplicating. Deduplicating would force the assembly this
+    /// predicate is about — a second batch-sized allocation and a second full
+    /// copy — to save one memcpy per repeated row from an already-resident
+    /// shard, since a raw-local row's whole "transform" is an elementwise clip.
+    /// Measured on `cellset_gather` / tabula (SLURM 2969753): deduplicating
+    /// this path put `cellsets_per_sec__gather_random` at 0.85x and
+    /// `__gather_grouped` at 0.93x of the per-set walk.
+    ///
+    /// The loader-level form of the same rule — without a plan in hand — is
+    /// what `SparseCellSetBudgetModel::transient_bytes` charges on.
+    fn plan_needs_assembly(&self, plan: &SparseCellSetPlan, lo: usize, hi: usize) -> bool {
+        if self.remap.is_some() || self.downsample.is_some() {
+            return true;
+        }
+        let first = plan.file_ids[lo];
+        plan.file_ids[lo..hi].iter().any(|&f| f != first)
+    }
+
     /// W11 — the multi-set batch executor.
     ///
     /// One occurrence table over the whole plan, **one read per file** over that
@@ -1217,38 +1246,35 @@ impl SparseCellSetLoader {
     ) -> Result<SparseCellSetBatch> {
         self.check_cross_file_sets(plan)?;
         let (emit_lo, emit_hi) = Self::emitted_range(plan);
-        let occ = Occurrences::build(plan, emit_lo, emit_hi);
         let n_out = emit_hi - emit_lo;
 
-        // --- one read per file, over its unique rows, exact spans -----------
+        // --- the direct path: the read IS the batch --------------------------
         //
-        // `read_row_indices_with_admission` carries the plan's verdict and does
-        // the indptr-only prescan itself, so the rows land in one exactly-sized
-        // allocation with no estimate. Widening from per-set to per-plan is also
-        // what lets the chunked parallel group decode overlap groups across
-        // shards rather than within one set's worth.
-        let mut per_file: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(occ.by_file.len());
-        for (fid, slots) in &occ.by_file {
-            let rows: Vec<u64> = slots.iter().map(|&s| occ.slots[s as usize].1).collect();
-            let reader = engine.lease(*fid)?;
-            per_file.push(
-                reader
-                    .read_row_indices_with_admission(&rows, admit_row_groups.as_ref())
-                    .map_err(LoaderError::FormatError)?,
-            );
-        }
-
-        // --- fast path: the read IS the batch --------------------------------
+        // One file and no stage that can change a row's length: the plan's rows
+        // are read in plan order at their final lengths, so the `ScxCsr` is
+        // moved out whole. **One allocation for the entire gather**, sized by
+        // the read's own indptr prescan.
         //
-        // One file, no duplicate occurrences, and no stage that could shrink a
-        // row: the rows are already in plan order at their final lengths, so
-        // the `ScxCsr` is moved out whole and the gather's whole output is the
-        // one allocation `read_row_indices_with_admission` already made. Taken
-        // BEFORE the transform bookkeeping below, which would otherwise cost
-        // four `Vec`s per plan this path does not need.
-        let no_shrink = self.remap.is_none() && self.downsample.is_none();
-        if no_shrink && occ.identity && per_file.len() == 1 {
-            let mut csr = per_file.pop().expect("one bucket");
+        // ⚠️ Deliberately taken WITHOUT deduplicating, and the measurement is
+        // why. Deduplicating forces the batch to be assembled from the read
+        // afterwards, which costs a second batch-sized allocation and a second
+        // full copy; what it saves here is one memcpy per repeated row from an
+        // already-resident shard, because a raw-local row's "transform" is an
+        // elementwise clip. The trade only goes the other way when a row
+        // carries real work — a remap, a downsample — or when the batch has to
+        // be assembled anyway because the plan spans files. Measured on
+        // `cellset_gather` / tabula (SLURM 2969753, 12 rounds): deduplicating
+        // this path put `cellsets_per_sec__gather_random` at 0.85x and
+        // `__gather_grouped` at 0.93x of the per-set walk.
+        if n_out > 0 && !self.plan_needs_assembly(plan, emit_lo, emit_hi) {
+            let fid = plan.file_ids[emit_lo];
+            let reader = engine.lease(fid)?;
+            let mut csr = reader
+                .read_row_indices_with_admission(
+                    &plan.rows[emit_lo..emit_hi],
+                    admit_row_groups.as_ref(),
+                )
+                .map_err(LoaderError::FormatError)?;
             // Elementwise over the whole batch: `clip_negatives` is per value,
             // so a row-by-row walk would be the same work in more passes.
             crate::downsample::clip_negatives(&mut csr.data);
@@ -1277,12 +1303,35 @@ impl SparseCellSetLoader {
             });
         }
 
+        let occ = Occurrences::build(plan, emit_lo, emit_hi);
+
+        // --- one read per file, over its unique rows, exact spans -----------
+        //
+        // `read_row_indices_with_admission` carries the plan's verdict and does
+        // the indptr-only prescan itself, so the rows land in one exactly-sized
+        // allocation with no estimate. Widening from per-set to per-plan is also
+        // what lets the chunked parallel group decode overlap groups across
+        // shards rather than within one set's worth.
+        let mut per_file: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(occ.by_file.len());
+        for (fid, slots) in &occ.by_file {
+            let rows: Vec<u64> = slots.iter().map(|&s| occ.slots[s as usize].1).collect();
+            let reader = engine.lease(*fid)?;
+            per_file.push(
+                reader
+                    .read_row_indices_with_admission(&rows, admit_row_groups.as_ref())
+                    .map_err(LoaderError::FormatError)?,
+            );
+        }
+
         // --- transform each unique row once, in place ------------------------
         //
         // Every stage either shrinks a row or preserves it (`remap_row` drops
         // `-1` sentinels and coalesces; `downsample_row` truncates; the clip and
         // the value transforms are elementwise), so a row's output always fits
         // its own raw span and no second buffer is needed to hold it.
+        // Reachable here with no transform at all: a multi-file raw-local plan
+        // must still be assembled, because the files are read separately.
+        let no_shrink = self.remap.is_none() && self.downsample.is_none();
         let mut lens: Vec<u32> = vec![0; occ.slots.len()];
         for (bucket, (fid, slots)) in occ.by_file.iter().enumerate() {
             let csr = &mut per_file[bucket];
@@ -2081,8 +2130,6 @@ struct Occurrences {
     by_file: Vec<(u32, Vec<u32>)>,
     /// Slot -> `(bucket in by_file, local row in that bucket's csr)`.
     slot_loc: Vec<(u32, u32)>,
-    /// `slot_of_pos[i] == i` for every `i` — i.e. the plan names no row twice.
-    identity: bool,
 }
 
 impl Occurrences {
@@ -2094,7 +2141,6 @@ impl Occurrences {
         let mut by_file: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut file_bucket: HashMap<u32, usize> = HashMap::new();
         let mut slot_loc: Vec<(u32, u32)> = Vec::with_capacity(n);
-        let mut identity = true;
 
         for p in emit_lo..emit_hi {
             let key = (plan.file_ids[p], plan.rows[p]);
@@ -2114,7 +2160,6 @@ impl Occurrences {
                     s
                 }
             };
-            identity &= slot as usize == slot_of_pos.len();
             slot_of_pos.push(slot);
         }
 
@@ -2123,7 +2168,6 @@ impl Occurrences {
             slot_of_pos,
             by_file,
             slot_loc,
-            identity,
         }
     }
 }

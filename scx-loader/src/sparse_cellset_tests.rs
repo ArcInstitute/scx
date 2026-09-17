@@ -2969,15 +2969,22 @@ fn whole_plan_gather_matches_the_per_set_walk() {
     }
 }
 
-/// A `(file, row)` named by two different sets of one plan is **read once** and
-/// emitted twice.
+/// A `(file, row)` named by two different sets of one plan comes back at both
+/// positions, with the same bytes, from **one** shard decode.
 ///
 /// No Rust test covered a cross-set duplicate before W11: every multi-set plan
 /// literal in this file used disjoint `(file, row)` pairs across its sets, and
 /// the one duplicate that existed (`[5, 3, 0, 7, 7, 31]`) was adjacent inside a
 /// single set.
+///
+/// ⚠️ It says nothing about **row** deduplication, because on this
+/// configuration there is none: a raw-local single-file plan takes the direct
+/// path, where a repeat costs one more memcpy from the resident shard and the
+/// batch is the read. `duplicate_occurrences_draw_the_same_downsample` and
+/// `the_occurrence_table_dedups_across_sets_and_within_them` cover the
+/// configuration that does deduplicate.
 #[test]
-fn a_row_in_two_sets_is_decoded_once_and_emitted_twice() {
+fn a_row_in_two_sets_comes_back_at_both_positions() {
     use std::sync::atomic::Ordering as AtomicOrdering;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dup_across_sets.scx");
@@ -3232,10 +3239,8 @@ fn the_occurrence_table_dedups_across_sets_and_within_them() {
     assert_eq!(occ.by_file, vec![(0, vec![0, 2]), (1, vec![1, 3])]);
     // slot -> (bucket, local row in that bucket's read)
     assert_eq!(occ.slot_loc, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
-    assert!(!occ.identity, "the plan names two rows twice");
 
-    // A plan with no repeats takes the identity branch, which is what selects
-    // the move-the-read-out fast path.
+    // A plan with no repeats maps every position to its own slot.
     let clean = SparseCellSetPlan {
         file_ids: vec![0, 0, 0],
         rows: vec![7, 1, 4],
@@ -3243,14 +3248,12 @@ fn the_occurrence_table_dedups_across_sets_and_within_them() {
         set_offsets: vec![0, 3],
     };
     let occ = Occurrences::build(&clean, 0, 3);
-    assert!(occ.identity);
     assert_eq!(occ.slot_of_pos, vec![0, 1, 2]);
 
     // And the table covers the EMITTED range only.
     let occ = Occurrences::build(&plan, 1, 4);
     assert_eq!(occ.slots, vec![(1, 9), (0, 4), (0, 9)]);
     assert_eq!(occ.slot_of_pos, vec![0, 1, 2]);
-    assert!(occ.identity);
 }
 
 /// W11: the batch executor's unique-row read is charged **only** on the
@@ -3400,4 +3403,125 @@ fn both_executors_refuse_a_cross_file_set_identically() {
     use std::sync::atomic::Ordering as AtomicOrdering;
     assert_eq!(a.cache_metrics().misses.load(AtomicOrdering::Relaxed), 0);
     assert!(b.cache_metrics().misses.load(AtomicOrdering::Relaxed) > 0);
+}
+
+/// The routing rule: which plans have to be assembled from a separate read.
+///
+/// This is the phase's one real configuration decision and it was made by
+/// measurement, so it is pinned directly rather than inferred from a timing.
+/// Deduplicating a raw-local single-file plan forces the assembly — a second
+/// batch-sized allocation and a second full copy — to save one memcpy per
+/// repeated row from an already-resident shard, and the A/B priced that at
+/// 0.85x on `gather_random`.
+#[test]
+fn only_a_multi_file_or_length_changing_plan_is_assembled() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("r0.scx");
+    let p1 = dir.path().join("r1.scx");
+    write_ragged_fixture(&p0, 32, 8, 2);
+    write_ragged_fixture(&p1, 32, 8, 2);
+
+    let one_file = SparseCellSetPlan {
+        file_ids: vec![0; 4],
+        // Repeats on purpose: a repeat is NOT a reason to assemble.
+        rows: vec![3, 7, 3, 7],
+        role_tags: vec![0; 4],
+        set_offsets: vec![0, 2, 4],
+    };
+    let two_files = SparseCellSetPlan {
+        file_ids: vec![0, 0, 1, 1],
+        rows: vec![3, 7, 3, 7],
+        role_tags: vec![0; 4],
+        set_offsets: vec![0, 2, 4],
+    };
+
+    let raw = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !raw.plan_needs_assembly(&one_file, 0, 4),
+        "raw-local, one file"
+    );
+    assert!(raw.plan_needs_assembly(&two_files, 0, 4), "two files");
+
+    // `normalize` / `log1p` are elementwise, so they do NOT force it.
+    let scaled = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        None,
+        None,
+        /*normalize*/ true,
+        /*log1p*/ true,
+        1e4,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !scaled.plan_needs_assembly(&one_file, 0, 4),
+        "value-only transforms"
+    );
+
+    // A remap drops and coalesces; a downsample truncates. Both can shrink a
+    // row, so neither can be written where it landed.
+    let remapped = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        Some(vec![(0..8).collect(), (0..8).collect()]),
+        Some(8),
+        false,
+        false,
+        0.0,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(remapped.plan_needs_assembly(&one_file, 0, 4), "remap");
+
+    let downsampled = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        Some(ds_cfg(
+            2,
+            crate::downsample::DownsampleMethod::Multinomial,
+            5,
+            vec![1, 2],
+        )),
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(
+        downsampled.plan_needs_assembly(&one_file, 0, 4),
+        "downsample"
+    );
+
+    // And the rule the budget charges on is the loader-level form of the same
+    // one: it must not charge the configuration that never assembles.
+    assert_eq!(raw.budget_breakdown().transient_bytes, 0);
 }
