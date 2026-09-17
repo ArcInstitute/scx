@@ -99,6 +99,83 @@ pub fn row_group_cache_enabled() -> bool {
 /// never drift.
 pub const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
 
+/// What a read is allowed to **retain** in the shard LRU's row-group half.
+///
+/// A read's *output* never depends on this — retention is a cache policy, not
+/// a correctness property. What it decides is whether a decoded row group is
+/// inserted under the byte budget (and single-flighted across concurrent
+/// callers) or decoded independently and dropped.
+///
+/// * [`Admit::All`] — retain every group this read touches. What a plan gets
+///   when its whole footprint fits the budget share it was sized against.
+/// * [`Admit::None`] — retain nothing. A working set larger than the cache is
+///   the one pattern an LRU makes strictly worse: every group is inserted and
+///   evicted before the next read could hit it, so residency is spent for zero
+///   hits (measured at 0 hits, +350-500 MB and 2-4 % slower on
+///   tabula_sapiens_100k).
+/// * [`Admit::Groups`] — retain exactly the named keys. The reuse signal: a
+///   plan over its share forfeits its cold tail but keeps the groups several
+///   plans of the prefetch window touch (a control pool, shared neighbours, a
+///   repeated pair member). Strictly between the other two, and the reason the
+///   verdict is a set rather than a `bool`.
+///
+/// Keys are `(file_id, shard_idx, row_group_idx)` — the same triple the cache
+/// is keyed on, and what [`BackedCsrReader::touched_row_groups`] names. `Arc`
+/// because one verdict is consulted by every set of a cell-set plan and, on the
+/// parallel decode path, from several threads at once.
+#[derive(Debug, Clone, Default)]
+pub enum Admit {
+    #[default]
+    All,
+    None,
+    Groups(Arc<HashSet<(u32, usize, usize)>>),
+}
+
+impl Admit {
+    /// Whether group `g` of shard `shard_idx` in file `file_id` may be retained.
+    pub fn admits(&self, file_id: u32, shard_idx: usize, g: usize) -> bool {
+        match self {
+            Admit::All => true,
+            Admit::None => false,
+            Admit::Groups(keys) => keys.contains(&(file_id, shard_idx, g)),
+        }
+    }
+
+    /// `Admit::Groups` of `keys`, collapsing an empty set to [`Admit::None`].
+    ///
+    /// The collapse is not cosmetic. An empty `Groups` and `None` decide every
+    /// lookup identically, so keeping them distinct would let a counter or a
+    /// test read "partial admission happened" off a verdict that admitted
+    /// nothing — which is exactly the claim this phase has to be able to
+    /// measure.
+    pub fn groups(keys: HashSet<(u32, usize, usize)>) -> Self {
+        if keys.is_empty() {
+            Admit::None
+        } else {
+            Admit::Groups(Arc::new(keys))
+        }
+    }
+
+    /// Number of keys a partial verdict names; `0` for both totals, which are
+    /// not key sets. For metrics and tests, never for a decision.
+    pub fn named_keys(&self) -> usize {
+        match self {
+            Admit::Groups(keys) => keys.len(),
+            _ => 0,
+        }
+    }
+}
+
+impl From<bool> for Admit {
+    fn from(b: bool) -> Self {
+        if b {
+            Admit::All
+        } else {
+            Admit::None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

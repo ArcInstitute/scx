@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 use scx_format_io::freshness::FileIdentity;
-use scx_format_io::{BackedCsrIndex, BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache};
+use scx_format_io::{
+    Admit, BackedCsrIndex, BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache,
+};
 
 use crate::error::{LoaderError, Result};
 use crate::plan_engine::{IterMetrics, PrefetchEngine};
@@ -1012,7 +1014,7 @@ impl SparseCellSetLoader {
                     .zip(plan.rows.iter().copied())
                     .collect()
             },
-            move |eng: &PrefetchEngine, plan: SparseCellSetPlan, admit_row_groups: bool| {
+            move |eng: &PrefetchEngine, plan: SparseCellSetPlan, admit_row_groups: Admit| {
                 loader.gather_admitting(eng, &plan, Some(admit_row_groups))
             },
         );
@@ -1068,7 +1070,7 @@ impl SparseCellSetLoader {
             .engine
             .bucket_plan_rows(plan.file_ids.iter().copied().zip(plan.rows.iter().copied()));
         let (planned, budget) = self.engine.plan_footprint(&per_shard, None)?;
-        self.gather_admitting(&self.engine, plan, Some(planned <= budget))
+        self.gather_admitting(&self.engine, plan, Some(Admit::from(planned <= budget)))
     }
 
     /// [`Self::gather`] with the row-group admission decided by the caller.
@@ -1082,7 +1084,7 @@ impl SparseCellSetLoader {
         &self,
         engine: &PrefetchEngine,
         plan: &SparseCellSetPlan,
-        admit_row_groups: Option<bool>,
+        admit_row_groups: Option<Admit>,
     ) -> Result<SparseCellSetBatch> {
         let total_rows = plan.rows.len();
         // Width is checked by `check_plan_width` on both public routes, before
@@ -1203,15 +1205,19 @@ impl SparseCellSetLoader {
                 let fid = set_fids[0];
                 let reader = engine.lease(fid)?;
                 reader
-                    .read_rows_with_admission(set_rows, admit_row_groups, |orig_pos, idx, dat| {
-                        // `orig_pos` is the position in `set_rows`, not the row id
-                        // — the scatter fires in shard-grouped order. The row id is
-                        // what keys the downsample RNG, so read it back through the
-                        // request array.
-                        per_row[orig_pos] =
-                            Some(self.transform_row(fid, set_rows[orig_pos], idx, dat));
-                        Ok(())
-                    })
+                    .read_rows_with_admission(
+                        set_rows,
+                        admit_row_groups.as_ref(),
+                        |orig_pos, idx, dat| {
+                            // `orig_pos` is the position in `set_rows`, not the row id
+                            // — the scatter fires in shard-grouped order. The row id is
+                            // what keys the downsample RNG, so read it back through the
+                            // request array.
+                            per_row[orig_pos] =
+                                Some(self.transform_row(fid, set_rows[orig_pos], idx, dat));
+                            Ok(())
+                        },
+                    )
                     .map_err(LoaderError::FormatError)?;
             } else {
                 // --- cross-file insurance path (requires global remap) ---
@@ -1230,12 +1236,16 @@ impl SparseCellSetLoader {
                     let reader = engine.lease(f)?;
                     let rs: Vec<u64> = items.iter().map(|&(_, r)| r).collect();
                     reader
-                        .read_rows_with_admission(&rs, admit_row_groups, |orig_pos, idx, dat| {
-                            let (within_set_pos, src_row) = items[orig_pos];
-                            per_row[within_set_pos] =
-                                Some(self.transform_row(f, src_row, idx, dat));
-                            Ok(())
-                        })
+                        .read_rows_with_admission(
+                            &rs,
+                            admit_row_groups.as_ref(),
+                            |orig_pos, idx, dat| {
+                                let (within_set_pos, src_row) = items[orig_pos];
+                                per_row[within_set_pos] =
+                                    Some(self.transform_row(f, src_row, idx, dat));
+                                Ok(())
+                            },
+                        )
                         .map_err(LoaderError::FormatError)?;
                 }
             }

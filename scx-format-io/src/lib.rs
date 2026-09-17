@@ -51,7 +51,7 @@ pub use arrow_compat::{
     pandas_index_columns, resolve_index_columns, upcast_to_large_types,
 };
 pub use backed::{
-    BackedCscIndex, BackedCscReader, BackedCsrIndex, BackedCsrReader, BackedDenseReader,
+    Admit, BackedCscIndex, BackedCscReader, BackedCsrIndex, BackedCsrReader, BackedDenseReader,
     BackedPairwiseReader, CacheMetrics, PairwiseRows, ShardCache, SharedShardCache, SizeHint,
 };
 #[cfg(feature = "deletion-vectors")]

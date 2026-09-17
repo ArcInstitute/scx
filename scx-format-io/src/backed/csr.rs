@@ -858,19 +858,21 @@ impl BackedCsrReader {
         // evict each other on every repeat of the same read (review on #528).
         // Sized from the block index, no decode; `None` layouts (unframed)
         // contribute nothing and take the full-shard path below.
-        let admit_windows = !self.retains_row_groups() || {
-            let bytes = plans
-                .iter()
-                .filter(|p| p.use_row_range)
-                .fold(0usize, |acc, p| {
-                    acc.saturating_add(self.window_group_bytes(
-                        p.shard_idx,
-                        p.local_start,
-                        p.local_end,
-                    ))
-                });
-            bytes <= self.shard_cache.bytes_budget()
-        };
+        let admit_windows: Admit = Admit::from(
+            !self.retains_row_groups() || {
+                let bytes = plans
+                    .iter()
+                    .filter(|p| p.use_row_range)
+                    .fold(0usize, |acc, p| {
+                        acc.saturating_add(self.window_group_bytes(
+                            p.shard_idx,
+                            p.local_start,
+                            p.local_end,
+                        ))
+                    });
+                bytes <= self.shard_cache.bytes_budget()
+            },
+        );
 
         // Phase 2 — copy each window into its pre-carved slot. Row-range plans
         // first (they retain only their touched row groups, never the whole
@@ -883,7 +885,7 @@ impl BackedCsrReader {
                     plan.shard_idx,
                     plan.local_start,
                     plan.local_end,
-                    admit_windows,
+                    &admit_windows,
                 )? {
                     Self::copy_window(
                         &run,
@@ -1057,7 +1059,7 @@ impl BackedCsrReader {
         shard_idx: usize,
         local_start: usize,
         local_end: usize,
-        admit: bool,
+        admit: &Admit,
     ) -> Result<Option<ScxCsr>> {
         let Some(layout) = self.framed_layout(shard_idx) else {
             return Ok(None);
@@ -1096,13 +1098,13 @@ impl BackedCsrReader {
         shard_idx: usize,
         layout: &FramedShardLayout,
         g: usize,
-        admit: bool,
+        admit: &Admit,
     ) -> Result<Arc<ScxCsr>> {
         if !self.retains_row_groups() {
             return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
         }
         let key = CacheKey::Group(self.file_id, shard_idx, g);
-        if admit {
+        if admit.admits(self.file_id, shard_idx, g) {
             let shard_cache = Arc::clone(&self.shard_cache);
             return shard_cache.get_or_decode(key, || {
                 self.reader.decode_framed_row_group(layout, g).map(Arc::new)
@@ -1284,7 +1286,7 @@ impl BackedCsrReader {
         // Always admitted: the caller (the L2 prefetcher) has already checked
         // the plan fits its share of the budget before asking for a warm.
         for &g in &groups {
-            self.row_group(shard_idx, &layout, g, true)?;
+            self.row_group(shard_idx, &layout, g, &Admit::All)?;
         }
         Ok(groups.len())
     }
@@ -1426,7 +1428,7 @@ impl BackedCsrReader {
     pub fn read_rows_with_admission<F>(
         &self,
         rows: &[u64],
-        admit_row_groups: Option<bool>,
+        admit_row_groups: Option<&Admit>,
         scatter: F,
     ) -> Result<()>
     where
@@ -1513,7 +1515,7 @@ impl BackedCsrReader {
         &self,
         sorted_pairs: &[(u64, usize)],
         groups: &[RowGroup],
-        admit_row_groups: Option<bool>,
+        admit_row_groups: Option<&Admit>,
         mut scatter: F,
     ) -> Result<()>
     where
@@ -1539,8 +1541,14 @@ impl BackedCsrReader {
         // alongside — decides once per plan and passes the verdict in
         // (`read_rows_with_admission`); a standalone gather decides for itself
         // against the whole budget. Sized from the block index, no decode.
-        let admit_groups = admit_row_groups
-            .unwrap_or_else(|| self.gather_row_groups_fit_budget(sorted_pairs, groups));
+        let own_verdict: Admit;
+        let admit_groups: &Admit = match admit_row_groups {
+            Some(a) => a,
+            None => {
+                own_verdict = Admit::from(self.gather_row_groups_fit_budget(sorted_pairs, groups));
+                &own_verdict
+            }
+        };
 
         for g in groups {
             let group = &sorted_pairs[g.start..g.end];
@@ -1604,7 +1612,7 @@ impl BackedCsrReader {
         shard_idx: usize,
         s_start: u64,
         group: &[(u64, usize)],
-        admit: bool,
+        admit: &Admit,
         scatter: &mut F,
     ) -> Result<bool>
     where

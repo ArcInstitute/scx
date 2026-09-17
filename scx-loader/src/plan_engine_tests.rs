@@ -106,13 +106,13 @@ fn rows_of(plan: &Plan) -> Vec<(u32, u64)> {
 /// Takes the plan **by value**, matching `ProcFn` since ORG-9.10-1: the queue
 /// is the plan's last owner, so a consumer that needs to consume or reorder it
 /// (the pair loader sorts in place) does not have to clone per batch.
-fn gather(engine: &PrefetchEngine, plan: Plan, admit_row_groups: bool) -> Result<Vec<(i32, f32)>> {
+fn gather(engine: &PrefetchEngine, plan: Plan, admit_row_groups: Admit) -> Result<Vec<(i32, f32)>> {
     let mut out = Vec::with_capacity(plan.len());
     for &(fid, row) in &plan {
         let mut got: Option<(i32, f32)> = None;
         engine
             .lease(fid)?
-            .read_rows_with_admission(&[row], Some(admit_row_groups), |_pos, idx, data| {
+            .read_rows_with_admission(&[row], Some(&admit_row_groups), |_pos, idx, data| {
                 got = idx.first().copied().zip(data.first().copied());
                 Ok(())
             })

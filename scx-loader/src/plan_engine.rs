@@ -43,7 +43,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
-use scx_format_io::{BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache};
+use scx_format_io::{Admit, BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
@@ -416,7 +416,7 @@ impl PrefetchEngine {
         P: Send + 'static,
         PlanIter: Iterator<Item = Result<P>> + Send + 'static,
         RowsFn: Fn(&P) -> Vec<(u32, u64)>,
-        ProcFn: Fn(&PrefetchEngine, P, bool) -> Result<T>,
+        ProcFn: Fn(&PrefetchEngine, P, Admit) -> Result<T>,
     {
         let cap = lookahead.max(1);
         let (plan_tx, plan_rx) = bounded(cap);
@@ -557,7 +557,7 @@ struct InFlight<P> {
     prefetches: Vec<ShardJoin>,
     /// The plan's row-group admission verdict (see `spawn_prefetches`), handed
     /// to `process` so the gather retains exactly what the prefetcher warmed.
-    admit_row_groups: bool,
+    admit_row_groups: Admit,
 }
 
 /// Iterator returned by [`PrefetchEngine::iter_with_plans`].
@@ -686,10 +686,10 @@ where
     /// verdict against the full budget let N files (or N sets) each pass while
     /// their union thrashed the LRU — found by review on #528. At
     /// `lookahead == 0` nothing is warmed and the share is the whole budget.
-    fn spawn_prefetches(&self, plan: &P) -> Result<(Vec<ShardJoin>, bool)> {
+    fn spawn_prefetches(&self, plan: &P) -> Result<(Vec<ShardJoin>, Admit)> {
         let rows = (self.rows_of)(plan);
         if rows.is_empty() {
-            return Ok((Vec::new(), true));
+            return Ok((Vec::new(), Admit::All));
         }
 
         // Dedup rows and bucket them per (file, shard). The gather passes the
@@ -774,7 +774,10 @@ where
         }
         if self.lookahead == 0 || declined_for_reader_limit {
             let (planned, budget) = self.engine.plan_footprint(&per_shard, None)?;
-            return Ok((Vec::new(), planned <= budget / (self.lookahead + 1)));
+            return Ok((
+                Vec::new(),
+                Admit::from(planned <= budget / (self.lookahead + 1)),
+            ));
         }
 
         // One lease per touched file for the whole of the rest of this
@@ -876,7 +879,7 @@ where
                 reader.read_shard_cached_arc(sidx).map(|_| ())
             }));
         }
-        Ok((joins, admit_row_groups))
+        Ok((joins, Admit::from(admit_row_groups)))
     }
 
     /// Block on every prefetch handle for the head plan, surfacing the first
@@ -903,7 +906,7 @@ where
 impl<P, T, RowsFn, ProcFn> Iterator for PlanPrefetchIter<P, T, RowsFn, ProcFn>
 where
     RowsFn: Fn(&P) -> Vec<(u32, u64)>,
-    ProcFn: Fn(&PrefetchEngine, P, bool) -> Result<T>,
+    ProcFn: Fn(&PrefetchEngine, P, Admit) -> Result<T>,
 {
     type Item = Result<T>;
 

@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use arrow::record_batch::RecordBatch;
-use scx_format_io::{BackedCsrReader, ScxReader};
+use scx_format_io::{Admit, BackedCsrReader, ScxReader};
 
 use crate::batch::ObsColumn;
 use crate::budget::{BudgetBreakdown, BudgetModel, PYTHON_OVERHEAD_BYTES};
@@ -759,7 +759,7 @@ impl IndexPlanLoader {
     pub(crate) fn process_plan_admitting(
         &self,
         mut plan: Vec<(u64, u64)>,
-        admit_row_groups: Option<bool>,
+        admit_row_groups: Option<Admit>,
     ) -> Result<IndexPlanBatch> {
         if plan.len() > self.max_plan_size {
             return Err(LoaderError::ConfigError {
@@ -855,7 +855,7 @@ impl IndexPlanLoader {
     fn gather_pairs_dense(
         &self,
         plan: &[(u64, u64)],
-        admit_row_groups: Option<bool>,
+        admit_row_groups: Option<Admit>,
     ) -> Result<PairedDenseGather> {
         let n_pairs = plan.len();
         let n_cols = self.n_output_cols;
@@ -903,7 +903,7 @@ impl IndexPlanLoader {
         let mut scatter_err: Option<LoaderError> = None;
         let res = self.backed.read_rows_with_admission(
             &unique_rows,
-            admit_row_groups,
+            admit_row_groups.as_ref(),
             |orig_pos, idx, data| {
                 for &request in &row_to_requests[orig_pos] {
                     if let Err(e) = self.scatter_pair_request(
@@ -1086,7 +1086,7 @@ impl IndexPlanLoader {
             // The plan arrives by value, so `process_plan` keeps its in-place
             // `sort_by_shard` and moves the sorted plan straight into the
             // batch's `pairs` — no defensive clone per batch.
-            move |_engine: &PrefetchEngine, plan: Vec<(u64, u64)>, admit_row_groups: bool| {
+            move |_engine: &PrefetchEngine, plan: Vec<(u64, u64)>, admit_row_groups: Admit| {
                 loader.process_plan_admitting(plan, Some(admit_row_groups))
             },
         );
