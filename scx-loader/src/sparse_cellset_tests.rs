@@ -2947,6 +2947,9 @@ fn whole_plan_gather_matches_the_per_set_walk() {
             plan_of(vec![10, 11, 12, 13, 14], vec![1, 3]),
         ),
         ("no sets at all", plan_of(vec![1, 2, 3], vec![0])),
+        // `set_offsets` is not required to be non-empty either, and
+        // `validate_plan`'s loop accepts it, so both executors must.
+        ("no set_offsets at all", plan_of(vec![1, 2, 3], vec![])),
         ("one empty set", plan_of(vec![1, 2, 3], vec![0, 0])),
         (
             "cross-shard, descending, with repeats",
