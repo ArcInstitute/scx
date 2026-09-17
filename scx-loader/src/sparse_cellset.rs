@@ -235,6 +235,26 @@ fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> (usize, f64) {
 /// they assert against the policy rather than restating its arithmetic, which
 /// is what lets them keep proving "no reallocation happened" when the bias
 /// changes.
+/// Process-wide switch for the **multi-set batch executor** (W11).
+///
+/// Default `plan`: one occurrence table over the whole batch, one read per file
+/// over its deduplicated rows, each unique `(file, row)` transformed once.
+/// `SCX_CELLSET_EXECUTOR=set` restores the pre-W11 per-set walk — one read per
+/// set, a per-set `Vec<Option<(Vec<i32>, Vec<f32>)>>`, and an
+/// `extend_from_slice` copy of every row — which is the same-build A/B arm for
+/// the capture, exactly as `SCX_ROW_GROUP_ADMIT=plan` is for the admission
+/// policy.
+///
+/// Anything other than `set` (case-insensitive) is `plan`, including an unset
+/// variable and a typo: a misspelled arm must not silently restore the old
+/// executor in a capture that then reports it as the default.
+pub(crate) fn whole_plan_executor() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("SCX_CELLSET_EXECUTOR").is_ok_and(|v| v.eq_ignore_ascii_case("set"))
+    })
+}
+
 pub(crate) fn presize_nnz(rows: usize, mean_nnz_per_row: f64) -> usize {
     let est = (rows as f64 * mean_nnz_per_row).ceil() as usize;
     est.saturating_add(est / 8)
@@ -1087,7 +1107,241 @@ impl SparseCellSetLoader {
         admit_row_groups: Option<Admit>,
     ) -> Result<SparseCellSetBatch> {
         self.validate_plan(engine, plan)?;
-        self.gather_per_set(engine, plan, admit_row_groups)
+        if whole_plan_executor() {
+            self.gather_whole_plan(engine, plan, admit_row_groups)
+        } else {
+            self.gather_per_set(engine, plan, admit_row_groups)
+        }
+    }
+
+    /// Positions of `plan` the gather emits: `[set_offsets[0], set_offsets[n])`.
+    ///
+    /// `set_offsets` is validated non-decreasing and in range but is **not**
+    /// required to start at 0 or to end at `rows.len()`, so a plan can name rows
+    /// no set covers. The per-set walk never reads those — it iterates set
+    /// spans — and the whole-plan executor must not either, or a plan with a
+    /// partial cover would read rows the other arm does not and move the
+    /// admission footprint with it.
+    fn emitted_range(plan: &SparseCellSetPlan) -> (usize, usize) {
+        let n_sets = plan.set_offsets.len().saturating_sub(1);
+        if n_sets == 0 {
+            return (0, 0);
+        }
+        (
+            plan.set_offsets[0] as usize,
+            plan.set_offsets[n_sets] as usize,
+        )
+    }
+
+    /// A set whose rows span more than one file needs a global vocabulary:
+    /// raw-local indices from different files are not comparable.
+    ///
+    /// Checked over every set **before** any read, where the per-set walk
+    /// discovers it partway through and has already done the earlier sets' I/O.
+    /// Same error, same message; only the wasted work differs.
+    fn check_cross_file_sets(&self, plan: &SparseCellSetPlan) -> Result<()> {
+        if self.remap.is_some() {
+            return Ok(());
+        }
+        let n_sets = plan.set_offsets.len().saturating_sub(1);
+        for s in 0..n_sets {
+            let lo = plan.set_offsets[s] as usize;
+            let hi = plan.set_offsets[s + 1] as usize;
+            if hi <= lo {
+                continue;
+            }
+            let f0 = plan.file_ids[lo];
+            if plan.file_ids[lo..hi].iter().any(|&f| f != f0) {
+                return Err(LoaderError::ConfigError {
+                    reason: "cross-file cell set requires global-vocab remap tables \
+                                 (raw-local indices from different files are not comparable)"
+                        .into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// W11 — the multi-set batch executor.
+    ///
+    /// One occurrence table over the whole plan, **one read per file** over that
+    /// file's deduplicated rows, each unique `(file, row)` transformed once, and
+    /// the output allocated exactly once from the measured lengths. Against the
+    /// per-set walk this removes, per plan: `n_sets - n_files` reads, two `Vec`
+    /// allocations per row, one full copy of the batch, and every duplicate
+    /// occurrence's decode and transform.
+    ///
+    /// **Dedup cannot change the output.** [`Self::transform_row`] is a pure
+    /// function of `(file_id, row, indices, data)` — the remap table is indexed
+    /// by `file_id` and the downsample draw is keyed on the file's *content*
+    /// identity and the *physical* row ([`crate::seed::row_seed`]), never on
+    /// batch position — so two occurrences of one `(file, row)` are bit-identical
+    /// and one may be memcpy'd from the other.
+    fn gather_whole_plan(
+        &self,
+        engine: &PrefetchEngine,
+        plan: &SparseCellSetPlan,
+        admit_row_groups: Option<Admit>,
+    ) -> Result<SparseCellSetBatch> {
+        self.check_cross_file_sets(plan)?;
+        let (emit_lo, emit_hi) = Self::emitted_range(plan);
+        let occ = Occurrences::build(plan, emit_lo, emit_hi);
+        let n_out = emit_hi - emit_lo;
+
+        // --- one read per file, over its unique rows, exact spans -----------
+        //
+        // `read_row_indices_with_admission` carries the plan's verdict and does
+        // the indptr-only prescan itself, so the rows land in one exactly-sized
+        // allocation with no estimate. Widening from per-set to per-plan is also
+        // what lets the chunked parallel group decode overlap groups across
+        // shards rather than within one set's worth.
+        let mut per_file: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(occ.by_file.len());
+        for (fid, slots) in &occ.by_file {
+            let rows: Vec<u64> = slots.iter().map(|&s| occ.slots[s as usize].1).collect();
+            let reader = engine.lease(*fid)?;
+            per_file.push(
+                reader
+                    .read_row_indices_with_admission(&rows, admit_row_groups.as_ref())
+                    .map_err(LoaderError::FormatError)?,
+            );
+        }
+
+        // --- fast path: the read IS the batch --------------------------------
+        //
+        // One file, no duplicate occurrences, and no stage that could shrink a
+        // row: the rows are already in plan order at their final lengths, so
+        // the `ScxCsr` is moved out whole and the gather's whole output is the
+        // one allocation `read_row_indices_with_admission` already made. Taken
+        // BEFORE the transform bookkeeping below, which would otherwise cost
+        // four `Vec`s per plan this path does not need.
+        let no_shrink = self.remap.is_none() && self.downsample.is_none();
+        if no_shrink && occ.identity && per_file.len() == 1 {
+            let mut csr = per_file.pop().expect("one bucket");
+            // Elementwise over the whole batch: `clip_negatives` is per value,
+            // so a row-by-row walk would be the same work in more passes.
+            crate::downsample::clip_negatives(&mut csr.data);
+            if self.normalize || self.log1p {
+                // Per row, because `normalize` divides by that row's library
+                // size. In place, into the spans the indptr already names.
+                let bounds: Vec<(usize, usize)> = (0..n_out)
+                    .map(|l| (csr.indptr[l] as usize, csr.indptr[l + 1] as usize))
+                    .collect();
+                let rows = spans_mut(&mut csr.data, &bounds);
+                crate::pool::cpu_pool().install(|| {
+                    rows.into_par_iter().for_each(|d| {
+                        apply_sparse_transforms(d, self.normalize, self.log1p, self.target_sum)
+                    })
+                });
+            }
+            return Ok(SparseCellSetBatch {
+                indptr: csr.indptr,
+                indices: csr.indices,
+                data: csr.data,
+                shape: (n_out, self.n_cols),
+                cell_indices: plan.rows[emit_lo..emit_hi].to_vec(),
+                file_ids: plan.file_ids[emit_lo..emit_hi].to_vec(),
+                set_offsets: plan.set_offsets.clone(),
+                role_tags: plan.role_tags[emit_lo..emit_hi].to_vec(),
+            });
+        }
+
+        // --- transform each unique row once, in place ------------------------
+        //
+        // Every stage either shrinks a row or preserves it (`remap_row` drops
+        // `-1` sentinels and coalesces; `downsample_row` truncates; the clip and
+        // the value transforms are elementwise), so a row's output always fits
+        // its own raw span and no second buffer is needed to hold it.
+        let mut lens: Vec<u32> = vec![0; occ.slots.len()];
+        for (bucket, (fid, slots)) in occ.by_file.iter().enumerate() {
+            let csr = &mut per_file[bucket];
+            let bounds: Vec<(usize, usize)> = (0..slots.len())
+                .map(|l| (csr.indptr[l] as usize, csr.indptr[l + 1] as usize))
+                .collect();
+            let idx_spans = spans_mut(&mut csr.indices, &bounds);
+            let dat_spans = spans_mut(&mut csr.data, &bounds);
+            let fid = *fid;
+            // `cpu_pool().install`, never rayon's global registry: this runs on
+            // the consumer thread, which in a forked DataLoader worker has no
+            // usable global pool (see `crate::pool`).
+            let out: Vec<u32> = crate::pool::cpu_pool().install(|| {
+                idx_spans
+                    .into_par_iter()
+                    .zip(dat_spans.into_par_iter())
+                    .enumerate()
+                    .map_init(TransformScratch::default, |sc, (l, (ix, dx))| {
+                        let row = occ.slots[slots[l] as usize].1;
+                        if no_shrink {
+                            // Nothing can move, so the row is transformed
+                            // where it already lies — no scratch, no copy.
+                            crate::downsample::clip_negatives(dx);
+                            if self.normalize || self.log1p {
+                                apply_sparse_transforms(
+                                    dx,
+                                    self.normalize,
+                                    self.log1p,
+                                    self.target_sum,
+                                );
+                            }
+                            ix.len() as u32
+                        } else {
+                            self.transform_row_into(fid, row, ix, dx, sc);
+                            let n = sc.idx.len();
+                            ix[..n].copy_from_slice(&sc.idx);
+                            dx[..n].copy_from_slice(&sc.dat);
+                            n as u32
+                        }
+                    })
+                    .collect()
+            });
+            for (l, &n) in out.iter().enumerate() {
+                lens[slots[l] as usize] = n;
+            }
+        }
+
+        // --- assemble in plan order ------------------------------------------
+        let mut indptr: Vec<i64> = Vec::with_capacity(n_out + 1);
+        indptr.push(0);
+        let mut acc: i64 = 0;
+        for p in 0..n_out {
+            acc += i64::from(lens[occ.slot_of_pos[p] as usize]);
+            indptr.push(acc);
+        }
+        let nnz = acc as usize;
+        let mut indices: Vec<i32> = vec![0; nnz];
+        let mut data: Vec<f32> = vec![0.0; nnz];
+        let bounds: Vec<(usize, usize)> = (0..n_out)
+            .map(|p| (indptr[p] as usize, indptr[p + 1] as usize))
+            .collect();
+        let out_idx = spans_mut(&mut indices, &bounds);
+        let out_dat = spans_mut(&mut data, &bounds);
+        let occ_ref = &occ;
+        let per_file_ref = &per_file;
+        crate::pool::cpu_pool().install(|| {
+            out_idx
+                .into_par_iter()
+                .zip(out_dat.into_par_iter())
+                .enumerate()
+                .for_each(|(p, (oi, od))| {
+                    let slot = occ_ref.slot_of_pos[p] as usize;
+                    let (bucket, local) = occ_ref.slot_loc[slot];
+                    let csr = &per_file_ref[bucket as usize];
+                    let lo = csr.indptr[local as usize] as usize;
+                    let n = oi.len();
+                    oi.copy_from_slice(&csr.indices[lo..lo + n]);
+                    od.copy_from_slice(&csr.data[lo..lo + n]);
+                })
+        });
+
+        Ok(SparseCellSetBatch {
+            indptr,
+            indices,
+            data,
+            shape: (n_out, self.n_cols),
+            cell_indices: plan.rows[emit_lo..emit_hi].to_vec(),
+            file_ids: plan.file_ids[emit_lo..emit_hi].to_vec(),
+            set_offsets: plan.set_offsets.clone(),
+            role_tags: plan.role_tags[emit_lo..emit_hi].to_vec(),
+        })
     }
 
     /// Structural validation of a plan, which arrives straight from (untrusted)
@@ -1318,24 +1572,52 @@ impl SparseCellSetLoader {
     /// `−1 → 0` stays an explicit zero and nnz is unchanged. Callers that count nnz
     /// therefore see the same structure with and without the clip.
     fn transform_row(&self, fid: u32, row: u64, idx: &[i32], dat: &[f32]) -> (Vec<i32>, Vec<f32>) {
-        let (mut out_idx, mut out_dat) = match &self.remap {
-            Some(tables) => remap_row(idx, dat, &tables[fid as usize]),
-            None => (idx.to_vec(), dat.to_vec()),
-        };
-        crate::downsample::clip_negatives(&mut out_dat);
+        let mut sc = TransformScratch::default();
+        self.transform_row_into(fid, row, idx, dat, &mut sc);
+        (sc.idx, sc.dat)
+    }
+
+    /// [`Self::transform_row`] writing into a caller-owned [`TransformScratch`],
+    /// so the batch executor pays its allocations once per rayon worker rather
+    /// than once per row. One implementation of the stage order, so the owned
+    /// and the reused form cannot drift.
+    fn transform_row_into(
+        &self,
+        fid: u32,
+        row: u64,
+        idx: &[i32],
+        dat: &[f32],
+        sc: &mut TransformScratch,
+    ) {
+        match &self.remap {
+            Some(tables) => remap_row_into(
+                idx,
+                dat,
+                &tables[fid as usize],
+                &mut sc.pairs,
+                &mut sc.idx,
+                &mut sc.dat,
+            ),
+            None => {
+                sc.idx.clear();
+                sc.idx.extend_from_slice(idx);
+                sc.dat.clear();
+                sc.dat.extend_from_slice(dat);
+            }
+        }
+        crate::downsample::clip_negatives(&mut sc.dat);
         if let Some(cfg) = &self.downsample {
             crate::downsample::downsample_row(
-                &mut out_idx,
-                &mut out_dat,
+                &mut sc.idx,
+                &mut sc.dat,
                 cfg,
                 cfg.identity_for(fid),
                 row,
             );
         }
         if self.normalize || self.log1p {
-            apply_sparse_transforms(&mut out_dat, self.normalize, self.log1p, self.target_sum);
+            apply_sparse_transforms(&mut sc.dat, self.normalize, self.log1p, self.target_sum);
         }
-        (out_idx, out_dat)
     }
 }
 
@@ -1749,12 +2031,122 @@ pub(crate) fn validate_indptr(indptr: &[i64], nnz: usize) -> Result<()> {
     Ok(())
 }
 
+/// Where every output position's row comes from, over the whole batch.
+///
+/// Built once per plan, over the **emitted** positions only. The point of it is
+/// that a `(file, row)` the plan names more than once — a control pool repeated
+/// in every set, a shared neighbour, a group sampled with replacement — is read
+/// and transformed once and memcpy'd into each of its positions.
+struct Occurrences {
+    /// Unique `(file_id, row)` in first-occurrence order.
+    slots: Vec<(u32, u64)>,
+    /// Emitted position (relative to `emit_lo`) -> slot index.
+    slot_of_pos: Vec<u32>,
+    /// `(file_id, its slot indices)`, files in first-appearance order and each
+    /// file's slots in first-occurrence order — which is the row order its one
+    /// `read_row_indices_with_admission` call is made in, and therefore the row
+    /// order of the `ScxCsr` that comes back.
+    by_file: Vec<(u32, Vec<u32>)>,
+    /// Slot -> `(bucket in by_file, local row in that bucket's csr)`.
+    slot_loc: Vec<(u32, u32)>,
+    /// `slot_of_pos[i] == i` for every `i` — i.e. the plan names no row twice.
+    identity: bool,
+}
+
+impl Occurrences {
+    fn build(plan: &SparseCellSetPlan, emit_lo: usize, emit_hi: usize) -> Self {
+        let n = emit_hi.saturating_sub(emit_lo);
+        let mut index: HashMap<(u32, u64), u32> = HashMap::with_capacity(n);
+        let mut slots: Vec<(u32, u64)> = Vec::with_capacity(n);
+        let mut slot_of_pos: Vec<u32> = Vec::with_capacity(n);
+        let mut by_file: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut file_bucket: HashMap<u32, usize> = HashMap::new();
+        let mut slot_loc: Vec<(u32, u32)> = Vec::with_capacity(n);
+        let mut identity = true;
+
+        for p in emit_lo..emit_hi {
+            let key = (plan.file_ids[p], plan.rows[p]);
+            let slot = match index.get(&key) {
+                Some(&s) => s,
+                None => {
+                    let s = slots.len() as u32;
+                    index.insert(key, s);
+                    slots.push(key);
+                    let bucket = *file_bucket.entry(key.0).or_insert_with(|| {
+                        by_file.push((key.0, Vec::new()));
+                        by_file.len() - 1
+                    });
+                    let local = by_file[bucket].1.len() as u32;
+                    by_file[bucket].1.push(s);
+                    slot_loc.push((bucket as u32, local));
+                    s
+                }
+            };
+            identity &= slot as usize == slot_of_pos.len();
+            slot_of_pos.push(slot);
+        }
+
+        Occurrences {
+            slots,
+            slot_of_pos,
+            by_file,
+            slot_loc,
+            identity,
+        }
+    }
+}
+
+/// Split `buf` into the disjoint spans `bounds` names, for a parallel scatter.
+///
+/// `bounds` must be ascending and non-overlapping, which is what a prefix sum
+/// over row lengths produces — that is the whole reason the spans can be written
+/// in parallel without synchronisation. Asserted in debug rather than merely
+/// assumed; in release an overlap makes `split_at_mut` panic on the negative
+/// stride, so it cannot silently alias.
+fn spans_mut<'a, T>(buf: &'a mut [T], bounds: &[(usize, usize)]) -> Vec<&'a mut [T]> {
+    let mut out = Vec::with_capacity(bounds.len());
+    let mut rest = buf;
+    let mut base = 0usize;
+    for &(lo, hi) in bounds {
+        debug_assert!(
+            lo >= base && hi >= lo,
+            "spans must be ascending and non-overlapping: ({lo}, {hi}) after {base}"
+        );
+        let (_, tail) = rest.split_at_mut(lo - base);
+        let (span, tail) = tail.split_at_mut(hi - lo);
+        out.push(span);
+        rest = tail;
+        base = hi;
+    }
+    out
+}
+
+/// Per-rayon-worker buffers for [`SparseCellSetLoader::transform_row_into`],
+/// created once per worker by `map_init` instead of three `Vec`s per row.
+#[derive(Default)]
+struct TransformScratch {
+    idx: Vec<i32>,
+    dat: Vec<f32>,
+    pairs: Vec<(i32, f32)>,
+}
+
 /// Map local gene ids to global via `local_to_global` (`-1` = drop), then sort
 /// by global id and coalesce duplicates by summing — matching state3's
 /// `local_to_global` + `_coalesce_gene_counts` (`dataset.py:381-391`), so the
 /// output CSR row stays canonical (sorted, unique).
-fn remap_row(indices: &[i32], data: &[f32], local_to_global: &[i32]) -> (Vec<i32>, Vec<f32>) {
-    let mut pairs: Vec<(i32, f32)> = Vec::with_capacity(indices.len());
+/// Writes into caller-owned buffers rather than returning them, so the batch
+/// executor pays three allocations per rayon worker instead of three per row.
+/// `sort_by_key` is stable, and the sum order within an equal-id run is what
+/// makes the coalesced f32 reproducible.
+fn remap_row_into(
+    indices: &[i32],
+    data: &[f32],
+    local_to_global: &[i32],
+    pairs: &mut Vec<(i32, f32)>,
+    out_idx: &mut Vec<i32>,
+    out_dat: &mut Vec<f32>,
+) {
+    pairs.clear();
     for (&col, &val) in indices.iter().zip(data.iter()) {
         let g = if col >= 0 {
             local_to_global.get(col as usize).copied().unwrap_or(-1)
@@ -1766,9 +2158,9 @@ fn remap_row(indices: &[i32], data: &[f32], local_to_global: &[i32]) -> (Vec<i32
         }
     }
     pairs.sort_by_key(|&(g, _)| g);
-    let mut out_idx: Vec<i32> = Vec::with_capacity(pairs.len());
-    let mut out_dat: Vec<f32> = Vec::with_capacity(pairs.len());
-    for (g, v) in pairs {
+    out_idx.clear();
+    out_dat.clear();
+    for &(g, v) in pairs.iter() {
         if out_idx.last() == Some(&g) {
             *out_dat.last_mut().unwrap() += v;
         } else {
@@ -1776,7 +2168,6 @@ fn remap_row(indices: &[i32], data: &[f32], local_to_global: &[i32]) -> (Vec<i32
             out_dat.push(v);
         }
     }
-    (out_idx, out_dat)
 }
 
 /// Value-only, zero-preserving sparse transforms on a row's `data`, delegating

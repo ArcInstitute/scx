@@ -238,8 +238,15 @@ impl PrefetchEngine {
 
     /// Deduplicate a plan's `(file, row)` pairs into per-`(file, shard)` buckets.
     ///
-    /// The gather passes the same deduplicated set to `read_rows_with`, so each
-    /// bucket's length is the `group_len` the block-index decision sees.
+    /// The cell-set gather passes the same deduplicated set to
+    /// `read_row_indices_with_admission`, so each bucket's length is the
+    /// `group_len` the block-index decision sees. ⚠️ That was **aspirational
+    /// until W11**: the gather walked the plan one set at a time and passed each
+    /// set's raw rows, duplicates included, so a shard could read as dense here
+    /// and sparse there and take a different route from the one this sizing
+    /// assumed. The whole-plan batch executor closes it — see
+    /// `cellset_plan_admission_ignores_plan_level_density`, which asserts both
+    /// arms. `IndexPlanLoader` still reads per plan-item.
     /// An out-of-range `file_id` is skipped rather than panicked on: the
     /// gather's own validation is what reports it, and this runs first.
     pub(crate) fn bucket_plan_rows(
