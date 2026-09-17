@@ -202,7 +202,14 @@ Two things to know:
   as a ceiling on process RSS. It is **opt-in** and defaults to uncharged and
   unenforced: this class has no `max_plan_size`, so plan width is
   yours to declare, and a default guess would shrink the cache — the lever worth
-  2,486× below — on every existing caller.
+  2,486× below — on every existing caller. Alongside it,
+  `breakdown["transient_bytes"]` charges the **second** buffer a gather holds
+  while it assembles (see [How a batch is gathered](#how-a-batch-is-gathered)),
+  on the configurations that cannot avoid one: a remap, a downsample, or a
+  manifest of more than one file. A single-file raw-local loader is charged 0
+  there, and a plan that happens to repeat a row on that configuration pays an
+  uncharged transient — a floor rather than a bound, said here rather than left
+  to be discovered.
 - **Bound the manifest itself when it is very large.**
   `SparseCellSetDataset(paths, reader_limit=N)` keeps at most `N` of the
   manifest's files open at a time, reopening on demand. Default `None` opens
@@ -558,6 +565,46 @@ per plan against its divided share (`budget / (lookahead + 1)`), `gather` decide
 against the whole byte budget. That changes what the shard cache *retains*, not
 what is read, so the batches are identical — but `gather` runs on the calling
 thread with no prefetch, so it is not the way to stream.
+
+### How a batch is gathered
+
+Both routes run the same executor, and it works over the **whole batch** rather
+than one set at a time:
+
+1. An **occurrence table** over the plan's emitted positions: unique
+   `(file_id, row)` in first-occurrence order, and, per position, which of those
+   it names.
+2. **One read per file**, over that file's deduplicated rows, through
+   `BackedCsrReader::read_row_indices_with_admission` — which prescans each
+   touched shard's indptr, so the rows land in one exactly-sized allocation and
+   the gather never grows a buffer.
+3. Each unique row **transformed once**, in place, in parallel: remap, the
+   non-negativity clip, the seeded downsample, `normalize`/`log1p`. Every stage
+   either shrinks a row or preserves it, so a row's output fits its own span.
+4. The batch written from the measured lengths, each position's span filled in
+   parallel. A single-file plan with no repeated rows and no length-changing
+   transform skips this step entirely — the read's own buffers *are* the batch.
+
+Two consequences worth planning around:
+
+- **A repeated row costs a memcpy, not a decode.** A control pool carried by
+  every set, a neighbour shared between centres, a covariate group sampled with
+  replacement — each distinct `(file, row)` is read and transformed once however
+  many positions name it. This is safe rather than approximate: the row
+  transform is a pure function of `(file_id, row, indices, data)`, and the
+  downsample draw is keyed on the file's content identity and the *physical*
+  row, never on batch position, so the copies are bit-identical to what separate
+  reads would have produced.
+- **Two buffers, briefly, on the general path.** When the batch cannot be the
+  read — duplicates, more than one file, or a transform that changes nnz — the
+  deduplicated read and the batch are live together for the span of the gather.
+  `memory_budget()["breakdown"]["transient_bytes"]` charges it where it is
+  unavoidable; see [Sizing the shard cache](#sizing-the-shard-cache).
+
+`SCX_CELLSET_EXECUTOR=set` restores the previous per-set walk — one read per
+set, a per-row buffer, a copy of every row into the batch. It exists as a
+same-build A/B arm for benchmarking and is not a supported configuration; the
+batches are identical either way.
 
 ### Very large manifests
 

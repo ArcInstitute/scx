@@ -466,13 +466,16 @@ class SparseCellSetDataset:
         `cache_bytes` and `python_overhead_bytes` are the non-zero terms by
         default: on the sparse path the shard cache *is* the budget, and there
         is no plan-tuple term. Pass `max_plan_rows` and `batch_buffer_bytes`
-        joins them. `total_bytes` fits
+        joins them — plus `transient_bytes`, the second buffer a gather holds
+        while it assembles the batch from a deduplicated read, on the
+        configurations that cannot avoid one (a remap, a downsample, or more
+        than one file). `total_bytes` fits
         `max_memory_mb` unless `budget_exceeded` is True, which means even a
         one-shard cache does not fit.
 
         That is a statement about the cache this loader sizes, not a ceiling on
-        process RSS: the batch's transients are never charged and the batch
-        itself only when `max_plan_rows` declares how wide plans get (this path
+        process RSS: the batch's per-row transients are never charged and the
+        batch itself only when `max_plan_rows` declares how wide plans get (this path
         has no `max_plan_size`, so plan width is otherwise the caller's), and
         the LRU keeps a single oversize shard rather than refusing to cache it,
         so one above-average shard can sit above the byte cap.
