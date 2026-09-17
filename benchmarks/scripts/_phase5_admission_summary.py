@@ -76,6 +76,9 @@ def write_manifest(root: pathlib.Path, dest: pathlib.Path) -> None:
     )
     prov = json.loads((root / "provenance.json").read_text()) if (
         root / "provenance.json").exists() else {}
+    # `mkdir` first: the factors summariser does this and this one did not,
+    # so `--manifest <new dir>/x.json` crashed with FileNotFoundError.
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps({"provenance": prov, "rounds": rounds}, indent=1) + "\n")
     print(f"wrote {len(rounds)} rounds to {dest}")
 

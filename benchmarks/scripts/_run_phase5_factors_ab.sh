@@ -20,7 +20,7 @@
 # Arms, all one build:
 #   plan   — pre-W10 admission (all-or-nothing per plan), parallel decode ON
 #   reuse  — shipped: reuse-signal admission, parallel decode ON
-#   serial — shipped admission, `SCX_ROW_GROUP_DECODE_CHUNK=1` (one group per
+#   serial — shipped admission, `SCX_ROW_GROUP_SERIAL_DECODE=1` (one group per
 #            chunk, i.e. the pre-change serial decode)
 #
 # `reuse` vs `plan` isolates the admission policy; `reuse` vs `serial` isolates
@@ -202,9 +202,9 @@ PY
 arm_env() {
     local name="$1"
     case "$name" in
-        plan)   export SCX_ROW_GROUP_ADMIT=plan;  unset SCX_ROW_GROUP_DECODE_CHUNK ;;
-        reuse)  export SCX_ROW_GROUP_ADMIT=reuse; unset SCX_ROW_GROUP_DECODE_CHUNK ;;
-        serial) export SCX_ROW_GROUP_ADMIT=reuse; export SCX_ROW_GROUP_DECODE_CHUNK=1 ;;
+        plan)   export SCX_ROW_GROUP_ADMIT=plan;  unset SCX_ROW_GROUP_SERIAL_DECODE ;;
+        reuse)  export SCX_ROW_GROUP_ADMIT=reuse; unset SCX_ROW_GROUP_SERIAL_DECODE ;;
+        serial) export SCX_ROW_GROUP_ADMIT=reuse; export SCX_ROW_GROUP_SERIAL_DECODE=1 ;;
         *) echo "unknown arm $name" >&2; return 1 ;;
     esac
     export ARM_NAME="$name"
@@ -272,7 +272,7 @@ pathlib.Path("$OUT/provenance.json").write_text(json.dumps({
     "arms": {
       "plan":   "SCX_ROW_GROUP_ADMIT=plan (pre-W10 admission), parallel decode on",
       "reuse":  "shipped: reuse-signal admission, parallel decode on",
-      "serial": "shipped admission, SCX_ROW_GROUP_DECODE_CHUNK=1 (pre-change serial decode)",
+      "serial": "shipped admission, SCX_ROW_GROUP_SERIAL_DECODE=1 (pre-change serial decode)",
     },
     "contrasts": {
       "admission": "reuse vs plan",

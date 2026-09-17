@@ -1459,10 +1459,11 @@ impl BackedCsrReader {
     ///
     /// For each request `rows[i]`, calls `scatter(i, indices, data)` where
     /// `(indices, data)` are slices into the cached shard's CSR for that row.
-    /// Each touched shard is decoded once via the LRU cache; scatter calls
-    /// fire in shard-grouped (sorted-by-row) order, but the `i` argument is
-    /// the original position in `rows`, so callers can write to a dense
-    /// output buffer indexed by request order.
+    /// Each touched shard is decoded once via the LRU cache. The `i` argument
+    /// is the original position in `rows`, so callers write to a dense output
+    /// buffer indexed by request order — **which is the only ordering
+    /// guarantee**. Scatter calls do NOT fire sorted by row: see
+    /// [`Self::read_rows_with_admission`] for the per-pass order and why.
     ///
     /// Allocates no intermediate `ScxCsr` and does no per-row `row_slice`
     /// — the per-shard request sub-slice is found via binary search on the
@@ -1489,8 +1490,19 @@ impl BackedCsrReader {
     /// every gather the plan will make and against the plan's share of the
     /// budget, so the L1 gathers and the L2 warm cannot disagree and a plan of
     /// many individually-fitting gathers whose union does not fit cannot churn
-    /// the LRU. A resident group is served as a hit either way; `Some(false)`
-    /// only stops misses from being inserted.
+    /// the LRU. A resident group is served as a hit either way;
+    /// [`Admit::None`] only stops misses from being inserted, and
+    /// [`Admit::Groups`] stops all but the named keys.
+    /// ⚠️ **Scatter order is per PASS, not sorted by row.** `scatter_groups`
+    /// serves every full-shard fallback first and every block-index row group
+    /// second, so on a MIXED request a later full-shard row fires before an
+    /// earlier block-index one. Every in-tree consumer addresses its output by
+    /// the `orig_pos` this hands it (`index_plan`, `sparse_cellset`,
+    /// `read_row_indices`) and is unaffected; a caller that assumed monotonic
+    /// row order across a mixed gather is not. The contiguous `read_rows` path
+    /// has always been range-first / full-second, so this makes the two
+    /// consistent rather than introducing the split — but it IS a change to
+    /// what the pre-split docs on this method promised. Review on #540.
     pub fn read_rows_with_admission<F>(
         &self,
         rows: &[u64],
@@ -1781,30 +1793,75 @@ impl BackedCsrReader {
     /// fork, whose worker threads actually exist. Same contract as
     /// [`Self::warm_shards`].
     fn decode_group_runs(&self, window: &[GroupRun], admit: &Admit) -> Result<Vec<Arc<ScxCsr>>> {
-        #[cfg(feature = "parallel")]
-        {
-            if window.len() > 1 {
-                let decode_all = || -> Result<Vec<Arc<ScxCsr>>> {
-                    window
-                        .par_iter()
-                        .map(|run| self.decode_one_group_run(run, admit))
-                        .collect()
-                };
-                let out = match self.cpu_pool.as_ref() {
-                    Some(pool) => pool.install(decode_all),
-                    None => decode_all(),
-                }?;
-                if let Some(m) = self.metrics() {
-                    m.parallel_group_decodes
-                        .fetch_add(window.len() as u64, Ordering::Relaxed);
+        // ⚠️ **Serve residents serially; parallelise only the misses.**
+        //
+        // A cache hit is a mutex lookup, and routing every run through rayon
+        // regardless cost a MEASURED regression on the high-hit-rate path: on
+        // `index_plan` / tabula the row-group hit rate is 0.9899 (≈38,500 hits
+        // against 391 misses) and the random-plan scenario read
+        // `gather_latency_ms_p50` 27.96 → 29.17 ms (0.952×, 1 of 12 rounds won,
+        // p = 0.006) and p99 29.91 → 31.84 ms (p = 0.039) against the serial
+        // arm — a reliable loss, in the phase's own committed A/B, found by
+        // review reading that JSON. The miss-heavy `read_scattered` win
+        // (2.39-2.79×) is real and untouched by this split, because there
+        // almost every run IS a miss.
+        //
+        // The probe is free on a miss: `get_cached` counts a hit and touches
+        // recency, and counts nothing when absent, so the subsequent
+        // `row_group` still records the miss exactly once.
+        let mut out: Vec<Option<Arc<ScxCsr>>> = Vec::with_capacity(window.len());
+        let mut misses: Vec<usize> = Vec::with_capacity(window.len());
+        for (i, run) in window.iter().enumerate() {
+            match self.resident_group(run) {
+                Some(rg) => out.push(Some(rg)),
+                None => {
+                    out.push(None);
+                    misses.push(i);
                 }
-                return Ok(out);
             }
         }
-        window
-            .iter()
-            .map(|run| self.decode_one_group_run(run, admit))
-            .collect()
+
+        #[cfg(feature = "parallel")]
+        if misses.len() > 1 {
+            let decode_misses = || -> Result<Vec<Arc<ScxCsr>>> {
+                misses
+                    .par_iter()
+                    .map(|&i| self.decode_one_group_run(&window[i], admit))
+                    .collect()
+            };
+            let decoded = match self.cpu_pool.as_ref() {
+                Some(pool) => pool.install(decode_misses),
+                None => decode_misses(),
+            }?;
+            if let Some(m) = self.metrics() {
+                // Counts the groups actually DECODED in parallel, not the
+                // window's length: a chunk of cache hits overlaps nothing.
+                m.parallel_group_decodes
+                    .fetch_add(misses.len() as u64, Ordering::Relaxed);
+            }
+            for (&i, rg) in misses.iter().zip(decoded) {
+                out[i] = Some(rg);
+            }
+            return Ok(out.into_iter().map(|rg| rg.expect("filled")).collect());
+        }
+
+        for &i in &misses {
+            out[i] = Some(self.decode_one_group_run(&window[i], admit)?);
+        }
+        Ok(out.into_iter().map(|rg| rg.expect("filled")).collect())
+    }
+
+    /// The run's row group if it is already resident, without decoding.
+    ///
+    /// `None` when this reader retains no row groups — there is no cache to
+    /// probe, so every run is a "miss" and decodes, which is what the
+    /// `SCX_ROW_GROUP_CACHE=0` arm measures.
+    fn resident_group(&self, run: &GroupRun) -> Option<Arc<ScxCsr>> {
+        if !self.retains_row_groups() {
+            return None;
+        }
+        self.shard_cache
+            .get_cached(CacheKey::Group(self.file_id, run.shard_idx, run.g))
     }
 
     /// One run's row group, through the LRU ([`Self::row_group`]) so an
@@ -1820,10 +1877,10 @@ impl BackedCsrReader {
     /// bound on peak is one decode per worker and no worker idles inside a
     /// chunk.
     fn group_decode_chunk(&self) -> usize {
-        // The A/B arm first: `SCX_ROW_GROUP_DECODE_CHUNK=1` forces one group per
+        // The A/B arm first: `SCX_ROW_GROUP_SERIAL_DECODE=1` forces one group per
         // chunk and therefore the serial path, which is the pre-change regime.
-        if let Some(n) = row_group_decode_chunk_override() {
-            return n;
+        if row_group_serial_decode_enabled() {
+            return 1;
         }
         #[cfg(feature = "parallel")]
         {

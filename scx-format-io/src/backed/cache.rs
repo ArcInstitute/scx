@@ -126,11 +126,13 @@ pub struct CacheMetrics {
     pub row_group_duplicate_waiters: AtomicU64,
 
     // --- W10: what the reuse-signal verdict actually decided -----------------
-    /// Row groups a gather **fetched** inside a parallel chunk — a decode or a
-    /// cache hit, since the chunk cannot know which before it runs. Zero when a
-    /// gather's chunk held one group, when the `parallel` feature is off, or
-    /// when nothing took the block-index route, so a flat zero beside a
-    /// non-zero `block_index_groups` says the gathers are too narrow to
+    /// Row groups a gather actually **decoded** inside a parallel chunk.
+    ///
+    /// Residents are served serially before any chunk is dispatched, so a cache
+    /// hit is never counted here and never pays rayon's per-item cost — routing
+    /// hits through the pool was a measured regression on the 0.99-hit-rate
+    /// `index_plan` path. A flat zero beside a non-zero `block_index_groups`
+    /// therefore means the gathers were served from cache or were too narrow to
     /// overlap, not that the pool is missing.
     pub parallel_group_decodes: AtomicU64,
     /// Bytes of the row groups an admission verdict let a gather retain.

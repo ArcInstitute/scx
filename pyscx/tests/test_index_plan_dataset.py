@@ -1693,13 +1693,22 @@ class TestReuseSignalAdmission:
 
 
 class TestDecodeChunkKillSwitch:
-    """`SCX_ROW_GROUP_DECODE_CHUNK=1` forces one group per chunk — the serial
+    """`SCX_ROW_GROUP_SERIAL_DECODE=1` forces one group per chunk — the serial
     decode path, and the same-build A/B arm for the chunked parallel decode.
 
     Without this knob that change cannot be measured on one build: it is not
     gated by `SCX_ROW_GROUP_ADMIT`, so it is identical in both admission arms
     and cancels out of every ratio they produce. Read once per process, hence a
     subprocess per arm.
+
+    ⚠️ Every probe pins `SCX_LOADER_CPU_THREADS`. The default chunk is the
+    reader's pool width, which `scx_loader::pool` resolves from
+    `num_cpus::get_physical()` — **1 on a GitHub `ubuntu-latest` runner** (2
+    vCPUs, one physical core). So the default arm was legitimately serial there,
+    `parallel_group_decodes` stayed 0, and both tests failed CI on their own
+    premise assertion. The premise is now made true rather than skipped: a host
+    that cannot run the shipped decode path must not be the reason CI never
+    exercises it.
     """
 
     @staticmethod
@@ -1726,11 +1735,11 @@ class TestDecodeChunkKillSwitch:
             print(json.dumps(ds.cache_metrics()))
             """
         )
-        env = {**os.environ}
+        env = {**os.environ, "SCX_LOADER_CPU_THREADS": "4"}
         if chunk is not None:
-            env["SCX_ROW_GROUP_DECODE_CHUNK"] = chunk
+            env["SCX_ROW_GROUP_SERIAL_DECODE"] = chunk
         else:
-            env.pop("SCX_ROW_GROUP_DECODE_CHUNK", None)
+            env.pop("SCX_ROW_GROUP_SERIAL_DECODE", None)
         r = subprocess.run(
             [sys.executable, "-c", src], capture_output=True, text=True, env=env
         )
@@ -1760,6 +1769,10 @@ class TestDecodeChunkKillSwitch:
         # `0` and a non-number must both fall back to the pool width, or a
         # mistyped arm silently measures the serial path and reports itself as
         # the default.
-        for bad in ("0", "yes", "", "-1"):
+        # A boolean now: only the exact string "1" serialises. Anything else —
+        # a typo, a width left over from when this took an integer — must fall
+        # back to the pool width rather than silently serialising a capture that
+        # then reports itself as the default.
+        for bad in ("0", "yes", "", "-1", "2", "true"):
             got = self._probe(path, bad)
             assert got["parallel_group_decodes"] > 0, (bad, got)

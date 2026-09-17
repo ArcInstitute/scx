@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # Phase 5 (W10) — reuse-signal admission A/B, ONE build, two arms.
 #
+# ⚠️ **SUPERSEDED by `_run_phase5_factors_ab.sh`. Do not start a new capture
+# here.** This driver holds the chunked parallel decode constant across both its
+# arms — that change is not gated by `SCX_ROW_GROUP_ADMIT` — so it structurally
+# cannot measure the larger of the phase's two factors, and reporting its result
+# as the phase's verdict is the mistake job 2964125 produced. The factors driver
+# runs three arms and isolates both.
+#
+# Kept, rather than deleted as review suggested, for one reason:
+# `results/raw/phase5_admission/` is cited by name in `docs/performance.md`, and
+# `docs/benchmark_manifest.md` requires a committed performance claim to have a
+# reproducible producer. Deleting this script would leave that row unreproducible.
+#
 # `SCX_ROW_GROUP_ADMIT=plan` restores the pre-W10 all-or-nothing verdict and the
 # unset default is `reuse`, so unlike phases 1-3 this needs no second worktree
 # and no per-arm `maturin develop`: the arm is selected by an environment

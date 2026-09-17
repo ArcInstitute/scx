@@ -404,23 +404,6 @@ def _cache_hit_rate(ds: Any) -> float | None:
     return None
 
 
-def _cache_snapshot(ds: Any) -> tuple[int, int, float | None]:
-    """`(full_shard_groups, block_index_groups, hit_rate)` from ONE metrics read.
-
-    One read, not three: `cache_metrics()` crosses the Python boundary and the
-    counters must describe the same instant to be interpretable together.
-    """
-    cm = ds.cache_metrics()
-    hits = float(cm.get("hits", 0))
-    misses = float(cm.get("misses", 0))
-    hit_rate = round(hits / (hits + misses), 4) if hits + misses > 0 else None
-    return (
-        int(cm.get("full_shard_groups", 0)),
-        int(cm.get("block_index_groups", 0)),
-        hit_rate,
-    )
-
-
 def _run_gather(
     scx_path: str,
     plans_factory: Callable[[], Iterator[tuple]],

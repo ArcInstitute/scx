@@ -1708,7 +1708,7 @@ fn two_plans_are_enough_for_a_reuse_signal() {
     let verdict = verdict_from_window(false, &keys, &window, roomy);
     assert!(verdict.admits(0, 1, 2), "two plans want the shared group");
     assert!(!verdict.admits(0, 3, 4), "nobody else wants the tail");
-    assert_eq!(verdict.named_keys(), 1);
+    assert!(matches!(&verdict, Admit::Groups(k) if k.len() == 1));
 
     // Only the leaving plan itself — not a reuse signal, and the empty set
     // collapses to `None` rather than an empty `Groups`.
@@ -1755,7 +1755,10 @@ fn a_partial_verdict_spends_its_share_hottest_first() {
 
     // Room for two.
     let verdict = verdict_from_window(false, &keys, &window, 250);
-    assert_eq!(verdict.named_keys(), 2, "the share admits two of the four");
+    assert!(
+        matches!(&verdict, Admit::Groups(k) if k.len() == 2),
+        "the room admits two of the four"
+    );
     assert!(
         verdict.admits(0, 0, 0) && verdict.admits(0, 0, 1),
         "the hottest two"
@@ -1830,5 +1833,102 @@ fn the_leaving_plan_counts_itself_end_to_end() {
         1,
         "exactly one plan got a partial verdict — the second is left alone in \
          the window and correctly gets none"
+    );
+}
+
+/// A partial verdict may spend only the room its plan's **whole shards** leave,
+/// and may never name a key on a shard taken whole.
+///
+/// Both halves were review findings on #540 (codex and Cursor Agent, found
+/// independently). `plan_footprint_keyed` counts whole-shard bytes into
+/// `planned` — those shards are warmed and inserted whether or not any row
+/// group is admitted — but the first version discarded that component and let
+/// `verdict_from_window` spend the *entire* `budget / (lookahead + 1)` share on
+/// groups on top of them, so real residency could reach
+/// `whole_shard_bytes + share`. It also named keys on ineligible shards, which
+/// `scatter_groups` never consults, so the allowance could be crowded out by
+/// names the gather would not retain.
+///
+/// Fixture: 256 rows, 4 shards of 64, groups of 16. Each plan takes 16
+/// CONSECUTIVE rows of shard 0 — a quarter of the shard, which fails
+/// `block_index_eligible`'s `len * 4 < 64` window and takes the whole-shard
+/// route at 1,032 B — plus one row each of shards 1 and 2, one group apiece.
+/// So `planned` = 1,032 + 3 x 264 = 1,824 B, and the two eligible keys are 264 B
+/// each. Two identical plans at `lookahead = 2` make both of those keys hot.
+///
+/// Mutations: pass `share` instead of `group_room` to `admit_for` (the tight arm
+/// admits); stop filtering keys by `block_index_eligible` (shard 0's group is
+/// named and, being hottest-tied, can take the room first).
+#[test]
+fn a_partial_verdict_spends_only_the_room_its_whole_shards_leave() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    let shard_bytes = (64 + 1) * 8 + 64 * 8; // 1,032 B, as `plan_admission_…` pins
+    let plan: Plan = (0..16u64)
+        .map(|i| (0u32, i))
+        .chain([(0u32, 70u64), (0u32, 130)])
+        .collect();
+
+    // `run(share)` → bytes the gathers retained as row groups.
+    let run = |share: usize| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = framed_engine_with_budget(dir.path(), true, share * 3); // lookahead 2
+        assert_eq!(
+            engine.lease(0).unwrap().shard_decoded_bytes(0),
+            shard_bytes,
+            "premise: shard 0's whole-shard size"
+        );
+        assert!(
+            !engine.lease(0).unwrap().block_index_eligible(0, 16),
+            "premise: 16 of 64 rows fails the block-index window, so shard 0 is taken whole"
+        );
+        let plans = vec![plan.clone(), plan.clone()];
+        let want: Vec<Vec<(i32, f32)>> = plans
+            .iter()
+            .map(|p| p.iter().map(|&(_, r)| framed_expected(r)).collect())
+            .collect();
+        let mut it = Arc::clone(&engine).iter_with_plans(into_iter(plans), 2, rows_of, gather);
+        it.block_until_full = true;
+        let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+        assert_eq!(out, want, "admission never changes a scattered value");
+        engine
+            .cache_metrics()
+            .row_group_bytes_inserted
+            .load(AtomicOrdering::Relaxed)
+    };
+
+    // Tight: the share holds the whole shard but leaves under one group's worth.
+    let tight = 1100usize;
+    assert!(
+        tight > shard_bytes && tight - shard_bytes < FRAMED_GROUP_BYTES,
+        "premise: the share holds shard 0 whole and leaves {} B, under one group",
+        tight - shard_bytes
+    );
+    assert!(
+        shard_bytes + 3 * FRAMED_GROUP_BYTES > tight,
+        "premise: the plan is still OVER its share, so the partial verdict decides"
+    );
+    assert_eq!(
+        run(tight),
+        0,
+        "nothing may be admitted: the whole shard already claims all but {} B \
+         of the share, and no group fits that",
+        tight - shard_bytes
+    );
+
+    // Roomy: the same plan, a share that leaves room for exactly one group.
+    let roomy = 1500usize;
+    assert!(
+        roomy - shard_bytes >= FRAMED_GROUP_BYTES && roomy - shard_bytes < 2 * FRAMED_GROUP_BYTES,
+        "premise: room for exactly one of the two hot groups"
+    );
+    assert!(
+        shard_bytes + 3 * FRAMED_GROUP_BYTES > roomy,
+        "premise: still over its share"
+    );
+    assert_eq!(
+        run(roomy) as usize,
+        FRAMED_GROUP_BYTES,
+        "exactly one hot group fits the room the whole shard leaves"
     );
 }

@@ -118,27 +118,26 @@ pub fn row_group_admit_reuse_enabled() -> bool {
 /// never drift.
 pub const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
 
-/// Process-wide override for how many row groups a block-index gather decodes
-/// per chunk. `None` (unset) means the reader's pool width, which is the
-/// shipped behaviour.
+/// Process-wide switch for the **serial** row-group decode.
 ///
-/// `SCX_ROW_GROUP_DECODE_CHUNK=1` makes every chunk one group and so takes the
-/// serial path — the pre-change regime, and the same-build A/B arm for the
-/// chunked parallel decode itself. Without it that change is unmeasurable on
-/// one build: it is not gated by `SCX_ROW_GROUP_ADMIT`, so it is identical in
-/// both admission arms and cancels out of every ratio they produce.
+/// Default off: a block-index gather decodes its touched row groups one
+/// pool-width chunk at a time. `SCX_ROW_GROUP_SERIAL_DECODE=1` makes every
+/// chunk one group and so takes the serial path — the pre-change regime, and
+/// the same-build A/B arm for the chunked parallel decode itself. Without it
+/// that change is unmeasurable on one build: it is not gated by
+/// `SCX_ROW_GROUP_ADMIT`, so it is identical in both admission arms and cancels
+/// out of every ratio they produce.
 ///
-/// A value that does not parse as a positive integer is ignored rather than
-/// treated as `1`: a typo must not silently serialise a capture that then
-/// reports itself as the default. Read once per process.
-pub fn row_group_decode_chunk_override() -> Option<usize> {
-    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        std::env::var("SCX_ROW_GROUP_DECODE_CHUNK")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-    })
+/// A **boolean**, not a width. An earlier version took any positive integer,
+/// which was a configuration surface no caller set to anything but `1` — and a
+/// large value silently defeated the `chunk × max group bytes` peak bound the
+/// chunking exists to keep. Anything other than `1` is off, so a typo cannot
+/// serialise a capture that then reports itself as the default. Read once per
+/// process.
+pub fn row_group_serial_decode_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("SCX_ROW_GROUP_SERIAL_DECODE").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// `(file_id, shard_idx, row_group_idx)` — how the shard cache keys a decoded
@@ -200,15 +199,6 @@ impl Admit {
             Admit::None
         } else {
             Admit::Groups(Arc::new(keys))
-        }
-    }
-
-    /// Number of keys a partial verdict names; `0` for both totals, which are
-    /// not key sets. For metrics and tests, never for a decision.
-    pub fn named_keys(&self) -> usize {
-        match self {
-            Admit::Groups(keys) => keys.len(),
-            _ => 0,
         }
     }
 }

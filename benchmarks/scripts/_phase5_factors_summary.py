@@ -57,15 +57,32 @@ CONTRASTS = (("admission", "plan", "reuse"), ("parallel_decode", "serial", "reus
 # meaningless even when it is 1.0.
 EXCLUDE = frozenset({"round", "n_batches", "n_cells", "n_steady_steps"})
 
-# Metrics worth a row, in reporting order. Anything else emitted is still in
-# the committed JSON; this is the reading order, not a filter on what was kept.
-PREFERRED = (
+# Metrics worth reading first. Anything else emitted is still reported below
+# them; this is the reading order, not a filter on what was kept.
+#
+# ⚠️ Matched as a PREFIX, not by equality. `read_scattered` emits bare
+# `gather_latency_ms_p50` but `index_plan` emits it once per scenario
+# (`gather_latency_ms_p50__pyscx_index_plan_random`), and an equality match put
+# every one of those in the alphabetically-sorted tail — which is how a
+# REGRESSION (index_plan random p50 27.96 -> 29.17 ms, 1/12 rounds, p = 0.006)
+# sat in this summariser's own output unread until a reviewer went to the JSON.
+# A metric this file was built to surface must not depend on where the benchmark
+# chose to put a suffix.
+PREFERRED_PREFIXES = (
     "gather_latency_ms_p50",
     "gather_latency_ms_p99",
     "row_group_hit_rate",
     "block_index_adoption_rate",
-    "peak_rss_mb_median",
+    "peak_rss_mb",
 )
+
+
+def _preference(m: str) -> int:
+    """Sort key: position in `PREFERRED_PREFIXES`, else after all of them."""
+    for i, pre in enumerate(PREFERRED_PREFIXES):
+        if m.startswith(pre):
+            return i
+    return len(PREFERRED_PREFIXES)
 
 
 def _lower_is_better(m: str) -> bool:
@@ -135,9 +152,7 @@ def main(root: pathlib.Path) -> int:
                     and not isinstance(v, bool)
                     and k not in EXCLUDE
                 }
-            ordered = [m for m in PREFERRED if m in metrics] + sorted(
-                m for m in metrics if m not in PREFERRED
-            )
+            ordered = sorted(metrics, key=lambda m: (_preference(m), m))
 
             rows, side = [], []
             for m in ordered:

@@ -234,7 +234,17 @@ fn write_fixture(dir: &TempDir, framed: bool) -> std::path::PathBuf {
 }
 
 fn open(path: &std::path::Path) -> BackedCsrReader {
+    // `mut` only under `parallel` — without it nothing reconfigures the reader
+    // and clippy's `unused_mut` is denied in the feature-matrix legs.
+    #[cfg(feature = "parallel")]
     let mut backed = BackedCsrReader::new(ScxReader::open(path).unwrap(), CACHE_SHARDS);
+    #[cfg(not(feature = "parallel"))]
+    let backed = BackedCsrReader::new(ScxReader::open(path).unwrap(), CACHE_SHARDS);
+    // Only the pool pin is feature-gated, not the test: without `parallel`,
+    // `group_decode_chunk()` is already 1, so the peak bound below is *tighter*
+    // and every other assertion still means something. `set_cpu_pool` and
+    // `rayon` do not exist in that build.
+    #[cfg(feature = "parallel")]
     backed.set_cpu_pool(std::sync::Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(GROUP_DECODE_WIDTH)

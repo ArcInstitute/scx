@@ -4901,7 +4901,13 @@ fn touched_row_groups_names_the_groups_planned_bytes_sizes() {
 /// nothing else. `parallel_group_decodes` is asserted alongside so the test can
 /// tell "the widths agree" from "no width ever ran in parallel" — three widths
 /// agreeing about a path none of them took would read as coverage.
+///
+/// ⚠️ `#[cfg(feature = "parallel")]`: `set_cpu_pool` and the `rayon` dependency
+/// only exist under that feature, and `--no-default-features` compiles this
+/// file. Un-gated it broke the `Feature matrix (clippy, no-hdf5 legs)` CI leg —
+/// the same regression this file already records ~400 lines above, reintroduced.
 #[test]
+#[cfg(feature = "parallel")]
 fn parallel_group_decode_matches_the_serial_walk_at_every_pool_width() {
     use std::sync::atomic::Ordering;
     let dir = TempDir::new().unwrap();
