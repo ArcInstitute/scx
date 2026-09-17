@@ -1700,11 +1700,12 @@ fn a_repeat_outside_the_window_is_not_hot() {
 fn two_plans_are_enough_for_a_reuse_signal() {
     let shared: RowGroupKey = (0, 1, 2);
     let mine: RowGroupKey = (0, 3, 4);
-    let keys = vec![shared, mine];
+    let keys: Vec<KeyedBytes> = vec![(shared, 100), (mine, 100)];
+    let roomy = 1_000usize;
 
     // The leaving plan (1) plus one peer still queued (1) — the group is hot.
     let window: HashMap<RowGroupKey, u32> = [(shared, 2), (mine, 1)].into_iter().collect();
-    let verdict = verdict_from_window(false, &keys, &window);
+    let verdict = verdict_from_window(false, &keys, &window, roomy);
     assert!(verdict.admits(0, 1, 2), "two plans want the shared group");
     assert!(!verdict.admits(0, 3, 4), "nobody else wants the tail");
     assert_eq!(verdict.named_keys(), 1);
@@ -1712,21 +1713,68 @@ fn two_plans_are_enough_for_a_reuse_signal() {
     // Only the leaving plan itself — not a reuse signal, and the empty set
     // collapses to `None` rather than an empty `Groups`.
     let alone: HashMap<RowGroupKey, u32> = [(shared, 1), (mine, 1)].into_iter().collect();
-    let verdict = verdict_from_window(false, &keys, &alone);
+    let verdict = verdict_from_window(false, &keys, &alone, roomy);
     assert!(matches!(verdict, Admit::None));
     assert!(!verdict.admits(0, 1, 2));
 
     // A plan that fits its share is admitted whole whatever the window says,
     // which is what keeps this change strictly additive.
     assert!(matches!(
-        verdict_from_window(true, &keys, &alone),
+        verdict_from_window(true, &keys, &alone, roomy),
         Admit::All
     ));
 
     // A key absent from the window is never hot — a plan cannot vouch for a
     // group it did not declare.
     assert!(matches!(
-        verdict_from_window(false, &keys, &HashMap::new()),
+        verdict_from_window(false, &keys, &HashMap::new(), roomy),
+        Admit::None
+    ));
+}
+
+/// A partial verdict is **bounded by the same share the whole-plan rule uses**,
+/// and spends it hottest-first.
+///
+/// Without the bound the reuse signal degenerates exactly where it is needed
+/// most: measured on tabula_sapiens_100k, a 64-set batch's random tail touches
+/// nearly every one of the file's ~392 row groups, so every key reaches a window
+/// count of two and "admit the reused groups" becomes "admit everything" — the
+/// regime the first row-group LRU capture measured at 0 % hits, +350-500 MB and
+/// 2-4 % slower. Interactively: 845 -> 1,138 MB peak RSS and 23.1 -> 21.9
+/// sets/s for a 0.087 hit rate, before this bound.
+///
+/// Mutations: drop the `break` (admits a colder key to fill the last bytes);
+/// sort ascending by count (spends the share on the least-reused groups);
+/// remove the ceiling entirely (admits all four).
+#[test]
+fn a_partial_verdict_spends_its_share_hottest_first() {
+    let k = |g: usize| -> RowGroupKey { (0, 0, g) };
+    // Four hot keys of 100 bytes each, at descending window counts.
+    let keys: Vec<KeyedBytes> = (0..4).map(|g| (k(g), 100usize)).collect();
+    let window: HashMap<RowGroupKey, u32> = (0..4).map(|g| (k(g), (5 - g) as u32)).collect();
+
+    // Room for two.
+    let verdict = verdict_from_window(false, &keys, &window, 250);
+    assert_eq!(verdict.named_keys(), 2, "the share admits two of the four");
+    assert!(
+        verdict.admits(0, 0, 0) && verdict.admits(0, 0, 1),
+        "the hottest two"
+    );
+    assert!(!verdict.admits(0, 0, 2) && !verdict.admits(0, 0, 3));
+
+    // Room for none: the ceiling is respected even when every key is hot, so a
+    // saturated window cannot reintroduce the unbounded regime.
+    assert!(matches!(
+        verdict_from_window(false, &keys, &window, 50),
+        Admit::None
+    ));
+
+    // A key too large for the share on its own stops the walk rather than being
+    // skipped over in favour of a colder, smaller one.
+    let mixed: Vec<KeyedBytes> = vec![(k(0), 500), (k(1), 10)];
+    let win2: HashMap<RowGroupKey, u32> = [(k(0), 3), (k(1), 2)].into_iter().collect();
+    assert!(matches!(
+        verdict_from_window(false, &mixed, &win2, 100),
         Admit::None
     ));
 }

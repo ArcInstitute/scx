@@ -350,6 +350,22 @@ class _Outcome:
     # pair is a route label, not two independent counters.
     full_shard_groups: int = 0
     block_index_groups: int = 0
+    # The row-group half of the same LRU, and what the W10 admission verdict
+    # decided about it. `shard_cache_hit_rate` above is WHOLE SHARDS and stays
+    # `None` on a framed file that never inserts one, so a scenario reading
+    # only that cannot see the block-index route's retention at all.
+    row_group_hits: int = 0
+    row_group_misses: int = 0
+    reuse_admissions: int = 0
+    admitted_group_bytes: int = 0
+    rejected_group_bytes: int = 0
+
+    @property
+    def row_group_hit_rate(self) -> float | None:
+        total = self.row_group_hits + self.row_group_misses
+        # `None`, never 0.0, when the route was not taken: an absent metric must
+        # not read as a floor failure. Same rule `read_scattered` follows.
+        return round(self.row_group_hits / total, 4) if total > 0 else None
 
 
 def _supports_scatter_block_index() -> bool:
@@ -446,10 +462,14 @@ def _run_gather(
                 n_cells += int(batch["shape"][0])
             wall_s = time.perf_counter() - t0
         # Read the counters BEFORE closing: `close()` is terminal on this class
-        # and the accessors raise afterwards.
-        full_shard, block_index, hit_rate = _cache_snapshot(ds)
+        # and the accessors raise afterwards. ONE read — the counters must
+        # describe the same instant to be interpretable together.
+        cm = ds.cache_metrics()
     finally:
         ds.close()
+    hits = float(cm.get("hits", 0))
+    misses = float(cm.get("misses", 0))
+    hit_rate = round(hits / (hits + misses), 4) if hits + misses > 0 else None
     return _Outcome(
         n_sets=n_sets,
         n_cells=n_cells,
@@ -457,8 +477,17 @@ def _run_gather(
         ttfb_s=ttfb_s,
         peak_rss_mb=sampler.peak_mb,
         shard_cache_hit_rate=hit_rate,
-        full_shard_groups=full_shard,
-        block_index_groups=block_index,
+        full_shard_groups=int(cm.get("full_shard_groups", 0)),
+        block_index_groups=int(cm.get("block_index_groups", 0)),
+        row_group_hits=int(cm.get("row_group_hits", 0)),
+        row_group_misses=int(cm.get("row_group_misses", 0)),
+        # `.get` with a default, not `[...]`: these four are W10 keys and a
+        # capture may run against a build that predates them. An absent key is
+        # reported as zero and the arm's own premise assertion is what catches
+        # a build too old to measure, not a KeyError mid-gather.
+        reuse_admissions=int(cm.get("reuse_admissions", 0)),
+        admitted_group_bytes=int(cm.get("admitted_group_bytes", 0)),
+        rejected_group_bytes=int(cm.get("rejected_group_bytes", 0)),
     )
 
 
@@ -846,6 +875,124 @@ _TOKENIZE_SAMPLE_N = 1024
 _TOKENIZE_SEED = 20260914
 
 _TOKENIZE_ARMS = ("crop", "rank", "bin", "sample")
+
+
+# ---------------------------------------------------------------------------
+# W10: hot-control / cold-tail arm (reuse-signal admission)
+# ---------------------------------------------------------------------------
+#
+# The trace the row-group LRU exists for and that no scenario measured: a fixed
+# **control pool** re-read by every batch (the perturbation-screen shape §5.2
+# names, and STATE3's) beside a **cold tail** each batch sees once.
+#
+# Every registered multi-shard fixture measured a 0.000 row-group hit rate on
+# random plans before W10 — a plan over its `budget / (lookahead + 1)` share
+# forfeited retention outright — so this arm is the one whose numbers the
+# admission policy can move at all. It is an arm, not a `_SCENARIOS` entry, for
+# the reasons the W7 block below gives.
+
+# Sets per batch drawn from the fixed control pool, identical in every batch.
+# These are the rows a reuse signal is supposed to keep resident.
+_HOT_CONTROL_SETS = 8
+# Rows the control pool is drawn from, as a contiguous prefix of the obs axis.
+# Small and local on purpose — see `_hot_cold_plans`.
+_HOT_CONTROL_POOL = 2048
+# Sets per batch drawn fresh — the tail the policy must keep REFUSING. A rule
+# that admitted these too would read as a bigger win here while costing exactly
+# the residency the share rule bounds, so the arm records both halves.
+_HOT_TAIL_SETS = 56
+# Cells per set, matching the S=64 scenarios so µs/cell is comparable to them.
+_HOT_SET_SIZE = _SET_SIZE_S64
+_HOT_N_BATCHES = 12
+_HOT_SEED = 20260917
+# The route this arm exists to exercise. `SparseCellSetDataset` defaults to the
+# whole-shard route, and passed nothing this arm would time an R2 gather under a
+# reuse name — which is why the premise below raises rather than skips when the
+# block-index counters come back at zero.
+_HOT_SCATTER_BLOCK_INDEX = True
+# Deliberately tight: the plan's row-group footprint has to EXCEED its
+# `budget / (lookahead + 1)` share, or every plan is admitted whole and the arm
+# measures the pre-W10 rule under the new name.
+_HOT_MAX_MEMORY_MB = 256
+
+
+def _hot_cold_plans(
+    n_obs: int,
+    n_batches: int = _HOT_N_BATCHES,
+    seed: int = _HOT_SEED,
+) -> Iterator[tuple]:
+    """Batches of `_HOT_CONTROL_SETS` fixed control sets + `_HOT_TAIL_SETS` fresh
+    ones. The control sets are drawn once and reused verbatim, so their rows are
+    touched by every plan in any lookahead window."""
+    rng = np.random.default_rng(seed)
+    # The control pool is a CONTIGUOUS block, not a random draw. That is both
+    # what a real screen looks like after `scx sort --group-by perturbation`
+    # and the only shape a cache can hold: 512 control rows drawn uniformly
+    # from a 100k-row file touch nearly every row group in it, so "retain the
+    # hot set" would mean retaining the whole decoded matrix and no budget
+    # short of the file admits it. Measured on tabula_sapiens_100k — a uniform
+    # control pool recovered a 0.078 hit rate at +35 % peak RSS, which is the
+    # pathology the share rule exists to prevent, wearing the reuse signal's
+    # name.
+    pool_end = min(n_obs, _HOT_CONTROL_POOL)
+    controls = [
+        rng.integers(0, pool_end, size=_HOT_SET_SIZE).astype(np.uint64)
+        for _ in range(_HOT_CONTROL_SETS)
+    ]
+    for _ in range(n_batches):
+        tail = [
+            rng.integers(0, n_obs, size=_HOT_SET_SIZE).astype(np.uint64)
+            for _ in range(_HOT_TAIL_SETS)
+        ]
+        yield _pack_plan([*(c.copy() for c in controls), *tail])
+
+
+def _hot_cold_premises(n_obs: int) -> dict[str, Any]:
+    """Raise unless the arm is measuring what its name says.
+
+    Both checks are on the PLAN, not on the cache: asking the cache whether the
+    controls were reused would be asking the subject under test to certify its
+    own premise, which is the shape that let phase 4's overlap premise pass on a
+    random-plan control.
+
+    The tail check is a **fixture-capacity** one and is why the caller records
+    the failure and drops the arm rather than failing the job: at the pinned
+    shape a batch draws `_HOT_TAIL_SETS * _HOT_SET_SIZE` rows, so on a small
+    corpus the "cold" tails collide with each other and the arm cannot separate
+    hot from cold at all (pbmc3k, 2,700 rows: 0.55 overlap). Widening the shape
+    per fixture is not the fix — a rate is only comparable at a fixed shape, and
+    a floor authored from a shape that moves with `n_obs` binds to nothing.
+    """
+    batches = list(_hot_cold_plans(n_obs, n_batches=3))
+    if len(batches) < 2:
+        raise RuntimeError("hot/cold arm needs at least two batches to have a window")
+    head = [set(b[1][: _HOT_CONTROL_SETS * _HOT_SET_SIZE].tolist()) for b in batches]
+    shared = set.intersection(*head)
+    if not shared:
+        raise RuntimeError(
+            "hot/cold arm: the control sets are not shared between batches, so "
+            "there is no reuse signal and this would time a plain random gather"
+        )
+    tails = [set(b[1][_HOT_CONTROL_SETS * _HOT_SET_SIZE :].tolist()) for b in batches]
+    tail_overlap = len(set.intersection(*tails)) / max(1, min(len(t) for t in tails))
+    if tail_overlap > 0.25:
+        raise RuntimeError(
+            f"hot/cold arm: the tails overlap {tail_overlap:.2f} of their rows, "
+            "so the 'cold' half is warm and the arm cannot separate the two"
+        )
+    # The ceiling on `row_group_hit_rate` for this shape, stated so the measured
+    # rate is interpretable: only the control sets can be served from cache, so
+    # the best any admission policy can do here is the control fraction of the
+    # lookups. Reading 0.039 against a 0.125 ceiling is a different fact from
+    # reading it against 1.0, and the arm should not make a reader derive it.
+    ceiling = _HOT_CONTROL_SETS / (_HOT_CONTROL_SETS + _HOT_TAIL_SETS)
+    return {
+        "control_rows": len(shared),
+        "control_pool": min(n_obs, _HOT_CONTROL_POOL),
+        "tail_overlap_fraction": round(tail_overlap, 4),
+        "sets_per_batch": _HOT_CONTROL_SETS + _HOT_TAIL_SETS,
+        "row_group_hit_rate_ceiling": round(ceiling, 4),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2167,6 +2314,96 @@ def run(
         # resident through the rank arm and into this triple's pooled peak.
         co_batches = None
         prepared = None
+        gc.collect()
+
+    # --- W10: hot-control / cold-tail arm ---------------------------------
+    hot_sc = "gather_hot_control_cold_tail"
+    try:
+        hot_premises = _hot_cold_premises(n_obs)
+    except Exception as e:  # noqa: BLE001
+        # Recorded and dropped, not raised: every failure `_hot_cold_premises`
+        # can report is a property of the FIXTURE (too few rows to hold a cold
+        # tail apart from itself), which this function cannot fix and which must
+        # not fail a whole cohort job for one optional arm. The premise that IS
+        # under this function's control — that the block-index route was taken
+        # at all — raises below.
+        result.metadata["hot_control_cold_tail"] = {
+            "applicable": False,
+            "reason": str(e),
+        }
+    else:
+        hot_rates: list[float] = []
+        hot_hit_rates: list[float] = []
+        hot_err: str | None = None
+        for _ in range(n_runs):
+            cache_policy = drop_file_cache(scx_path) if cold_cache else "warm"
+            try:
+                out = _run_gather(
+                    scx_path,
+                    lambda: _hot_cold_plans(n_obs),
+                    max_memory_mb=_HOT_MAX_MEMORY_MB,
+                    scatter_block_index=_HOT_SCATTER_BLOCK_INDEX,
+                )
+            except Exception as e:  # noqa: BLE001
+                hot_err = str(e)
+                break
+            if out.block_index_groups == 0:
+                # Under this function's control, so it raises rather than
+                # skipping: with the route not taken there is no row-group
+                # retention to admit and the arm would time an ordinary random
+                # gather under a reuse name.
+                raise RuntimeError(
+                    f"{hot_sc}: the block-index route was not taken "
+                    f"(full_shard_groups={out.full_shard_groups}); this arm "
+                    "cannot measure admission without it"
+                )
+            sps = out.n_sets / out.wall_s if out.wall_s else 0.0
+            us_per_cell = out.wall_s * 1e6 / out.n_cells if out.n_cells else 0.0
+            hit_rate = out.row_group_hit_rate
+            result.add_run(
+                wall_s=out.wall_s,
+                peak_rss_mb=out.peak_rss_mb,
+                scenario=hot_sc,
+                set_size=_HOT_SET_SIZE,
+                n_sets=out.n_sets,
+                n_cells=out.n_cells,
+                # Beside the rate, because none of it is comparable across a
+                # change in the shape: a floor authored from these numbers binds
+                # to this control/tail split and this budget.
+                sets_per_batch=_HOT_CONTROL_SETS + _HOT_TAIL_SETS,
+                control_sets=_HOT_CONTROL_SETS,
+                tail_sets=_HOT_TAIL_SETS,
+                max_memory_mb=_HOT_MAX_MEMORY_MB,
+                cache_policy=cache_policy,
+                **{
+                    f"cellsets_per_sec__{hot_sc}": round(sps, 1),
+                    f"us_per_cell__{hot_sc}": round(us_per_cell, 3),
+                    # THE metric of this arm. `shard_cache_hit_rate` is whole
+                    # shards and stays None on this route, so it cannot carry it.
+                    f"row_group_hit_rate__{hot_sc}": hit_rate,
+                    f"peak_rss_mb__{hot_sc}": round(out.peak_rss_mb, 1),
+                    f"ttfb_first_set_s__{hot_sc}": round(out.ttfb_s, 4),
+                    # Both halves of the verdict. A policy that admitted the cold
+                    # tail too would raise the hit rate AND collapse
+                    # `rejected_group_bytes`, and only the pair can tell the two
+                    # apart.
+                    f"reuse_admissions__{hot_sc}": out.reuse_admissions,
+                    f"admitted_group_bytes__{hot_sc}": out.admitted_group_bytes,
+                    f"rejected_group_bytes__{hot_sc}": out.rejected_group_bytes,
+                },
+            )
+            hot_rates.append(sps)
+            if hit_rate is not None:
+                hot_hit_rates.append(hit_rate)
+        summary: dict[str, Any] = {"applicable": True, **hot_premises}
+        if hot_err is not None:
+            summary["error"] = hot_err
+        if hot_rates:
+            summary["n_runs"] = len(hot_rates)
+            summary["median_cellsets_per_sec"] = round(median(hot_rates), 1)
+        if hot_hit_rates:
+            summary["median_row_group_hit_rate"] = round(median(hot_hit_rates), 4)
+        result.metadata["hot_control_cold_tail"] = summary
         gc.collect()
 
     # --- W7: neighbourhood plan arms --------------------------------------
