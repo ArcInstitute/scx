@@ -5459,3 +5459,73 @@ fn read_rows_with_admission_honours_the_callers_verdict() {
     );
     assert_eq!(b.cache_bytes_used(), 0);
 }
+
+/// The indptr prescan reads a **resident** shard's indptr rather than decoding
+/// it again, and does so without counting a read that did not happen.
+///
+/// `shard_indptr` decodes the stream afresh every call by design — it must not
+/// touch the LRU, or a prescan between planning and warming could change what
+/// `block_index_eligible` admits. That is right when the shard is cold and pure
+/// waste when it is not, and `read_row_indices` paid it on every call: measured
+/// at 2.73 -> 0.55 ms per gather on a 100k-row synthetic with every shard warm,
+/// i.e. seven re-decodes of a 16,384-entry indptr were 80 % of the call.
+///
+/// The observable is the **hit count**: the peek must add none. A `get_cached`
+/// in its place would count one per shard group and inflate the
+/// `shard_cache_hit_rate` the loader reports with lookups no read performed —
+/// which is the mutation this is watched failing against.
+#[test]
+fn the_indptr_prescan_reads_a_resident_shard_without_counting_a_hit() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    // Unframed and multi-shard, so every request group takes the full-shard
+    // path and the prescan is the only other thing touching the cache.
+    let (mut backed, full) = write_test_file_and_open(&dir, 64, 40, 4, 8);
+    let m = backed.enable_metrics();
+    let rows = [1u64, 17, 33, 49];
+
+    // Cold: the prescan takes the decode branch, and the answer is right.
+    let cold = backed.read_row_indices(&rows).unwrap();
+    for (out, &r) in rows.iter().enumerate() {
+        let want = full.row_slice(r as usize, r as usize + 1).unwrap();
+        let (lo, hi) = (cold.indptr[out] as usize, cold.indptr[out + 1] as usize);
+        assert_eq!(&cold.indices[lo..hi], &want.indices[..], "cold row {r}");
+        assert_eq!(&cold.data[lo..hi], &want.data[..], "cold row {r}");
+    }
+    let hits_after_cold = m.hits.load(Ordering::Relaxed);
+    let misses_after_cold = m.misses.load(Ordering::Relaxed);
+    assert_eq!(
+        misses_after_cold, 4,
+        "premise: four shards, decoded once each"
+    );
+    assert_eq!(
+        backed.indptr_decode_count(),
+        4,
+        "premise: cold, the prescan decodes one indptr per shard"
+    );
+
+    // Warm: the prescan peeks instead, so the only hits are the scatter's own —
+    // one `read_shard_cached_arc` per shard request group.
+    let warm = backed.read_row_indices(&rows).unwrap();
+    assert_eq!(warm.indptr, cold.indptr);
+    assert_eq!(warm.indices, cold.indices);
+    assert_eq!(warm.data, cold.data);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        misses_after_cold,
+        "nothing should have been decoded twice"
+    );
+    assert_eq!(
+        m.hits.load(Ordering::Relaxed) - hits_after_cold,
+        4,
+        "one hit per shard request group — the prescan's peek must add none"
+    );
+    // The claim the hit count cannot make: no second decode happened at all.
+    // `shard_indptr` is invisible to the cache metrics by design, so it is
+    // counted directly, in test builds only.
+    assert_eq!(
+        backed.indptr_decode_count(),
+        4,
+        "the warm gather must not have decoded a single indptr"
+    );
+}

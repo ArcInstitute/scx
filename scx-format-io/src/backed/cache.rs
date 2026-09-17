@@ -328,6 +328,11 @@ impl<K: CacheKeyKind, V: SizeHint> WeightedLruCache<K, V> {
         self.inner.get(key).map(|e| Arc::clone(&e.value))
     }
 
+    /// The cached value, without touching recency. `&self`, so it cannot.
+    pub(super) fn peek(&self, key: &K) -> Option<Arc<V>> {
+        self.inner.peek(key).map(|e| Arc::clone(&e.value))
+    }
+
     pub(super) fn contains(&self, key: &K) -> bool {
         self.inner.contains(key)
     }
@@ -643,6 +648,20 @@ impl<K: CacheKeyKind, V: SizeHint> ShardCache<K, V> {
             }
         }
         hit
+    }
+
+    /// The cached value for `key` if resident, counting **nothing** and
+    /// touching **neither** recency nor the hit/miss counters.
+    ///
+    /// Not a substitute for [`Self::get_cached`], which is a read being served
+    /// and says so. This is for a caller that is about to read the entry
+    /// anyway and only wants to avoid re-deriving something the resident copy
+    /// already holds — `read_row_indices`' indptr prescan, which otherwise
+    /// decodes a resident shard's indptr a second time. Counting that as a hit
+    /// would inflate `shard_cache_hit_rate` with lookups no read performed, and
+    /// bumping recency would let a prescan decide which shard is evicted next.
+    pub(super) fn peek_cached(&self, key: K) -> Option<Arc<V>> {
+        self.cache.as_ref()?.lock().unwrap().peek(&key)
     }
 
     /// Count a decode the caller ran **outside** the cache — neither inserted

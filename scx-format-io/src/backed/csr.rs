@@ -116,6 +116,17 @@ pub struct BackedCsrReader {
     /// This reader's id within its `shard_cache` namespace. `0` for a
     /// standalone reader; assigned by the multi-reader engine otherwise.
     file_id: u32,
+    /// Test-only: how many times [`Self::shard_indptr`] actually decoded.
+    ///
+    /// The prescan in [`Self::read_row_indices_with_admission`] reads a
+    /// resident shard's indptr instead of decoding it again, and that is a
+    /// *performance* claim with no counter behind it — `shard_indptr` is
+    /// deliberately invisible to the cache metrics, by design. Without this the
+    /// only observable is time, and a test could pin the peek's
+    /// side-effect-freedom while a version that peeked and then decoded anyway
+    /// still passed. Compiled out of every non-test build.
+    #[cfg(test)]
+    indptr_decodes: std::sync::atomic::AtomicUsize,
     /// Number of shards to prefetch with `MADV_WILLNEED` after a cache miss.
     prefetch_count: usize,
     /// Configured count cap on the LRU (0 = no cache). Mirrored here so
@@ -294,6 +305,8 @@ impl BackedCsrReader {
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
+            #[cfg(test)]
+            indptr_decodes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             decode_barrier: None,
         }
@@ -337,6 +350,8 @@ impl BackedCsrReader {
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
+            #[cfg(test)]
+            indptr_decodes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             decode_barrier: None,
         }
@@ -383,6 +398,8 @@ impl BackedCsrReader {
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
+            #[cfg(test)]
+            indptr_decodes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             decode_barrier: None,
         }
@@ -445,6 +462,8 @@ impl BackedCsrReader {
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
+            #[cfg(test)]
+            indptr_decodes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             decode_barrier: None,
         }
@@ -1067,6 +1086,9 @@ impl BackedCsrReader {
     /// prescan between planning and warming cannot change which groups
     /// [`Self::block_index_eligible`] admits.
     fn shard_indptr(&self, shard_idx: usize) -> Result<Vec<i64>> {
+        #[cfg(test)]
+        self.indptr_decodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let lite = self
             .shard_entry(shard_idx)
             .ok_or(ScxError::ShardIndexOutOfBounds {
@@ -1078,6 +1100,13 @@ impl BackedCsrReader {
             .read_shard_indptr_from_entry(&lite.into_transient_full_entry())?;
         self.check_decoded_shard_rows(shard_idx, ip.len().saturating_sub(1))?;
         Ok(ip)
+    }
+
+    /// Test-only: how many `shard_indptr` decodes this reader has run.
+    #[cfg(test)]
+    pub(crate) fn indptr_decode_count(&self) -> usize {
+        self.indptr_decodes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Decode just rows `[local_start, local_end)` of shard `shard_idx` directly
@@ -1465,9 +1494,30 @@ impl BackedCsrReader {
         let groups = self.plan_row_groups(&sorted)?;
 
         // Phase 1 — exact per-row lengths in request order, then prefix-sum.
+        //
+        // ⚠️ From the RESIDENT shard when there is one. `shard_indptr` decodes
+        // the indptr stream afresh every call by design (it must not touch the
+        // LRU, or a prescan between planning and warming could change what
+        // `block_index_eligible` admits) — but when the shard is already
+        // decoded its indptr is in memory and decoding it again is pure waste.
+        // Measured on a 100k-row synthetic, 16 sets x 64 rows, every shard
+        // warm: 2.73 -> 0.55 ms per gather, i.e. seven re-decodes of a
+        // 16,384-entry indptr were 80 % of the call. The peek counts nothing
+        // and touches neither recency nor the hit/miss counters: no read is
+        // being served here.
         let mut indptr = vec![0i64; rows.len() + 1];
         for g in &groups {
-            let ip = self.shard_indptr(g.shard_idx)?;
+            let resident = self
+                .shard_cache
+                .peek_cached(CacheKey::Shard(self.file_id, g.shard_idx));
+            let decoded;
+            let ip: &[i64] = match resident.as_deref() {
+                Some(csr) => &csr.indptr,
+                None => {
+                    decoded = self.shard_indptr(g.shard_idx)?;
+                    &decoded
+                }
+            };
             for &(row, pos) in &sorted[g.start..g.end] {
                 let local = (row - g.s_start) as usize;
                 indptr[pos + 1] = ip[local + 1] - ip[local];
