@@ -648,8 +648,9 @@ random plans, pbmc10k retained at 0.987 while tabula_sapiens_100k, census_500k a
 all retained **0.000**. An over-share plan now keeps the row groups **another plan of the
 lookahead window also touches** — the control pool of a perturbation screen, the shared
 neighbours of a spatial batch, a pair member repeated across pairs — taken hottest-first and
-only while they fit that same `budget / (lookahead + 1)` share, with its cold tail still
-decoded and dropped. `cache_metrics()` reports the split as `reuse_admissions` (plans given a
+only while they fit **the room that share leaves after the shards the plan takes whole** —
+those are inserted regardless of any admission decision, so the bound is
+`share - whole_shard_bytes`, not `share` — with its cold tail still decoded and dropped. `cache_metrics()` reports the split as `reuse_admissions` (plans given a
 partial verdict) and `admitted_group_bytes` / `rejected_group_bytes`.
 
 ⚠️ **The share bound on that partial verdict is load-bearing.** A wide random plan can touch
@@ -663,9 +664,11 @@ restores the all-or-nothing rule as the same-build A/B arm.
 pool-width chunk at a time and scatters each chunk before decoding the next, so the transient
 is one chunk rather than the gather's whole group set — which matters most for an over-budget
 gather, since that is both the one with the most groups to overlap and the one that retains
-none of them. `cache_metrics()["parallel_group_decodes"]` counts the groups *fetched* inside a chunk (a
-decode or a hit — the chunk cannot know which before it runs); it is 0 when every gather was
-narrow enough to fetch one group at a time. ⚠️ Note for anyone re-running the OPT-FORMATIO-1
+none of them. Residents are served serially before any chunk is dispatched, so a cache hit never pays the
+pool's per-item cost — routing hits through it was a measured regression on the 0.99-hit-rate
+`index_plan` path. `cache_metrics()["parallel_group_decodes"]` therefore counts the groups
+actually **decoded** inside a chunk; a zero beside a non-zero `block_index_groups` means the
+gathers were served from cache or were too narrow to overlap, not that the pool is missing. ⚠️ Note for anyone re-running the OPT-FORMATIO-1
 A/B: `SCX_ROW_GROUP_CACHE=0` now disables **retention only**, not the chunked parallel decode,
 so that arm is no longer the pre-change regime in full.
 

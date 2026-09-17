@@ -1137,18 +1137,7 @@ impl BackedCsrReader {
         }
         let key = CacheKey::Group(self.file_id, shard_idx, g);
         let admitted = admit.admits(self.file_id, shard_idx, g);
-        // Counted per LOOKUP, not per distinct group: the pair measures what the
-        // verdict decided each time it was consulted, which is what a partial
-        // verdict's recovery is read off. What survived the byte budget on top
-        // of that is `row_group_bytes_inserted`.
-        if let Some(m) = self.metrics() {
-            let bytes = layout.group_bytes(g) as u64;
-            if admitted {
-                m.admitted_group_bytes.fetch_add(bytes, Ordering::Relaxed);
-            } else {
-                m.rejected_group_bytes.fetch_add(bytes, Ordering::Relaxed);
-            }
-        }
+        self.charge_verdict(admit, shard_idx, layout, g);
         if admitted {
             let shard_cache = Arc::clone(&self.shard_cache);
             return shard_cache.get_or_decode(key, || {
@@ -1162,6 +1151,68 @@ impl BackedCsrReader {
         // instead, which is what "not retained" means).
         if let Some(rg) = self.shard_cache.get_cached(key) {
             return Ok(rg);
+        }
+        self.shard_cache.note_uncached_miss(CacheKind::RowGroup);
+        self.reader.decode_framed_row_group(layout, g).map(Arc::new)
+    }
+
+    /// Record what the verdict decided about one row-group **lookup**.
+    ///
+    /// Once per **group lookup** — the same unit `row_group_hits` /
+    /// `row_group_misses` count, i.e. each time this reader is asked for a
+    /// group, not each time a row is requested (one consultation serves every
+    /// row of its run). What survived the byte budget on top of that is
+    /// `row_group_bytes_inserted`.
+    ///
+    /// ⚠️ Extracted so the resident fast path in `decode_group_runs` charges it
+    /// too. That path bypasses [`Self::row_group`], and while the accounting
+    /// lived inline there a hit contributed to NEITHER counter — on a
+    /// 0.99-hit-rate gather the pair described 391 cold lookups instead of
+    /// ~38,900, silently, and reruns would not have been comparable with the
+    /// committed capture. Found by review on #540 (codex and Cursor Agent,
+    /// independently).
+    fn charge_verdict(
+        &self,
+        admit: &Admit,
+        shard_idx: usize,
+        layout: &FramedShardLayout,
+        g: usize,
+    ) {
+        if let Some(m) = self.metrics() {
+            let bytes = layout.group_bytes(g) as u64;
+            if admit.admits(self.file_id, shard_idx, g) {
+                m.admitted_group_bytes.fetch_add(bytes, Ordering::Relaxed);
+            } else {
+                m.rejected_group_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// [`Self::row_group`] for a key whose cache probe has **already missed**.
+    ///
+    /// Skips the redundant `get_cached` on the non-admitted branch: the
+    /// resident probe in `decode_group_runs` just answered that question, and
+    /// re-asking took the LRU mutex a second time on every miss — which is
+    /// nearly every run on the miss-heavy scattered path the chunking exists
+    /// for. The admitted branch still goes through `get_or_decode`, whose own
+    /// probe is part of the single-flight protocol and cannot be skipped.
+    fn row_group_after_probe_miss(
+        &self,
+        shard_idx: usize,
+        layout: &FramedShardLayout,
+        g: usize,
+        admit: &Admit,
+    ) -> Result<Arc<ScxCsr>> {
+        if !self.retains_row_groups() {
+            return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
+        }
+        self.charge_verdict(admit, shard_idx, layout, g);
+        if admit.admits(self.file_id, shard_idx, g) {
+            let key = CacheKey::Group(self.file_id, shard_idx, g);
+            let shard_cache = Arc::clone(&self.shard_cache);
+            return shard_cache.get_or_decode(key, || {
+                self.reader.decode_framed_row_group(layout, g).map(Arc::new)
+            });
         }
         self.shard_cache.note_uncached_miss(CacheKind::RowGroup);
         self.reader.decode_framed_row_group(layout, g).map(Arc::new)
@@ -1813,7 +1864,15 @@ impl BackedCsrReader {
         let mut misses: Vec<usize> = Vec::with_capacity(window.len());
         for (i, run) in window.iter().enumerate() {
             match self.resident_group(run) {
-                Some(rg) => out.push(Some(rg)),
+                Some(rg) => {
+                    // A hit is still a lookup the verdict decided, and the pair
+                    // is documented per lookup — so charge it here rather than
+                    // leaving the fast path invisible to it.
+                    if let Some(layout) = self.framed_layout(run.shard_idx) {
+                        self.charge_verdict(admit, run.shard_idx, &layout, run.g);
+                    }
+                    out.push(Some(rg));
+                }
                 None => {
                     out.push(None);
                     misses.push(i);
@@ -1870,7 +1929,7 @@ impl BackedCsrReader {
         let layout = self
             .framed_layout(run.shard_idx)
             .expect("collect_group_runs resolved this layout");
-        self.row_group(run.shard_idx, &layout, run.g, admit)
+        self.row_group_after_probe_miss(run.shard_idx, &layout, run.g, admit)
     }
 
     /// Groups decoded together in one chunk — the reader's pool width, so the

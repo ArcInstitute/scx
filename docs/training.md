@@ -233,7 +233,9 @@ Two things to know:
   `budget / (lookahead + 1)`. A plan that fits is retained whole. A plan that
   does not no longer forfeits everything: it keeps the row groups another plan
   of the lookahead window also touches — a control pool, shared neighbours, a
-  repeated pair member — hottest-first and only while they fit that same share,
+  repeated pair member — hottest-first and only while they fit the room that
+  share leaves after the shards the plan takes whole (those are inserted
+  regardless, so the bound is `share - whole_shard_bytes`),
   and still drops its cold tail, which is the half an LRU genuinely makes
   worse. `cache_metrics()["reuse_admissions"]` counts the plans that got a
   partial verdict; it reads 0 both on a loader whose plans all fit (nothing to

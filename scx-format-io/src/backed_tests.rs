@@ -4382,10 +4382,47 @@ fn second_gather_is_served_from_the_row_group_lru() {
         distinct as usize * RG_GROUP_BYTES
     );
 
+    let admitted_after_cold = m.admitted_group_bytes.load(Ordering::Relaxed);
+    let parallel_after_cold = m.parallel_group_decodes.load(Ordering::Relaxed);
+    assert_eq!(
+        admitted_after_cold as usize,
+        distinct as usize * RG_GROUP_BYTES,
+        "charged once per GROUP lookup — the unit `row_group_hits` counts too — \
+         not once per requested row: one `row_group` consultation serves every \
+         row of its run, so the seven rows here are four lookups"
+    );
+
     let second = rg_gather(&backed, &rows);
     assert_eq!(
         second, first,
         "the cached groups must reproduce the decoded ones exactly"
+    );
+
+    // Two properties of the resident fast path, neither of which the suite could
+    // see before review on #540 asked for them.
+    //
+    // (a) A hit is still a lookup the verdict decided. While the accounting
+    //     lived inside `row_group`, which the fast path bypasses, a warm gather
+    //     charged NEITHER counter and the pair silently stopped describing the
+    //     lookups it documents.
+    assert_eq!(
+        m.admitted_group_bytes.load(Ordering::Relaxed),
+        2 * admitted_after_cold,
+        "warm: the same four group lookups are charged again"
+    );
+    assert_eq!(
+        m.rejected_group_bytes.load(Ordering::Relaxed),
+        0,
+        "nothing was refused: this gather fits its budget"
+    );
+    // (b) A cache hit must never enter rayon. Routing hits through the pool cost
+    //     a measured regression on the 0.99-hit-rate `index_plan` path (p50
+    //     27.96 -> 29.17 ms, 1 of 12 rounds, p = 0.006), and without this
+    //     assertion a change that reintroduced it would go green.
+    assert_eq!(
+        m.parallel_group_decodes.load(Ordering::Relaxed),
+        parallel_after_cold,
+        "warm: every group was resident, so nothing was dispatched to the pool"
     );
     assert_eq!(
         m.row_group_misses.load(Ordering::Relaxed),

@@ -89,6 +89,13 @@ pub(crate) struct PlanFootprint {
     pub(crate) budget: usize,
     /// Only the keys a gather could actually look up — see `plan_footprint_keyed`.
     pub(crate) keys: Vec<KeyedBytes>,
+    /// `block_index_eligible` per `(file, shard)`, decided in the same walk.
+    ///
+    /// Returned rather than recomputed by the caller: the prefetcher needs it
+    /// per bucket to choose which L2 task to launch, and computing it twice off
+    /// the same inputs is two places that can drift about which route a shard
+    /// takes. (Antigravity, review on #540.)
+    pub(crate) eligible: HashMap<(u32, usize), bool>,
 }
 
 /// `(prefetch handles, whether the plan fits its budget share, the room a
@@ -306,8 +313,8 @@ impl PrefetchEngine {
         Ok((f.planned, f.budget))
     }
 
-    /// [`Self::plan_footprint`], optionally also naming the row-group cache keys
-    /// it summed.
+    /// [`Self::plan_footprint`], also naming the row-group cache keys it summed
+    /// and the per-shard block-index eligibility it decided along the way.
     ///
     /// One walk of the block index, two answers. The prefetcher needs both — the
     /// footprint to decide whether the plan fits its share, and the keys to say
@@ -337,6 +344,7 @@ impl PrefetchEngine {
         held: Option<&HashMap<u32, Arc<BackedCsrReader>>>,
     ) -> Result<PlanFootprint> {
         let mut keys: Vec<KeyedBytes> = Vec::new();
+        let mut eligible: HashMap<(u32, usize), bool> = HashMap::new();
         let mut whole_shard_bytes = 0usize;
         let mut planned = 0usize;
         let mut budget = usize::MAX;
@@ -357,16 +365,17 @@ impl PrefetchEngine {
                 None => self.registry.lease(fid)?,
             };
             for (sidx, shard_rows) in shards {
-                let eligible = reader.block_index_eligible(sidx, shard_rows.len());
+                let is_eligible = reader.block_index_eligible(sidx, shard_rows.len());
+                eligible.insert((fid, sidx), is_eligible);
                 // One walk, two answers: the bytes always, the keys only where a
                 // gather could consult them.
                 for (g, bytes) in reader.touched_row_groups(sidx, shard_rows) {
                     planned = planned.saturating_add(bytes);
-                    if eligible {
+                    if is_eligible {
                         keys.push(((fid, sidx, g), bytes));
                     }
                 }
-                if !eligible {
+                if !is_eligible {
                     let whole = reader.shard_decoded_bytes(sidx);
                     planned = planned.saturating_add(whole);
                     whole_shard_bytes = whole_shard_bytes.saturating_add(whole);
@@ -379,6 +388,7 @@ impl PrefetchEngine {
             whole_shard_bytes,
             budget,
             keys,
+            eligible,
         })
     }
 
@@ -991,16 +1001,10 @@ where
             .engine
             .plan_footprint_keyed(&per_shard, Some(&leased))?;
         let (planned, budget, keys) = (footprint.planned, footprint.budget, footprint.keys);
-        // Recomputed here because the prefetcher needs it per bucket to choose
-        // which L2 task to launch; `plan_footprint` consumes the same verdict
-        // internally to decide whether to add whole-shard bytes.
-        let eligible: HashMap<(u32, usize), bool> = per_shard
-            .iter()
-            .map(|(&(fid, sidx), rows)| {
-                let reader = &leased[&fid];
-                ((fid, sidx), reader.block_index_eligible(sidx, rows.len()))
-            })
-            .collect();
+        // Taken from the sizing walk rather than recomputed: it decided the same
+        // predicate to choose whether to add whole-shard bytes, and two
+        // computations off the same inputs are two places that can drift.
+        let eligible = &footprint.eligible;
         let share = budget / (self.lookahead + 1);
         let admit_row_groups = planned <= share;
         // What a PARTIAL verdict may spend. The shards this plan takes whole are

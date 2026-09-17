@@ -163,7 +163,13 @@ def main(root: pathlib.Path) -> int:
                         continue
                     bs.append(float(b))
                     as_.append(float(a))
-                    if b == 0 or a == 0:
+                    # ⚠️ A ratio needs both sides strictly POSITIVE. The
+                    # committed artifact carries `estimate_overshoot_mb__*` at
+                    # about -8,100, and `-8166 / -8138` is a number near 1 whose
+                    # direction means nothing — the first version of this file
+                    # printed win counts and a verdict for it. Signed
+                    # diagnostics fall through to the side-by-side table below.
+                    if b <= 0 or a <= 0:
                         continue
                     ratios.append(b / a if _lower_is_better(m) else a / b)
                 if not bs and not as_:
