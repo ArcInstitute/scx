@@ -2803,9 +2803,11 @@ changes, and it is not the one that moved.** The chunked parallel group decode
 is not gated by `SCX_ROW_GROUP_ADMIT`, so it is identical in the `plan` and
 `reuse` arms and cancels out of every ratio they produce; and that benchmark's
 hot/cold arm caps its hit rate at 8/64 = 0.125 by construction. The capture
-below adds a third arm — `SCX_ROW_GROUP_DECODE_CHUNK=1`, one group per chunk,
-i.e. the pre-change serial decode — and runs the benchmarks whose regime (R3)
-funded the work.
+below adds a third arm — one group per chunk, i.e. the pre-change serial
+decode — and runs the benchmarks whose regime (R3) funded the work. That arm was
+selected by `SCX_ROW_GROUP_DECODE_CHUNK=1`, which review renamed to the boolean
+`SCX_ROW_GROUP_SERIAL_DECODE=1`; the committed `provenance.json` records the name
+that actually ran and is left as it was.
 
 Three arms on one build, 12 rounds per cell, arm order rotated by round so each
 arm occupies each slot equally. `reuse` vs `plan` isolates the admission policy;
@@ -2826,6 +2828,20 @@ design* — a plan over its budget share used to forfeit retention outright.
 |---|---|---|---|---|---|
 | `gather_latency_ms_p50` | 1,192.3 | 431.3 | **2.79×** | 12/12 | 0.000 |
 | `gather_latency_ms_p99` | 1,232.6 | 471.6 | **2.60×** | 12/12 | 0.000 |
+
+> [!WARNING]
+> ⚠️ **The decode was also a reliable regression on the high-hit-rate path, and
+> that is fixed rather than excused.** In this same capture, `index_plan` /
+> tabula random-plan `gather_latency_ms_p50` read 27.96 → 29.17 ms (1 of 12
+> rounds won, p = 0.006) and p99 29.91 → 31.84 ms (p = 0.039) against the serial
+> arm. The cause was routing every run through rayon including LRU hits — ~38,500
+> hits against 391 misses on that path, where a "decode" is a mutex lookup.
+> Residents are now served serially and only misses are dispatched
+> (`parallel_group_decodes` on that path 19,441 → 0; `read_scattered` keeps 2,903
+> of 3,427), so the figures above describe the arm as captured and the shipped
+> build no longer pays rayon on a hit. **The numbers here have not been
+> re-captured against that fix** — the mechanism is verified by counter, the
+> latency is not.
 
 **Every work counter is identical on all 12 rounds across those two arms** —
 `block_index_groups`, `block_index_adoption_rate`, `row_group_hits`,
