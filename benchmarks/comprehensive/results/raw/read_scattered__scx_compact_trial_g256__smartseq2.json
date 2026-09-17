@@ -3,15 +3,15 @@
   "benchmark": "read_scattered",
   "format": "scx_compact_trial_g256",
   "dataset": "smartseq2",
-  "timestamp": "2026-09-17T06:09:13",
+  "timestamp": "2026-09-17T06:31:46",
   "system": {
-    "hostname": "GPUCACE",
+    "hostname": "GPU0F98",
     "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.3",
     "cpu": "Intel(R) Xeon(R) Platinum 8468",
     "cpu_cores_physical": 192,
-    "ram_gb": 1007,
+    "ram_gb": 2015,
     "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
     "library_versions": {
       "anndata": "0.12.10",
@@ -43,11 +43,11 @@
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M2QQRJRMEQ4P7N4H1Z901W7B",
-      "git_sha": "83d022d9e96f277b0d76259f421408bab039be71",
+      "run_id": "01M2QS1WCH4JAE5TBTAGA5ZMAW",
+      "git_sha": "c5d8a62a0802f7e365faf8c4317d99cce0fa66bc",
       "git_branch": "phase5-reuse-admission",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.18.1-18-g83d022d9-dirty",
+      "git_describe": "pyscx-v0.18.1-19-gc5d8a62a-dirty",
       "rayon_threads": "16",
       "omp_threads": "",
       "mkl_threads": "",
@@ -57,13 +57,13 @@
   },
   "runs": [
     {
-      "wall_s": 18.910481193801388,
+      "wall_s": 8.724559128982946,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1086.8,
+      "peak_rss_mb": 1210.6,
       "extra": {
-        "gather_latency_ms_p50": 1171.518,
-        "gather_latency_ms_p99": 1254.887,
+        "gather_latency_ms_p50": 473.182,
+        "gather_latency_ms_p99": 695.991,
         "block_index_groups": 64,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -74,12 +74,12 @@
         "reuse_admissions": 15,
         "admitted_group_bytes": 774472056,
         "rejected_group_bytes": 14859779584,
-        "parallel_group_decodes": 0,
+        "parallel_group_decodes": 2909,
         "n_batches": 16
       }
     }
   ],
-  "median_wall_s": 18.910481193801388,
+  "median_wall_s": 8.724559128982946,
   "wall_s_iqr": null,
   "n_runs": 1,
   "file_size_bytes": 262668092,

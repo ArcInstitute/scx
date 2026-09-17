@@ -2796,6 +2796,76 @@ and p = 1.000.
 > 8-of-64. The arm's own numbers bind to that shape and to the 256 MB budget
 > that puts a plan over its share at all.
 
+#### W10's two factors, isolated (three-arm A/B)
+
+⚠️ **The `cellset_gather` capture above measures only one of this phase's two
+changes, and it is not the one that moved.** The chunked parallel group decode
+is not gated by `SCX_ROW_GROUP_ADMIT`, so it is identical in the `plan` and
+`reuse` arms and cancels out of every ratio they produce; and that benchmark's
+hot/cold arm caps its hit rate at 8/64 = 0.125 by construction. The capture
+below adds a third arm — `SCX_ROW_GROUP_DECODE_CHUNK=1`, one group per chunk,
+i.e. the pre-change serial decode — and runs the benchmarks whose regime (R3)
+funded the work.
+
+Three arms on one build, 12 rounds per cell, arm order rotated by round so each
+arm occupies each slot equally. `reuse` vs `plan` isolates the admission policy;
+`reuse` vs `serial` isolates the decode. `p` is an exact two-sided sign test
+over per-round ratios with ties dropped.
+
+**`read_scattered` is the decisive cell.** It drives `IndexPlanDataset` at
+`cache_shards=128` under an auto-tuned two-shard budget, which is the regime
+`thresholds.yaml` records as sitting at a **0.000** row-group hit rate *by
+design* — a plan over its budget share used to forfeit retention outright.
+
+| tabula_sapiens_100k, g256 | serial | reuse | ratio | wins | p |
+|---|---|---|---|---|---|
+| `gather_latency_ms_p50` | 1,018.5 | 434.1 | **2.39×** | 12/12 | 0.000 |
+| `gather_latency_ms_p99` | 1,121.8 | 456.4 | **2.43×** | 12/12 | 0.000 |
+
+| smartseq2, g256 | serial | reuse | ratio | wins | p |
+|---|---|---|---|---|---|
+| `gather_latency_ms_p50` | 1,192.3 | 431.3 | **2.79×** | 12/12 | 0.000 |
+| `gather_latency_ms_p99` | 1,232.6 | 471.6 | **2.60×** | 12/12 | 0.000 |
+
+**Every work counter is identical on all 12 rounds across those two arms** —
+`block_index_groups`, `block_index_adoption_rate`, `row_group_hits`,
+`row_group_misses`, `admitted_group_bytes`, `reuse_admissions`. The arms decode
+the same groups and retain the same bytes; they differ only in whether the
+decodes are batched a pool-width chunk at a time across shards. That identity
+is the control, and it is why the latency ratio can be attributed to the
+batching rather than to a changed working set.
+
+And the admission policy, on the same runs:
+
+| tabula_sapiens_100k, g256 | plan | reuse | ratio | wins | p |
+|---|---|---|---|---|---|
+| `gather_latency_ms_p50` | 445.8 | 434.1 | 1.05× | 10/12 | 0.039 |
+| `row_group_misses` (fewer is better) | 3,427 | 2,911 | **1.18×** | 12/12 | 0.000 |
+| `row_group_hit_rate` | **0** | **0.1506** | — | — | — |
+| `reuse_admissions` | 0 | 11 | — | — | — |
+
+18 % fewer row-group decodes on every one of 12 rounds, and a 1.05× p50 gain
+that is reliable but small. On smartseq2 the same contrast gives 2,913 → 2,683
+misses (−8 %) and no reliable latency difference. The retention is real; the
+latency it buys is a few per cent, and the decode is where the time went.
+
+`index_plan` at its own 8 GB default budget shows the admission contrast at
+noise — its plans **fit** their share, so both arms read a 0.99 hit rate and the
+policy never engages. That is the expected result and worth stating: this policy
+only acts where a plan is over its share.
+
+> [!NOTE]
+> Manifest entry: `results/raw/phase5_factors/factors_ab.json` (108 rounds, each
+> carrying its full `BenchmarkResult` envelope) beside `provenance.json`,
+> written by the running job. SLURM job **2966558**, `cpu_batch_high_mem`, at
+> `83d022d9`, via `benchmarks/scripts/_run_phase5_factors_ab.sh`; summarised by
+> `_phase5_factors_summary.py`. Force-added. Every figure above was checked
+> programmatically against that file.
+>
+> **Not measured**: census at any scale, and `cellset_gather` under the third
+> arm (its hot/cold arm's hit-rate ceiling makes it the weakest witness of
+> either factor).
+
 ### Out-of-core loader — cold-cache measurements and the P-1 premise gate
 
 Every loader number above this subsection is **page-cache-warm**. That matters: annbatch's

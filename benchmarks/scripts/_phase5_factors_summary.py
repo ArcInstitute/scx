@@ -25,10 +25,37 @@ import pathlib
 import statistics
 import sys
 
-# Lower is better for anything named as a latency, a time, or a memory figure.
-LOWER_HINTS = ("_ms_", "latency", "us_per_cell", "peak_rss", "_s__", "wall")
+# Lower is better for anything named as a latency, a time, a memory figure —
+# or a MISS. `row_group_misses` dropping 15 % was reported as "REGRESSED
+# 0.849x" by the first version of this file, because "misses" was not in this
+# list and the default is higher-is-better. A wrong direction on a real
+# improvement is the same class of error as a wrong number.
+LOWER_HINTS = (
+    "_ms_", "latency", "us_per_cell", "peak_rss", "_s__", "wall",
+    "misses", "evictions", "overshoot",
+)
+
+# Counters with no direction: they DESCRIBE what a verdict decided rather than
+# scoring it. `rejected_group_bytes` falling is neither good nor bad on its own
+# — it falls precisely because some bytes were admitted instead — and calling
+# either way "IMPROVED" would be inventing a preference the metric does not
+# have. Reported with their ratio and no verdict.
+NEUTRAL = frozenset({
+    "admitted_group_bytes", "rejected_group_bytes", "reuse_admissions",
+    "parallel_group_decodes", "block_index_groups", "full_shard_groups",
+    "sidecar_groups", "memory_budget_total_mb",
+})
+
+
+def _is_neutral(m: str) -> bool:
+    return m.split("__", 1)[0] in NEUTRAL
 
 CONTRASTS = (("admission", "plan", "reuse"), ("parallel_decode", "serial", "reuse"))
+
+# Bookkeeping the runner records per round, not measurements. `round` is the
+# round number; the rest are the shape of the run, and a "ratio" over them is
+# meaningless even when it is 1.0.
+EXCLUDE = frozenset({"round", "n_batches", "n_cells", "n_steady_steps"})
 
 # Metrics worth a row, in reporting order. Anything else emitted is still in
 # the committed JSON; this is the reading order, not a filter on what was kept.
@@ -104,7 +131,9 @@ def main(root: pathlib.Path) -> int:
                 metrics |= {
                     k
                     for k, v in arms[new_arm].items()
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                    if isinstance(v, (int, float))
+                    and not isinstance(v, bool)
+                    and k not in EXCLUDE
                 }
             ordered = [m for m in PREFERRED if m in metrics] + sorted(
                 m for m in metrics if m not in PREFERRED
@@ -129,11 +158,28 @@ def main(root: pathlib.Path) -> int:
                     side.append((m, statistics.median(bs), statistics.median(as_)))
                     continue
                 med = statistics.median(ratios)
+                # ⚠️ TIES ARE DROPPED from the sign test, not counted as losses.
+                # The first version counted `r > 1.0` as a win and everything
+                # else as a loss, so a metric the two arms agree on EXACTLY —
+                # `block_index_groups`, a fixed batch count, the round number —
+                # came out "REGRESSED 1x at 0/12, p = 0.000". Excluding ties is
+                # the standard sign test; a metric with no non-tied round is
+                # identical, which is a finding in its own right on the
+                # counters that describe work rather than speed.
                 wins = sum(1 for r in ratios if r > 1.0)
-                n = len(ratios)
+                losses = sum(1 for r in ratios if r < 1.0)
+                n = wins + losses
                 p = _binom_two_sided(wins, n)
-                if n < 5:
-                    verdict = f"too few rounds (n={n})"
+                if _is_neutral(m):
+                    verdict = (
+                        f"descriptive, no direction ({wins}/{n} higher)"
+                        if n
+                        else f"identical on all {len(ratios)} rounds"
+                    )
+                elif n == 0:
+                    verdict = f"identical on all {len(ratios)} rounds"
+                elif n < 5:
+                    verdict = f"too few non-tied rounds (n={n})"
                 elif p > 0.05:
                     verdict = f"no reliable difference ({wins}/{n})"
                 elif med > 1:
@@ -166,6 +212,11 @@ def main(root: pathlib.Path) -> int:
     print("isolates the chunked parallel decode. The decode is NOT gated by")
     print("SCX_ROW_GROUP_ADMIT, so a two-arm admission A/B holds it constant and")
     print("cannot measure it — which is what the first phase-5 capture did.")
+    print()
+    print('"identical on all N rounds" means the two arms agreed EXACTLY every')
+    print("round. On a counter that describes work rather than speed — touched")
+    print("groups, adoption rate, batch count — that is the control: it says the")
+    print("arms did the same work and differ only in how they did it.")
     return 0
 
 
