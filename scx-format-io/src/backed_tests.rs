@@ -4832,6 +4832,66 @@ fn planned_row_group_bytes_matches_decoded_size_and_warm_feeds_the_gather() {
     assert!(backed.warm_row_groups(0, &[64]).is_err());
 }
 
+/// `touched_row_groups` names the groups `planned_row_group_bytes` sizes, and
+/// both are one walk of the block index.
+///
+/// **The expectation is derived from the fixture's geometry, not from the
+/// subject.** Asking `planned_row_group_bytes` what to expect would make this
+/// test unable to see the two of them agreeing on a wrong answer — which is
+/// precisely the risk created by expressing one in terms of the other.
+///
+/// Fixture: 64 rows over 2 shards of 32, row groups of 4. Shard 1 covers rows
+/// 32..64, so rows 40, 41, 63 are shard-local 8, 9, 31 and fall in groups
+/// 8/4 = 2, 9/4 = 2 and 31/4 = 7.
+#[test]
+fn touched_row_groups_names_the_groups_planned_bytes_sizes() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::Zstd);
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    let m = backed.enable_metrics();
+
+    // Unsorted and duplicated on purpose: the contract is ascending and
+    // deduplicated output whatever the caller passes.
+    let rows = [63u64, 40, 41, 40, 63];
+    let keys = backed.touched_row_groups(1, &rows);
+    assert_eq!(
+        keys.iter().map(|&(g, _)| g).collect::<Vec<_>>(),
+        vec![2usize, 7],
+        "ascending, deduplicated group indices"
+    );
+    for &(g, bytes) in &keys {
+        assert_eq!(bytes, RG_GROUP_BYTES, "group {g} charges one group's bytes");
+    }
+
+    // The fold is the sizing, and the sizing is 2 groups — NOT 5, which is what
+    // a lost `dedup()` would report for these five rows.
+    assert_eq!(
+        backed.planned_row_group_bytes(1, &rows),
+        2 * RG_GROUP_BYTES,
+        "planned bytes == the fold over the named keys"
+    );
+
+    // Neither call decodes anything or touches the LRU.
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 0);
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(backed.cache_bytes_used(), 0);
+
+    // Degenerate inputs name nothing rather than panicking.
+    assert!(backed.touched_row_groups(1, &[]).is_empty());
+    assert!(backed.touched_row_groups(99, &rows).is_empty());
+    assert_eq!(backed.planned_row_group_bytes(99, &rows), 0);
+
+    // And the route gate applies to the key list exactly as it does to the
+    // sizing — a caller must not be able to name keys no gather would retain.
+    let mut off =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    off.set_scatter_block_index(false);
+    assert!(off.touched_row_groups(1, &rows).is_empty());
+    assert_eq!(off.planned_row_group_bytes(1, &rows), 0);
+}
+
 /// A non-admitted gather still serves resident groups as hits — admission only
 /// stops *misses* from being inserted — and its misses decode uncached with no
 /// singleflight slot (the leader of a slot that inserts nothing would make

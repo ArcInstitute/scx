@@ -1193,25 +1193,61 @@ impl BackedCsrReader {
     /// prefetcher sums this over a plan and warms only a plan that fits its
     /// share of the budget; see `scx-loader`'s plan engine.
     pub fn planned_row_group_bytes(&self, shard_idx: usize, rows: &[u64]) -> usize {
-        // Both gates before `framed_layout`: with the route statically off
-        // (the cell-set loader's default) no gather can retain a group, and
-        // resolving every touched shard's layout to size nothing would be new
-        // work on that path (review on #528).
+        // Expressed as a fold over `touched_row_groups` rather than as its own
+        // walk of the block index. Two walks are how a sizing decision and an
+        // admission decision come to disagree about a group boundary: the
+        // prefetcher sizes a plan with this, and the reuse-signal verdict names
+        // the very same groups as cache keys with that. One walk, two answers.
+        self.touched_row_groups(shard_idx, rows)
+            .into_iter()
+            .fold(0usize, |acc, (_, bytes)| acc.saturating_add(bytes))
+    }
+
+    /// Distinct row groups the `rows` of `shard_idx` touch — ascending,
+    /// deduplicated, each paired with the decoded byte size the block index
+    /// stamps for it (`FramedShardLayout::group_bytes`, the same model the LRU
+    /// charges once the group is decoded). No decode, no LRU touch.
+    ///
+    /// Empty under exactly the gates [`Self::planned_row_group_bytes`] applies
+    /// — the block-index route statically or per-reader off, row-group
+    /// retention off, the shard unframed or out of range — so a caller cannot
+    /// derive cache keys for groups no gather would ever retain. That is the
+    /// point of returning the keys and the bytes together: a caller deciding
+    /// *which* groups to admit and a caller deciding *whether* the plan fits
+    /// are answering two questions about one list.
+    ///
+    /// `rows` need not be sorted and may repeat. An out-of-shard row is
+    /// **clamped** into the shard by `find_group`'s saturating search rather
+    /// than rejected, which is `touched_groups`' documented contract; a caller
+    /// that needs the error checks its rows first, as
+    /// [`Self::warm_row_groups`] does.
+    pub fn touched_row_groups(&self, shard_idx: usize, rows: &[u64]) -> Vec<(usize, usize)> {
+        // Both gates before `framed_layout`, for the reason review on #528
+        // gave: with the route statically off (the cell-set loader's default)
+        // no gather can retain a group, and resolving every touched shard's
+        // layout in order to name nothing would be new work on that path.
         if !self.block_index_route_enabled() || !self.retains_row_groups() {
-            return 0;
+            return Vec::new();
         }
         let Some(layout) = self.framed_layout(shard_idx) else {
-            return 0;
+            return Vec::new();
         };
         let Some((s_start, _)) = self.index.shard_range(shard_idx) else {
-            return 0;
+            return Vec::new();
         };
-        let mut locals: Vec<usize> = rows
-            .iter()
-            .map(|&row| row.saturating_sub(s_start) as usize)
-            .collect();
-        locals.sort_unstable();
-        Self::planned_bytes_sorted(&layout, locals.into_iter())
+        let mut groups = Self::touched_groups(&layout, s_start, rows);
+        groups.dedup();
+        groups
+            .into_iter()
+            // `find_group` saturates to `spans.len() - 1`, which underflows to
+            // `0` on a shard with no spans at all (`n_major == 0` tiles
+            // `[0, 0)` with none). Indexing `spans[0]` there would panic, and a
+            // reader returns rather than panics on malformed input. Filtering
+            // is not reachable through `shard_range`, whose empty shard maps no
+            // row — but this is a `pub` fn and the bound is cheap.
+            .filter(|&g| g < layout.spans.len())
+            .map(|g| (g, layout.group_bytes(g)))
+            .collect()
     }
 
     /// Decode the row groups `rows` (global row ids in `shard_idx`) touch into
