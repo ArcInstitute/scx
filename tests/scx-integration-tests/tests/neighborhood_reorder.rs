@@ -4,15 +4,23 @@
 //! `obsp` / `obsm` must gather the same **cells** — by `obs_names` — as plans
 //! built from the original, even though every physical row index moved.
 //!
-//! Two things this test is named for, because both were wrong in the phase's
-//! premises and both change what it covers:
+//! Two things this test is named for, because both change what it covers:
 //!
-//! 1. **`scx sort` re-emits `obsp` and `obsm` UNSHARDED** — `sort_engine`
-//!    calls `write_obsm` / `write_obsp`, not the `_shard_` writers. So the
-//!    "after" half exercises the legacy single-section read branch, not the
-//!    sharded one. That branch is exactly where the row-count trap lives (an
-//!    unsharded COO section's Arrow row count is nnz, not `n_obs`), so this is
-//!    worth covering — but it is not additional coverage of the sharded path.
+//! 1. **`scx sort` re-emits `obsp` and `obsm` SHARDED** — as of phase 9 it
+//!    routes all four mapping families through `write_*_shard*`, so the
+//!    "after" half exercises the sharded read branch whatever the input's
+//!    layout was. This file's fixture writes the input *unsharded* on purpose,
+//!    which makes the pair a legacy-in / sharded-out case.
+//!
+//!    That moved coverage rather than adding it: the legacy single-section
+//!    read branch — where the row-count trap lives, an unsharded COO
+//!    section's Arrow row count being nnz rather than `n_obs` — is no longer
+//!    reachable through a sorted file. It is still reachable through a file
+//!    written before phase 9 or by `scx subset`, and it is still covered, by
+//!    `scx-loader`'s `the_graph_driver_reads_a_legacy_unsharded_file` and
+//!    `scx-format-io`'s `a_legacy_unsharded_obsp_reads_its_true_row_count`.
+//!    Both build their own unsharded fixtures, so neither depends on an op to
+//!    produce one.
 //! 2. **`scx sort` applies deletion vectors**, so a sorted output has none.
 //!    The reorder case and the deletion case therefore cannot share a fixture,
 //!    and this file does not try to.
@@ -297,10 +305,20 @@ fn coordinate_plans_name_the_same_cells_after_a_row_reorder() {
 }
 
 #[test]
-fn the_sorted_output_really_is_the_legacy_unsharded_form() {
-    // The premise the two tests above rest on, asserted rather than assumed:
-    // if `scx sort` ever starts re-sharding obsp/obsm, those tests quietly stop
-    // covering the legacy branch and this one says so.
+fn the_sorted_output_really_is_the_sharded_form() {
+    // The premise the two tests above rest on, asserted rather than assumed.
+    //
+    // Before phase 9 this test asserted the **opposite** — that sort collapsed
+    // both families to one legacy section each — and it was right. It is
+    // inverted rather than deleted because it is one of only two things in the
+    // workspace that can see the difference: `scx-ops`' carry table folds
+    // `ObsmEmbedding` and `ObsmEmbeddingShard` into a single `SectionFamily`,
+    // so none of the carry tests can, and the other is the output-identity
+    // golden.
+    //
+    // Note the input fixture writes obsp/obsm unsharded, so this also pins
+    // that the emit rule does not depend on the input's layout.
+    use scx_format_io::section::SectionType;
     let dir = tempfile::tempdir().unwrap();
     let src = write_fixture(&dir);
     let sorted = dir.path().join("sorted.scx");
@@ -314,14 +332,23 @@ fn the_sorted_output_really_is_the_legacy_unsharded_form() {
         .map(|e| (e.name.clone(), e.section_type))
         .collect();
     assert!(!types.is_empty(), "sort dropped obsp/obsm entirely");
-    for (name, ty) in types {
+    for (name, ty) in &types {
         assert!(
             matches!(
                 ty,
-                scx_format_io::section::SectionType::ObspEmbedding
-                    | scx_format_io::section::SectionType::ObsmEmbedding
+                SectionType::ObspEmbeddingShard | SectionType::ObsmEmbeddingShard
             ),
-            "{name} came back as {ty:?}, not the legacy single-section form"
+            "{name} came back as {ty:?}, not a row-sharded section"
+        );
+        assert!(
+            name.contains("_shard_"),
+            "{name} has a sharded section type but not a sharded section name"
         );
     }
+    // And the flag `write_obsp` never set, which is why `scx info` on a sorted
+    // file used to report no obsp at all.
+    assert!(
+        reader.header().has_obsp(),
+        "a sorted file carrying a sharded obsp must advertise it in the header"
+    );
 }

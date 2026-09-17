@@ -351,9 +351,10 @@ impl PyExperiment {
     /// The bounded counterpart to `to_anndata().obsp[key]`, which materialises
     /// the whole graph: only the shards covering the range are decoded, so a
     /// caller can walk an atlas-scale graph a block at a time. (A graph stored
-    /// as one unsharded section — what `scx sort` emits — has to be decoded
-    /// whole whatever range is asked for; the range is then applied to the
-    /// decoded triples.)
+    /// as one unsharded section has to be decoded whole whatever range is
+    /// asked for; the range is then applied to the decoded triples. Since
+    /// phase 9 `scx sort` and `scx compact` emit shards, so that is a file
+    /// written before phase 9 rather than one an op just produced.)
     ///
     /// **Row space.** `logical=True` (the default, matching `read_obs`) treats
     /// `start` / `stop` as **live** row indices, drops any edge whose *either*

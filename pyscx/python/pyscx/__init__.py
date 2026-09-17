@@ -1217,8 +1217,9 @@ def neighborhood_plans_from_graph(
     Each set is **the centre first**, with `role_tag` 0, then its neighbours
     with `role_tag` 1. The graph is read one row range at a time, so peak memory
     is one obsp shard plus one chunk — except on a graph stored as a single
-    unsharded section, which has to be decoded whole. `scx sort` writes obsp
-    back that way, so a sorted file is always the unbounded case.
+    unsharded section, which has to be decoded whole. `scx sort` and
+    `scx compact` write obsp back as shards, so their output is bounded; a
+    file written before that changed is the unbounded case.
 
     Rows are **physical** file rows, which is what the gather wants. Deleted
     cells are dropped rather than renumbered: a deleted centre produces no set

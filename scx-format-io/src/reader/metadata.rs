@@ -57,9 +57,11 @@ pub(crate) struct MappingLayout {
 /// diverge, and getting it wrong is silent: for a dense `obsm` section
 /// one Arrow row *is* one obs row, but for a COO `obsp` section one
 /// Arrow row is one `(row, col, data)` triple, so `batch.num_rows()`
-/// answers **nnz**. `scx sort` writes obsp back unsharded
-/// (`scx-ops/src/sort_engine.rs` calls `write_obsp`, not
-/// `write_obsp_shard_coo`), so this is not a hypothetical branch.
+/// answers **nnz**. Since phase 9 `scx sort` and `scx compact` write obsp
+/// back **sharded** (both go through
+/// `scx_format_io::for_each_coo_mapping_shard`), so the legacy arm is no
+/// longer something an op produces — but it is still not a hypothetical
+/// branch, because every file written before phase 9 takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LegacyRowCount {
     /// One Arrow row per logical row — dense `obsm` / `varm`.

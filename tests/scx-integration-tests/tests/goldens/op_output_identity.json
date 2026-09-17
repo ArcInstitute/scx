@@ -913,7 +913,7 @@
       ],
       "header": {
         "format_version": 3,
-        "flags": 5,
+        "flags": 13,
         "n_obs": 6,
         "n_vars": 6,
         "nnz": 12,
@@ -1009,18 +1009,32 @@
           "blake3": "c3ef034867025c10cc9246e5c2c5211144871e8b7871fb7657c808efba49b39b"
         },
         {
-          "name": "obsm/X_pca",
-          "section_type": 8,
+          "name": "obsm/X_pca_shard_0",
+          "section_type": 20,
           "modality_id": 0,
-          "length": 946,
-          "blake3": "7ec8059f10081a2723441f11af08c35206e6305b747bb9ebd74f8ace46adfd0e"
+          "length": 1322,
+          "blake3": "7515839ab8a96d662ac35fc8bbe38a89f98886b59162df35694920fab55ac66a"
         },
         {
-          "name": "obsp/connectivities",
-          "section_type": 18,
+          "name": "obsm/X_pca_shard_1",
+          "section_type": 20,
           "modality_id": 0,
-          "length": 1522,
-          "blake3": "60409a71e492ac7cc53ffa7c95469880a8923d55e99f7008aedc5855321efa66"
+          "length": 1322,
+          "blake3": "2dda76cd9dd7cd51a73f058f7ac1776861760cca9b1ebc2e09188cc0af60e09f"
+        },
+        {
+          "name": "obsp/connectivities_shard_0",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "d107ec574734aa98da3f27714f04d127e1064ef9cf1fd9ed487955f74ec81022"
+        },
+        {
+          "name": "obsp/connectivities_shard_1",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "a0408e587e5a9ef041bfa628d0b1a38aa716708d7b58d4340ed76f01fa21446c"
         },
         {
           "name": "spliced_shard_0",
@@ -1075,18 +1089,32 @@
           "blake3": "694e7da91331e7f95fda16d1d1faba12c491a6726243c6084ecf58b21c78c28c"
         },
         {
-          "name": "varm/PCs",
-          "section_type": 17,
+          "name": "varm/PCs_shard_0",
+          "section_type": 21,
           "modality_id": 0,
-          "length": 946,
-          "blake3": "ac950e6d3e3589434481b318adffc21cd32d823bd69d42cde35e894b61c3bcb0"
+          "length": 1322,
+          "blake3": "579da5c02911633956164f8a074cfee086589065ccb475ab9a6b7a058dd89fc8"
         },
         {
-          "name": "varp/gene_corr",
-          "section_type": 19,
+          "name": "varm/PCs_shard_1",
+          "section_type": 21,
           "modality_id": 0,
-          "length": 1482,
-          "blake3": "066592ba477f9f528847fdd2430c62a9d9ba0ced66b6b9f18fd7adb30ce6bdd0"
+          "length": 1322,
+          "blake3": "8d5d3a141128a4770f0eed142d3b503f9f2e28aa62ef1b867a4ed5939924b070"
+        },
+        {
+          "name": "varp/gene_corr_shard_0",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "c7a8d36b9eeded625e83ca74fc41d515ce55c9db88bf56e8875261808915bdae"
+        },
+        {
+          "name": "varp/gene_corr_shard_1",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "06530429e62cace15ce38965e4c84f7d7888435fbb3b8499f81fa7855e23b33d"
         }
       ]
     },
@@ -1097,7 +1125,7 @@
       ],
       "header": {
         "format_version": 3,
-        "flags": 4,
+        "flags": 12,
         "n_obs": 6,
         "n_vars": 6,
         "nnz": 12,
@@ -1163,18 +1191,32 @@
           "blake3": "61c23a9e62a88dbb246c6dae80ae685b42856b43eb2c86ab297079e20caeca3e"
         },
         {
-          "name": "obsm/X_pca",
-          "section_type": 8,
+          "name": "obsm/X_pca_shard_0",
+          "section_type": 20,
           "modality_id": 0,
-          "length": 946,
-          "blake3": "7ec8059f10081a2723441f11af08c35206e6305b747bb9ebd74f8ace46adfd0e"
+          "length": 1322,
+          "blake3": "7515839ab8a96d662ac35fc8bbe38a89f98886b59162df35694920fab55ac66a"
         },
         {
-          "name": "obsp/connectivities",
-          "section_type": 18,
+          "name": "obsm/X_pca_shard_1",
+          "section_type": 20,
           "modality_id": 0,
-          "length": 1522,
-          "blake3": "60409a71e492ac7cc53ffa7c95469880a8923d55e99f7008aedc5855321efa66"
+          "length": 1322,
+          "blake3": "2dda76cd9dd7cd51a73f058f7ac1776861760cca9b1ebc2e09188cc0af60e09f"
+        },
+        {
+          "name": "obsp/connectivities_shard_0",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "d107ec574734aa98da3f27714f04d127e1064ef9cf1fd9ed487955f74ec81022"
+        },
+        {
+          "name": "obsp/connectivities_shard_1",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "a0408e587e5a9ef041bfa628d0b1a38aa716708d7b58d4340ed76f01fa21446c"
         },
         {
           "name": "spliced_shard_0",
@@ -1229,18 +1271,32 @@
           "blake3": "694e7da91331e7f95fda16d1d1faba12c491a6726243c6084ecf58b21c78c28c"
         },
         {
-          "name": "varm/PCs",
-          "section_type": 17,
+          "name": "varm/PCs_shard_0",
+          "section_type": 21,
           "modality_id": 0,
-          "length": 946,
-          "blake3": "ac950e6d3e3589434481b318adffc21cd32d823bd69d42cde35e894b61c3bcb0"
+          "length": 1322,
+          "blake3": "579da5c02911633956164f8a074cfee086589065ccb475ab9a6b7a058dd89fc8"
         },
         {
-          "name": "varp/gene_corr",
-          "section_type": 19,
+          "name": "varm/PCs_shard_1",
+          "section_type": 21,
           "modality_id": 0,
-          "length": 1482,
-          "blake3": "066592ba477f9f528847fdd2430c62a9d9ba0ced66b6b9f18fd7adb30ce6bdd0"
+          "length": 1322,
+          "blake3": "8d5d3a141128a4770f0eed142d3b503f9f2e28aa62ef1b867a4ed5939924b070"
+        },
+        {
+          "name": "varp/gene_corr_shard_0",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "c7a8d36b9eeded625e83ca74fc41d515ce55c9db88bf56e8875261808915bdae"
+        },
+        {
+          "name": "varp/gene_corr_shard_1",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "06530429e62cace15ce38965e4c84f7d7888435fbb3b8499f81fa7855e23b33d"
         }
       ]
     },
@@ -1251,7 +1307,7 @@
       ],
       "header": {
         "format_version": 3,
-        "flags": 4,
+        "flags": 12,
         "n_obs": 6,
         "n_vars": 6,
         "nnz": 12,
@@ -1328,18 +1384,32 @@
           "blake3": "c3ef034867025c10cc9246e5c2c5211144871e8b7871fb7657c808efba49b39b"
         },
         {
-          "name": "obsm/X_pca",
-          "section_type": 8,
+          "name": "obsm/X_pca_shard_0",
+          "section_type": 20,
           "modality_id": 0,
-          "length": 946,
-          "blake3": "7ec8059f10081a2723441f11af08c35206e6305b747bb9ebd74f8ace46adfd0e"
+          "length": 1322,
+          "blake3": "7515839ab8a96d662ac35fc8bbe38a89f98886b59162df35694920fab55ac66a"
         },
         {
-          "name": "obsp/connectivities",
-          "section_type": 18,
+          "name": "obsm/X_pca_shard_1",
+          "section_type": 20,
           "modality_id": 0,
-          "length": 1522,
-          "blake3": "60409a71e492ac7cc53ffa7c95469880a8923d55e99f7008aedc5855321efa66"
+          "length": 1322,
+          "blake3": "2dda76cd9dd7cd51a73f058f7ac1776861760cca9b1ebc2e09188cc0af60e09f"
+        },
+        {
+          "name": "obsp/connectivities_shard_0",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "d107ec574734aa98da3f27714f04d127e1064ef9cf1fd9ed487955f74ec81022"
+        },
+        {
+          "name": "obsp/connectivities_shard_1",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "a0408e587e5a9ef041bfa628d0b1a38aa716708d7b58d4340ed76f01fa21446c"
         },
         {
           "name": "spliced_shard_0",
@@ -1394,18 +1464,32 @@
           "blake3": "694e7da91331e7f95fda16d1d1faba12c491a6726243c6084ecf58b21c78c28c"
         },
         {
-          "name": "varm/PCs",
-          "section_type": 17,
+          "name": "varm/PCs_shard_0",
+          "section_type": 21,
           "modality_id": 0,
-          "length": 946,
-          "blake3": "ac950e6d3e3589434481b318adffc21cd32d823bd69d42cde35e894b61c3bcb0"
+          "length": 1322,
+          "blake3": "579da5c02911633956164f8a074cfee086589065ccb475ab9a6b7a058dd89fc8"
         },
         {
-          "name": "varp/gene_corr",
-          "section_type": 19,
+          "name": "varm/PCs_shard_1",
+          "section_type": 21,
           "modality_id": 0,
-          "length": 1482,
-          "blake3": "066592ba477f9f528847fdd2430c62a9d9ba0ced66b6b9f18fd7adb30ce6bdd0"
+          "length": 1322,
+          "blake3": "8d5d3a141128a4770f0eed142d3b503f9f2e28aa62ef1b867a4ed5939924b070"
+        },
+        {
+          "name": "varp/gene_corr_shard_0",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "c7a8d36b9eeded625e83ca74fc41d515ce55c9db88bf56e8875261808915bdae"
+        },
+        {
+          "name": "varp/gene_corr_shard_1",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "06530429e62cace15ce38965e4c84f7d7888435fbb3b8499f81fa7855e23b33d"
         }
       ]
     },
@@ -2364,7 +2448,7 @@
       ],
       "header": {
         "format_version": 3,
-        "flags": 4,
+        "flags": 12,
         "n_obs": 6,
         "n_vars": 6,
         "nnz": 12,
@@ -2432,18 +2516,18 @@
           "blake3": "0b4d35bc14dd89de4f00f62297899c686c6017f6b1368f9d87f8569cab22c5cf"
         },
         {
-          "name": "obsm/X_pca",
-          "section_type": 8,
+          "name": "obsm/X_pca_shard_0",
+          "section_type": 20,
           "modality_id": 0,
-          "length": 946,
-          "blake3": "214f0fa29870bf340cc3cc5e33358dda2ee9d969b2b8ecdbd42fc65bcbded7cb"
+          "length": 1322,
+          "blake3": "51fbfc078b4a5ce9c75b658059df9dc6c91f2958180b9897a1ca4b329744789e"
         },
         {
-          "name": "obsp/connectivities",
-          "section_type": 18,
+          "name": "obsp/connectivities_shard_0",
+          "section_type": 22,
           "modality_id": 0,
-          "length": 1522,
-          "blake3": "1e458872a8a33c37416fd4847a920cfc28dec067fff945b0db3ab1243e0a291d"
+          "length": 1778,
+          "blake3": "32d5cf0375687251b463c06c1736eb53293460088d4b13c863554202fab27dac"
         },
         {
           "name": "spliced_shard_0",
@@ -2479,18 +2563,18 @@
           "blake3": "694e7da91331e7f95fda16d1d1faba12c491a6726243c6084ecf58b21c78c28c"
         },
         {
-          "name": "varm/PCs",
-          "section_type": 17,
+          "name": "varm/PCs_shard_0",
+          "section_type": 21,
           "modality_id": 0,
-          "length": 946,
-          "blake3": "ac950e6d3e3589434481b318adffc21cd32d823bd69d42cde35e894b61c3bcb0"
+          "length": 1322,
+          "blake3": "4d12bd9fe26d7cc4728683c8fcc6c655ea8d68b73e9f240f763fed04ae764fd9"
         },
         {
-          "name": "varp/gene_corr",
-          "section_type": 19,
+          "name": "varp/gene_corr_shard_0",
+          "section_type": 23,
           "modality_id": 0,
-          "length": 1482,
-          "blake3": "066592ba477f9f528847fdd2430c62a9d9ba0ced66b6b9f18fd7adb30ce6bdd0"
+          "length": 1778,
+          "blake3": "5e2ac057040e27855ac968b3d97a514bb4908bc80d69d498a654b74943773ee5"
         }
       ]
     }

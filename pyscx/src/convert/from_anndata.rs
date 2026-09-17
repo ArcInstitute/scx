@@ -1083,13 +1083,16 @@ pub fn from_anndata_impl(
             }
         }
         py.detach(|| -> Result<(), scx_format_io::ScxError> {
-            for_each_dense_shard(
-                &batch,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsm_shard(key, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )
+            scx_format_io::for_each_dense_mapping_shard(&batch, shard_target_rows, |m, shard| {
+                writer.write_obsm_shard(
+                    key,
+                    m.shard_idx,
+                    m.row_start,
+                    m.n_shard_rows,
+                    m.n_rows_total,
+                    shard,
+                )
+            })
         })
         .map_err(to_pyerr)?;
     }
@@ -1118,11 +1121,18 @@ pub fn from_anndata_impl(
                 }
             }
             py.detach(|| -> Result<(), scx_format_io::ScxError> {
-                for_each_dense_shard(
+                scx_format_io::for_each_dense_mapping_shard(
                     &batch,
                     shard_target_rows,
-                    |idx, row_start, n_shard_rows, n_total, shard| {
-                        writer.write_varm_shard(key, idx, row_start, n_shard_rows, n_total, shard)
+                    |m, shard| {
+                        writer.write_varm_shard(
+                            key,
+                            m.shard_idx,
+                            m.row_start,
+                            m.n_shard_rows,
+                            m.n_rows_total,
+                            shard,
+                        )
                     },
                 )
             })
@@ -1153,16 +1163,17 @@ pub fn from_anndata_impl(
                 }
             }
             py.detach(|| -> Result<(), scx_format_io::ScxError> {
-                for_each_coo_shard(
+                scx_format_io::for_each_coo_mapping_shard(
+                    &format!("obsp/{key}"),
                     &batch,
                     shard_target_rows,
-                    |idx, row_start, n_shard_rows, n_total, shard| {
+                    |m, shard| {
                         writer.write_obsp_shard_coo(
                             key,
-                            idx,
-                            row_start,
-                            n_shard_rows,
-                            n_total,
+                            m.shard_idx,
+                            m.row_start,
+                            m.n_shard_rows,
+                            m.n_rows_total,
                             shard,
                         )
                     },
@@ -1195,16 +1206,17 @@ pub fn from_anndata_impl(
                 }
             }
             py.detach(|| -> Result<(), scx_format_io::ScxError> {
-                for_each_coo_shard(
+                scx_format_io::for_each_coo_mapping_shard(
+                    &format!("varp/{key}"),
                     &batch,
                     shard_target_rows,
-                    |idx, row_start, n_shard_rows, n_total, shard| {
+                    |m, shard| {
                         writer.write_varp_shard_coo(
                             key,
-                            idx,
-                            row_start,
-                            n_shard_rows,
-                            n_total,
+                            m.shard_idx,
+                            m.row_start,
+                            m.n_shard_rows,
+                            m.n_rows_total,
                             shard,
                         )
                     },

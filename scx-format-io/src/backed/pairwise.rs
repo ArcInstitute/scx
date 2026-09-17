@@ -19,7 +19,7 @@
 //!    does, and it is why a caller cannot get a row's degree without reading
 //!    the row.
 //! 3. **Triples are not guaranteed sorted by `row` within a shard.**
-//!    `scx-convert`'s override path (`pipeline/mappings.rs::partition_coo_to_shards`)
+//!    The shared emitter (`crate::mapping_shards::for_each_coo_mapping_shard`)
 //!    buckets by `row / step` in one linear pass preserving *input* order; only
 //!    the h5py streaming path happens to come out row-sorted. So the row
 //!    grouping is a counting sort, never a binary search, and the column order
@@ -37,9 +37,12 @@
 //!
 //! Bounded reads need a **sharded** obsp. A legacy single-section
 //! `ObspEmbedding` is one Arrow batch and must be deserialised whole whatever
-//! range is asked for; the range is then applied to the decoded triples. That
-//! is not hypothetical: `scx sort` re-emits obsp through `write_obsp`, so a
-//! sorted file's graph is always unsharded.
+//! range is asked for; the range is then applied to the decoded triples.
+//!
+//! That branch is no longer what the rewrite ops produce — since phase 9,
+//! `scx sort` and `scx compact` emit all four mapping families as shards — but
+//! it is still reachable, and not hypothetically: a file written before
+//! phase 9 has an unsharded graph, and `scx subset` drops obsp entirely.
 //!
 //! # Row space
 //!
@@ -222,7 +225,8 @@ impl BackedPairwiseReader {
     }
 
     /// `true` when the mapping is stored as one unsharded section, which is
-    /// what `scx sort` emits and what makes a read unbounded.
+    /// what makes a read unbounded. Since phase 9 no rewrite op writes one;
+    /// a file predating it does.
     pub fn is_legacy_single_section(&self) -> bool {
         self.sorted_entries
             .iter()
@@ -311,8 +315,9 @@ impl BackedPairwiseReader {
                 batch.num_columns()
             )));
         }
-        let rows = coo_coord_column(&batch, 0, &self.name)?;
-        let cols = coo_coord_column(&batch, 1, &self.name)?;
+        let logical = format!("obsp/{}", self.name);
+        let rows = coo_coord_column(&batch, 0, &logical)?;
+        let cols = coo_coord_column(&batch, 1, &logical)?;
         let vals = coo_data_column(&batch, &self.name)?;
         if rows.len() != cols.len() || rows.len() != vals.len() {
             return Err(ScxError::InvalidCatalog(format!(
@@ -446,10 +451,14 @@ impl BackedPairwiseReader {
 
 /// Read COO coordinate column `col_idx` as `i64`, accepting both the `Int32`
 /// (v1) and `Int64` (v2 wide-axis) forms the writer picks between.
-fn coo_coord_column(
+///
+/// `logical` is the fully qualified section label (`"obsp/connectivities"`),
+/// not the bare key: this is shared with [`crate::mapping_shards`], which
+/// buckets `varp` too, so the family cannot be assumed here.
+pub(crate) fn coo_coord_column(
     batch: &arrow::array::RecordBatch,
     col_idx: usize,
-    name: &str,
+    logical: &str,
 ) -> Result<Vec<i64>> {
     use arrow::array::{Int32Array, Int64Array};
     let col = batch.column(col_idx);
@@ -459,8 +468,8 @@ fn coo_coord_column(
     // one was not written by this workspace and is refused rather than read.
     if col.null_count() > 0 {
         return Err(ScxError::InvalidCatalog(format!(
-            "obsp/{name}: COO coordinate column {col_idx} has {} null entries; a COO triple has \
-             no meaning with a missing coordinate",
+            "{logical}: COO coordinate column {col_idx} has {} null entries; a COO triple \
+             has no meaning with a missing coordinate",
             col.null_count()
         )));
     }
@@ -471,7 +480,7 @@ fn coo_coord_column(
         return Ok(a.values().to_vec());
     }
     Err(ScxError::InvalidCatalog(format!(
-        "obsp/{name}: COO coordinate column {col_idx} has dtype {:?}, expected Int32 or Int64",
+        "{logical}: COO coordinate column {col_idx} has dtype {:?}, expected Int32 or Int64",
         col.data_type()
     )))
 }

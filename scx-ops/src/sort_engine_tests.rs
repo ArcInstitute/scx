@@ -19,8 +19,9 @@ use scx_format_io::{BitmapPolicy, ScxReader};
 use super::{sort, sort_with_strategy};
 use crate::sort::{ReferenceSpec, SortOptions, SortStrategy};
 use crate::test_utils::{
-    fixture_composite, fixture_deletion, fixture_multimodal, fixture_null_key, fixture_numeric,
-    fixture_obsp_layers, fixture_plain, fixture_skewed,
+    fixture_all_mapping_families, fixture_composite, fixture_deletion, fixture_multimodal,
+    fixture_multimodal_global_mappings, fixture_null_key, fixture_numeric, fixture_obsp_layers,
+    fixture_plain, fixture_skewed,
 };
 
 // --- helpers ---------------------------------------------------------------
@@ -2527,4 +2528,209 @@ fn cross_row_codec_probe_distinguishes_scx1_from_zstd() {
         // blowup being warned about.
         assert_eq!(dominant, Some(codec), "dominant codec must be reported");
     }
+}
+
+// --- Phase 9: the four mapping families are re-emitted as row-shards --------
+//
+// Why these are assertions on the *catalog* and not on content: `scx-ops`'
+// carry table folds `ObsmEmbedding` and `ObsmEmbeddingShard` into one
+// `SectionFamily` (`carry.rs`), so every `*_matches_the_table` test is blind to
+// the difference, and every other obsp/obsm test in this crate reads through
+// `read_obsp` / `read_all_obsm`, which assemble either layout transparently.
+// Nothing else here can see a collapse back to one section.
+
+/// Every `obsm/`, `varm/`, `obsp/`, `varp/` catalog entry, as
+/// `(name, section_type)`, for `modality_id == 0`.
+fn mapping_sections(path: &Path) -> Vec<(String, SectionType)> {
+    let reader = ScxReader::open(path).unwrap();
+    let mut v: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| {
+            e.modality_id == 0
+                && ["obsm/", "varm/", "obsp/", "varp/"]
+                    .iter()
+                    .any(|p| e.name.starts_with(p))
+        })
+        .map(|e| (e.name.clone(), e.section_type))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// Assert all four families came back sharded, and name the offender if not.
+fn assert_all_four_sharded(path: &Path) {
+    let got = mapping_sections(path);
+    for prefix in ["obsm/", "varm/", "obsp/", "varp/"] {
+        assert!(
+            got.iter().any(|(n, _)| n.starts_with(prefix)),
+            "no {prefix} section in the output at all; got {got:?}"
+        );
+    }
+    for (name, ty) in &got {
+        assert!(
+            matches!(
+                ty,
+                SectionType::ObsmEmbeddingShard
+                    | SectionType::VarmEmbeddingShard
+                    | SectionType::ObspEmbeddingShard
+                    | SectionType::VarpEmbeddingShard
+            ),
+            "{name} came back as {ty:?}, not a row-sharded section"
+        );
+        assert!(
+            name.contains("_shard_"),
+            "{name} has a sharded section type but an unsharded section name"
+        );
+    }
+}
+
+#[test]
+fn sort_emits_all_four_mapping_families_as_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_all_mapping_families(&dir);
+    let out = dir.path().join("out.scx");
+    sort(&inp, &out, &opts(&["cell_type"])).unwrap();
+    assert_all_four_sharded(&out);
+}
+
+#[test]
+fn sort_multimodal_emits_all_four_global_families_as_shards() {
+    // The modality-0 block in `sort_multimodal` is a separate call site from
+    // the unimodal tail, so neither test implies the other.
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_multimodal_global_mappings(&dir);
+    let out = dir.path().join("out_mm.scx");
+    sort(&inp, &out, &opts(&["cell_type"])).unwrap();
+    let ro = ScxReader::open(&out).unwrap();
+    assert!(ro.is_multimodal());
+    assert_all_four_sharded(&out);
+    // Per-modality obsm is a third call site, deliberately left unsharded
+    // (`write_obsm_for`), and must not have been swept into the globals.
+    assert_eq!(
+        ro.read_obsm_for(1, "X_umap").unwrap().num_rows(),
+        12,
+        "per-modality obsm still round-trips"
+    );
+}
+
+#[test]
+fn sort_shards_a_legacy_unsharded_input_too() {
+    // The emit rule is the op's, not the input's: `fixture_multimodal_global_mappings`
+    // writes all four globals through the unsharded writers. A rule that
+    // preserved the input layout would leave a legacy file legacy — and it is
+    // a legacy file that most needs the bounded read.
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_multimodal_global_mappings(&dir);
+    let before = mapping_sections(&inp);
+    assert!(
+        before
+            .iter()
+            .any(|(_, t)| matches!(t, SectionType::ObspEmbedding | SectionType::ObsmEmbedding)),
+        "premise: the input must be unsharded, got {before:?}"
+    );
+    let out = dir.path().join("out_legacy_in.scx");
+    sort(&inp, &out, &opts(&["cell_type"])).unwrap();
+    assert_all_four_sharded(&out);
+}
+
+#[test]
+fn sharding_obsp_does_not_change_which_edges_survive() {
+    // The content claim, stated at the strength it actually holds.
+    //
+    // Bucketing groups triples by `row / step` while `remap_obsp_coo` emits
+    // them in input order, so the assembled batch is NOT byte-identical to the
+    // pre-phase-9 single section — it is the same MULTISET of triples. That is
+    // not observable through any reader: `BackedPairwiseReader` counting-sorts
+    // and then sorts columns within a row, the h5ad exporter sorts by
+    // `(row, col)` for a canonical CSR, and scipy's `coo_matrix` imposes no
+    // order.
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_obsp_layers(&dir); // 8 obs, ring edge r -> (r+1)%8, data r+1
+    let out = dir.path().join("out.scx");
+    sort(&inp, &out, &opts(&["cell_type"])).unwrap();
+
+    let ro = ScxReader::open(&out).unwrap();
+    let out_ids = col_of(&out, "cell_id");
+    let np = new_pos_map(&out_ids, 8);
+    let obsp = ro.read_obsp("connectivities").unwrap();
+
+    assert_eq!(
+        obsp_dim(&obsp, "n_rows"),
+        8,
+        "no deletions -> dim unchanged"
+    );
+    assert_eq!(obsp_dim(&obsp, "n_cols"), 8);
+    // The extent the assembled shards declare must equal the output's own obs
+    // axis, or `BackedPairwiseReader::new_obsp` refuses to open the file (it
+    // requires the graph be square AND on the file's obs axis).
+    assert_eq!(
+        obsp_dim(&obsp, "n_rows") as u64,
+        ro.n_obs(),
+        "the graph's declared extent must match the output header's n_obs"
+    );
+
+    let expected: HashSet<(i64, i64, u32)> = (0..8i64)
+        .map(|r| {
+            let c = (r + 1) % 8;
+            (np[r as usize], np[c as usize], (r + 1) as u32)
+        })
+        .collect();
+    let got: HashSet<(i64, i64, u32)> = obsp_edges(&obsp)
+        .into_iter()
+        .map(|(r, c, d)| (r, c, d as u32))
+        .collect();
+    assert_eq!(got, expected, "every edge survives, remapped, exactly once");
+    assert_eq!(
+        obsp_edges(&obsp).len(),
+        expected.len(),
+        "and no edge is duplicated across shards"
+    );
+}
+
+#[test]
+fn a_sorted_graph_reads_bounded() {
+    // The point of the phase. Before it, `sort` wrote one section, the layout
+    // resolver produced a single entry spanning the whole axis, and every
+    // `read_rows_range` decoded the entire graph.
+    //
+    // Asserted on the decode count (`memo_metrics`), not on wall time: this is
+    // a claim about how many shards were touched, and a timing assertion would
+    // be a claim about a machine.
+    use scx_format_io::BackedPairwiseReader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_obsp_layers(&dir);
+    let out = dir.path().join("out.scx");
+    sort(&inp, &out, &opts(&["cell_type"])).unwrap(); // shard_target_rows = 2
+    let backed =
+        BackedPairwiseReader::new_obsp(ScxReader::open(&out).unwrap(), "connectivities").unwrap();
+
+    assert!(
+        !backed.is_legacy_single_section(),
+        "a sorted graph must not resolve to the legacy whole-axis layout"
+    );
+    assert_eq!(backed.shard_count(), 4, "8 obs at a target of 2 rows");
+
+    // Two reads inside shard 0: one decode, then a memo hit. A single section
+    // would also report one decode here — but it would be a decode of the
+    // whole graph, which `shard_count` above is what distinguishes.
+    backed.read_rows_range(0, 1).unwrap();
+    backed.read_rows_range(1, 2).unwrap();
+    assert_eq!(
+        backed.memo_metrics(),
+        (1, 1),
+        "(hits, misses): the second read inside shard 0 must not decode again"
+    );
+
+    // A range confined to the last shard decodes that shard and no other.
+    let fresh =
+        BackedPairwiseReader::new_obsp(ScxReader::open(&out).unwrap(), "connectivities").unwrap();
+    fresh.read_rows_range(6, 8).unwrap();
+    assert_eq!(
+        fresh.memo_metrics(),
+        (0, 1),
+        "one shard decoded for a range inside one shard, not four"
+    );
 }

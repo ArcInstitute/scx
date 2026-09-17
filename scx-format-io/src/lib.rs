@@ -30,6 +30,7 @@ pub mod deletion_vectors;
 pub mod distinct;
 pub mod encoder;
 pub mod freshness;
+pub mod mapping_shards;
 pub mod mem;
 pub mod prefetch;
 pub mod profile;
@@ -69,6 +70,7 @@ pub use encoder::{
     encode_one_shard, encode_one_shard_from_bytes, encode_shard_adaptive, encode_shard_framed,
     EncodeShardOptions, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
 };
+pub use mapping_shards::{for_each_coo_mapping_shard, for_each_dense_mapping_shard};
 pub use mem::MemoryBudget;
 pub use prefetch::{
     accumulate_shards, clamp_prefetch_depth, col_means_and_sum_sq_prefetched,

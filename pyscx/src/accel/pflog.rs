@@ -49,7 +49,6 @@ use scx_sparse::ScxCsr;
 use crate::convert::dtype::UnsFormat;
 use crate::convert::from_anndata::build_output_header;
 use crate::convert::h5ad::extract_scx_overrides;
-use crate::convert::scx_to_scx::{for_each_coo_shard, for_each_dense_shard};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::to_pyerr;
 
@@ -646,38 +645,60 @@ fn stream_pflog_to_scx<S: ShardSource>(
     // obsm / varm / obsp / varp / uns (mirror route_scx_lazy_to_scx).
     py.detach(|| -> Result<(), scx_format_io::ScxError> {
         for (k, b) in &ov.obsm {
-            for_each_dense_shard(
-                b,
-                shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
+            scx_format_io::for_each_dense_mapping_shard(b, shard_rows, |m, shard| {
+                writer.write_obsm_shard(
+                    k,
+                    m.shard_idx,
+                    m.row_start,
+                    m.n_shard_rows,
+                    m.n_rows_total,
+                    shard,
+                )
+            })?;
         }
         for (k, b) in &ov.varm {
-            for_each_dense_shard(
-                b,
-                shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varm_shard(k, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
+            scx_format_io::for_each_dense_mapping_shard(b, shard_rows, |m, shard| {
+                writer.write_varm_shard(
+                    k,
+                    m.shard_idx,
+                    m.row_start,
+                    m.n_shard_rows,
+                    m.n_rows_total,
+                    shard,
+                )
+            })?;
         }
         for (k, b) in &ov.obsp {
-            for_each_coo_shard(
+            scx_format_io::for_each_coo_mapping_shard(
+                &format!("obsp/{k}"),
                 b,
                 shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
+                |m, shard| {
+                    writer.write_obsp_shard_coo(
+                        k,
+                        m.shard_idx,
+                        m.row_start,
+                        m.n_shard_rows,
+                        m.n_rows_total,
+                        shard,
+                    )
                 },
             )?;
         }
         for (k, b) in &ov.varp {
-            for_each_coo_shard(
+            scx_format_io::for_each_coo_mapping_shard(
+                &format!("varp/{k}"),
                 b,
                 shard_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varp_shard_coo(k, idx, row_start, n_shard_rows, n_total, shard)
+                |m, shard| {
+                    writer.write_varp_shard_coo(
+                        k,
+                        m.shard_idx,
+                        m.row_start,
+                        m.n_shard_rows,
+                        m.n_rows_total,
+                        shard,
+                    )
                 },
             )?;
         }

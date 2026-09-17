@@ -60,8 +60,44 @@ writing something it claims to carry fails loudly instead of losing it quietly.
 
 Read that table rather than this document when you need the answer for `varm`,
 `obsp`, `varp`, `adata.raw`, detection bitmaps, layers or the grouped-sort
-sidecar. It is the source of truth, it is snapshot-tested, and it cannot get out
-of step with the code without a test going red.
+sidecar. It is the source of truth for **whether** a family survives, it is
+snapshot-tested, and it cannot get out of step with the code without a test
+going red.
+
+What it deliberately does not answer is **in what layout**. `carry.rs` folds a
+family's sharded and unsharded section types into one `SectionFamily`
+(`ObsmEmbedding` and `ObsmEmbeddingShard` are both `Obsm`), so an op that
+replaced one with the other would change no cell in the table and pass the
+audit. That is not a gap to close — the table is about survival — but it does
+mean a layout change needs its own test, and the two that can see one are
+`tests/goldens/op_output_identity.json` and the sharded-form assertions in
+`scx-ops`' sort/compact tests. Phase 9, which moved `sort` and `compact` from
+the unsharded mapping writers to the sharded ones, is exactly that shape.
+
+**Mapping layout after `sort` / `compact`.** Both ops re-emit all four
+auxiliary mapping families — `obsm`, `varm`, `obsp`, `varp` — as **row-shards**
+(`<family>/<key>_shard_<idx>`), at the same `shard_target_rows` as the file's X
+and obs shards: `sort` from `SortOptions::shard_target_rows`, `compact` from
+the input header's value. Boundaries are over the **output** row space, so a
+compacted mapping is cut by its surviving rows and a sorted one by the
+permuted order.
+
+This is what makes `Experiment.read_obsp_rows` and the neighbourhood plan
+builders bounded on a sorted file; before phase 9 both ops collapsed the
+mapping to a single section and every row-range read decoded the whole graph.
+Three consequences:
+
+- A file written before phase 9 keeps its single section and stays readable —
+  the readers prefer shards and fall back — it is just not bounded.
+- A sorted or compacted file's header now reports `has_obsp`. The unsharded
+  `write_obsp` never set that flag, so `scx info` used to under-report a graph
+  the file did carry.
+- `obsp` / `varp` triples come back in a different **order** (grouped by row
+  band rather than in the remap's input order). Same edges; no reader depends
+  on the order, since each imposes its own.
+
+`scx optimize` copies mapping sections verbatim, so it preserves whichever
+layout it finds. `scx subset` still drops all four families.
 
 Three of its answers are worth surfacing here.
 

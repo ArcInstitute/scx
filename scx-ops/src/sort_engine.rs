@@ -1007,26 +1007,46 @@ pub fn sort_with_strategy(
     emit_layers_in_memory(&reader, &mut writer, &order_old, opts)?;
 
     // ----- obsm (in-memory take) -----
+    // All four mapping families are re-emitted as row-shards, at the same
+    // `shard_target_rows` the X and obs shards above use. Sort applies a global
+    // permutation, so the input's shard boundaries are meaningless here and
+    // there is nothing to preserve; what matters is that the output is
+    // bounded-readable, which one collapsed section is not.
     let mut obsm: Vec<_> = reader.read_all_obsm()?.into_iter().collect();
     obsm.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, batch) in &obsm {
         let reordered = take_rows(batch, &order_old)?;
-        writer.write_obsm(name, &reordered)?;
+        crate::rewrite_helpers::write_obsm_sharded(
+            &mut writer,
+            name,
+            &reordered,
+            opts.shard_target_rows,
+        )?;
     }
 
-    // ----- uns / varm / varp passthrough; obsp dropped  -----
+    // ----- uns / varm / varp passthrough (var axis: neither deleted nor permuted) -----
     if let Ok(uns) = reader.read_uns() {
         writer.write_uns(&uns)?;
     }
     let mut varm: Vec<_> = reader.read_all_varm()?.into_iter().collect();
     varm.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, batch) in &varm {
-        writer.write_varm(name, batch)?;
+        crate::rewrite_helpers::write_varm_sharded(
+            &mut writer,
+            name,
+            batch,
+            opts.shard_target_rows,
+        )?;
     }
     let mut varp: Vec<_> = reader.read_all_varp()?.into_iter().collect();
     varp.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, batch) in &varp {
-        writer.write_varp(name, batch)?;
+        crate::rewrite_helpers::write_varp_sharded(
+            &mut writer,
+            name,
+            batch,
+            opts.shard_target_rows,
+        )?;
     }
     // obsp (obs×obs COO): remap both endpoints through the sort permutation
     // (T5.3). `new_pos_of_old` is exactly the old→new map `remap_obsp_coo`
@@ -1035,7 +1055,12 @@ pub fn sort_with_strategy(
     obsp.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, batch) in &obsp {
         let remapped = crate::compact::remap_obsp_coo(batch, &new_pos_of_old)?;
-        writer.write_obsp(name, &remapped)?;
+        crate::rewrite_helpers::write_obsp_sharded(
+            &mut writer,
+            name,
+            &remapped,
+            opts.shard_target_rows,
+        )?;
     }
 
     // ----- predicate index (always (re)built; sort key auto-added) -----
@@ -1277,7 +1302,12 @@ fn sort_multimodal(
         SectionType::ObsmEmbeddingShard,
     ) {
         let batch = reader.read_obsm(&key)?;
-        writer.write_obsm(&key, &take_rows(&batch, order_old)?)?;
+        crate::rewrite_helpers::write_obsm_sharded(
+            &mut writer,
+            &key,
+            &take_rows(&batch, order_old)?,
+            opts.shard_target_rows,
+        )?;
     }
     for key in crate::compact::discover_modality_keys(
         reader,
@@ -1286,7 +1316,12 @@ fn sort_multimodal(
         SectionType::VarmEmbedding,
         SectionType::VarmEmbeddingShard,
     ) {
-        writer.write_varm(&key, &reader.read_varm(&key)?)?;
+        crate::rewrite_helpers::write_varm_sharded(
+            &mut writer,
+            &key,
+            &reader.read_varm(&key)?,
+            opts.shard_target_rows,
+        )?;
     }
     for key in crate::compact::discover_modality_keys(
         reader,
@@ -1295,7 +1330,12 @@ fn sort_multimodal(
         SectionType::VarpEmbedding,
         SectionType::VarpEmbeddingShard,
     ) {
-        writer.write_varp(&key, &reader.read_varp(&key)?)?;
+        crate::rewrite_helpers::write_varp_sharded(
+            &mut writer,
+            &key,
+            &reader.read_varp(&key)?,
+            opts.shard_target_rows,
+        )?;
     }
     for key in crate::compact::discover_modality_keys(
         reader,
@@ -1305,9 +1345,11 @@ fn sort_multimodal(
         SectionType::ObspEmbeddingShard,
     ) {
         let batch = reader.read_obsp(&key)?;
-        writer.write_obsp(
+        crate::rewrite_helpers::write_obsp_sharded(
+            &mut writer,
             &key,
             &crate::compact::remap_obsp_coo(&batch, new_pos_of_old)?,
+            opts.shard_target_rows,
         )?;
     }
     if let Ok(uns) = reader.read_uns() {
