@@ -3957,7 +3957,10 @@ thread_local! {
     /// parallel on their own threads, and the prescan this pins runs on the
     /// calling thread. A shared counter would make the assertion depend on what
     /// else happened to be running.
-    static INDPTR_DECODES: Cell<usize> = const { Cell::new(0) };
+    // Fully qualified: `Cell` is imported here only under
+    // `#[cfg(feature = "parallel")]`, and this counter is not feature-gated —
+    // the `--no-default-features` clippy leg is what says so.
+    static INDPTR_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Called from `BackedCsrReader::shard_indptr`, unconditionally in the
