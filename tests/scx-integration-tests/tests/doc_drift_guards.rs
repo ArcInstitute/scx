@@ -377,7 +377,7 @@ fn no_doc_claims_a_write_door_decodes_categoricals() {
         // Retired when `scx sort`'s obs spill path stopped decoding.
         "One writer still decodes",
         "Every write door but `scx sort",
-        "re-encodes obs categoricals",
+        "re-encodes obs categoricals per spilled shard",
         "the in-memory sort path is correct",
     ];
     let mut docs: Vec<PathBuf> = Vec::new();

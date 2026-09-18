@@ -77,7 +77,7 @@
 //!
 //! **Framing, by exactly one arm.** `optimize_framed` is the only arm whose
 //! output goes through `scx_format_io::encode_shard_framed`; every other
-//! fixture here is unframed, so the eleven other arms say nothing about the
+//! fixture here is unframed, so the fifteen other arms say nothing about the
 //! row-group layout. Do not "simplify" its fixture — the row count and the
 //! `decode_target` are what make it cover anything, and its own premise
 //! assertions explain why.

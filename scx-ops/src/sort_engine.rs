@@ -71,7 +71,7 @@
 //! predicate index is skipped on the multimodal path (unimodal-only
 //! engine-wide, as in compact).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -2270,20 +2270,20 @@ fn write_obs_sharded(writer: &mut ScxWriter, obs: &RecordBatch, shard_target: u3
 // (`Unsupported output type for dictionary packing: Boolean`), so the sort
 // failed outright.
 //
-// Nothing is decoded now. Pass 0 reads the obs shards twice — once to collect
-// which columns are categorical **anywhere in the file**
-// ([`categorical_obs_columns_across_shards`]; reading only shard 0 disagreed
-// with the read side, which promotes a field any shard declares a dictionary),
-// then once to fold them into a 0-row batch holding the **union of the declared
-// values** ([`build_obs_vocabulary_template`]), through the same
-// `scx_format_io` pipeline `read_obs()` uses, so the vocabulary and key width
-// are the ones the in-memory path would have written. Pass 1 remaps each
-// shard's keys onto that union and spills the `Int32` **codes** — 4 B/row
-// instead of the value width. Pass 2 rebuilds the dictionary from the codes and
-// the union's values `Arc`, which every output shard then shares, as the
-// in-memory path's `RecordBatch::slice` does. The result is byte-identical obs
-// sections on the two paths, which is what `obs_spill_obs_matches_in_memory`
-// pins.
+// Nothing is decoded now. Pass 0a reads every shard's Arrow IPC **footer** to
+// learn which columns are categorical anywhere in the file
+// ([`categorical_obs_fields_across_shards`]; reading only shard 0 disagreed
+// with the read side, which promotes a field any shard declares a dictionary).
+// Pass 0b then decodes the shards once to fold them into a 0-row batch holding
+// the **union of the declared values** ([`build_obs_vocabulary_template`]),
+// through the same `scx_format_io` pipeline `read_obs()` uses, so the
+// vocabulary and key width are the ones the in-memory path would have written;
+// it is skipped outright on a plain-obs file. Pass 1 remaps each shard's keys
+// onto that union and spills the `Int32` **codes** — 4 B/row instead of the
+// value width. Pass 2 rebuilds the dictionary from the codes and the union's
+// values `Arc`, which every output shard then shares, as the in-memory path's
+// `RecordBatch::slice` does. The result is byte-identical obs sections on the
+// two paths, which is what `obs_spill_obs_matches_in_memory` pins.
 // ---------------------------------------------------------------------------
 
 /// Reserved synthetic column carrying each spilled row's destination row index
@@ -2337,7 +2337,8 @@ fn largen_value_type(dt: &DataType) -> DataType {
     }
 }
 
-/// Pass 0a — which obs columns are categorical **anywhere in the file**.
+/// Pass 0a — which obs columns are categorical **anywhere in the file**, and
+/// the first shard field that declares each one.
 ///
 /// The union over every shard's schema, not shard 0's, because the read side
 /// promotes a field that any shard declares a dictionary
@@ -2346,12 +2347,90 @@ fn largen_value_type(dt: &DataType) -> DataType {
 /// plain-obs source onto a dictionary base leaves dictionary shards followed by
 /// plain ones, and the reverse leaves plain shards followed by dictionary ones.
 /// Reading only shard 0 got the second one wrong.
-fn categorical_obs_columns_across_shards(reader: &ScxReader) -> Result<HashSet<String>> {
-    let mut all: HashSet<String> = HashSet::new();
-    for res in reader.obs_shards() {
-        all.extend(categorical_obs_columns(&res?.schema()));
+///
+/// The **first** declaring field, specifically, because that is the one
+/// `reconcile_dictionary_representations` propagates its value type and its
+/// categorical metadata (the `scx.categorical.ordered` stamp) from; taking any
+/// other would diverge from `read_obs()` on a file whose shards disagree.
+///
+/// Schema-only: [`ScxReader::obs_shard_schemas`] reads each shard's Arrow IPC
+/// footer and nothing else, where `obs_shards()` would deserialise every
+/// column and run an O(rows) wide→narrow pass first. This runs on every
+/// spilled sort, plain-obs files included, so it must not cost a decode.
+fn categorical_obs_fields_across_shards(reader: &ScxReader) -> Result<HashMap<String, Field>> {
+    let mut declared: HashMap<String, Field> = HashMap::new();
+    for res in reader.obs_shard_schemas() {
+        for f in res?.fields() {
+            if matches!(f.data_type(), DataType::Dictionary(_, _)) {
+                declared
+                    .entry(f.name().clone())
+                    .or_insert_with(|| f.as_ref().clone());
+            }
+        }
     }
-    Ok(all)
+    Ok(declared)
+}
+
+/// The 0-row batch the pass-0b fold starts from: every categorical column an
+/// **empty** `Dictionary(Int32, V)`, every other column an empty array of the
+/// shard's own (widened) type.
+///
+/// Its job is to make every fold pair contain a dictionary. Without it, a run
+/// of plain shards ahead of the first dictionary shard has nothing for
+/// `reconcile_dictionary_representations` to promote against, so
+/// `share_dictionary_values` leaves those columns alone and slicing the
+/// accumulator to zero rows throws their values away — pass 1 then rediscovers
+/// them and trips the "gained categories" guard. Declaring nothing itself, the
+/// seed cannot perturb the union order: first occurrence over shards in index
+/// order, exactly as `read_obs()` computes it.
+///
+/// Each categorical field is shard 0's own when shard 0 declares it a
+/// dictionary, and otherwise carries shard 0's nullability with the *first*
+/// declaring shard's value type and metadata — which is precisely the field
+/// `reconcile_dictionary_representations` would have built for shard 0.
+fn empty_dictionary_seed(
+    widened_shard0: &Schema,
+    declared: &HashMap<String, Field>,
+) -> Result<RecordBatch> {
+    use arrow::array::{DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+
+    let mut fields: Vec<Field> = Vec::with_capacity(widened_shard0.fields().len());
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(widened_shard0.fields().len());
+    for f in widened_shard0.fields() {
+        match declared.get(f.name()) {
+            Some(decl) => {
+                let value_type = match decl.data_type() {
+                    DataType::Dictionary(_, v) => largen_value_type(v),
+                    other => largen_value_type(other),
+                };
+                let (metadata, value_type) = match f.data_type() {
+                    // Shard 0 already declares it: keep its own field verbatim,
+                    // which is what an unreconciled fold would carry forward.
+                    DataType::Dictionary(_, v) => (f.metadata().clone(), largen_value_type(v)),
+                    _ => (decl.metadata().clone(), value_type),
+                };
+                let arr = DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(Vec::<i32>::new()),
+                    arrow::array::new_empty_array(&value_type),
+                )?;
+                fields.push(
+                    Field::new(
+                        f.name(),
+                        DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_type)),
+                        f.is_nullable(),
+                    )
+                    .with_metadata(metadata),
+                );
+                cols.push(Arc::new(arr) as ArrayRef);
+            }
+            None => {
+                fields.push(f.as_ref().clone());
+                cols.push(arrow::array::new_empty_array(f.data_type()));
+            }
+        }
+    }
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
 }
 
 /// Pass 0b — fold every input obs shard into a **0-row** batch carrying, per
@@ -2390,13 +2469,13 @@ fn categorical_obs_columns_across_shards(reader: &ScxReader) -> Result<HashSet<S
 /// path exists to avoid.
 fn build_obs_vocabulary_template(
     reader: &ScxReader,
-    categorical: &HashSet<String>,
+    declared: &HashMap<String, Field>,
 ) -> Result<RecordBatch> {
     let mut acc: Option<RecordBatch> = None;
     for (idx, res) in reader.obs_shards().enumerate() {
         let shard = res?;
         let mut all_dict = true;
-        for name in categorical {
+        for name in declared.keys() {
             match shard.column_by_name(name) {
                 None => {
                     return Err(OpsError::InvalidInput(format!(
@@ -2409,21 +2488,23 @@ fn build_obs_vocabulary_template(
         }
         let shard = if all_dict { shard.slice(0, 0) } else { shard };
         let wide = scx_format_io::widen_metadata_batch_for_concat(&shard)?;
-        acc = Some(match acc.take() {
-            None => wide,
-            Some(prev) => {
-                // `share_dictionary_values` hands both batches the union over
-                // the pair, so the (0-row) first one carries it forward. No
-                // concat is needed until the final narrowing.
-                let prepared =
-                    scx_format_io::reconcile_and_share_metadata_batches(vec![prev, wide])?;
-                prepared
-                    .into_iter()
-                    .next()
-                    .expect("reconcile preserves batch count")
-                    .slice(0, 0)
-            }
-        });
+        let prev = match acc.take() {
+            Some(prev) => prev,
+            None => empty_dictionary_seed(&wide.schema(), declared)?,
+        };
+        // Both batches come back over one interned values `Arc`, so the
+        // (0-row) first one carries the union forward. The seed guarantees
+        // there is always a dictionary in the pair for a plain shard to be
+        // promoted against; without it a plain accumulator would be sliced
+        // away instead of unioned.
+        let prepared = scx_format_io::reconcile_and_share_metadata_batches(vec![prev, wide])?;
+        acc = Some(
+            prepared
+                .into_iter()
+                .next()
+                .expect("reconcile preserves batch count")
+                .slice(0, 0),
+        );
     }
     let acc = acc.ok_or_else(|| {
         OpsError::InvalidInput("scx sort: obs spill requires at least one obs shard".to_string())
@@ -2431,18 +2512,9 @@ fn build_obs_vocabulary_template(
     // Narrow once: `unify_dictionary_columns` picks the minimal key width for
     // the finished union and `downcast_large_types` restores the narrow value
     // type, which is the representation the in-memory path hands the writer.
-    let prepared = scx_format_io::reconcile_and_share_metadata_batches(vec![acc])?;
-    Ok(scx_format_io::concat_prepared_metadata_batches(&prepared)?.slice(0, 0))
-}
-
-/// Which obs columns a schema declares as categorical.
-fn categorical_obs_columns(schema: &Schema) -> HashSet<String> {
-    schema
-        .fields()
-        .iter()
-        .filter(|f| matches!(f.data_type(), DataType::Dictionary(_, _)))
-        .map(|f| f.name().clone())
-        .collect()
+    // No `reconcile_and_share_metadata_batches` hop first — both halves of it
+    // return a one-element input unchanged.
+    Ok(scx_format_io::concat_prepared_metadata_batches(std::slice::from_ref(&acc))?.slice(0, 0))
 }
 
 /// Everything the two spill passes need to agree on: the on-spill schema, the
@@ -2486,7 +2558,7 @@ struct ObsSpillLayout {
 /// what the in-memory path does.
 fn obs_spill_layout(
     shard_schema: &Schema,
-    categorical: HashSet<String>,
+    declared: HashMap<String, Field>,
     template: Option<RecordBatch>,
 ) -> Result<ObsSpillLayout> {
     let mut spill_fields: Vec<Field> = Vec::with_capacity(shard_schema.fields().len());
@@ -2497,7 +2569,7 @@ fn obs_spill_layout(
                 "scx sort: obs already has a column named '{OBS_NEW_POS_COL}' (reserved)"
             )));
         }
-        if categorical.contains(f.name()) {
+        if declared.contains_key(f.name()) {
             let unified = template
                 .as_ref()
                 .and_then(|t| {
@@ -2536,9 +2608,9 @@ fn obs_spill_layout(
     // Not `filter_map`: a categorical whose template column is somehow not a
     // dictionary would otherwise be dropped here and resurface in `reencode`
     // as an arrow schema mismatch naming neither the column nor the cause.
-    let mut vocabulary: HashMap<String, ArrayRef> = HashMap::with_capacity(categorical.len());
+    let mut vocabulary: HashMap<String, ArrayRef> = HashMap::with_capacity(declared.len());
     if let Some(t) = &template {
-        for name in &categorical {
+        for name in declared.keys() {
             let values = t
                 .column_by_name(name)
                 .and_then(|c| c.as_any_dictionary_opt().map(|d| d.values().clone()))
@@ -2589,14 +2661,26 @@ fn align_obs_shard_for_spill(
     let wide = scx_format_io::widen_metadata_batch_for_concat(batch)?;
     if wide.num_columns() != layout.coded_schema.fields().len() {
         let wide_schema = wide.schema();
-        let extra: Vec<&str> = wide_schema
+        let names: Vec<&str> = wide_schema
             .fields()
             .iter()
             .map(|f| f.name().as_str())
+            .collect();
+        let unexpected: Vec<&str> = names
+            .iter()
+            .copied()
             .filter(|n| layout.coded_schema.column_with_name(n).is_none())
             .collect();
+        let missing: Vec<&str> = layout
+            .coded_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .filter(|n| !names.contains(n))
+            .collect();
         return Err(OpsError::InvalidInput(format!(
-            "scx sort: obs shard has {} columns, the spill schema names {} (unexpected: {extra:?})",
+            "scx sort: obs shard has {} columns, the spill schema names {} \
+             (unexpected: {unexpected:?}, missing: {missing:?})",
             wide.num_columns(),
             layout.coded_schema.fields().len(),
         )));
@@ -2981,15 +3065,16 @@ fn prepare_obs_spill(
     let p0 = obs_partition_rows(budget, bytes_per_row, opts.shard_target_rows);
     let (p, n_parts) = cap_spill_partitions(p0, n_live, bytes_per_row, Some(budget))?;
 
-    // Pass 0 — only when shard 0 declares a categorical; a plain-obs file pays
-    // no extra read of the obs sections.
-    let categorical = categorical_obs_columns_across_shards(reader)?;
-    let template = if categorical.is_empty() {
+    // Pass 0a is schema-only and always runs: which columns are categorical is
+    // a property of the whole file, not of shard 0. Pass 0b — the decode that
+    // folds the vocabularies — is skipped entirely on a plain-obs file.
+    let declared = categorical_obs_fields_across_shards(reader)?;
+    let template = if declared.is_empty() {
         None
     } else {
-        Some(build_obs_vocabulary_template(reader, &categorical)?)
+        Some(build_obs_vocabulary_template(reader, &declared)?)
     };
-    let layout = obs_spill_layout(&s0.schema(), categorical, template)?;
+    let layout = obs_spill_layout(&s0.schema(), declared, template)?;
 
     let spill = SpillDir::create(opts.temp_dir.as_deref())?;
     scatter_obs_to_spill(reader, new_pos_of_old, p, n_parts, &layout, &spill)?;

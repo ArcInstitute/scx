@@ -1881,6 +1881,37 @@ impl ScxReader {
         self.metadata_shards_iter(SectionType::ObsMetadataShard, "obs_metadata/shard_")
     }
 
+    /// Iterate obs metadata shards in `shard_idx` order, yielding each
+    /// shard's **schema as stored on disk** and nothing else.
+    ///
+    /// A pure Arrow IPC footer read per shard — no batch deserialisation and
+    /// no wide→narrow normalisation, unlike [`Self::obs_shards`], whose
+    /// `downcast_large_types` is O(rows) per wide string column. Use this when
+    /// the question is about types rather than values: `scx sort`'s bounded
+    /// obs path asks which columns any shard declares categorical before it
+    /// decides whether to read them at all.
+    ///
+    /// Schemas come back **physical**, so a column the writer upcast is
+    /// reported `LargeUtf8` where [`Self::obs_shards`] would narrow it.
+    pub fn obs_shard_schemas(&self) -> impl Iterator<Item = Result<arrow::datatypes::Schema>> + '_ {
+        let mut entries: Vec<(u32, &FullCatalogEntry)> = self
+            .full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+            .filter_map(|e| {
+                e.name
+                    .strip_prefix("obs_metadata/shard_")
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .map(|idx| (idx, e))
+            })
+            .collect();
+        entries.sort_by_key(|(idx, _)| *idx);
+        entries
+            .into_iter()
+            .map(move |(_, e)| self.read_arrow_ipc_schema_physical(e))
+    }
+
     /// Iterate var metadata shards in `shard_idx` order. Mirror of
     /// [`Self::obs_shards`].
     pub fn var_shards(&self) -> impl Iterator<Item = Result<RecordBatch>> + '_ {

@@ -3175,3 +3175,120 @@ fn obs_spill_promotes_when_only_a_later_shard_is_a_dictionary() {
         assert_eq!(rm.read_obs_shard(i).unwrap(), rs.read_obs_shard(i).unwrap());
     }
 }
+
+/// Two or more **plain** shards ahead of the first dictionary shard.
+///
+/// The pairwise fold carries the accumulator forward as a 0-row slice, which is
+/// only lossless once a column is dictionary-typed: an arrow slice of a
+/// `DictionaryArray` keeps its values array, a slice of a plain array keeps
+/// nothing. With a plain run at the front there was no dictionary in the pair
+/// yet, so `reconcile_dictionary_representations` had nothing to promote
+/// against and every plain shard but the last one before the first dictionary
+/// lost its values — which pass 1 then found again, tripping the
+/// "gained categories while spilling" guard. Found by
+/// **Antigravity - Gemini 3.8 Flash** on PR #547.
+#[test]
+fn obs_spill_keeps_values_from_a_plain_run_before_the_first_dictionary() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain0: arrow::array::ArrayRef = Arc::new(StringArray::from(vec!["p0", "shared", "p0b"]));
+    let plain1: arrow::array::ArrayRef = Arc::new(StringArray::from(vec!["p1", "shared", "p1b"]));
+    let inp = write_obs_column_fixture(
+        &dir,
+        "plain_run.scx",
+        "cell_type",
+        vec![
+            plain0,
+            plain1,
+            str_dict(&["d", "shared", "unused"], &[0, 1, 0]),
+        ],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rs = ScxReader::open(&spilled).unwrap();
+    let obs = rs.read_obs().unwrap();
+    assert_eq!(
+        declared_levels(&obs, "cell_type").1,
+        vec!["p0", "shared", "p0b", "p1", "p1b", "d", "unused"],
+        "every shard's values must reach the union, in read_obs() order",
+    );
+    let rm = ScxReader::open(&mem).unwrap();
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        assert_eq!(rm.read_obs_shard(i).unwrap(), rs.read_obs_shard(i).unwrap());
+    }
+}
+
+/// A later obs shard carrying a column the spill schema does not name is
+/// rejected, not silently dropped. Pins the half of the by-name correction that
+/// the reverse-mix test does not cover. Found by
+/// **Cursor Agent - Grok 4.6 High** on PR #547.
+#[test]
+fn obs_spill_rejects_a_shard_with_an_extra_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("extra_col.scx");
+    let (n_obs, n_vars) = (6usize, 4usize);
+    let header =
+        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, (n_obs * 2) as u64, 3, 0, 0);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for r in 0..n_obs {
+        indices.push(((r * 2) % n_vars) as u32);
+        indices.push(((r * 2 + 1) % n_vars) as u32);
+        values.push(((r + 1) % 256) as u8);
+        values.push(((r + 2) % 256) as u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    w.write_csr_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    w.write_var(
+        &RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "gene_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_vars).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for si in 0..2usize {
+        let rs = si * 3;
+        let ids: Vec<String> = (rs..rs + 3)
+            .map(|i| format!("cell_{:03}", n_obs - 1 - i))
+            .collect();
+        let mut fields = vec![Field::new("cell_id", DataType::Utf8, false)];
+        let mut cols: Vec<arrow::array::ArrayRef> = vec![Arc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))];
+        if si == 1 {
+            fields.push(Field::new("surprise", DataType::Utf8, true));
+            cols.push(Arc::new(StringArray::from(vec!["x", "y", "z"])));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+        w.write_obs_shard(si as u32, rs as u64, 3, n_obs as u64, &batch)
+            .unwrap();
+    }
+    w.finish().unwrap();
+
+    let bpr = obs_bytes_per_row(&path);
+    let mut o = opts(&["cell_id"]);
+    o.memory_budget = Some(bpr * 3);
+    let out = dir.path().join("out.scx");
+    let err = sort_with_strategy(&path, &out, &o, Some(SortStrategy::InMemory)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("the spill schema names"),
+        "expected the column-count rejection, got: {msg}"
+    );
+}
