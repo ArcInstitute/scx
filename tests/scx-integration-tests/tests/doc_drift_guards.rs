@@ -379,7 +379,6 @@ fn no_doc_claims_a_write_door_decodes_categoricals() {
         "Every write door but `scx sort",
         "re-encodes obs categoricals",
         "the in-memory sort path is correct",
-        "the in-memory sort path does not",
     ];
     let mut docs: Vec<PathBuf> = Vec::new();
     collect_files(&root.join("docs"), "md", &mut docs);

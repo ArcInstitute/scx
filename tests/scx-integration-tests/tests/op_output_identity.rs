@@ -1,6 +1,6 @@
 //! The committed byte-identity A/B matrix: what does each rewriting op write?
 //!
-//! Fifteen arms over nine ops, one manifest of per-section digests, three ways
+//! Sixteen arms over nine ops, one manifest of per-section digests, three ways
 //! to use it:
 //!
 //! * **default** — assert against the checked-in golden. A refactor that

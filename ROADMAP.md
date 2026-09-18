@@ -557,10 +557,11 @@ count *matrix*; this is the obs-column half.
   shared by every output shard. The bounded path's obs sections are now
   byte-identical to the in-memory `take` path's, which is what pins it
   (`obs_spill_obs_matches_in_memory`, plus the `sort_categorical_spilled`
-  output-identity arm). Unchanged: which columns count as categorical is still
-  read from shard 0's schema, so a file whose *first* obs shard stores a column
-  plain and a later one stores it as a dictionary still writes that column
-  plain.
+  output-identity arm). Which columns count as categorical is the union over
+  **every** shard's schema, not shard 0's, so both heterogeneous orders a
+  representation-preserving `append` can leave — dictionary shards then plain
+  ones, or plain then dictionary — come out as the dictionary the read side
+  assembles, rather than only the first.
 - [x] `pyscx.export_batches` — one h5ad per batch without materialising the
   pool, guarding **both** identities a tool and the import rely on (`obs_names`
   and the resolved key) for uniqueness *within* each batch.

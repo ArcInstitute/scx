@@ -3133,3 +3133,45 @@ fn obs_spill_leaves_a_plain_column_plain() {
         assert_eq!(rm.read_obs_shard(i).unwrap(), b);
     }
 }
+
+/// The mirror of [`obs_spill_promotes_a_plain_shard_against_a_dictionary_base`]:
+/// the **first** obs shard stores the column plain and a later one stores it as
+/// a dictionary.
+///
+/// Deciding which columns are categorical from shard 0 alone got this
+/// direction wrong — the spill wrote the column plain while `read_obs()`
+/// promotes a field any shard declares a dictionary, so the two writers
+/// disagreed on a layout the docs say is reachable. Found by
+/// **codex - gpt-5.6-sol** on PR #547.
+#[test]
+fn obs_spill_promotes_when_only_a_later_shard_is_a_dictionary() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain: arrow::array::ArrayRef = Arc::new(StringArray::from(vec!["a", "base", "base"]));
+    let inp = write_obs_column_fixture(
+        &dir,
+        "plain_first.scx",
+        "cell_type",
+        vec![plain, str_dict(&["b", "a", "unused"], &[0, 1, 0])],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rm = ScxReader::open(&mem).unwrap();
+    let rs = ScxReader::open(&spilled).unwrap();
+    let obs = rs.read_obs().unwrap();
+    assert!(
+        matches!(
+            obs.column_by_name("cell_type").unwrap().data_type(),
+            DataType::Dictionary(_, _)
+        ),
+        "a column any shard declares categorical must come out categorical",
+    );
+    assert_eq!(
+        declared_levels(&obs, "cell_type").1,
+        vec!["a", "base", "b", "unused"],
+        "the plain first shard's values lead the union, then the later shard's",
+    );
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        assert_eq!(rm.read_obs_shard(i).unwrap(), rs.read_obs_shard(i).unwrap());
+    }
+}
