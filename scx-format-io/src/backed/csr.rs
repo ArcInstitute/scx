@@ -116,17 +116,6 @@ pub struct BackedCsrReader {
     /// This reader's id within its `shard_cache` namespace. `0` for a
     /// standalone reader; assigned by the multi-reader engine otherwise.
     file_id: u32,
-    /// Test-only: how many times [`Self::shard_indptr`] actually decoded.
-    ///
-    /// The prescan in [`Self::read_row_indices_with_admission`] reads a
-    /// resident shard's indptr instead of decoding it again, and that is a
-    /// *performance* claim with no counter behind it — `shard_indptr` is
-    /// deliberately invisible to the cache metrics, by design. Without this the
-    /// only observable is time, and a test could pin the peek's
-    /// side-effect-freedom while a version that peeked and then decoded anyway
-    /// still passed. Compiled out of every non-test build.
-    #[cfg(test)]
-    indptr_decodes: std::sync::atomic::AtomicUsize,
     /// Number of shards to prefetch with `MADV_WILLNEED` after a cache miss.
     prefetch_count: usize,
     /// Configured count cap on the LRU (0 = no cache). Mirrored here so
@@ -305,8 +294,6 @@ impl BackedCsrReader {
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
-            #[cfg(test)]
-            indptr_decodes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             decode_barrier: None,
         }
@@ -350,8 +337,6 @@ impl BackedCsrReader {
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
-            #[cfg(test)]
-            indptr_decodes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             decode_barrier: None,
         }
@@ -398,8 +383,6 @@ impl BackedCsrReader {
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
-            #[cfg(test)]
-            indptr_decodes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             decode_barrier: None,
         }
@@ -462,8 +445,6 @@ impl BackedCsrReader {
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
-            #[cfg(test)]
-            indptr_decodes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-hooks")]
             decode_barrier: None,
         }
@@ -1086,9 +1067,7 @@ impl BackedCsrReader {
     /// prescan between planning and warming cannot change which groups
     /// [`Self::block_index_eligible`] admits.
     fn shard_indptr(&self, shard_idx: usize) -> Result<Vec<i64>> {
-        #[cfg(test)]
-        self.indptr_decodes
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_indptr_decode();
         let lite = self
             .shard_entry(shard_idx)
             .ok_or(ScxError::ShardIndexOutOfBounds {
@@ -1100,13 +1079,6 @@ impl BackedCsrReader {
             .read_shard_indptr_from_entry(&lite.into_transient_full_entry())?;
         self.check_decoded_shard_rows(shard_idx, ip.len().saturating_sub(1))?;
         Ok(ip)
-    }
-
-    /// Test-only: how many `shard_indptr` decodes this reader has run.
-    #[cfg(test)]
-    pub(crate) fn indptr_decode_count(&self) -> usize {
-        self.indptr_decodes
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Decode just rows `[local_start, local_end)` of shard `shard_idx` directly
@@ -2625,4 +2597,23 @@ impl BackedCsrReader {
     pub(crate) fn set_row_group_cache(&mut self, enabled: bool) {
         self.row_group_cache = enabled;
     }
+}
+
+/// Record that [`BackedCsrReader::shard_indptr`] decoded, for the test that
+/// pins the prescan reading a **resident** shard instead.
+///
+/// ⚠️ Two definitions rather than a `#[cfg(test)]` at the call site, and the
+/// reason is the guards above: `shard_indptr` sits at ~line 1090, ahead of the
+/// `get_or_decode` calls the I-ORG-1 dedup guards count, and those guards read
+/// production code as `sed '/#\[cfg(test)\]/,$d'`. A `#[cfg(test)]` there
+/// truncates their view of the file and fails "All three backed readers share
+/// one ShardCache" on an invariant that holds — which is what happened on #528
+/// round 2, and again here. In a non-test build this is an empty inline call.
+#[cfg(not(test))]
+#[inline(always)]
+fn note_indptr_decode() {}
+
+#[cfg(test)]
+fn note_indptr_decode() {
+    tests::note_indptr_decode();
 }

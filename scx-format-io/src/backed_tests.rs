@@ -3950,6 +3950,28 @@ thread_local! {
 #[cfg(feature = "parallel")]
 static WARM_NONCES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 
+thread_local! {
+    /// How many times `shard_indptr` decoded **on this thread**.
+    ///
+    /// Thread-local rather than a global counter because libtest runs tests in
+    /// parallel on their own threads, and the prescan this pins runs on the
+    /// calling thread. A shared counter would make the assertion depend on what
+    /// else happened to be running.
+    static INDPTR_DECODES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Called from `BackedCsrReader::shard_indptr`, unconditionally in the
+/// production body — see `note_indptr_decode` at the end of `backed/csr.rs` for
+/// why it cannot be a `#[cfg(test)]` at the call site.
+pub(super) fn note_indptr_decode() {
+    INDPTR_DECODES.with(|c| c.set(c.get() + 1));
+}
+
+/// This thread's `shard_indptr` decode count.
+fn indptr_decodes() -> usize {
+    INDPTR_DECODES.with(|c| c.get())
+}
+
 /// Called from `BackedCsrReader::warm_one_shard` on whatever thread rayon chose.
 #[cfg(feature = "parallel")]
 pub(super) fn note_warm_thread() {
@@ -5483,6 +5505,8 @@ fn the_indptr_prescan_reads_a_resident_shard_without_counting_a_hit() {
     let (mut backed, full) = write_test_file_and_open(&dir, 64, 40, 4, 8);
     let m = backed.enable_metrics();
     let rows = [1u64, 17, 33, 49];
+    // libtest may reuse a thread, so this is a delta and not an absolute.
+    let decodes0 = indptr_decodes();
 
     // Cold: the prescan takes the decode branch, and the answer is right.
     let cold = backed.read_row_indices(&rows).unwrap();
@@ -5499,7 +5523,7 @@ fn the_indptr_prescan_reads_a_resident_shard_without_counting_a_hit() {
         "premise: four shards, decoded once each"
     );
     assert_eq!(
-        backed.indptr_decode_count(),
+        indptr_decodes() - decodes0,
         4,
         "premise: cold, the prescan decodes one indptr per shard"
     );
@@ -5524,7 +5548,7 @@ fn the_indptr_prescan_reads_a_resident_shard_without_counting_a_hit() {
     // `shard_indptr` is invisible to the cache metrics by design, so it is
     // counted directly, in test builds only.
     assert_eq!(
-        backed.indptr_decode_count(),
+        indptr_decodes() - decodes0,
         4,
         "the warm gather must not have decoded a single indptr"
     );
