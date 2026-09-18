@@ -246,7 +246,8 @@ pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
 /// Reconcile per-shard columns that disagree on `Dictionary`-vs-plain encoding
 /// so they can be concatenated.
 ///
-/// Every SCX write door now writes a categorical as a `Dictionary`, but a
+/// Every write door but `scx sort`'s spill path now writes a categorical as a
+/// `Dictionary`, but a
 /// sharded axis can still carry the column as `Dictionary(_, V)` in some shards
 /// and plain `V` in others. Three ways to get there: a file an older `append` /
 /// `merge` grew (they decoded categoricals before write), a file whose obs was

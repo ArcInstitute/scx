@@ -302,13 +302,15 @@ impl<'a> ObsCursor<'a> {
 /// per-row half of the preparation (widening) already happened once, when
 /// `ObsCursor` loaded the chunk.
 fn materialize_obs_shard(pending: &[ObsSlice]) -> Result<RecordBatch> {
-    if pending.len() == 1 {
-        // One slice of one chunk: already unique, nothing to reconcile. Keeps
-        // the chunk's own key width, exactly as the unsorted merge emitter
-        // writes its chunks.
-        let s = &pending[0];
-        return Ok(s.chunk.slice(s.offset, s.len));
-    }
+    // No single-slice shortcut. It is tempting — one slice of one chunk needs
+    // no reconciling — but `ObsCursor` widened that chunk's dictionary keys to
+    // Int32 at load, and nothing downstream narrows them again
+    // (`write_obs_shard` does not). Returning the slice verbatim would write
+    // Int32 keys for every categorical on the shape this k-way merge is *for*:
+    // already-sorted, non-interleaved inputs, where each output shard is one
+    // run from one input. That is 4x the code buffer against an Int8 input.
+    // `concat_prepared_metadata_batches` costs a concat of one batch and gets
+    // the minimal key back from `unify_dictionary_columns`.
     // Identity, not equality: two slices share a parent iff they name the same
     // `Arc`. Comparing the batches themselves would be both wrong (a clone is
     // a different pointer) and expensive.

@@ -3991,7 +3991,8 @@ stays a real category. This deliberately differs from `scx_loader`'s training-in
 `CategoryDict`, which appends a synthetic trailing `"NaN"` level and documents that it is
 not `pandas.Categorical.codes`-stable. Category order is **first-seen**, not lexicographic.
 Both on-disk encodings are accepted, including a file that carries both across its shards.
-Every SCX write door now writes a categorical as a dictionary, but a file an older `append`
+Every write door but `scx sort --memory-budget`'s spill path now writes a categorical as a
+dictionary, but a file an older `append`
 or `merge` grew is mixed, and so is one appended to from a plain-obs source (these ops
 preserve the representation they are handed rather than promoting a plain column).
 

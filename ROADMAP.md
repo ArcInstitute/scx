@@ -526,9 +526,11 @@ count *matrix*; this is the obs-column half.
   source column is written back plain, never promoted, so
   `reconcile_dictionary_representations` remains live for files older scx
   versions wrote and for a plain-source append onto a dictionary base.
-  `scx_format_io::concat_metadata_batches` (upcast → widen keys → reconcile →
-  share values → concat → unify → downcast, the read side's own pipeline) is
-  the primitive `merge --sort-by` reuses for the one concat that spans inputs;
+  `scx_format_io`'s read-side pipeline — `widen_metadata_batch_for_concat`
+  (per batch: upcast → widen keys), `reconcile_and_share_metadata_batches`
+  (cross-batch: reconcile → share values) and
+  `concat_prepared_metadata_batches` (concat → unify → downcast) — is what
+  `merge --sort-by` reuses for the one concat that spans inputs;
   the other seven sites needed no unification at all, since each batch is one
   self-contained Arrow IPC section. Two things shipped with it: `merge`'s
   obs-identity check now compares **logical** types, because a merge output's

@@ -3938,3 +3938,55 @@ fn many_shard_read_obs_timing() {
         vec!["T cell", "B cell", "NK cell"],
     );
 }
+
+#[test]
+fn sorted_merge_does_not_widen_keys_on_a_single_run_shard() {
+    // `ObsCursor` widens each chunk's dictionary keys to Int32 at load, so the
+    // per-emit pipeline does not have to redo that per-row work. The
+    // *single-slice* emit path must therefore still narrow on the way out —
+    // otherwise the common shape this k-way merge targets (already-sorted,
+    // non-interleaved inputs, one slice per output shard) writes Int32 keys
+    // where the input had Int8, quadrupling every categorical's code buffer.
+    //
+    // The cross-input tests cannot see this: they deliberately force a shard
+    // to span both inputs, which takes the multi-slice finalizer.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    // Disjoint, already-ordered key ranges: every output shard is one run from
+    // one input.
+    write_legacy_input_with_obs(
+        &p0,
+        &rekeyed_dict_obs(0, 4, &["alpha", "beta"], 2, false, DataType::Int8),
+        &var_batch(),
+    );
+    write_legacy_input_with_obs(
+        &p1,
+        &rekeyed_dict_obs(4, 4, &["alpha", "beta"], 2, false, DataType::Int8),
+        &var_batch(),
+    );
+
+    let out = dir.path().join("sorted.scx");
+    let mut opts = sorted_merge_opts(&["cell_id"], false, false);
+    opts.shard_target_rows = Some(4); // exactly one input's run per shard
+    scx_ops::merge_with_options(&[p0.as_path(), p1.as_path()], &out, &opts).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert!(
+        reader.obs_metadata_shard_count() >= 2,
+        "premise: more than one output shard, each from a single run"
+    );
+    for (i, shard) in reader.obs_shards().enumerate() {
+        let shard = shard.unwrap();
+        let dt = shard.column_by_name("label").unwrap().data_type().clone();
+        let DataType::Dictionary(key, _) = &dt else {
+            panic!("output shard {i} lost the dictionary: {dt:?}");
+        };
+        assert_eq!(
+            **key,
+            DataType::Int8,
+            "output shard {i} widened a 2-level categorical's key to {key:?}; \
+             the minimal fit is Int8"
+        );
+    }
+}
