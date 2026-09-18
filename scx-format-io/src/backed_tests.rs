@@ -5556,3 +5556,67 @@ fn the_indptr_prescan_reads_a_resident_shard_without_counting_a_hit() {
         "the warm gather must not have decoded a single indptr"
     );
 }
+
+/// The block-index density predicate counts **distinct rows**, not request
+/// positions.
+///
+/// ⚠️ Found by review on #542, independently by two reviewers, and it is a
+/// defect in this crate rather than in its caller: the predicate asks whether
+/// a request is a small fraction of the shard, and a repeated row costs one
+/// more memcpy out of the same decoded span — never another row group. Counting
+/// occurrences also put this decision at odds with the one `scx-loader`'s
+/// prefetch engine makes, which deduplicates before sizing, so a plan could be
+/// planned and admitted as row groups and then read as a whole shard whose
+/// bytes the admission sum never counted.
+///
+/// The window is `unique * 4 < shard_rows <= positions * 4`. Sixteen positions
+/// over four distinct rows of a 64-row shard sits in it exactly.
+#[test]
+fn the_block_index_route_counts_distinct_rows_not_request_positions() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    // 1 shard x 64 rows, 4 row groups of 16.
+    let (path, full) = write_framed_file(&dir, 64, 100, 1, 16, CodecId::None);
+    let distinct = [0u64, 16, 32, 48];
+    let rows: Vec<u64> = (0..4).flat_map(|_| distinct.iter().copied()).collect();
+
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, usize::MAX);
+    assert!(
+        backed.block_index_eligible(0, distinct.len()),
+        "premise: the distinct rows are sparse enough for the route"
+    );
+    assert!(
+        !backed.block_index_eligible(0, rows.len()),
+        "premise: the position count is not — this is the disagreeing window"
+    );
+    let m = backed.enable_metrics();
+
+    let got = backed.read_row_indices(&rows).unwrap();
+
+    assert_eq!(
+        m.full_shard_groups.load(Ordering::Relaxed),
+        0,
+        "sixteen positions over four distinct rows must not read as a dense request"
+    );
+    assert_eq!(m.block_index_groups.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        0,
+        "no whole shard should have been decoded"
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        4,
+        "one decode per distinct row group"
+    );
+
+    // And every occurrence is still its own output row, with the right bytes.
+    assert_eq!(got.indptr.len(), rows.len() + 1);
+    for (out, &r) in rows.iter().enumerate() {
+        let want = full.row_slice(r as usize, r as usize + 1).unwrap();
+        let (lo, hi) = (got.indptr[out] as usize, got.indptr[out + 1] as usize);
+        assert_eq!(&got.indices[lo..hi], &want.indices[..], "position {out}");
+        assert_eq!(&got.data[lo..hi], &want.data[..], "position {out}");
+    }
+}

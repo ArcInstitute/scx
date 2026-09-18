@@ -3008,8 +3008,10 @@ fn a_row_in_two_sets_comes_back_at_both_positions() {
         assert_eq!(batch_row(&b, j).0.len(), nnz, "position {j} (row {row})");
     }
 
-    // And the plan issued exactly one read, over the seven unique rows: one
-    // whole-shard miss per shard, not one per set.
+    // And the plan issued exactly one read: one whole-shard miss per shard, not
+    // one per set. (Six distinct rows over eight positions — the direct path
+    // does not deduplicate them, and does not need to: each repeat is another
+    // memcpy out of the same decoded span.)
     let m = loader.cache_metrics();
     assert_eq!(
         m.misses.load(AtomicOrdering::Relaxed),
@@ -3644,4 +3646,103 @@ fn a_multi_file_raw_local_gather_still_clips_negatives() {
         assert_eq!(idx.len(), 3, "clip must not change nnz: {idx:?}");
         assert_eq!(dat[1], 0.0, "the clipped entry should be an explicit zero");
     }
+}
+
+/// A plan that **repeats** rows must not lose the block-index route the
+/// prefetch engine already planned and warmed for it.
+///
+/// ⚠️ Found by review (codex - gpt-5.6-sol and Cursor Agent - Grok 4.6 High,
+/// independently). `PrefetchEngine::bucket_plan_rows` deduplicates `(file,
+/// row)` before sizing, so `plan_footprint` decides the route — and the
+/// admission budget — from **distinct** rows. The direct executor passes every
+/// occurrence, and `plan_row_groups` took the occurrence count as its density
+/// input, so a plan whose distinct rows are sparse but whose positions are
+/// dense planned one route and read the other: the engine warmed and retained
+/// four row groups, then the gather decoded and inserted the whole shard on top
+/// of them. Whole-shard inserts ignore `Admit`, so the footprint the engine
+/// checked was missing that shard's bytes entirely — on a ~188 MB census shard
+/// that is a cache-budget hole, not a metric nit.
+///
+/// The window is `unique * 4 < shard_rows <= positions * 4`. Sixteen positions
+/// over four distinct rows of a 64-row shard sits in it exactly: 4*4 < 64 and
+/// 16*4 == 64.
+#[test]
+fn a_plan_that_repeats_rows_keeps_the_block_index_route() {
+    use crate::plan_engine::tests::{write_framed_fixture, FRAMED_GROUP_BYTES};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("repeat.scx");
+    write_framed_fixture(&p0);
+
+    // Four distinct rows, one per row group of the 64-row shard, each named by
+    // all four sets.
+    let distinct = [0u64, 16, 32, 48];
+    let rows: Vec<u64> = (0..4).flat_map(|_| distinct.iter().copied()).collect();
+    let n = rows.len();
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        /*cache_shards*/ 16,
+        Some(8 * FRAMED_GROUP_BYTES),
+        /*lookahead*/ 4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        /*scatter_block_index*/ true,
+        None,
+    )
+    .unwrap();
+    let reader = loader.engine.lease(0).unwrap();
+    assert!(
+        reader.block_index_eligible(0, distinct.len()),
+        "premise: the plan's DISTINCT rows are sparse enough for the route"
+    );
+    assert!(
+        !reader.block_index_eligible(0, n),
+        "premise: its POSITION count is not — this is the disagreeing window"
+    );
+    drop(reader);
+
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; n],
+        rows: rows.clone(),
+        role_tags: (0..n as i32).collect(),
+        set_offsets: vec![0, 4, 8, 12, 16],
+    };
+
+    // The other half of the disagreement, and the one with the budget in it:
+    // the engine's footprint is the four row groups, NOT the whole shard. If
+    // the gather takes the full-shard route it inserts bytes this sum never
+    // counted, because a whole-shard insert ignores `Admit`.
+    let buckets = loader
+        .engine
+        .bucket_plan_rows(plan.file_ids.iter().copied().zip(plan.rows.iter().copied()));
+    let (planned, _share) = loader.engine.plan_footprint(&buckets, None).unwrap();
+    assert_eq!(
+        planned,
+        4 * FRAMED_GROUP_BYTES,
+        "premise: the engine sized this plan as four row groups, not a shard"
+    );
+
+    let b = loader
+        .gather_whole_plan(&loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+    assert_eq!(b.cell_indices, rows, "every occurrence is still emitted");
+
+    let m = loader.cache_metrics();
+    assert_eq!(
+        m.full_shard_groups.load(AtomicOrdering::Relaxed),
+        0,
+        "the gather must not fall back to a whole-shard decode: the engine sized \
+         and admitted this plan as row groups"
+    );
+    assert!(m.block_index_groups.load(AtomicOrdering::Relaxed) > 0);
+    assert_eq!(
+        m.misses.load(AtomicOrdering::Relaxed),
+        0,
+        "no whole shard should have been decoded or inserted"
+    );
 }

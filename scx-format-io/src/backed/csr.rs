@@ -1447,12 +1447,16 @@ impl BackedCsrReader {
     ///
     /// `None` decides per gather (this call's groups must fit the whole byte
     /// budget); `Some(admit)` is a verdict taken over a larger working set —
-    /// `scx-loader`'s plan engine decides once per plan, and the cell-set
-    /// gather then reads the plan's whole deduplicated row list through this
-    /// method, so the L1 gather and the L2 warm cannot disagree. Without it a
-    /// caller that already holds a plan-wide verdict would have to choose
-    /// between the exact prescan here and carrying that verdict, which is why
-    /// this variant exists rather than a second prescan in the loader.
+    /// `scx-loader`'s plan engine decides once per plan and the cell-set gather
+    /// carries that verdict in here, so the L1 gather and the L2 warm cannot
+    /// disagree. Without it a caller holding a plan-wide verdict would have to
+    /// choose between the exact prescan here and carrying that verdict, which
+    /// is why this variant exists rather than a second prescan in the loader.
+    ///
+    /// ⚠️ `rows` may contain **duplicates**, and the cell-set gather's direct
+    /// path passes them: each occurrence is its own output row. The route
+    /// decision in [`Self::plan_row_groups`] counts distinct rows for exactly
+    /// that reason.
     pub fn read_row_indices_with_admission(
         &self,
         rows: &[u64],
@@ -1481,7 +1485,18 @@ impl BackedCsrReader {
         for g in &groups {
             let resident = self
                 .shard_cache
-                .peek_cached(CacheKey::Shard(self.file_id, g.shard_idx));
+                .peek_cached(CacheKey::Shard(self.file_id, g.shard_idx))
+                // ⚠️ `shard_indptr` runs `check_decoded_shard_rows` before it
+                // returns and the peek must not skip it, or a cached entry
+                // short of the catalog's row count panics on the index below
+                // instead of raising `InvalidCatalog`. Checked rather than
+                // asserted: a resident entry that does not describe the shard
+                // is not something to trust and then index. (Review on #542,
+                // Cursor Agent - Grok 4.6 High.)
+                .filter(|csr| {
+                    self.check_decoded_shard_rows(g.shard_idx, csr.indptr.len().saturating_sub(1))
+                        .is_ok()
+                });
             let decoded;
             let ip: &[i64] = match resident.as_deref() {
                 Some(csr) => &csr.indptr,
@@ -1657,7 +1672,26 @@ impl BackedCsrReader {
             // engines leave block-index-eligible cold sparse shards un-warmed, so an
             // eligible predicate returns true here and the O(rows) path is taken;
             // dense/cached/unframed groups still go full-shard.
-            let use_block_index = self.block_index_eligible(shard_idx, group_len);
+            //
+            // ⚠️ **DISTINCT rows, not request positions.** The predicate asks
+            // whether the request is a small fraction of the shard, and a
+            // repeated row costs a second memcpy out of the same decoded span —
+            // never another row group. Counting occurrences also put this
+            // decision at odds with the one the prefetch engine makes:
+            // `bucket_plan_rows` deduplicates `(file, row)` before sizing, so a
+            // plan whose distinct rows are sparse and whose positions are dense
+            // was planned and admitted as row groups and then read as a whole
+            // shard — and a whole-shard insert ignores `Admit`, so the bytes the
+            // engine checked its budget against were not the bytes the read took.
+            // `sorted_pairs` is sorted by row, so the duplicates of a row are
+            // adjacent and the count is one pass. (Review on #542, found
+            // independently by two reviewers.)
+            let distinct_rows = sorted_pairs[start..end]
+                .windows(2)
+                .filter(|w| w[0].0 != w[1].0)
+                .count()
+                + 1;
+            let use_block_index = self.block_index_eligible(shard_idx, distinct_rows);
             groups.push(RowGroup {
                 start,
                 end,

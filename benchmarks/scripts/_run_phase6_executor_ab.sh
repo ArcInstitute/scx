@@ -29,7 +29,13 @@
 
 set -euo pipefail
 
-REPO=/home/nickyoungblut/dev/rust/scx
+# ⚠️ Not derived from `${BASH_SOURCE[0]}`: sbatch copies the batch script into
+# its own spool before running it, so `dirname $0/../..` resolves somewhere
+# under the spool and would silently name the wrong tree rather than failing.
+# Two scripts in this directory do derive it that way and are wrong for the
+# same reason. An env override is the portable half without the hazard.
+# (Review on #542, Antigravity - Gemini 3.8 Flash.)
+REPO="${SCX_REPO:-/home/nickyoungblut/dev/rust/scx}"
 VENV="$REPO/.venv"
 WORK=/large_storage/arcinfra/projects/scx/scratch/phase6
 OUT="$WORK/executor_${SLURM_JOB_ID:-manual}"

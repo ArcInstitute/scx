@@ -3,8 +3,11 @@
 //! Consumes state3's role-tagged, multi-file cell-set plans and gathers them as
 //! sparse CSR through the [`crate::plan_engine::PrefetchEngine`], emitting the
 //! SCX-DATA-LOADER §4.4 batch contract. Each plan item is **one batch** of cell
-//! sets, delimited by `set_offsets`; each set's rows are gathered via one
-//! `read_rows_with` per reader (single-file fast path) into per-set CSR builders.
+//! sets, delimited by `set_offsets`, and the whole batch is gathered by one
+//! executor rather than one set at a time: a raw-local single-file plan is read
+//! in plan order and **moved out as the batch**, and a plan spanning files or
+//! carrying a length-changing transform is assembled from a deduplicated read
+//! ([`SparseCellSetLoader::plan_needs_assembly`]).
 //!
 //! Output is **raw-local CSR by default**; an **optional** per-file `local→global`
 //! remap (off by default) emits global-vocab CSR for callers that want it (§4.3
@@ -229,16 +232,11 @@ fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> (usize, f64) {
     acc.finish()
 }
 
-/// Capacity to pre-size a gathered batch's `indices` / `data` to.
-///
-/// `rows x mean_nnz_per_row`, biased up by an eighth. Shared with the tests so
-/// they assert against the policy rather than restating its arithmetic, which
-/// is what lets them keep proving "no reallocation happened" when the bias
-/// changes.
 /// Process-wide switch for the **multi-set batch executor** (W11).
 ///
-/// Default `plan`: one occurrence table over the whole batch, one read per file
-/// over its deduplicated rows, each unique `(file, row)` transformed once.
+/// Default `plan`: one executor over the whole batch — a raw-local single-file
+/// plan read verbatim and moved out as the batch, anything else assembled from
+/// a deduplicated read (see [`SparseCellSetLoader::plan_needs_assembly`]).
 /// `SCX_CELLSET_EXECUTOR=set` restores the pre-W11 per-set walk — one read per
 /// set, a per-set `Vec<Option<(Vec<i32>, Vec<f32>)>>`, and an
 /// `extend_from_slice` copy of every row — which is the same-build A/B arm for
@@ -255,6 +253,14 @@ pub(crate) fn whole_plan_executor() -> bool {
     })
 }
 
+/// Capacity to pre-size a gathered batch's `indices` / `data` to.
+///
+/// `rows x mean_nnz_per_row`, biased up by an eighth. ⚠️ **No longer what the
+/// gather allocates** — the batch executor sizes the batch exactly, from the
+/// read's own indptr prescan. This survives as the `max_plan_rows` budget
+/// charge, where no per-plan figure exists at construction time, and is shared
+/// with the tests so they assert against the policy rather than restating its
+/// arithmetic.
 pub(crate) fn presize_nnz(rows: usize, mean_nnz_per_row: f64) -> usize {
     let est = (rows as f64 * mean_nnz_per_row).ceil() as usize;
     est.saturating_add(est / 8)
@@ -385,16 +391,15 @@ pub(crate) struct SparseCellSetBudgetModel {
     /// and no length-changing transform is handed the read's own buffers as the
     /// batch, and holds one.
     ///
-    /// Which of the two a gather takes is decided per *plan* — a repeated row
-    /// forces the general path on any configuration — so the model charges on
-    /// the three facts it knows at construction: a remap or a downsample makes
-    /// every plan take it, and so does a manifest of more than one file. On a
-    /// single-file raw-local loader the term is 0 and a plan that repeats a row
-    /// pays an uncharged transient, which is a **floor rather than a bound** and
-    /// is said here rather than left to be discovered. The charged figure is one
-    /// batch, which is its ceiling: the unique rows of a plan are at most its
-    /// rows, and are fewer exactly when the duplicates that force this path
-    /// exist.
+    /// Which of the two a gather takes is [`SparseCellSetLoader::plan_needs_assembly`],
+    /// and it is decided by facts this model also knows at construction: a
+    /// remap or a downsample can shrink a row, and a plan spanning files is
+    /// read once per file, so neither can be handed out where it landed. A
+    /// single-file raw-local loader never assembles — **including for a plan
+    /// that repeats rows**, which is the whole point of that rule — so the term
+    /// is 0 there and there is no uncharged second buffer to warn about. The
+    /// charged figure is one batch, which is the ceiling: a plan's unique rows
+    /// are at most its rows, and are fewer exactly when it repeats them.
     transient_bytes: usize,
 }
 
@@ -1125,13 +1130,15 @@ impl SparseCellSetLoader {
         self.gather_admitting(&self.engine, plan, Some(Admit::from(planned <= budget)))
     }
 
-    /// [`Self::gather`] with the row-group admission decided by the caller.
-    /// A plan is gathered one `read_rows_with` call per set (and per file on
-    /// the cross-file path), so only the caller sees the plan's whole working
-    /// set: the prefetch engine sums it over every file and shard and passes
-    /// its verdict in, so sets that fit one at a time but not together do not
-    /// churn the LRU. The `process` callback for the engine (shards already
+    /// [`Self::gather`] with the row-group admission decided by the caller, and
+    /// the `process` callback the prefetch engine drives (shards already
     /// warmed).
+    ///
+    /// Validates the plan, then dispatches to [`Self::gather_whole_plan`] or —
+    /// under `SCX_CELLSET_EXECUTOR=set` — to the pre-W11 [`Self::gather_per_set`].
+    /// The verdict is taken once by the engine over every file and shard the
+    /// plan touches, so a plan whose sets fit one at a time but not together
+    /// cannot churn the LRU.
     pub(crate) fn gather_admitting(
         &self,
         engine: &PrefetchEngine,
