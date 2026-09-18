@@ -129,7 +129,14 @@ pyscx.sort("input.scx", "sorted.scx", by=["cell_type"], memory_budget="8G")
 The standalone engine auto-selects a strategy from `(n_obs, n_vars, density, key
 cardinality, --memory-budget)`: an in-memory argsort for files that fit the
 budget, a zero-spill K-pass-by-category for a low-cardinality categorical key,
-or a bounded-memory external partition sort otherwise. See
+or a bounded-memory external partition sort otherwise. That choice is about
+**X**; the obs axis has its own, independent in-memory-vs-spill decision
+(`--memory-budget` plus an already-sharded obs). Both obs writers emit the same
+bytes — the spill path carries each categorical's dictionary *codes* against one
+union vocabulary folded from the input's shards rather than decoding and
+re-encoding per spilled shard, so declared levels, declared order, the
+`scx.categorical.ordered` stamp and the shared vocabulary survive a spilled sort
+exactly as they do an in-memory one. See
 [performance.md § Sort (physical layout)](performance.md#sort-physical-layout)
 for measured compression and locality numbers.
 
@@ -386,7 +393,7 @@ its own rows use. That is deliberate — pruning per shard is what silently drop
 a declared-but-unused `pd.Categorical` level — but it means a high-cardinality
 column stored as a categorical is duplicated once per shard. `from_anndata`'s
 sharded write has always had this shape; since the write doors stopped decoding,
-`append` and `merge` do too.
+`append`, `merge` and both of `scx sort`'s obs writers do too.
 
 It cuts both ways, and which way depends on the levels-to-rows ratio.
 Measured (`scx-ops/tests/streaming_merge_append.rs`, the two `#[ignore]`d

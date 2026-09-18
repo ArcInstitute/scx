@@ -1881,6 +1881,24 @@ impl ScxReader {
         self.metadata_shards_iter(SectionType::ObsMetadataShard, "obs_metadata/shard_")
     }
 
+    /// Iterate obs metadata shards in `shard_idx` order, yielding each
+    /// shard's **schema as stored on disk** and nothing else.
+    ///
+    /// A pure Arrow IPC footer read per shard — no batch deserialisation and
+    /// no wide→narrow normalisation, unlike [`Self::obs_shards`], whose
+    /// `downcast_large_types` is O(rows) per wide string column. Use this when
+    /// the question is about types rather than values: `scx sort`'s bounded
+    /// obs path asks which columns any shard declares categorical before it
+    /// decides whether to read them at all.
+    ///
+    /// Schemas come back **physical**, so a column the writer upcast is
+    /// reported `LargeUtf8` where [`Self::obs_shards`] would narrow it.
+    pub fn obs_shard_schemas(&self) -> impl Iterator<Item = Result<arrow::datatypes::Schema>> + '_ {
+        self.metadata_shard_entries(SectionType::ObsMetadataShard, "obs_metadata/shard_")
+            .into_iter()
+            .map(move |e| self.read_arrow_ipc_schema_physical(e))
+    }
+
     /// Iterate var metadata shards in `shard_idx` order. Mirror of
     /// [`Self::obs_shards`].
     pub fn var_shards(&self) -> impl Iterator<Item = Result<RecordBatch>> + '_ {
@@ -1896,6 +1914,20 @@ impl ScxReader {
         shard_type: SectionType,
         name_prefix: &'static str,
     ) -> impl Iterator<Item = Result<RecordBatch>> + '_ {
+        self.metadata_shard_entries(shard_type, name_prefix)
+            .into_iter()
+            .map(move |e| self.read_arrow_ipc(e))
+    }
+
+    /// The catalog entries for one metadata-shard family, in `shard_idx`
+    /// order. The `section_type` + prefix + parse + sort every shard-family
+    /// iterator starts from, in one place so a second consumer cannot drift
+    /// from the first.
+    fn metadata_shard_entries(
+        &self,
+        shard_type: SectionType,
+        name_prefix: &'static str,
+    ) -> Vec<&FullCatalogEntry> {
         let mut entries: Vec<(u32, &FullCatalogEntry)> = self
             .full_catalog
             .entries
@@ -1908,9 +1940,7 @@ impl ScxReader {
             })
             .collect();
         entries.sort_by_key(|(idx, _)| *idx);
-        entries
-            .into_iter()
-            .map(move |(_, e)| self.read_arrow_ipc(e))
+        entries.into_iter().map(|(_, e)| e).collect()
     }
 
     /// Read a named obsm embedding as an Arrow RecordBatch.

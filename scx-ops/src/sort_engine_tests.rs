@@ -297,8 +297,12 @@ fn write_dict_obs_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
 }
 
 /// On a `Dictionary`-typed categorical sort key, the spill path must (a)
-/// preserve the categorical dtype on read (re-encode works), and (b) produce
-/// content + values identical to the in-memory path.
+/// preserve the categorical dtype, its declared vocabulary and its key width
+/// on read, and (b) produce content + values identical to the in-memory path.
+///
+/// The declared-list and key-width halves were added with §6.15: asserting
+/// only `matches!(dt, Dictionary(_, _))` passed against a re-encode that
+/// rebuilt the vocabulary per shard and forced every key to `Int32`.
 #[test]
 fn obs_spill_preserves_categorical_dtype() {
     let dir = tempfile::tempdir().unwrap();
@@ -328,6 +332,16 @@ fn obs_spill_preserves_categorical_dtype() {
         "spill path must preserve categorical dtype, got {:?}",
         ct.data_type()
     );
+    // The fixture's three shards declare `a`/`b`/`c` between them; the output
+    // carries their union at the minimal key width, as the in-memory path does.
+    assert_eq!(
+        declared_levels(&obs, "cell_type"),
+        declared_levels(
+            &ScxReader::open(&mem).unwrap().read_obs().unwrap(),
+            "cell_type"
+        ),
+    );
+    assert_eq!(declared_levels(&obs, "cell_type").0, DataType::Int8);
 
     assert_eq!(content(&mem), content(&out), "spill vs in-memory content");
     assert_eq!(col_of(&out, "cell_type"), col_of(&mem, "cell_type"));
@@ -2733,5 +2747,681 @@ fn a_sorted_graph_reads_bounded() {
         fresh.memo_metrics(),
         (0, 1),
         "one shard decoded for a range inside one shard, not four"
+    );
+}
+
+// --- §6.15: the obs spill path must not rebuild the vocabulary -------------
+
+/// Build a sharded-obs `.scx` carrying `cell_id` (the sort key) plus one extra
+/// obs column supplied per shard, so a test can control the declared
+/// vocabulary, its order, its unused levels and its value type exactly.
+///
+/// One CSR shard, `n_vars = 4`, three rows per obs shard. The obs shards are
+/// written with `write_obs_shard` directly, which is what makes
+/// `obs_metadata_shard_count() > 0` and so makes the spill path reachable.
+fn write_obs_column_fixture(
+    dir: &tempfile::TempDir,
+    name: &str,
+    col_name: &str,
+    per_shard: Vec<arrow::array::ArrayRef>,
+    field_metadata: HashMap<String, String>,
+) -> std::path::PathBuf {
+    let rows_per_shard = per_shard[0].len();
+    let n_obs = per_shard.iter().map(|c| c.len()).sum::<usize>();
+    let n_vars = 4usize;
+    let path = dir.path().join(name);
+    let header =
+        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, (n_obs * 2) as u64, 3, 0, 0);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for r in 0..n_obs {
+        indices.push(((r * 2) % n_vars) as u32);
+        indices.push(((r * 2 + 1) % n_vars) as u32);
+        values.push(((r + 1) % 256) as u8);
+        values.push(((r + 2) % 256) as u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    w.write_csr_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "gene_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            (0..n_vars).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    w.write_var(&var).unwrap();
+
+    for (si, col) in per_shard.iter().enumerate() {
+        let rs = si * rows_per_shard;
+        // Descending ids so the sort actually reorders rows across shards.
+        let ids: Vec<String> = (rs..rs + col.len())
+            .map(|i| format!("cell_{:03}", n_obs - 1 - i))
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new(col_name, col.data_type().clone(), true)
+                .with_metadata(field_metadata.clone()),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                col.clone(),
+            ],
+        )
+        .unwrap();
+        w.write_obs_shard(si as u32, rs as u64, col.len() as u64, n_obs as u64, &batch)
+            .unwrap();
+    }
+    w.finish().unwrap();
+    path
+}
+
+fn str_dict(declared: &[&str], keys: &[i8]) -> arrow::array::ArrayRef {
+    use arrow::array::Int8Array;
+    Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys.to_vec()),
+            Arc::new(StringArray::from(declared.to_vec())) as arrow::array::ArrayRef,
+        )
+        .unwrap(),
+    )
+}
+
+fn ordered_metadata() -> HashMap<String, String> {
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    md
+}
+
+/// The declared values of a dictionary column, as strings, plus its key type.
+fn declared_levels(batch: &RecordBatch, name: &str) -> (DataType, Vec<String>) {
+    use arrow::array::{Array, ArrayRef};
+    use arrow::datatypes::{Int16Type, Int32Type};
+    let col = batch.column_by_name(name).unwrap();
+    let DataType::Dictionary(key_type, _) = col.data_type() else {
+        panic!("column '{name}' is {:?}, not a dictionary", col.data_type());
+    };
+    let any = col.as_any();
+    let values: ArrayRef = if let Some(d) = any.downcast_ref::<DictionaryArray<Int8Type>>() {
+        d.values().clone()
+    } else if let Some(d) = any.downcast_ref::<DictionaryArray<Int16Type>>() {
+        d.values().clone()
+    } else if let Some(d) = any.downcast_ref::<DictionaryArray<Int32Type>>() {
+        d.values().clone()
+    } else {
+        panic!("unexpected dictionary key width {key_type:?}");
+    };
+    let s = arrow::compute::cast(&values, &DataType::Utf8).unwrap();
+    let s = s.as_any().downcast_ref::<StringArray>().unwrap();
+    (
+        (**key_type).clone(),
+        (0..s.len()).map(|i| s.value(i).to_string()).collect(),
+    )
+}
+
+/// Sort `inp` twice with X pinned to `InMemory` — once with no budget (obs
+/// in-memory) and once with a budget small enough to force the obs spill — and
+/// return `(in_memory_path, spilled_path)`. Panics unless the second actually
+/// spilled, so a test can never silently assert against two in-memory runs.
+fn sort_both_obs_paths(
+    dir: &tempfile::TempDir,
+    inp: &Path,
+    by: &[&str],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bpr = obs_bytes_per_row(inp);
+    let mem = dir.path().join("mem.scx");
+    let mem_s = sort_with_strategy(inp, &mem, &opts(by), Some(SortStrategy::InMemory)).unwrap();
+    assert!(!mem_s.obs_spilled, "no budget must keep obs in memory");
+
+    let mut o = opts(by);
+    o.memory_budget = Some(bpr * 3);
+    let spilled = dir.path().join("spilled.scx");
+    let sp_s = sort_with_strategy(inp, &spilled, &o, Some(SortStrategy::InMemory)).unwrap();
+    assert!(
+        sp_s.obs_spilled,
+        "budget {} should force obs spill",
+        bpr * 3
+    );
+    assert!(sp_s.obs_partitions >= 2, "expected multiple obs partitions");
+    (mem, spilled)
+}
+
+/// A file whose `cell_type` declares `["z", "a", "m"]` — an order that is
+/// neither sorted nor first-occurrence — and whose rows never reference `"z"`.
+fn unused_level_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    write_obs_column_fixture(
+        dir,
+        "unused_level.scx",
+        "cell_type",
+        vec![
+            str_dict(&["z", "a", "m"], &[1, 2, 1]),
+            str_dict(&["z", "a", "m"], &[2, 1, 2]),
+            str_dict(&["z", "a", "m"], &[1, 2, 1]),
+        ],
+        ordered_metadata(),
+    )
+}
+
+/// The headline §6.15 regression test: the obs sections a spilled sort writes
+/// must be exactly the ones the in-memory `take` path writes. Subsumes declared
+/// levels, declared order, key width, vocabulary sharing across shards, field
+/// metadata and the pandas schema envelope in one assertion.
+#[test]
+fn obs_spill_obs_matches_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = unused_level_fixture(&dir);
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rm = ScxReader::open(&mem).unwrap();
+    let rs = ScxReader::open(&spilled).unwrap();
+    assert_eq!(
+        rm.obs_metadata_shard_count(),
+        rs.obs_metadata_shard_count(),
+        "shard count"
+    );
+    assert!(rm.obs_metadata_shard_count() >= 2, "need multiple shards");
+    for i in 0..rm.obs_metadata_shard_count() as u32 {
+        let a = rm.read_obs_shard(i).unwrap();
+        let b = rs.read_obs_shard(i).unwrap();
+        assert_eq!(a.schema(), b.schema(), "obs shard {i} schema");
+        assert_eq!(a, b, "obs shard {i} contents");
+    }
+    assert_eq!(rm.read_obs().unwrap(), rs.read_obs().unwrap());
+}
+
+/// A `pd.Categorical` level no row uses is declared on disk and must survive the
+/// spill. It cannot be recovered on read — the re-encode never wrote it to any
+/// shard — so this is the failure §6.15 is about.
+#[test]
+fn obs_spill_keeps_a_declared_but_unused_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = unused_level_fixture(&dir);
+    let (_mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let obs = ScxReader::open(&spilled).unwrap().read_obs().unwrap();
+    let (key_type, levels) = declared_levels(&obs, "cell_type");
+    assert_eq!(
+        levels,
+        vec!["z", "a", "m"],
+        "declared levels and their order must survive the spill"
+    );
+    assert_eq!(key_type, DataType::Int8, "minimal key width for 3 levels");
+}
+
+/// The `scx.categorical.ordered` stamp is only meaningful alongside the
+/// declared order, and the spill used to keep the stamp while replacing the
+/// order with a per-shard first-occurrence one.
+#[test]
+fn obs_spill_keeps_the_ordered_flag_with_its_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = unused_level_fixture(&dir);
+    let (_mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let obs = ScxReader::open(&spilled).unwrap().read_obs().unwrap();
+    let schema = obs.schema();
+    let (_, ct) = schema.column_with_name("cell_type").unwrap();
+    assert_eq!(
+        ct.metadata().get(scx_format_io::CATEGORICAL_ORDERED_KEY),
+        Some(&"true".to_string()),
+    );
+    assert_eq!(declared_levels(&obs, "cell_type").1, vec!["z", "a", "m"]);
+}
+
+/// Every output shard must declare the *same* vocabulary. The assembler unions
+/// divergent per-shard lists on the way back out, so `read_obs()` cannot see
+/// this — only the raw per-shard read can.
+#[test]
+fn obs_spill_shares_one_vocabulary_across_output_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = unused_level_fixture(&dir);
+    let (_mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let r = ScxReader::open(&spilled).unwrap();
+    let n = r.obs_metadata_shard_count();
+    assert!(n >= 2, "need multiple output shards, got {n}");
+    for i in 0..n as u32 {
+        assert_eq!(
+            declared_levels(&r.read_obs_shard(i).unwrap(), "cell_type"),
+            (DataType::Int8, vec!["z".into(), "a".into(), "m".into()]),
+            "obs shard {i} declares a different vocabulary",
+        );
+    }
+}
+
+/// Arrow has no boolean dictionary packing, so the old
+/// `cast(col, Dictionary(Int32, Boolean))` re-encode failed the sort outright
+/// (`Unsupported output type for dictionary packing: Boolean`). Nothing packs
+/// now, so a boolean categorical spills like any other.
+#[test]
+fn obs_spill_handles_a_boolean_categorical() {
+    use arrow::array::{BooleanArray, Int8Array};
+    let dir = tempfile::tempdir().unwrap();
+    let bool_dict = |keys: Vec<i8>| -> arrow::array::ArrayRef {
+        Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(BooleanArray::from(vec![true, false])) as arrow::array::ArrayRef,
+            )
+            .unwrap(),
+        )
+    };
+    let inp = write_obs_column_fixture(
+        &dir,
+        "bool_cat.scx",
+        "is_doublet",
+        vec![bool_dict(vec![0, 1, 0]), bool_dict(vec![1, 1, 0])],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rm = ScxReader::open(&mem).unwrap();
+    let rs = ScxReader::open(&spilled).unwrap();
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        assert_eq!(rm.read_obs_shard(i).unwrap(), rs.read_obs_shard(i).unwrap());
+    }
+    let obs = rs.read_obs().unwrap();
+    assert!(matches!(
+        obs.column_by_name("is_doublet").unwrap().data_type(),
+        DataType::Dictionary(_, _)
+    ));
+}
+
+/// Per-shard vocabularies that genuinely differ (each shard declaring levels
+/// the others do not) union to one list, in first-occurrence-over-shards order,
+/// shared by every output shard.
+#[test]
+fn obs_spill_unions_per_shard_vocabularies() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = write_obs_column_fixture(
+        &dir,
+        "per_shard_vocab.scx",
+        "cell_type",
+        vec![
+            str_dict(&["b", "a", "unused_0"], &[0, 1, 0]),
+            str_dict(&["c", "a"], &[0, 1, 0]),
+            str_dict(&["unused_2", "b"], &[1, 1, 1]),
+        ],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rs = ScxReader::open(&spilled).unwrap();
+    let want: Vec<String> = ["b", "a", "unused_0", "c", "unused_2"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        assert_eq!(
+            declared_levels(&rs.read_obs_shard(i).unwrap(), "cell_type"),
+            (DataType::Int8, want.clone()),
+            "obs shard {i}",
+        );
+    }
+    let rm = ScxReader::open(&mem).unwrap();
+    assert_eq!(rm.read_obs().unwrap(), rs.read_obs().unwrap());
+}
+
+/// A file whose first shard is a dictionary and whose later shards store the
+/// column plain — the shape an `append` from a plain source onto a
+/// dictionary-encoded base leaves. The plain shard's values join the union and
+/// its rows come back keyed against it.
+#[test]
+fn obs_spill_promotes_a_plain_shard_against_a_dictionary_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain: arrow::array::ArrayRef =
+        Arc::new(StringArray::from(vec!["a", "appended", "appended"]));
+    let inp = write_obs_column_fixture(
+        &dir,
+        "mixed.scx",
+        "cell_type",
+        vec![str_dict(&["b", "a", "unused"], &[0, 1, 0]), plain],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rs = ScxReader::open(&spilled).unwrap();
+    let obs = rs.read_obs().unwrap();
+    assert_eq!(
+        declared_levels(&obs, "cell_type").1,
+        vec!["b", "a", "unused", "appended"],
+    );
+    assert_eq!(ScxReader::open(&mem).unwrap().read_obs().unwrap(), obs);
+}
+
+/// Negative control: the ops stay representation-preserving. A plain-`Utf8` obs
+/// column spills and comes back plain — never promoted to a categorical — and
+/// still matches the in-memory path shard for shard.
+#[test]
+fn obs_spill_leaves_a_plain_column_plain() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let sharded = dir.path().join("sharded.scx");
+    sort(&inp, &sharded, &opts(&["cell_type"])).unwrap();
+    let (mem, spilled) = sort_both_obs_paths(&dir, &sharded, &["cell_type"]);
+
+    let rm = ScxReader::open(&mem).unwrap();
+    let rs = ScxReader::open(&spilled).unwrap();
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        let b = rs.read_obs_shard(i).unwrap();
+        assert!(
+            b.schema()
+                .fields()
+                .iter()
+                .all(|f| !matches!(f.data_type(), DataType::Dictionary(_, _))),
+            "obs shard {i} promoted a plain column to a categorical",
+        );
+        assert_eq!(rm.read_obs_shard(i).unwrap(), b);
+    }
+}
+
+/// The mirror of [`obs_spill_promotes_a_plain_shard_against_a_dictionary_base`]:
+/// the **first** obs shard stores the column plain and a later one stores it as
+/// a dictionary.
+///
+/// Deciding which columns are categorical from shard 0 alone got this
+/// direction wrong — the spill wrote the column plain while `read_obs()`
+/// promotes a field any shard declares a dictionary, so the two writers
+/// disagreed on a layout the docs say is reachable. Found by
+/// **codex - gpt-5.6-sol** on PR #547.
+#[test]
+fn obs_spill_promotes_when_only_a_later_shard_is_a_dictionary() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain: arrow::array::ArrayRef = Arc::new(StringArray::from(vec!["a", "base", "base"]));
+    let inp = write_obs_column_fixture(
+        &dir,
+        "plain_first.scx",
+        "cell_type",
+        vec![plain, str_dict(&["b", "a", "unused"], &[0, 1, 0])],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rm = ScxReader::open(&mem).unwrap();
+    let rs = ScxReader::open(&spilled).unwrap();
+    let obs = rs.read_obs().unwrap();
+    assert!(
+        matches!(
+            obs.column_by_name("cell_type").unwrap().data_type(),
+            DataType::Dictionary(_, _)
+        ),
+        "a column any shard declares categorical must come out categorical",
+    );
+    assert_eq!(
+        declared_levels(&obs, "cell_type").1,
+        vec!["a", "base", "b", "unused"],
+        "the plain first shard's values lead the union, then the later shard's",
+    );
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        assert_eq!(rm.read_obs_shard(i).unwrap(), rs.read_obs_shard(i).unwrap());
+    }
+}
+
+/// Two or more **plain** shards ahead of the first dictionary shard.
+///
+/// The pairwise fold carries the accumulator forward as a 0-row slice, which is
+/// only lossless once a column is dictionary-typed: an arrow slice of a
+/// `DictionaryArray` keeps its values array, a slice of a plain array keeps
+/// nothing. With a plain run at the front there was no dictionary in the pair
+/// yet, so `reconcile_dictionary_representations` had nothing to promote
+/// against and every plain shard but the last one before the first dictionary
+/// lost its values — which pass 1 then found again, tripping the
+/// "gained categories while spilling" guard. Found by
+/// **Antigravity - Gemini 3.8 Flash** on PR #547.
+#[test]
+fn obs_spill_keeps_values_from_a_plain_run_before_the_first_dictionary() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain0: arrow::array::ArrayRef = Arc::new(StringArray::from(vec!["p0", "shared", "p0b"]));
+    let plain1: arrow::array::ArrayRef = Arc::new(StringArray::from(vec!["p1", "shared", "p1b"]));
+    let inp = write_obs_column_fixture(
+        &dir,
+        "plain_run.scx",
+        "cell_type",
+        vec![
+            plain0,
+            plain1,
+            str_dict(&["d", "shared", "unused"], &[0, 1, 0]),
+        ],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rs = ScxReader::open(&spilled).unwrap();
+    let obs = rs.read_obs().unwrap();
+    assert_eq!(
+        declared_levels(&obs, "cell_type").1,
+        vec!["p0", "shared", "p0b", "p1", "p1b", "d", "unused"],
+        "every shard's values must reach the union, in read_obs() order",
+    );
+    let rm = ScxReader::open(&mem).unwrap();
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        assert_eq!(rm.read_obs_shard(i).unwrap(), rs.read_obs_shard(i).unwrap());
+    }
+}
+
+/// A later obs shard carrying a column the spill schema does not name is
+/// rejected, not silently dropped. Pins the half of the by-name correction that
+/// the reverse-mix test does not cover. Found by
+/// **Cursor Agent - Grok 4.6 High** on PR #547.
+#[test]
+fn obs_spill_rejects_a_shard_with_an_extra_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("extra_col.scx");
+    let (n_obs, n_vars) = (6usize, 4usize);
+    let header =
+        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, (n_obs * 2) as u64, 3, 0, 0);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for r in 0..n_obs {
+        indices.push(((r * 2) % n_vars) as u32);
+        indices.push(((r * 2 + 1) % n_vars) as u32);
+        values.push(((r + 1) % 256) as u8);
+        values.push(((r + 2) % 256) as u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    w.write_csr_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    w.write_var(
+        &RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "gene_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_vars).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for si in 0..2usize {
+        let rs = si * 3;
+        let ids: Vec<String> = (rs..rs + 3)
+            .map(|i| format!("cell_{:03}", n_obs - 1 - i))
+            .collect();
+        let mut fields = vec![Field::new("cell_id", DataType::Utf8, false)];
+        let mut cols: Vec<arrow::array::ArrayRef> = vec![Arc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))];
+        if si == 1 {
+            fields.push(Field::new("surprise", DataType::Utf8, true));
+            cols.push(Arc::new(StringArray::from(vec!["x", "y", "z"])));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+        w.write_obs_shard(si as u32, rs as u64, 3, n_obs as u64, &batch)
+            .unwrap();
+    }
+    w.finish().unwrap();
+
+    let bpr = obs_bytes_per_row(&path);
+    let mut o = opts(&["cell_id"]);
+    o.memory_budget = Some(bpr * 3);
+    let out = dir.path().join("out.scx");
+    let err = sort_with_strategy(&path, &out, &o, Some(SortStrategy::InMemory)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("the spill schema names"),
+        "expected the column-count rejection, got: {msg}"
+    );
+}
+
+/// A categorical whose **values are a nested type** (`Dictionary(_, List<Utf8>)`).
+///
+/// Raised on PR #547 by **codex - gpt-5.6-sol** as a case the seeded fold would
+/// lose, on the premise that `intern_declared_values` declines nested value
+/// types and so leaves the empty seed as the accumulator. It does not:
+/// `RowConverter::supports_fields` is `true` for `List`, `LargeList`,
+/// `FixedSizeList` and `Struct`, so the union is interned exactly as for a
+/// string. Of the nested types only `Map` is declined — and there neither
+/// writer works, because the decode→re-encode fallback both would fall back to
+/// raises `Unsupported output type for dictionary packing: Map(...)`. Pinned
+/// here so the supported half stays covered.
+#[test]
+fn obs_spill_handles_a_nested_dictionary_value_type() {
+    use arrow::array::{Int32Array, ListArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::Int32Type;
+
+    let dir = tempfile::tempdir().unwrap();
+    let list_dict = |keys: Vec<i32>| -> arrow::array::ArrayRef {
+        let inner = StringArray::from(vec!["a", "b", "c", "d"]);
+        let values = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0, 2, 3, 4].into()),
+            Arc::new(inner) as arrow::array::ArrayRef,
+            None,
+        );
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                Arc::new(values) as arrow::array::ArrayRef,
+            )
+            .unwrap(),
+        )
+    };
+    let inp = write_obs_column_fixture(
+        &dir,
+        "nested_dict.scx",
+        "tags",
+        vec![list_dict(vec![0, 1, 0]), list_dict(vec![1, 1, 0])],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rm = ScxReader::open(&mem).unwrap();
+    let rs = ScxReader::open(&spilled).unwrap();
+    assert!(matches!(
+        rs.read_obs()
+            .unwrap()
+            .column_by_name("tags")
+            .unwrap()
+            .data_type(),
+        DataType::Dictionary(_, _)
+    ));
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        assert_eq!(rm.read_obs_shard(i).unwrap(), rs.read_obs_shard(i).unwrap());
+    }
+}
+
+/// The count-mismatch rejection's *missing* arm, the mirror of
+/// [`obs_spill_rejects_a_shard_with_an_extra_column`]. Noted as untested by
+/// **Cursor Agent - Grok 4.6 High** on PR #547.
+#[test]
+fn obs_spill_rejects_a_shard_with_a_missing_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing_col.scx");
+    let (n_obs, n_vars) = (6usize, 4usize);
+    let header =
+        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, (n_obs * 2) as u64, 3, 0, 0);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for r in 0..n_obs {
+        indices.push(((r * 2) % n_vars) as u32);
+        indices.push(((r * 2 + 1) % n_vars) as u32);
+        values.push(((r + 1) % 256) as u8);
+        values.push(((r + 2) % 256) as u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    w.write_csr_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    w.write_var(
+        &RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "gene_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_vars).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Shard 0 has two columns, shard 1 only `cell_id`.
+    for si in 0..2usize {
+        let rs = si * 3;
+        let ids: Vec<String> = (rs..rs + 3)
+            .map(|i| format!("cell_{:03}", n_obs - 1 - i))
+            .collect();
+        let mut fields = vec![Field::new("cell_id", DataType::Utf8, false)];
+        let mut cols: Vec<arrow::array::ArrayRef> = vec![Arc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))];
+        if si == 0 {
+            fields.push(Field::new("extra", DataType::Utf8, true));
+            cols.push(Arc::new(StringArray::from(vec!["x", "y", "z"])));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+        w.write_obs_shard(si as u32, rs as u64, 3, n_obs as u64, &batch)
+            .unwrap();
+    }
+    w.finish().unwrap();
+
+    let bpr = obs_bytes_per_row(&path);
+    let mut o = opts(&["cell_id"]);
+    o.memory_budget = Some(bpr * 3);
+    let out = dir.path().join("out.scx");
+    let err = sort_with_strategy(&path, &out, &o, Some(SortStrategy::InMemory)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing: [\"extra\"]"),
+        "expected the missing-column arm of the rejection, got: {msg}"
     );
 }

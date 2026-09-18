@@ -1846,10 +1846,14 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   (Before pyscx 0.17 every one of these writers demoted every categorical obs
   column to plain strings; `append` / `merge` / `merge --sort-by` did too until
   this change.) So a `merge` output and an `append` onto a legacy single-section obs
-  both read back as `category` with the union vocabulary. One writer still
-  decodes: `scx sort --memory-budget`'s spill path re-encodes obs categoricals
-  per spilled shard and rebuilds each shard's vocabulary from its own rows, so
-  it prunes declared levels — the in-memory sort path does not. A dictionary/plain shard mix is still readable — the assembler
+  both read back as `category` with the union vocabulary. `scx sort` matches on
+  both of its obs writers: the bounded `--memory-budget` spill path spills each
+  categorical's dictionary **codes** against one union vocabulary folded from the
+  input's shards, rather than decoding and re-encoding per spilled shard, so its
+  obs sections are byte-identical to the in-memory path's — same declared levels,
+  same order, same key width, one vocabulary shared by every output shard. (A
+  boolean categorical also no longer fails the sort: arrow cannot pack one into a
+  dictionary, and nothing packs now.) A dictionary/plain shard mix is still readable — the assembler
   reconciles it — and still reachable, either on a file an older scx version
   grew or by appending a plain-obs source onto a dictionary-encoded base, since
   these ops preserve whichever representation they are handed rather than

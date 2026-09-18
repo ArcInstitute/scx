@@ -1,6 +1,6 @@
 //! The committed byte-identity A/B matrix: what does each rewriting op write?
 //!
-//! Fifteen arms over nine ops, one manifest of per-section digests, three ways
+//! Sixteen arms over nine ops, one manifest of per-section digests, three ways
 //! to use it:
 //!
 //! * **default** — assert against the checked-in golden. A refactor that
@@ -43,7 +43,7 @@
 //! ## What this cannot see
 //!
 //! Read this before citing a green run as "the rewrite did not change bytes".
-//! It is true of these fifteen arms and of nothing else.
+//! It is true of these sixteen arms and of nothing else.
 //!
 //! **Regions of the file.** `FileHeader::file_checksum` is deliberately outside
 //! the digest (it covers the `Provenance` section, which is itself excluded),
@@ -77,7 +77,7 @@
 //!
 //! **Framing, by exactly one arm.** `optimize_framed` is the only arm whose
 //! output goes through `scx_format_io::encode_shard_framed`; every other
-//! fixture here is unframed, so the eleven other arms say nothing about the
+//! fixture here is unframed, so the fifteen other arms say nothing about the
 //! row-group layout. Do not "simplify" its fixture — the row count and the
 //! `decode_target` are what make it cover anything, and its own premise
 //! assertions explain why.
@@ -116,8 +116,10 @@ use scx_testkit::fixtures::{mixed_codec_file, mixed_codec_file_with, FixtureOpts
 /// with the var attach) so both in-place attaches are pinned from here on,
 /// `append_categorical` and `merge_categorical` (the two rewrite ops that write
 /// obs the caller can hand them a categorical in, added when they stopped
-/// decoding those to plain strings), and `optimize_framed` and
-/// `optimize_csr_obsp` — fifteen in all.
+/// decoding those to plain strings), `sort_categorical_spilled` (the obs
+/// spill-scatter write, which is a *different writer* from the `sort` arm's
+/// in-memory one), and `optimize_framed` and `optimize_csr_obsp` — sixteen in
+/// all.
 /// `optimize_framed` is the **only** arm whose output goes through the
 /// row-group-framed encoder, and `optimize_csr_obsp` the **only** one whose
 /// output carries an `ObspCsrShard`; see their comments in `build_manifest`
@@ -138,6 +140,7 @@ const EXPECTED_OPS: &[&str] = &[
     "optimize_csr_obsp",
     "optimize_framed",
     "sort",
+    "sort_categorical_spilled",
 ];
 
 /// Force a predicate index on one obs column.
@@ -180,6 +183,57 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     };
     scx_ops::sort_engine::sort(&src, &out, &sort_opts).unwrap();
     m.record("sort", &out, Strictness::Content).unwrap();
+
+    // `sort`'s obs **spill-scatter** writer, which the arm above never reaches:
+    // that one runs on a plain-`Utf8` obs with no `--memory-budget`, so it takes
+    // the in-memory `take` path and has no dictionary to get wrong. This one
+    // engages the bounded path (sharded obs + a budget) over a categorical, and
+    // pins the bytes it emits for a declared-but-unused level (`"NK cell"`), the
+    // declared order, the `scx.categorical.ordered` stamp and the one vocabulary
+    // every output shard must share. The spill path used to rebuild all of that
+    // from each shard's own rows.
+    //
+    // Two steps because the spill only engages on an input whose obs is already
+    // sharded, and the fixtures write obs as a single section. X is pinned to
+    // `InMemory` on the second sort so the arm isolates the obs writer;
+    // `strategy_differential_identical` covers the external X path.
+    let cat_src = fixture_all_families_with_categorical_obs(dir, "sort_cat_src.scx");
+    let sharded = dir.join("sort_cat_sharded.scx");
+    let spill_opts = scx_ops::SortOptions {
+        by: vec!["cell_type".to_string()],
+        shard_target_rows: 2,
+        ..Default::default()
+    };
+    scx_ops::sort_engine::sort(&cat_src, &sharded, &spill_opts).unwrap();
+    // Budget derived from the data, not from the machine, so the arm is
+    // reproducible: three rows' worth of obs forces multiple spill partitions
+    // while still clearing the "one output shard must fit" guard.
+    let s0 = scx_format_io::ScxReader::open(&sharded)
+        .unwrap()
+        .read_obs_shard(0)
+        .unwrap();
+    let obs_bytes: usize = s0.columns().iter().map(|c| c.get_array_memory_size()).sum();
+    let bytes_per_row = (obs_bytes / s0.num_rows().max(1)) as u64;
+    let out = dir.join("sort_categorical_spilled.scx");
+    let summary = scx_ops::sort_engine::sort_with_strategy(
+        &sharded,
+        &out,
+        &scx_ops::SortOptions {
+            memory_budget: Some(bytes_per_row * 3),
+            ..spill_opts.clone()
+        },
+        Some(scx_ops::SortStrategy::InMemory),
+    )
+    .unwrap();
+    assert!(
+        summary.obs_spilled && summary.obs_partitions >= 2,
+        "the sort_categorical_spilled arm must actually spill obs \
+         (spilled={}, partitions={})",
+        summary.obs_spilled,
+        summary.obs_partitions,
+    );
+    m.record("sort_categorical_spilled", &out, Strictness::Content)
+        .unwrap();
 
     let out = dir.join("optimize.scx");
     scx_ops::optimize(&src, &out, None, scx_format_io::ObsShardPolicy::Off).unwrap();

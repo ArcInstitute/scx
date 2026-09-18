@@ -539,10 +539,31 @@ count *matrix*; this is the obs-column half.
   categorical to its plain vector instead of erroring. Known cost: an arrow
   slice of a dictionary keeps the whole values array, so each output shard
   carries the full declared vocabulary — the price of not pruning declared
-  levels per shard. Not done: `scx sort --memory-budget`'s spill path
-  re-encodes obs categoricals per spilled shard and rebuilds each shard's
-  vocabulary from its own rows, so it still prunes declared levels and gives
-  each shard a different declared list; the in-memory sort path is correct.
+  levels per shard.
+- [x] Dictionary output from `scx sort --memory-budget` — the last write door,
+  and a different writer from the three above: the obs **spill-scatter** path
+  decoded every categorical on the way into the spill and re-encoded it with
+  `cast(col, Dictionary(Int32, V))` on the way out, once per output shard.
+  Arrow builds a vocabulary from the rows it is handed, so a declared-but-unused
+  level vanished unrecoverably (no shard ever wrote it), the declared order
+  became a per-shard first-occurrence order while the `scx.categorical.ordered`
+  stamp still claimed the column was ordered, every output shard declared a
+  different list, and a **boolean** categorical failed the sort outright
+  (arrow has no boolean dictionary packing). No categorical is decoded to its
+  value array any more: a footer-only scan finds which columns any shard
+  declares categorical, then one pass over the obs shards folds the union of
+  their declared values through the same
+  `scx_format_io` pipeline `read_obs()` uses, each shard's keys are remapped
+  onto it, and the spill carries the `Int32` **codes** — 4 B/row instead of the
+  value width — which pass 2 rebuilds against the union's values array, `Arc`-
+  shared by every output shard. The bounded path's obs sections are now
+  byte-identical to the in-memory `take` path's, which is what pins it
+  (`obs_spill_obs_matches_in_memory`, plus the `sort_categorical_spilled`
+  output-identity arm). Which columns count as categorical is the union over
+  **every** shard's schema, not shard 0's, so both heterogeneous orders a
+  representation-preserving `append` can leave — dictionary shards then plain
+  ones, or plain then dictionary — come out as the dictionary the read side
+  assembles, rather than only the first.
 - [x] `pyscx.export_batches` — one h5ad per batch without materialising the
   pool, guarding **both** identities a tool and the import rely on (`obs_names`
   and the resolved key) for uniqueness *within* each batch.
