@@ -3703,6 +3703,30 @@ decode:
 Forcing the assembled path on that plan takes the peak to 2.35× the result and
 fails the test's budget, which is how the direct path is pinned.
 
+#### ⚠️ census_500k was attempted and abandoned, with its own counters as the reason
+
+The phase's gate names census_500k as the second fixture. The cell was
+submitted (`2969831`) and **cancelled after one arm of one round**, which is
+shipped as `census_500k_single_run_probe.json` — not as a measurement of the
+executor, but as the evidence for dropping it.
+
+That one run took **1,267 s** across its 15 timed sub-runs, so the 12-round
+two-arm design needed about **8.5 hours**. More to the point, it would not have
+been measuring the gather. The four floored scenarios read a
+`shard_cache_hit_rate` of **0.296** (`gather_random`), 0.343 (`gather_grouped`),
+0.300 (`gather_random_s512`) and 0.730 (`gather_grouped_s512`), and the loader's
+own sizing warning asks for `max_memory_mb >= 5704` to hold 31 shards of
+~188 MB against the 21 the default budget affords. At a 0.30 hit rate the cell
+prices the shard cache re-decoding shards it just evicted:
+`cellsets_per_sec__gather_random` reads **2.7** there against ~766 on tabula.
+
+Raising the budget would make it measurable and also make it a different
+scenario from the one the floors are authored against, so it is recorded as not
+measurable at this shape rather than measured at another. Phase 1's driver had
+already excluded census from `cellset_gather` after a census_500k cell was
+killed at 205 minutes; this is the same finding with the cell's own counters
+attached.
+
 #### ⚠️ Three captures, and two of them are superseded
 
 Both superseded artifacts ship, because each is the evidence for the change that

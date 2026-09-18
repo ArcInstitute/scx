@@ -4199,6 +4199,18 @@ absolute_floors:
 #     independently per set, so it shares them across BATCHES (what a cache
 #     reuse signal needs) and is ~1.6 % duplicated within one.
 #
+#     ⚠️ And not on census_500k at the default budget at all. The phase
+#         attempted that cell (SLURM 2969831) and abandoned it after one arm of
+#         one round: 1,267 s for that run, and a `shard_cache_hit_rate` of
+#         0.296-0.730 across the four floored scenarios against the loader's own
+#         warning asking for `max_memory_mb >= 5704` to hold 31 shards of
+#         ~188 MB where the default budget affords 21. At a 0.30 hit rate the
+#         cell prices the shard cache re-decoding shards it just evicted, not
+#         the gather (`cellsets_per_sec__gather_random` = 2.7 there against
+#         ~766 on tabula). A floor authored from it would move with the cache
+#         budget rather than with the code. Evidence:
+#         `results/raw/phase6_executor/census_500k_single_run_probe.json`.
+#
 #     ACTIVATION, once a baseline carries the arm AND the A/B shows a rate the
 #     executor moves:
 #       1. Read the medians from
