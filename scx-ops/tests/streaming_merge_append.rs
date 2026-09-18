@@ -3189,41 +3189,103 @@ fn merge_disjoint_dictionary_vocabularies_lands_as_one_dictionary() {
     );
 }
 
+/// Re-key `dict_obs`'s `label` column to `key`, leaving everything else alone.
+///
+/// Key width is load-bearing, not cosmetic. `min_dictionary_key_type` narrows a
+/// categorical to `Int8` for <= 127 levels, so that is what the sharded-obs
+/// assembler returns and what a merge output's shards carry — while a
+/// hand-built `DictionaryArray::<Int32Type>` written as a legacy single section
+/// stays `Int32`. The read side's `unify_dictionary_columns` only takes its
+/// declared-value-preserving fast path on `Int32`; anything narrower falls into
+/// a decode-and-re-encode that rebuilds the vocabulary from the rows. A fixture
+/// built only from `Int32` keys therefore cannot see that difference.
+fn rekeyed_dict_obs(
+    start: usize,
+    n: usize,
+    levels: &[&str],
+    used: usize,
+    ordered: bool,
+    key: DataType,
+) -> RecordBatch {
+    let base = dict_obs(start, n, levels, used, ordered);
+    let col = arrow::compute::cast(
+        base.column_by_name("label").unwrap(),
+        &DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8)),
+    )
+    .unwrap();
+    let fields: Vec<Field> = base
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == "label" {
+                Field::new("label", col.data_type().clone(), true)
+                    .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    let columns: Vec<arrow::array::ArrayRef> = base
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if base.schema().field(i).name() == "label" {
+                col.clone()
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
 #[test]
 fn merge_keeps_a_declared_but_unused_level() {
-    // The assertion that catches a "fix" that swaps in the read side's
-    // `unify_dictionary_columns` without widening keys first: that function's
-    // non-Int32 fallback rebuilds the vocabulary from the rows, so "unused"
-    // disappears.
-    let dir = tempfile::tempdir().unwrap();
-    let p0 = dir.path().join("a.scx");
-    let p1 = dir.path().join("b.scx");
-    write_legacy_input_with_obs(
-        &p0,
-        &dict_obs(0, 4, &["low", "high", "unused"], 2, false),
-        &var_batch(),
-    );
-    write_legacy_input_with_obs(
-        &p1,
-        &dict_obs(4, 4, &["low", "high", "unused"], 2, false),
-        &var_batch(),
-    );
+    // The guard against a "fix" that swaps in the read side's
+    // `unify_dictionary_columns` instead of dropping the decode: that
+    // function's non-`Int32` fallback rebuilds the vocabulary from the rows, so
+    // `"unused"` disappears.
+    //
+    // ⚠️ This has to run over **narrow-keyed** inputs to mean anything. An
+    // `Int32`-keyed fixture takes the fast path, keeps the level, and the
+    // mutation passes — verified by actually making that substitution. Both
+    // widths are covered below so the test says which half it is testing.
+    for key in [DataType::Int8, DataType::Int16, DataType::Int32] {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = dir.path().join("a.scx");
+        let p1 = dir.path().join("b.scx");
+        let levels = ["low", "high", "unused"];
+        write_legacy_input_with_obs(
+            &p0,
+            &rekeyed_dict_obs(0, 4, &levels, 2, false, key.clone()),
+            &var_batch(),
+        );
+        write_legacy_input_with_obs(
+            &p1,
+            &rekeyed_dict_obs(4, 4, &levels, 2, false, key.clone()),
+            &var_batch(),
+        );
 
-    let out = dir.path().join("merged.scx");
-    scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
+        let out = dir.path().join("merged.scx");
+        scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
 
-    let reader = ScxReader::open(&out).unwrap();
-    for (i, shard) in reader.obs_shards().enumerate() {
-        let shard = shard.unwrap();
-        assert!(
-            declared_levels(&shard, "label").contains(&"unused".to_string()),
-            "merge output shard {i} dropped the declared-but-unused level"
+        let reader = ScxReader::open(&out).unwrap();
+        for (i, shard) in reader.obs_shards().enumerate() {
+            let shard = shard.unwrap();
+            assert!(
+                declared_levels(&shard, "label").contains(&"unused".to_string()),
+                "{key:?}-keyed input: merge output shard {i} dropped the \
+                 declared-but-unused level"
+            );
+        }
+        assert_eq!(
+            declared_levels(&reader.read_obs().unwrap(), "label"),
+            vec!["low", "high", "unused"],
+            "{key:?}-keyed input",
         );
     }
-    assert_eq!(
-        declared_levels(&reader.read_obs().unwrap(), "label"),
-        vec!["low", "high", "unused"],
-    );
 }
 
 #[test]
