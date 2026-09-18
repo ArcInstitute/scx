@@ -112,7 +112,7 @@ pub(crate) fn write_dataframe_group_filtered_at(
 /// Step (2) exists because step (3)'s premise — "field 0 already IS the index",
 /// true of the CLI convert path — is **false for a file whose obs was rewritten
 /// in place**. There, field order is whatever the caller's DataFrame had, and
-/// pyarrow puts the index last. Files written before the `unify_dict_columns`
+/// pyarrow puts the index last. Files written before the schema-metadata carry
 /// metadata fix carry no envelope at all, so without (2) their export silently
 /// renamed every cell to the value of the first string column. (3) survives
 /// only for genuinely envelope-less, index-field-less CLI output.

@@ -2996,7 +2996,8 @@ fn an_unreadable_uns_section_fails_the_attach_instead_of_being_replaced() {
 // A pandas categorical reaches this op as `Dictionary(_, Utf8)` with the
 // `scx.categorical.ordered` field stamp, and `from_anndata` writes it to disk
 // that way. Every in-place obs writer used to run the rebuilt table through
-// `unify_dict_columns`, which cast each dictionary column to plain strings — so
+// the shared `unify_dict_columns` cast, which decoded each dictionary column
+// to plain strings — so
 // after any attach the column came back from `read_obs()` as `object`, with its
 // category list and `ordered` bit gone. These pin the contract that it does
 // not: values unchanged, declared order and unused levels kept, `ordered` kept,

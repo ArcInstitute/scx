@@ -217,23 +217,24 @@ def test_append_does_not_invent_a_boolean_category(tmp_dir, levels, ordered):
         (1, 2, "int"),
     ],
 )
-def test_append_drops_an_unobserved_level_uniformly_across_value_types(
+def test_append_keeps_an_unobserved_level_uniformly_across_value_types(
     tmp_dir, base_level, appended_level, dtype
 ):
-    """Characterisation: `append` does not carry the appended shard's
-    *declared* vocabulary, for **any** categorical value type.
+    """`append` carries the appended shard's *declared* vocabulary, for
+    **any** categorical value type.
 
-    `scx-ops/src/append.rs` casts the appended obs column to its plain value
-    type, which erases the declared dictionary before the sharded-metadata
-    assembler ever sees it. A level the appended frame declared but no row
-    used is therefore gone after the append — for booleans, strings and
-    integers alike.
+    This used to assert the opposite, and said so: `scx-ops/src/append.rs`
+    cast the appended obs column to its plain value type, erasing the declared
+    dictionary before the sharded-metadata assembler ever saw it, so a level
+    the appended frame declared but no row used was gone after the append.
+    `append` no longer decodes, so the level survives — for booleans, strings
+    and integers alike.
 
-    This is pre-existing debt in `append`, not a property of any one encoder,
-    and it is pinned here so that a future attempt to "preserve" it for one
-    value type by *inventing* categories (which is what emitting
-    ``[false, true]`` unconditionally did) shows up as a failure of the
-    other two arms rather than as a silent asymmetry.
+    Parameterised over all three value types for the reason the
+    characterisation version was: the preserving path must not be
+    special-cased per encoder. In particular it must not *invent* categories,
+    which is what emitting ``[false, true]`` unconditionally did — that shows
+    up here as the bool arm reporting a level the source never declared.
     """
     import anndata
     import pandas as pd
@@ -258,9 +259,10 @@ def test_append_drops_an_unobserved_level_uniformly_across_value_types(
     after = pyscx.open(str(base)).read_obs()["c"]
 
     assert len(after) == 150
-    assert list(after.cat.categories) == [base_level], (
-        "append does not carry the appended shard's declared-but-unused level; "
-        "if that changes, it must change for every value type at once"
+    assert list(after.cat.categories) == [base_level, appended_level], (
+        "append must carry the appended shard's declared-but-unused level, and "
+        "must do so for every value type at once — and must not invent a level "
+        f"neither side declared (got {list(after.cat.categories)})"
     )
     # The rows themselves are intact — this is a vocabulary question only.
     assert list(after[:100]) == [base_level] * 100

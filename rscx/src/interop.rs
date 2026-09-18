@@ -247,46 +247,98 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType, ordered: bool) -> Res
 /// Dictionary encoding in Arrow maps to R's factor type:
 ///   - dictionary values → factor levels
 ///   - dictionary indices → factor integer codes (1-based in R)
+///
+/// **A string-valued dictionary is always a factor**, at either offset width
+/// and at every key width Arrow allows. `Utf8` and `LargeUtf8` are both string
+/// category types — SCX leaves a dictionary's values wide when their offsets
+/// exceed `i32::MAX` — and the key width is a storage detail the R side has no
+/// counterpart for. An unhandled *string* key width **errors** rather than
+/// falling through to the unpack arm below: silently returning a character
+/// vector would drop the factor class, the declared levels and the `ordered`
+/// bit, which is a wrong semantic type rather than a missing feature.
+///
+/// A `pd.Categorical` over integers, floats or booleans is a dictionary too,
+/// and for those the encoding really is a storage detail R cannot express — so
+/// the column is **unpacked to the plain vector it holds**. Refusing was the
+/// old behaviour and it became reachable in a new way once `append` / `merge`
+/// started writing the rows they add as dictionaries: a numeric categorical
+/// that used to arrive as a plain numeric vector would otherwise have started
+/// erroring, and the R user would read it as "merge did this".
 fn dictionary_to_factor(
     col: &dyn Array,
     key_type: &DataType,
     value_type: &DataType,
     ordered: bool,
 ) -> Result<Robj> {
-    // We support Dictionary<Int8/16/32, Utf8> which is the common h5ad categorical pattern
-    match (key_type, value_type) {
-        (DataType::Int8, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int8Type>(col, ordered)
+    // One classification, consulted once. An earlier version carried a
+    // separate `dictionary_becomes_factor` predicate beside this match, which
+    // meant the tests validated the copy rather than the dispatch — and the
+    // copy disagreed with it on unsigned keys.
+    let large_offsets = match value_type {
+        DataType::Utf8 => false,
+        DataType::LargeUtf8 => true,
+        // Not a string categorical: unpack to the values array and hand that
+        // to the ordinary converter. `cast` on a dictionary only resolves the
+        // keys, so this is not a reinterpretation of the data.
+        _ => {
+            let decoded = arrow::compute::cast(col, value_type).map_err(|e| {
+                Error::Other(format!(
+                    "could not decode Dictionary({key_type:?}, {value_type:?}) \
+                     for R conversion: {e}"
+                ))
+            })?;
+            return arrow_column_to_robj(decoded.as_ref(), value_type, ordered);
         }
-        (DataType::Int16, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int16Type>(col, ordered)
-        }
-        (DataType::Int32, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int32Type>(col, ordered)
-        }
-        _ => Err(Error::Other(format!(
-            "unsupported Dictionary key/value types: {:?}/{:?}",
-            key_type, value_type
+    };
+
+    macro_rules! by_offsets {
+        ($k:ty) => {
+            if large_offsets {
+                typed_dict_to_factor::<$k, i64>(col, ordered)
+            } else {
+                typed_dict_to_factor::<$k, i32>(col, ordered)
+            }
+        };
+    }
+    // Every Arrow dictionary key type, because every one of them can reach
+    // here: `scx-convert`'s categorical writer dispatches all eight, and a
+    // third-party Arrow file can carry any of them.
+    match key_type {
+        DataType::Int8 => by_offsets!(arrow::datatypes::Int8Type),
+        DataType::Int16 => by_offsets!(arrow::datatypes::Int16Type),
+        DataType::Int32 => by_offsets!(arrow::datatypes::Int32Type),
+        DataType::Int64 => by_offsets!(arrow::datatypes::Int64Type),
+        DataType::UInt8 => by_offsets!(arrow::datatypes::UInt8Type),
+        DataType::UInt16 => by_offsets!(arrow::datatypes::UInt16Type),
+        DataType::UInt32 => by_offsets!(arrow::datatypes::UInt32Type),
+        DataType::UInt64 => by_offsets!(arrow::datatypes::UInt64Type),
+        other => Err(Error::Other(format!(
+            "unsupported dictionary key type {other:?} for a string categorical; \
+             refusing rather than returning a plain character vector, which would \
+             silently drop the factor levels and the `ordered` bit"
         ))),
     }
 }
 
 /// Helper: extract factor levels and codes from a typed DictionaryArray.
-fn typed_dict_to_factor<K>(col: &dyn Array, ordered: bool) -> Result<Robj>
+fn typed_dict_to_factor<K, O>(col: &dyn Array, ordered: bool) -> Result<Robj>
 where
     K: arrow::datatypes::ArrowDictionaryKeyType,
     K::Native: TryInto<i32>,
+    O: arrow::array::OffsetSizeTrait,
 {
     use arrow::array::AsArray;
 
     let dict_arr = col.as_any_dictionary();
 
-    // Extract levels from the dictionary values (Utf8)
+    // Extract levels from the dictionary values. Generic over the string
+    // offset width so `Utf8` and `LargeUtf8` categoricals both land as
+    // factors; the levels themselves are `String` either way.
     let values = dict_arr
         .values()
         .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| Error::Other("Dictionary values are not Utf8".into()))?;
+        .downcast_ref::<arrow::array::GenericStringArray<O>>()
+        .ok_or_else(|| Error::Other("Dictionary values are not a string type".into()))?;
     let levels: Vec<String> = (0..values.len())
         .map(|i| values.value(i).to_string())
         .collect();

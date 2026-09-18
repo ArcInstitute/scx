@@ -1051,7 +1051,14 @@ fn finalize_append(
     // monotonically-non-decreasing `n_rows_total` stamps across
     // shards (each writer stamps the file's total at write time;
     // older shards retain their original smaller stamps).
-    let new_unified = unify_dict_columns(new_obs)?;
+    // Written verbatim. `new_obs` is one caller-supplied batch, so its
+    // dictionary is already unique, and a categorical column goes to disk as
+    // the dictionary it arrived as — field metadata (`scx.categorical.ordered`)
+    // and the schema-level `pandas` index envelope included. Nothing here
+    // *creates* a dictionary either: a plain source column stays plain, and the
+    // reader's `reconcile_dictionary_representations` handles the mix that
+    // leaves on a dictionary-encoded base.
+    let new_unified = new_obs.clone();
 
     // `user_wants_index` treats a non-zero `index_auto_threshold` as an
     // explicit request — fixes the pre-fix bug where
@@ -1091,7 +1098,9 @@ fn finalize_append(
     let old_unified_for_convert: Option<RecordBatch> = if input_is_sharded {
         None
     } else {
-        Some(unify_dict_columns(old_obs)?)
+        // The legacy `obs` section as stored (one Arrow IPC batch, already
+        // unique), re-emitted as shard 0 without touching its encoding.
+        Some(old_obs.clone())
     };
 
     // Pick a representative obs batch for forced-column schema
@@ -1574,216 +1583,17 @@ fn next_shard_idx(old_per_modality_csr: u32, n_appended_so_far: usize) -> Result
 }
 
 /// Return the effective (dictionary-stripped) value type of a `DataType`.
-/// Mirrors the behaviour of [`unify_dict_columns`] so the append-time schema
-/// check can compare across `Dictionary(_, V)` ↔ `V` asymmetries introduced
-/// by Arrow IPC round-trips.
+///
+/// `Dictionary(_, V)` and plain `V` are the same logical column — pandas
+/// stores every `Categorical` the former way — so the append-time schema check
+/// compares through this rather than by raw dtype. It has to: a target written
+/// by `from_anndata` carries the column as a dictionary while one grown by an
+/// older `append` carries it plain, and appending the one onto the other is
+/// legitimate. `merge`'s obs-identity check reads dtypes through the same
+/// rule (`merge::logical_field_type`).
 fn effective_type(dt: &arrow::datatypes::DataType) -> &arrow::datatypes::DataType {
     match dt {
         arrow::datatypes::DataType::Dictionary(_, value_type) => value_type,
         other => other,
-    }
-}
-
-/// Cast dictionary-encoded columns to their value type to unify (deduplicate)
-/// dictionary entries after `concat_batches`.
-///
-/// Arrow's `concat_batches` concatenates dictionaries without deduplication,
-/// which produces invalid categoricals for pandas. Casting dictionary → value
-/// type (e.g. Utf8) removes duplicates.
-///
-/// **The cast is one-way.** An earlier version of this comment claimed "Arrow
-/// IPC will re-encode them as dictionaries on the next write"; it does not —
-/// `ScxWriter::write_arrow_ipc` serialises whatever it is handed. So every op
-/// that runs this over an obs table permanently converts that table's
-/// categoricals to plain strings, and a `cell_type` column comes back from
-/// `read_obs()` as `object` rather than `category`. The in-place obs writers
-/// (`modify_metadata`, `attach_external_obs`, `attach_external_layer`) no
-/// longer call this: they never concatenate, so a dictionary they read or are
-/// handed is already unique, and they write it through as a dictionary with
-/// its field metadata. The callers that remain — `append`, `merge`,
-/// `merge_sorted` — do concatenate, and still decode here; giving them
-/// dictionary output too is the tracked follow-on (the read side's
-/// `unify_dictionary_columns` is the primitive to reuse). Recorded here so the
-/// next reader is not misled twice.
-///
-/// **Metadata is carried across unchanged**, at both the schema and the field
-/// level, because none of it is this function's business to edit. Two things
-/// ride on that and both used to be silently destroyed here:
-///
-/// * The schema-level `pandas` envelope naming `index_columns`. Without it the
-///   h5ad exporter falls back to "field 0 is the index"
-///   (`write_dataframe_header`, in `scx-convert/src/h5ad/column_stream.rs` and
-///   private to it), which is true for a
-///   CLI-converted file and false after an obs rewrite — so every exported
-///   cell got renamed to the first string column's value.
-/// * The per-field `scx.categorical.ordered` flag, which is stamped on exactly
-///   the dictionary columns this function rebuilds, so an ordered categorical
-///   came back unordered.
-///
-/// Both only fired when a dictionary column was present, since a batch without
-/// one takes the early return below — which is why the damage looked
-/// intermittent rather than systematic.
-pub(crate) fn unify_dict_columns(
-    batch: &RecordBatch,
-) -> std::result::Result<RecordBatch, arrow::error::ArrowError> {
-    use arrow::datatypes::DataType;
-
-    let schema = batch.schema();
-    let mut needs_unify = false;
-
-    for field in schema.fields() {
-        if matches!(field.data_type(), DataType::Dictionary(_, _)) {
-            needs_unify = true;
-            break;
-        }
-    }
-
-    if !needs_unify {
-        return Ok(batch.clone());
-    }
-
-    let mut new_fields = Vec::with_capacity(schema.fields().len());
-    let mut new_columns = Vec::with_capacity(batch.num_columns());
-
-    for (i, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(i);
-        if matches!(field.data_type(), DataType::Dictionary(_, _)) {
-            // OE8: single-source the Dictionary(_, V) → V extraction through
-            // `effective_type` so this cast path and the append-time schema
-            // check can't drift on how they strip the dictionary.
-            let value_type = effective_type(field.data_type());
-            let cast_col = arrow::compute::cast(col, value_type)?;
-            new_fields.push(
-                arrow::datatypes::Field::new(field.name(), value_type.clone(), field.is_nullable())
-                    // Only the *type* changes here. `scx.categorical.ordered`
-                    // lives on these very fields, so rebuilding without it turns
-                    // an ordered categorical unordered on every append / merge.
-                    .with_metadata(field.metadata().clone()),
-            );
-            new_columns.push(cast_col);
-        } else {
-            new_fields.push(field.as_ref().clone());
-            new_columns.push(col.clone());
-        }
-    }
-
-    // `Schema::new` starts with empty metadata; carry the original across so
-    // the `pandas` index envelope survives. See the doc comment above.
-    let new_schema =
-        arrow::datatypes::Schema::new(new_fields).with_metadata(schema.metadata().clone());
-    RecordBatch::try_new(std::sync::Arc::new(new_schema), new_columns)
-}
-
-#[cfg(test)]
-mod unify_dict_tests {
-    use super::unify_dict_columns;
-    use arrow::array::{ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    const PANDAS: &str = r#"{"index_columns": ["__index_level_0__"]}"#;
-
-    /// A batch shaped like a real obs section after a pandas round trip: the
-    /// index field is NOT field 0 (pyarrow puts it last), one categorical
-    /// column carrying the ordered flag, and the schema-level pandas envelope.
-    fn obs_like(with_dictionary: bool) -> RecordBatch {
-        let cell_type: ArrayRef = if with_dictionary {
-            Arc::new(
-                vec!["T", "B", "T"]
-                    .into_iter()
-                    .collect::<DictionaryArray<Int32Type>>(),
-            )
-        } else {
-            Arc::new(StringArray::from(vec!["T", "B", "T"]))
-        };
-        let n_counts: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30]));
-        let index: ArrayRef = Arc::new(StringArray::from(vec!["c0", "c1", "c2"]));
-
-        let mut field_md = HashMap::new();
-        field_md.insert(
-            scx_format::CATEGORICAL_ORDERED_KEY.to_string(),
-            "true".to_string(),
-        );
-        let mut schema_md = HashMap::new();
-        schema_md.insert("pandas".to_string(), PANDAS.to_string());
-
-        let schema = Schema::new(vec![
-            Field::new("cell_type", cell_type.data_type().clone(), true).with_metadata(field_md),
-            Field::new("n_counts", DataType::Int64, true),
-            Field::new("__index_level_0__", DataType::Utf8, true),
-        ])
-        .with_metadata(schema_md);
-
-        RecordBatch::try_new(Arc::new(schema), vec![cell_type, n_counts, index]).unwrap()
-    }
-
-    fn ordered_flag(batch: &RecordBatch) -> Option<String> {
-        batch
-            .schema()
-            .field_with_name("cell_type")
-            .ok()
-            .and_then(|f| {
-                f.metadata()
-                    .get(scx_format::CATEGORICAL_ORDERED_KEY)
-                    .cloned()
-            })
-    }
-
-    /// The regression. Rebuilding the schema with `Schema::new` alone drops the
-    /// pandas envelope, and the h5ad exporter then falls back to "field 0 is
-    /// the index" — which here is `cell_type`, so every exported cell would be
-    /// renamed to its cell type.
-    #[test]
-    fn preserves_the_pandas_index_envelope() {
-        let out = unify_dict_columns(&obs_like(true)).unwrap();
-        assert_eq!(
-            out.schema().metadata().get("pandas").map(String::as_str),
-            Some(PANDAS),
-        );
-        // And it really did do its job: the dictionary is gone.
-        assert_eq!(
-            out.schema()
-                .field_with_name("cell_type")
-                .unwrap()
-                .data_type(),
-            &DataType::Utf8,
-        );
-    }
-
-    /// `scx.categorical.ordered` sits on exactly the fields this function
-    /// rebuilds, so it is the metadata most easily lost here.
-    #[test]
-    fn preserves_the_ordered_categorical_flag() {
-        let out = unify_dict_columns(&obs_like(true)).unwrap();
-        assert_eq!(ordered_flag(&out).as_deref(), Some("true"));
-    }
-
-    /// The early-return path. This is why the damage looked intermittent: a
-    /// batch with no dictionary column was always fine, so a file with no
-    /// categoricals — and any *second* mutation, the first having decoded them
-    /// all — never showed the bug.
-    #[test]
-    fn the_no_dictionary_early_return_also_keeps_metadata() {
-        let out = unify_dict_columns(&obs_like(false)).unwrap();
-        assert_eq!(
-            out.schema().metadata().get("pandas").map(String::as_str),
-            Some(PANDAS),
-        );
-        assert_eq!(ordered_flag(&out).as_deref(), Some("true"));
-    }
-
-    #[test]
-    fn leaves_non_dictionary_columns_alone() {
-        let out = unify_dict_columns(&obs_like(true)).unwrap();
-        assert_eq!(out.num_rows(), 3);
-        assert_eq!(out.num_columns(), 3);
-        assert_eq!(
-            out.schema()
-                .field_with_name("n_counts")
-                .unwrap()
-                .data_type(),
-            &DataType::Int64,
-        );
     }
 }

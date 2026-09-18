@@ -2705,19 +2705,16 @@ fn test_append_preserves_utf8_schema_via_largeutf8_round_trip() {
     assert_eq!(cell_ids.value(4), "cell_0"); // start of appended batch
     assert_eq!(cell_ids.value(6), "cell_2");
 
-    // `append` still runs the new rows through `unify_dict_columns`, so on
-    // the merged side the cluster column is either a flat `Utf8` (all shards
-    // plain) or a `Dictionary` (the assembler reconciled a dictionary base
-    // shard with a plain appended one). The key invariant for this test is
-    // that it is *not* `LargeUtf8`.
+    // `append` writes the rows it adds back as the dictionary they arrived as,
+    // so both the base and the appended shards are dictionary-encoded and the
+    // assembled read is a dictionary too. (This assertion used to allow a plain
+    // `Utf8` as well, because append decoded categoricals on the way out.) The
+    // original invariant — never `LargeUtf8` on the read path — still holds and
+    // is what `downcast_large_types` is for.
     let cluster_dt = obs.schema().field(1).data_type().clone();
     assert!(
-        matches!(cluster_dt, DataType::Utf8 | DataType::Dictionary(_, _)),
-        "cluster column dtype should be Utf8 or Dictionary, got {cluster_dt:?}",
-    );
-    assert!(
-        !matches!(cluster_dt, DataType::LargeUtf8),
-        "cluster column must not surface as LargeUtf8",
+        matches!(cluster_dt, DataType::Dictionary(_, _)),
+        "cluster column should stay dictionary-encoded through an append, got {cluster_dt:?}",
     );
 }
 
@@ -4726,7 +4723,7 @@ fn compact_reshape_multimodal_streams_sharded_obs() {
 /// Obs shaped the way a pandas round trip leaves it: a categorical column at
 /// field 0, the index field last, and the schema-level `pandas` envelope naming
 /// it. (The categorical used to be what sent the batch down the
-/// dictionary-rebuilding path in `unify_dict_columns`; the in-place ops no
+/// dictionary-rebuilding path in the old `unify_dict_columns`; no op
 /// longer cast, but the shape is still the one the exporter's fallback gets
 /// wrong without the envelope.)
 fn obs_with_envelope_and_categorical(n: usize) -> arrow::array::RecordBatch {
@@ -4771,7 +4768,7 @@ fn obs_envelope_on_disk(path: &std::path::Path) -> Option<String> {
 /// The regression, at the layer that matters: not "does the helper preserve
 /// metadata" but "does the envelope still exist in the file afterwards".
 ///
-/// A unit test on `unify_dict_columns` alone would pass on a writer that
+/// A unit test on the schema-rebuild helper alone would pass on a writer that
 /// stripped the envelope later; this reads it back off disk. Without the fix
 /// the envelope is gone, and `to_h5ad` then renames every cell to its
 /// `cell_type` — the first string column — because the exporter falls back to
@@ -4794,9 +4791,9 @@ fn modify_metadata_keeps_the_pandas_index_envelope() {
     );
 }
 
-/// `append` runs the same `unify_dict_columns` over both the old and the new
-/// obs, so it shares the bug and needs its own coverage — only
-/// `modify_metadata` was in the original report.
+/// `append` rebuilds the schema on both the old and the new obs, so it shares
+/// the bug and needs its own coverage — only `modify_metadata` was in the
+/// original report.
 #[test]
 fn append_keeps_the_pandas_index_envelope() {
     let dir = TempDir::new().unwrap();
@@ -4831,7 +4828,7 @@ fn append_keeps_the_pandas_index_envelope() {
 
 /// An ordered categorical survives `modify_metadata(obs=)` whole: the
 /// `scx.categorical.ordered` stamp (which lived on the very fields
-/// `unify_dict_columns` used to rebuild without it, so it came back unordered
+/// the old `unify_dict_columns` rebuilt without it, so it came back unordered
 /// from every in-place obs write), and — since the in-place ops stopped casting
 /// dictionaries to plain strings — the dictionary dtype itself, with the
 /// caller's declared order and a level no row uses. Over a sharded obs, so the

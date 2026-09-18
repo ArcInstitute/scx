@@ -3279,7 +3279,7 @@ mod streaming_obs_hdf5 {
 /// The regression: an obs section written **without** the pandas envelope,
 /// whose index field is not field 0.
 ///
-/// Until the `unify_dict_columns` fix, every in-place obs write
+/// Until the categorical-fidelity fix, every in-place obs write
 /// (`append` / `merge` / `modify_metadata` / `attach_external_obs`) rebuilt the
 /// schema with `Schema::new(...)` and dropped the envelope. The exporter then
 /// fell back to "field 0 is the index" — true of CLI-converted obs, false here,

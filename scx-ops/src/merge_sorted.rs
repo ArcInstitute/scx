@@ -15,11 +15,10 @@
 //! merge does.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::row::{OwnedRow, Rows};
 use scx_codec::ValueEncoding;
@@ -29,7 +28,6 @@ use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 
-use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::helpers::{encode_values, widest_value_encoding};
 
@@ -77,8 +75,8 @@ fn canonicalize_keys(batch: &RecordBatch, by: &[String]) -> Result<RecordBatch> 
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
 }
 
-/// Per-input forward cursor over obs sort-key rows, unifying dictionaries
-/// before key extraction and asserting the input is a sorted run.
+/// Per-input forward cursor over obs sort-key rows, asserting the input is a
+/// sorted run.
 struct KeyCursor<'a> {
     chunks: Box<dyn Iterator<Item = Result<RecordBatch>> + 'a>,
     extractor: &'a scx_ops_sort::SortKeyExtractor,
@@ -96,8 +94,12 @@ impl<'a> KeyCursor<'a> {
                 match self.chunks.next() {
                     None => return Ok(None),
                     Some(chunk) => {
-                        let unified = unify_dict_columns(&chunk?)?;
-                        let keys = canonicalize_keys(&unified, self.by)?;
+                        // No dictionary handling needed: `canonicalize_keys`
+                        // casts every key column through `canonical_key_dtype`,
+                        // which already recurses through `Dictionary(_, v)`, so
+                        // the row encoding is the same whichever way the column
+                        // was stored.
+                        let keys = canonicalize_keys(&chunk?, self.by)?;
                         self.cur = Some(self.extractor.rows(&keys)?);
                         self.local = 0;
                     }
@@ -206,16 +208,44 @@ pub(crate) fn compute_merge_order(
     Ok(order)
 }
 
-/// Per-input forward cursor pulling exactly `n` obs (or dense) rows at a time
-/// across shard boundaries, unifying dictionaries.
+/// Per-input forward cursor pushing exactly `n` obs (or dense) rows at a time,
+/// across shard boundaries, into the caller's pending buffer.
+///
+/// It appends slices rather than returning one concatenated batch, so the only
+/// concat in the emitter is the per-output-shard one in `emit`. Concatenating
+/// here as well would mean doing it twice, and — now that categoricals stay
+/// dictionary-encoded — each concat is a place where two batches can disagree
+/// on key width or hold distinct values arrays, which arrow resolves by either
+/// duplicating the vocabulary or pruning it. One concat, one pipeline.
+///
+/// An arrow slice of a `DictionaryArray` keeps the whole values array, so a
+/// slice carries its chunk's full declared vocabulary even when no row in the
+/// slice uses part of it. That is deliberate: it is what lets a
+/// declared-but-unused level survive a shard split.
 struct ObsCursor<'a> {
     chunks: Box<dyn Iterator<Item = Result<RecordBatch>> + 'a>,
-    cur: Option<RecordBatch>,
+    cur: Option<Arc<RecordBatch>>,
     local: usize,
 }
+
+/// A run of rows from one source chunk, named rather than materialised.
+///
+/// A fully interleaved sorted merge emits **one row per run**, so an output
+/// shard's buffer holds `shard_target_rows` of these — 16 384 by default. The
+/// concat pipeline they eventually go through does per-batch work (widening,
+/// reconciling, re-keying onto a shared vocabulary), and paying that
+/// 16 384 times instead of once per *source chunk* measured at ~470 ms per
+/// output shard. Holding the parent and an offset lets `emit` prepare the two
+/// or three distinct chunks and slice the prepared result, which is the same
+/// bytes for ~1 % of the cost.
+struct ObsSlice {
+    chunk: Arc<RecordBatch>,
+    offset: usize,
+    len: usize,
+}
+
 impl<'a> ObsCursor<'a> {
-    fn next_rows(&mut self, n: usize) -> Result<RecordBatch> {
-        let mut parts: Vec<RecordBatch> = Vec::new();
+    fn extend_rows(&mut self, n: usize, out: &mut Vec<ObsSlice>) -> Result<()> {
         let mut need = n;
         while need > 0 {
             if self.cur.is_none() {
@@ -223,26 +253,97 @@ impl<'a> ObsCursor<'a> {
                     self.chunks.next().transpose()?.ok_or_else(|| {
                         OpsError::InvalidInput("merge order exceeds obs rows".into())
                     })?;
-                self.cur = Some(unify_dict_columns(&chunk)?);
+                // Widen here, **once per chunk**, not once per emit. These two
+                // steps are per-row (`upcast_to_large_types` rewrites string
+                // buffers; `widen_dictionary_keys` re-keys) and they depend
+                // only on the chunk, so paying them inside `materialize_obs_shard`
+                // would re-widen every row of every still-open parent on every
+                // output shard — amplified by the input count on a high-fan-in
+                // merge, where each emit takes a few rows from each of many
+                // 16K-row chunks. The cross-batch half (reconcile + share)
+                // genuinely depends on which chunks meet in a given shard and
+                // stays there.
+                let chunk = scx_format_io::widen_metadata_batch_for_concat(&chunk)?;
+                self.cur = Some(Arc::new(chunk));
                 self.local = 0;
             }
             let cur = self.cur.as_ref().unwrap();
             let avail = cur.num_rows() - self.local;
             let take = need.min(avail);
-            parts.push(cur.slice(self.local, take));
+            out.push(ObsSlice {
+                chunk: Arc::clone(cur),
+                offset: self.local,
+                len: take,
+            });
             self.local += take;
             need -= take;
             if self.local >= cur.num_rows() {
                 self.cur = None;
             }
         }
-        if parts.len() == 1 {
-            Ok(parts.pop().unwrap())
-        } else {
-            let schema = parts[0].schema();
-            Ok(concat_batches(&schema, &parts)?)
+        Ok(())
+    }
+}
+
+/// Materialise one output shard's worth of [`ObsSlice`]s as a single batch.
+///
+/// The slices can name chunks from **different inputs**, which agree only up
+/// to `validate_obs_identity`'s logical comparison: they may disagree on string
+/// width, on a categorical's key width, on Dictionary-vs-plain, and they hold
+/// distinct dictionary values arrays. A bare `concat_batches` fails on the
+/// first three and, on the fourth, either appends both vocabularies verbatim
+/// (duplicate categories, which pandas rejects) or merges and prunes them
+/// row-count-dependently. `scx_format_io`'s prepare/concat pair is the read
+/// side's own pipeline for exactly this.
+///
+/// It runs over the **distinct source chunks**, not over the slices: after
+/// preparation every chunk shares one values array per dictionary column, so
+/// slicing preserves that and `concat` takes its cheap keys-only path. The
+/// per-row half of the preparation (widening) already happened once, when
+/// `ObsCursor` loaded the chunk.
+fn materialize_obs_shard(pending: &[ObsSlice]) -> Result<RecordBatch> {
+    // No single-slice shortcut. It is tempting — one slice of one chunk needs
+    // no reconciling — but `ObsCursor` widened that chunk's dictionary keys to
+    // Int32 at load, and nothing downstream narrows them again
+    // (`write_obs_shard` does not). Returning the slice verbatim would write
+    // Int32 keys for every categorical on the shape this k-way merge is *for*:
+    // already-sorted, non-interleaved inputs, where each output shard is one
+    // run from one input. That is 4x the code buffer against an Int8 input.
+    // `concat_prepared_metadata_batches` costs a concat of one batch and gets
+    // the minimal key back from `unify_dictionary_columns`.
+    // Identity, not equality: two slices share a parent iff they name the same
+    // `Arc`. Comparing the batches themselves would be both wrong (a clone is
+    // a different pointer) and expensive.
+    //
+    // Pointer-keyed rather than a linear scan: `pending` holds one entry per
+    // sorted run, so a fully interleaved merge fills it with
+    // `shard_target_rows` entries (16 384 by default), and a high-fan-in merge
+    // pushes the distinct-chunk count up with the input count — the product is
+    // what a `Vec::position` walk would pay per emit.
+    let mut seen: HashMap<*const RecordBatch, usize> = HashMap::with_capacity(pending.len());
+    let mut distinct: Vec<Arc<RecordBatch>> = Vec::new();
+    let mut owner: Vec<usize> = Vec::with_capacity(pending.len());
+    for s in pending {
+        let key = Arc::as_ptr(&s.chunk);
+        match seen.get(&key) {
+            Some(&i) => owner.push(i),
+            None => {
+                distinct.push(Arc::clone(&s.chunk));
+                seen.insert(key, distinct.len() - 1);
+                owner.push(distinct.len() - 1);
+            }
         }
     }
+    // Already widened at chunk load; only the cross-batch half is left.
+    let prepared = scx_format_io::reconcile_and_share_metadata_batches(
+        distinct.iter().map(|b| (**b).clone()).collect(),
+    )?;
+    let slices: Vec<RecordBatch> = pending
+        .iter()
+        .zip(&owner)
+        .map(|(s, &i)| prepared[i].slice(s.offset, s.len))
+        .collect();
+    Ok(scx_format_io::concat_prepared_metadata_batches(&slices)?)
 }
 
 /// Per-input forward cursor over CSR shards (X or a layer), appending rows
@@ -415,24 +516,22 @@ pub(crate) fn emit_sorted(
             })
             .collect::<Result<_>>()?;
 
-        let mut pending: Vec<RecordBatch> = Vec::new();
+        let mut pending: Vec<ObsSlice> = Vec::new();
         let mut pending_rows: u64 = 0;
         let mut out_shard_idx: u32 = 0;
         let mut cumulative: u64 = 0;
 
         let emit = |writer: &mut ScxWriter,
                     builder: &mut Option<scx_engine::ObsPredicateIndexBuilder>,
-                    pending: &mut Vec<RecordBatch>,
+                    pending: &mut Vec<ObsSlice>,
                     pending_rows: &mut u64,
                     out_shard_idx: &mut u32,
                     cumulative: &mut u64|
          -> Result<()> {
-            let schema = pending[0].schema();
-            let batch = if pending.len() == 1 {
-                pending[0].clone()
-            } else {
-                concat_batches(&schema, pending.iter())?
-            };
+            // Output shards may disagree on key width — a shard drawn from one
+            // input keeps that input's, a shard spanning inputs carries the
+            // union's. The assembler reconciles that on read.
+            let batch = materialize_obs_shard(pending)?;
             let n = batch.num_rows() as u64;
             if let Some(b) = builder.as_mut() {
                 b.push_shard(&batch, *cumulative)?;
@@ -456,7 +555,7 @@ pub(crate) fn emit_sorted(
             while done < run {
                 let space = (target - pending_rows) as usize;
                 let take = (run - done).min(space);
-                pending.push(cursors[inp].next_rows(take)?);
+                cursors[inp].extend_rows(take, &mut pending)?;
                 pending_rows += take as u64;
                 done += take;
                 if pending_rows == target {
@@ -485,12 +584,13 @@ pub(crate) fn emit_sorted(
         if out_shard_idx == 0 {
             // Every input was empty: `order` had nothing to drain, so no obs
             // shard was written — and a file without an obs section is
-            // unreadable. Write input 0's own 0-row obs as one legacy section
-            // through the same `unify_dict_columns` every chunk goes through
-            // (mirrors the plain merge emitter).
+            // unreadable. Write input 0's own 0-row obs verbatim, exactly as
+            // the chunk path now writes its batches (mirrors the plain merge
+            // emitter), so an empty output has the schema a populated merge of
+            // these inputs would have.
             debug_assert_eq!(total_n_obs, 0);
             let empty_obs = readers[0].read_obs()?;
-            writer.write_obs(&crate::append::unify_dict_columns(&empty_obs)?)?;
+            writer.write_obs(&empty_obs)?;
         }
     }
 

@@ -88,12 +88,14 @@ pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
 /// `arrow::compute::cast` does this for most value types, but its dictionary
 /// *packing* has no `Boolean` support and fails with *"Unsupported output
 /// type for dictionary packing: Boolean"*. That is the same limitation
-/// [`widen_dictionary_keys`] sidesteps by casting keys, and it is reachable
-/// here by an ordinary `append`: the base shards keep their
-/// `Dictionary(_, Boolean)` while the appended obs shard lands as plain
-/// `Boolean`, so [`reconcile_dictionary_representations`] has to encode the
+/// [`widen_dictionary_keys`] sidesteps by casting keys. It was reachable by an
+/// ordinary `append`, which decoded the rows it added: the base shards kept
+/// their `Dictionary(_, Boolean)` while the appended obs shard landed as plain
+/// `Boolean`, so [`reconcile_dictionary_representations`] had to encode the
 /// plain side — and the whole assembled read (`read_obs`, `to_anndata`,
-/// filtered collect) died there.
+/// filtered collect) died there. `append` no longer decodes, but the mix is
+/// still reachable on a file an older scx version grew and by appending a
+/// plain-`Boolean` source onto a dictionary-encoded base.
 ///
 /// A `Boolean` column has at most three states, so it is packed by hand,
 /// nulls preserved as null keys. Packing by hand rather than degrading the
@@ -244,14 +246,14 @@ pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
 /// Reconcile per-shard columns that disagree on `Dictionary`-vs-plain encoding
 /// so they can be concatenated.
 ///
-/// `append` / `merge` write new obs/var as plain `Utf8`/`LargeUtf8` (their
-/// `unify_dict_columns` decodes categoricals before write), while `from_anndata`
-/// and the in-place obs writers (`modify_metadata`, `attach_external_obs`,
-/// `attach_external_layer`) write the same column as a `Dictionary` — as did
-/// every file whose obs was rewritten in place before those writers stopped
-/// casting. After an append, or on such a legacy file, a sharded axis can
-/// therefore carry the column as `Dictionary(_, V)` in some shards and plain `V`
-/// in others. `arrow::compute::concat_batches` requires every batch to share one
+/// Every write door but `scx sort`'s spill path now writes a categorical as a
+/// `Dictionary`, but a
+/// sharded axis can still carry the column as `Dictionary(_, V)` in some shards
+/// and plain `V` in others. Three ways to get there: a file an older `append` /
+/// `merge` grew (they decoded categoricals before write), a file whose obs was
+/// rewritten in place before those writers stopped casting, and — still live —
+/// an `append` whose *source* holds the column plain, since these ops preserve
+/// the representation they are handed rather than promoting a plain column. `arrow::compute::concat_batches` requires every batch to share one
 /// schema, so it rejects the mix with *"It is not possible to concatenate arrays
 /// of different data types (Dictionary(Int32, LargeUtf8), LargeUtf8)"*.
 ///
@@ -498,7 +500,7 @@ pub fn pandas_index_columns(schema: &Schema) -> Vec<String> {
 ///
 /// [`pandas_index_columns`] reads only the authoritative `pandas` schema
 /// metadata. That envelope is absent on two kinds of file: those written by
-/// the CLI convert path, and — until the `unify_dict_columns` fix — any file
+/// the CLI convert path, and — until the schema-metadata carry fix — any file
 /// whose obs was rewritten in place by `append` / `merge` / `modify_metadata` /
 /// `attach_external_obs`, all of which rebuilt the schema without it.
 ///
@@ -1092,7 +1094,7 @@ mod tests {
     }
 
     /// The case that matters for already-written files: no envelope (an obs
-    /// rewritten in place before the `unify_dict_columns` fix), and the index
+    /// rewritten in place before the schema-metadata carry fix), and the index
     /// field is NOT field 0 — pyarrow puts it last. Falling back to field 0
     /// here is what renamed every exported cell to its cell type.
     #[test]

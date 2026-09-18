@@ -374,9 +374,31 @@ Categorical obs columns in a `collect()` whose rows the caller narrowed
 (`filter_obs` or `limit`) carry only the categories present in the surviving
 rows (AnnData/pandas convention), not the full parent dictionary —
 deterministically, on both obs layouts; an unfiltered `collect()` and a full
-`read_obs()` keep the declared list, unused levels included. (Exception until
-`append` writes dictionaries: a filtered result drawn entirely from appended,
-plain-encoded shards comes back as plain strings.)
+`read_obs()` keep the declared list, unused levels included. (This used to
+have an exception: a filtered result drawn entirely from appended shards came
+back as plain strings, because `append` decoded categoricals on the way out. It
+no longer does.)
+
+⚠️ **What a dictionary costs per shard.** An arrow slice of a
+`DictionaryArray` keeps the whole values array, so every obs shard carries the
+*full* declared vocabulary of the batch it was sliced from, not just the levels
+its own rows use. That is deliberate — pruning per shard is what silently drops
+a declared-but-unused `pd.Categorical` level — but it means a high-cardinality
+column stored as a categorical is duplicated once per shard. `from_anndata`'s
+sharded write has always had this shape; since the write doors stopped decoding,
+`append` and `merge` do too.
+
+It cuts both ways, and which way depends on the levels-to-rows ratio.
+Measured (`scx-ops/tests/streaming_merge_append.rs`, the two `#[ignore]`d
+measurements): a sorted merge of 40 000 rows over a 240-level categorical
+writes **0.87 MiB instead of 1.28 MiB** — the dictionary is pure win when rows
+greatly outnumber levels, which is the normal categorical case. An append of
+4 000 rows carrying a **5 000**-level vocabulary across 2 shards writes
+**310 KiB of obs sections instead of 160 KiB** — the vocabulary is duplicated
+per shard and is itself larger than the values it encodes. A high-cardinality
+column stored as a `pd.Categorical` (a barcode field, typically) is the case to
+watch; storing it as a plain string column avoids the duplication entirely, and
+these ops preserve that choice.
 
 ### Training loader (shard-level streaming)
 

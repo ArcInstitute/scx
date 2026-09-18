@@ -825,11 +825,10 @@ fn test_assemble_dictionary_dedup_many_shards() {
     }
 }
 
-/// Regression: an append writes obs categoricals as plain `Utf8` (its
-/// `unify_dict_columns` decodes them) while `from_anndata` writes the same
-/// column as a `Dictionary`. After an append, a sharded obs axis therefore
-/// carries the column as `Dictionary` in the base shards and plain `Utf8` in
-/// the appended shards. Before the fix, `concat_batches` rejected the mix with
+/// Regression: a sharded obs axis can carry a categorical as `Dictionary` in
+/// some shards and plain `Utf8` in others — a file an older `append` grew (it
+/// decoded categoricals on the way out), or one appended to from a plain-obs
+/// source, which is still how the mix is produced today. Before the fix, `concat_batches` rejected the mix with
 /// *"It is not possible to concatenate arrays of different data types
 /// (Dictionary(Int32, LargeUtf8), LargeUtf8)"* and the file's obs became
 /// unreadable via `to_anndata()`. `reconcile_dictionary_representations` now
@@ -3805,4 +3804,28 @@ fn obs_categorical_filtered_agrees_with_read_obs_filtered_column() {
 
     let (physical, _) = reader.obs_categorical("cell_id").unwrap();
     assert_eq!(physical.len(), 10, "the physical fold keeps every row");
+}
+
+/// The key width a dictionary is narrowed to is chosen by **capacity**, not by
+/// the type's maximum: `n` values are addressed by keys `0..n-1`, so `Int8`
+/// (largest key 127) holds 128 of them. Comparing against `i8::MAX` widened at
+/// exactly 128 and 32 768 — never wrong, but 2x the code buffer at a perfectly
+/// ordinary cell-type vocabulary size. Both boundaries and both sides.
+#[test]
+fn test_min_dictionary_key_type_uses_capacity_not_max() {
+    use crate::reader::metadata::min_dictionary_key_type;
+    use arrow::datatypes::DataType;
+    assert_eq!(min_dictionary_key_type(1), DataType::Int8);
+    assert_eq!(
+        min_dictionary_key_type(128),
+        DataType::Int8,
+        "Int8 holds 128"
+    );
+    assert_eq!(min_dictionary_key_type(129), DataType::Int16);
+    assert_eq!(
+        min_dictionary_key_type(32_768),
+        DataType::Int16,
+        "Int16 holds 32768"
+    );
+    assert_eq!(min_dictionary_key_type(32_769), DataType::Int32);
 }

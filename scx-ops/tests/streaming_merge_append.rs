@@ -1260,83 +1260,6 @@ fn append_then_append_extends_shards() {
 }
 
 #[test]
-fn merge_dict_columns_round_trip() {
-    // Dict-encoded categorical with different per-input dictionaries:
-    // the merge must unify dict columns shard-by-shard (Phase 2a) so
-    // the assembled batch preserves the original string values.
-    fn build_dict_obs(start: usize, n: usize, values: &[&str]) -> RecordBatch {
-        let cell_ids: Vec<String> = (start..start + n).map(|i| format!("cell_{i:04}")).collect();
-        let dict_keys: Int32Array = (0..n).map(|i| (i % values.len()) as i32).collect();
-        let dict_values = StringArray::from(values.to_vec());
-        let dict_array = DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
-            dict_keys,
-            Arc::new(dict_values),
-        )
-        .unwrap();
-        let schema = Schema::new(vec![
-            Field::new("cell_id", DataType::Utf8, false),
-            Field::new(
-                "label",
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                false,
-            ),
-        ]);
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(StringArray::from(cell_ids)), Arc::new(dict_array)],
-        )
-        .unwrap()
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let p0 = dir.path().join("a.scx");
-    let p1 = dir.path().join("b.scx");
-    let var = var_batch();
-    // input 0: label dictionary is {"alpha", "beta"}
-    {
-        let obs = build_dict_obs(0, 4, &["alpha", "beta"]);
-        let mut writer = ScxWriter::new(&p0, header(4, 4)).unwrap();
-        writer.write_obs(&obs).unwrap();
-        writer.write_var(&var).unwrap();
-        write_zero_csr_shard(&mut writer, 0, 4);
-        writer.finish().unwrap();
-    }
-    // input 1: label dictionary is {"gamma", "delta"} — disjoint
-    {
-        let obs = build_dict_obs(4, 4, &["gamma", "delta"]);
-        let mut writer = ScxWriter::new(&p1, header(4, 4)).unwrap();
-        writer.write_obs(&obs).unwrap();
-        writer.write_var(&var).unwrap();
-        write_zero_csr_shard(&mut writer, 0, 4);
-        writer.finish().unwrap();
-    }
-
-    let out = dir.path().join("merged.scx");
-    scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
-
-    let assembled = ScxReader::open(&out).unwrap().read_obs().unwrap();
-    assert_eq!(assembled.num_rows(), 8);
-    // After unify_dict_columns the label column lands as Utf8 (the
-    // dictionary's value type).
-    let labels = assembled
-        .column_by_name("label")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap_or_else(|| {
-            panic!(
-                "expected Utf8 label, got {:?}",
-                assembled.column(1).data_type()
-            )
-        });
-    let observed: Vec<&str> = (0..8).map(|i| labels.value(i)).collect();
-    assert_eq!(
-        observed,
-        vec!["alpha", "beta", "alpha", "beta", "gamma", "delta", "gamma", "delta"]
-    );
-}
-
-#[test]
 fn merge_with_index_options_streaming_matches_batch() {
     // The streaming predicate-index builder must produce a
     // byte-identical PredicateIndex section to the (legacy) batch
@@ -3032,4 +2955,1038 @@ fn sorted_merge_composite_key() {
     assert!(ct.windows(2).all(|w| w[0] <= w[1]));
     // Within ct=="A": cell_id "cell_0","cell_1","cell_2" ascending (string order).
     assert_eq!(read_cell_tags(&r), vec![0, 1, 2, 10, 11]);
+}
+
+// ---------------------------------------------------------------------------
+// Dictionary (categorical) output from `append` / `merge` / `merge_sorted`
+//
+// Until these ops stopped decoding, every categorical obs column they wrote
+// came back from `read_obs()` as plain strings: the declared level list, the
+// unused levels and the `scx.categorical.ordered` bit were all destroyed on the
+// way out, and only an append onto an already-sharded dictionary base read back
+// as `category` at all (because the assembler reconciles the resulting
+// Dictionary/plain shard mix). These pin the fix.
+// ---------------------------------------------------------------------------
+
+/// A categorical obs batch: `cell_id: Utf8` plus `label`, a
+/// `Dictionary(Int32, Utf8)` over `levels`. Rows cycle through the first
+/// `used` levels, so `levels[used..]` are **declared but unused** — the levels
+/// a decode-and-re-encode silently drops.
+fn dict_obs(start: usize, n: usize, levels: &[&str], used: usize, ordered: bool) -> RecordBatch {
+    use std::collections::HashMap;
+
+    let cell_ids: Vec<String> = (start..start + n).map(|i| format!("cell_{i:04}")).collect();
+    let keys: Int32Array = (0..n).map(|i| (i % used) as i32).collect();
+    let dict = DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+        keys,
+        Arc::new(StringArray::from(levels.to_vec())),
+    )
+    .unwrap();
+
+    let mut field_md = HashMap::new();
+    if ordered {
+        field_md.insert(
+            scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("label", dict.data_type().clone(), true).with_metadata(field_md),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(StringArray::from(cell_ids)), Arc::new(dict)],
+    )
+    .unwrap()
+}
+
+/// The **declared** category list of a dictionary column, in declared order.
+/// Panics with the observed dtype when the column is not a dictionary, which is
+/// the pre-fix failure these tests are watching for.
+fn declared_levels(batch: &RecordBatch, col: &str) -> Vec<String> {
+    use arrow::array::AsArray;
+    let c = batch
+        .column_by_name(col)
+        .unwrap_or_else(|| panic!("no column '{col}'"));
+    assert!(
+        matches!(c.data_type(), DataType::Dictionary(_, _)),
+        "column '{col}' must be dictionary-encoded, got {:?}",
+        c.data_type()
+    );
+    let values = c.as_any_dictionary().values();
+    let s = arrow::compute::cast(values, &DataType::Utf8).unwrap();
+    let s = s.as_string::<i32>();
+    (0..s.len()).map(|i| s.value(i).to_string()).collect()
+}
+
+/// Row values of a column, whatever its encoding — so a test can check values
+/// and dtype independently.
+fn string_values(batch: &RecordBatch, col: &str) -> Vec<String> {
+    use arrow::array::AsArray;
+    let c = batch.column_by_name(col).unwrap();
+    let utf8 = arrow::compute::cast(c, &DataType::Utf8).unwrap();
+    let s = utf8.as_string::<i32>();
+    (0..s.len()).map(|i| s.value(i).to_string()).collect()
+}
+
+/// Write `obs` as a row-sharded SCX file, `shard_rows` per obs shard.
+fn write_sharded_dict_input(path: &std::path::Path, obs: &RecordBatch, shard_rows: usize) {
+    let n_obs = obs.num_rows() as u64;
+    let mut w = ScxWriter::new(path, header(n_obs, 4)).unwrap();
+    let mut start = 0usize;
+    let mut idx: u32 = 0;
+    while start < obs.num_rows() {
+        let take = shard_rows.min(obs.num_rows() - start);
+        w.write_obs_shard(
+            idx,
+            start as u64,
+            take as u64,
+            n_obs,
+            &obs.slice(start, take),
+        )
+        .unwrap();
+        start += take;
+        idx += 1;
+    }
+    w.write_var(&var_batch()).unwrap();
+    write_zero_csr_shard(&mut w, 0, n_obs);
+    w.finish().unwrap();
+}
+
+/// Zero-valued CSR payload for `n` appended rows.
+fn empty_append_payload(n: usize) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+    (vec![0u64; n + 1], Vec::new(), Vec::new())
+}
+
+#[test]
+fn append_onto_a_legacy_dictionary_base_keeps_the_dictionary() {
+    // The convert-on-append path: a legacy single-section obs is rewritten as
+    // shard 0 and the new rows land as shard 1+. Pre-fix BOTH sides went
+    // through `unify_dict_columns`, so the whole file came back plain — this is
+    // the arm the roadmap called out as "a legacy-layout append is plain
+    // throughout".
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("target.scx");
+    write_legacy_input_with_obs(
+        &path,
+        &dict_obs(0, 4, &["alpha", "beta", "unused"], 2, false),
+        &var_batch(),
+    );
+
+    let (indptr, indices, values) = empty_append_payload(2);
+    scx_ops::append(
+        &path,
+        &dict_obs(4, 2, &["alpha", "beta", "unused"], 2, false),
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &scx_ops::AppendOptions::default(),
+    )
+    .unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.obs_metadata_shard_count() >= 2,
+        "premise: the convert-on-append path must have produced obs shards"
+    );
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 6);
+    assert_eq!(
+        declared_levels(&obs, "label"),
+        vec!["alpha", "beta", "unused"],
+        "every declared level must survive the append, used or not"
+    );
+    assert_eq!(
+        string_values(&obs, "label"),
+        vec!["alpha", "beta", "alpha", "beta", "alpha", "beta"],
+    );
+}
+
+#[test]
+fn append_onto_a_sharded_dictionary_base_writes_dictionary_shards() {
+    // The raw-copy-extend path. Note what this asserts and why: the *assembled*
+    // `read_obs()` came back as a dictionary even pre-fix, because
+    // `reconcile_dictionary_representations` encodes the plain appended shard to
+    // match the dictionary base shards. So the assembled read proves nothing
+    // here — the regression assertion is on the appended shard's own on-disk
+    // schema.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("target.scx");
+    write_sharded_dict_input(&path, &dict_obs(0, 4, &["alpha", "beta"], 2, false), 2);
+
+    let (indptr, indices, values) = empty_append_payload(3);
+    scx_ops::append(
+        &path,
+        &dict_obs(4, 3, &["gamma", "delta"], 2, false),
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &scx_ops::AppendOptions::default(),
+    )
+    .unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    let n_shards = reader.obs_metadata_shard_count();
+    assert!(n_shards >= 3, "expected the appended rows to add a shard");
+    for (i, shard) in reader.obs_shards().enumerate() {
+        let shard = shard.unwrap();
+        let dt = shard.column_by_name("label").unwrap().data_type().clone();
+        assert!(
+            matches!(dt, DataType::Dictionary(_, _)),
+            "obs shard {i} wrote 'label' as {dt:?}; every shard must stay dictionary-encoded"
+        );
+    }
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(
+        declared_levels(&obs, "label"),
+        vec!["alpha", "beta", "gamma", "delta"],
+    );
+}
+
+#[test]
+fn merge_disjoint_dictionary_vocabularies_lands_as_one_dictionary() {
+    // Replaces `merge_dict_columns_round_trip`, which asserted the opposite
+    // ("after unify_dict_columns the label column lands as Utf8").
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_legacy_input_with_obs(
+        &p0,
+        &dict_obs(0, 4, &["alpha", "beta"], 2, false),
+        &var_batch(),
+    );
+    write_legacy_input_with_obs(
+        &p1,
+        &dict_obs(4, 4, &["gamma", "delta"], 2, false),
+        &var_batch(),
+    );
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    for (i, shard) in reader.obs_shards().enumerate() {
+        let shard = shard.unwrap();
+        let dt = shard.column_by_name("label").unwrap().data_type().clone();
+        assert!(
+            matches!(dt, DataType::Dictionary(_, _)),
+            "merge output shard {i} wrote 'label' as {dt:?}"
+        );
+    }
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 8);
+    assert_eq!(
+        declared_levels(&obs, "label"),
+        vec!["alpha", "beta", "gamma", "delta"],
+        "first-occurrence order over shards in index order",
+    );
+    assert_eq!(
+        string_values(&obs, "label"),
+        vec!["alpha", "beta", "alpha", "beta", "gamma", "delta", "gamma", "delta"],
+    );
+}
+
+/// Re-key `dict_obs`'s `label` column to `key`, leaving everything else alone.
+///
+/// Key width is load-bearing, not cosmetic. `min_dictionary_key_type` narrows a
+/// categorical to `Int8` for <= 127 levels, so that is what the sharded-obs
+/// assembler returns and what a merge output's shards carry — while a
+/// hand-built `DictionaryArray::<Int32Type>` written as a legacy single section
+/// stays `Int32`. The read side's `unify_dictionary_columns` only takes its
+/// declared-value-preserving fast path on `Int32`; anything narrower falls into
+/// a decode-and-re-encode that rebuilds the vocabulary from the rows. A fixture
+/// built only from `Int32` keys therefore cannot see that difference.
+fn rekeyed_dict_obs(
+    start: usize,
+    n: usize,
+    levels: &[&str],
+    used: usize,
+    ordered: bool,
+    key: DataType,
+) -> RecordBatch {
+    let base = dict_obs(start, n, levels, used, ordered);
+    let col = arrow::compute::cast(
+        base.column_by_name("label").unwrap(),
+        &DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8)),
+    )
+    .unwrap();
+    let fields: Vec<Field> = base
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == "label" {
+                Field::new("label", col.data_type().clone(), true)
+                    .with_metadata(f.metadata().clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    let columns: Vec<arrow::array::ArrayRef> = base
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if base.schema().field(i).name() == "label" {
+                col.clone()
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
+#[test]
+fn merge_keeps_a_declared_but_unused_level() {
+    // The guard against a "fix" that swaps in the read side's
+    // `unify_dictionary_columns` instead of dropping the decode: that
+    // function's non-`Int32` fallback rebuilds the vocabulary from the rows, so
+    // `"unused"` disappears.
+    //
+    // ⚠️ This has to run over **narrow-keyed** inputs to mean anything. An
+    // `Int32`-keyed fixture takes the fast path, keeps the level, and the
+    // mutation passes — verified by actually making that substitution. Both
+    // widths are covered below so the test says which half it is testing.
+    for key in [DataType::Int8, DataType::Int16, DataType::Int32] {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = dir.path().join("a.scx");
+        let p1 = dir.path().join("b.scx");
+        let levels = ["low", "high", "unused"];
+        write_legacy_input_with_obs(
+            &p0,
+            &rekeyed_dict_obs(0, 4, &levels, 2, false, key.clone()),
+            &var_batch(),
+        );
+        write_legacy_input_with_obs(
+            &p1,
+            &rekeyed_dict_obs(4, 4, &levels, 2, false, key.clone()),
+            &var_batch(),
+        );
+
+        let out = dir.path().join("merged.scx");
+        scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
+
+        let reader = ScxReader::open(&out).unwrap();
+        for (i, shard) in reader.obs_shards().enumerate() {
+            let shard = shard.unwrap();
+            assert!(
+                declared_levels(&shard, "label").contains(&"unused".to_string()),
+                "{key:?}-keyed input: merge output shard {i} dropped the \
+                 declared-but-unused level"
+            );
+        }
+        assert_eq!(
+            declared_levels(&reader.read_obs().unwrap(), "label"),
+            vec!["low", "high", "unused"],
+            "{key:?}-keyed input",
+        );
+    }
+}
+
+#[test]
+fn merge_keeps_the_ordered_categorical_flag_and_declared_order() {
+    // Two halves, and only one of them is a regression test. The
+    // `scx.categorical.ordered` stamp already survived pre-fix — PR B taught
+    // `unify_dict_columns` to carry field metadata across even while it
+    // destroyed the dtype. What is new is that there is a *declared order* to
+    // preserve at all: pre-fix the column was plain `Utf8`, so "ordered" was a
+    // flag on a column with no category list.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    // Declared order is deliberately NOT alphabetical.
+    let levels = ["medium", "low", "high"];
+    write_legacy_input_with_obs(&p0, &dict_obs(0, 4, &levels, 3, true), &var_batch());
+    write_legacy_input_with_obs(&p1, &dict_obs(4, 4, &levels, 3, true), &var_batch());
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
+
+    let obs = ScxReader::open(&out).unwrap().read_obs().unwrap();
+    assert_eq!(
+        declared_levels(&obs, "label"),
+        vec!["medium", "low", "high"],
+        "the declared order must survive, not be re-derived alphabetically",
+    );
+    assert_eq!(
+        obs.schema()
+            .field_with_name("label")
+            .unwrap()
+            .metadata()
+            .get(scx_format_io::CATEGORICAL_ORDERED_KEY)
+            .map(String::as_str),
+        Some("true"),
+    );
+}
+
+#[test]
+fn sorted_merge_unions_dictionary_vocabularies_across_inputs() {
+    // `merge --sort-by` is the one emitter that concatenates across inputs, so
+    // it is the one that needs the full prepare/concat pipeline. The
+    // duplicate-free assertion is what distinguishes "the pipeline ran" from
+    // "we merely stopped decoding": a bare `concat_batches` over two disjoint
+    // dictionaries appends both vocabularies verbatim.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    // Interleaving keys so an output shard has to span both inputs.
+    let mk = |start: usize, levels: [&str; 2]| {
+        let cell_ids: Vec<String> = (start..start + 2).map(|i| format!("cell_{i:04}")).collect();
+        let keys: Int32Array = vec![0i32, 1].into();
+        let dict = DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+            keys,
+            Arc::new(StringArray::from(levels.to_vec())),
+        )
+        .unwrap();
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("label", dict.data_type().clone(), true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(cell_ids)), Arc::new(dict)],
+        )
+        .unwrap()
+    };
+    write_legacy_input_with_obs(&p0, &mk(0, ["A", "C"]), &var_batch());
+    write_legacy_input_with_obs(&p1, &mk(2, ["B", "D"]), &var_batch());
+
+    let out = dir.path().join("sorted.scx");
+    let mut opts = sorted_merge_opts(&["label"], false, false);
+    opts.shard_target_rows = Some(2); // force more than one `emit`
+    scx_ops::merge_with_options(&[p0.as_path(), p1.as_path()], &out, &opts).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    for (i, shard) in reader.obs_shards().enumerate() {
+        let shard = shard.unwrap();
+        let levels = declared_levels(&shard, "label");
+        let mut sorted = levels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            levels.len(),
+            "output shard {i} has duplicate categories {levels:?} — `concat` appended \
+             the per-input vocabularies instead of sharing one",
+        );
+    }
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(string_values(&obs, "label"), vec!["A", "B", "C", "D"]);
+    let mut levels = declared_levels(&obs, "label");
+    levels.sort();
+    assert_eq!(levels, vec!["A", "B", "C", "D"]);
+}
+
+#[test]
+fn multimodal_merge_keeps_obs_dictionaries() {
+    use scx_format_io::modality::ModalityType;
+
+    fn write_mm(path: &std::path::Path, obs: &RecordBatch) {
+        let n_obs = obs.num_rows() as u64;
+        let mut w = ScxWriter::new(path, header(n_obs, 4)).unwrap();
+        w.write_obs(obs).unwrap();
+        for (name, ty) in [("rna", ModalityType::Rna), ("adt", ModalityType::Protein)] {
+            let id = w
+                .add_modality(name, ty, CodecId::None, ValueEncoding::Uint8, false)
+                .unwrap();
+            w.write_var_for(id, &var_batch()).unwrap();
+            w.set_modality_n_vars(id, 4).unwrap();
+            let indptr: Vec<u64> = vec![0u64; (n_obs + 1) as usize];
+            let shard = scx_format_io::ShardBuffers::new(
+                &indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+            );
+            w.write_csr_shard_for(id, 0, shard).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_mm(&p0, &dict_obs(0, 4, &["alpha", "beta"], 2, false));
+    write_mm(&p1, &dict_obs(4, 4, &["gamma", "delta"], 2, false));
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert!(reader.is_multimodal(), "premise: multimodal emitter ran");
+    assert_eq!(
+        declared_levels(&reader.read_obs().unwrap(), "label"),
+        vec!["alpha", "beta", "gamma", "delta"],
+    );
+}
+
+#[test]
+fn an_empty_merge_output_has_the_same_obs_schema_as_a_populated_one() {
+    // The all-inputs-empty fallback writes one legacy `obs` section instead of
+    // shards, and it exists specifically so an empty output is not a third
+    // schema shape. It therefore has to move in lockstep with the chunk path.
+    let dir = tempfile::tempdir().unwrap();
+    let levels = ["alpha", "beta", "unused"];
+
+    let e0 = dir.path().join("e0.scx");
+    let e1 = dir.path().join("e1.scx");
+    write_legacy_input_with_obs(&e0, &dict_obs(0, 0, &levels, 2, true), &var_batch());
+    write_legacy_input_with_obs(&e1, &dict_obs(0, 0, &levels, 2, true), &var_batch());
+    let empty_out = dir.path().join("empty.scx");
+    scx_ops::merge(&[e0.as_path(), e1.as_path()], &empty_out).unwrap();
+
+    let p0 = dir.path().join("p0.scx");
+    let p1 = dir.path().join("p1.scx");
+    write_legacy_input_with_obs(&p0, &dict_obs(0, 4, &levels, 2, true), &var_batch());
+    write_legacy_input_with_obs(&p1, &dict_obs(4, 4, &levels, 2, true), &var_batch());
+    let full_out = dir.path().join("full.scx");
+    scx_ops::merge(&[p0.as_path(), p1.as_path()], &full_out).unwrap();
+
+    let empty_obs = ScxReader::open(&empty_out).unwrap().read_obs().unwrap();
+    let full_obs = ScxReader::open(&full_out).unwrap().read_obs().unwrap();
+    assert_eq!(empty_obs.num_rows(), 0);
+    assert_eq!(full_obs.num_rows(), 8);
+
+    // The two layouts differ by design — an empty merge writes one legacy obs
+    // section, a populated one writes shards — and reading them back differs
+    // with them: `assemble_sharded_metadata` narrows a categorical's key to the
+    // minimal fit while a single-section read keeps whatever key the writer
+    // built (docs/sharding.md § the two layouts). So compare *logical* types,
+    // which is also what merge's own obs-identity check compares.
+    fn logical(dt: &DataType) -> &DataType {
+        match dt {
+            DataType::Dictionary(_, v) => v,
+            other => other,
+        }
+    }
+    for (a, b) in empty_obs
+        .schema()
+        .fields()
+        .iter()
+        .zip(full_obs.schema().fields().iter())
+    {
+        assert_eq!(a.name(), b.name());
+        assert_eq!(
+            logical(a.data_type()),
+            logical(b.data_type()),
+            "column '{}' differs between an empty and a populated merge",
+            a.name()
+        );
+        assert!(
+            matches!(a.data_type(), DataType::Dictionary(_, _))
+                == matches!(b.data_type(), DataType::Dictionary(_, _)),
+            "column '{}' is dictionary-encoded in one output and not the other ({:?} vs {:?})",
+            a.name(),
+            a.data_type(),
+            b.data_type(),
+        );
+        assert_eq!(a.metadata(), b.metadata(), "column '{}'", a.name());
+    }
+    assert_eq!(declared_levels(&empty_obs, "label"), levels.to_vec());
+    assert_eq!(declared_levels(&full_obs, "label"), levels.to_vec());
+}
+
+#[test]
+fn merge_accepts_inputs_whose_categorical_key_widths_differ() {
+    // `validate_obs_identity` compares raw dtypes over each input's *shard 0*
+    // schema as written on disk. A merge output's shards come out of
+    // `unify_dictionary_columns`, which narrows the key to the minimal fit — so
+    // two merge outputs whose categorical cardinalities straddle 127 carry
+    // `Dictionary(Int8, _)` and `Dictionary(Int16, _)`, and merging them back
+    // together refuses. This shape is what the dictionary change newly
+    // produces, which is why the relaxation ships with it.
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build the two inputs with explicitly narrowed keys, i.e. exactly the
+    // bytes a post-fix merge emits.
+    let narrowed = |start: usize, n_levels: usize, key: DataType| {
+        let levels: Vec<String> = (0..n_levels).map(|i| format!("l{i:03}")).collect();
+        let refs: Vec<&str> = levels.iter().map(|s| s.as_str()).collect();
+        let wide = dict_obs(start, 4, &refs, 3, false);
+        let col = arrow::compute::cast(
+            wide.column_by_name("label").unwrap(),
+            &DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8)),
+        )
+        .unwrap();
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("label", col.data_type().clone(), true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![wide.column_by_name("cell_id").unwrap().clone(), col],
+        )
+        .unwrap()
+    };
+
+    let p0 = dir.path().join("narrow.scx");
+    let p1 = dir.path().join("wide.scx");
+    write_legacy_input_with_obs(&p0, &narrowed(0, 3, DataType::Int8), &var_batch());
+    write_legacy_input_with_obs(&p1, &narrowed(4, 200, DataType::Int16), &var_batch());
+
+    // Premise: the two files disagree on key width in the schema
+    // `validate_obs_identity` actually reads (shard 0 / the legacy section as
+    // stored), not merely in the assembled read.
+    let k = |path: &std::path::Path| {
+        ScxReader::open(path)
+            .unwrap()
+            .read_obs_schema_logical_lossy()
+            .unwrap()
+            .field_with_name("label")
+            .unwrap()
+            .data_type()
+            .clone()
+    };
+    assert_ne!(
+        k(&p0),
+        k(&p1),
+        "premise: the validator's own view of the two schemas must differ"
+    );
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[p0.as_path(), p1.as_path()], &out)
+        .expect("merge must accept inputs that differ only in a categorical's key width");
+    let obs = ScxReader::open(&out).unwrap().read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 8);
+    // `l000..l002` is a prefix of `l000..l199`, so the union is 200.
+    assert_eq!(declared_levels(&obs, "label").len(), 200);
+}
+
+#[test]
+fn merge_still_rejects_a_genuine_obs_dtype_mismatch() {
+    // The negative control for the relaxation above. Without this, "compare
+    // logical types" is indistinguishable from deleting the check.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_legacy_input_with_obs(
+        &p0,
+        &dict_obs(0, 4, &["alpha", "beta"], 2, false),
+        &var_batch(),
+    );
+
+    // Same column name, dictionary-encoded too, but over Int64 levels.
+    let keys: Int32Array = vec![0i32, 1, 0, 1].into();
+    let dict = DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+        keys,
+        Arc::new(arrow::array::Int64Array::from(vec![10i64, 20])),
+    )
+    .unwrap();
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("label", dict.data_type().clone(), true),
+    ]);
+    let numeric_obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "cell_0004".to_string(),
+                "cell_0005".to_string(),
+                "cell_0006".to_string(),
+                "cell_0007".to_string(),
+            ])),
+            Arc::new(dict),
+        ],
+    )
+    .unwrap();
+    write_legacy_input_with_obs(&p1, &numeric_obs, &var_batch());
+
+    let out = dir.path().join("merged.scx");
+    let err = scx_ops::merge(&[p0.as_path(), p1.as_path()], &out)
+        .expect_err("a Utf8-valued vs Int64-valued categorical is a real mismatch");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("label") && msg.contains("Utf8") && msg.contains("Int64"),
+        "the error must name the column and both raw dtypes, got: {msg}"
+    );
+}
+
+#[test]
+fn filtered_collect_on_a_merge_output_returns_categories() {
+    // `docs/api.md` § Filtered-obs categorical semantics: a `collect()` whose
+    // rows the caller narrowed carries only the categories its surviving rows
+    // use. A merge output could not honour that at all while it was plain
+    // strings — `docs/sharding.md` documented the gap explicitly.
+    use scx_engine::QueryPipeline;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_legacy_input_with_obs(
+        &p0,
+        &dict_obs(0, 4, &["alpha", "beta"], 2, false),
+        &var_batch(),
+    );
+    write_legacy_input_with_obs(
+        &p1,
+        &dict_obs(4, 4, &["gamma", "delta"], 2, false),
+        &var_batch(),
+    );
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
+
+    let filtered = QueryPipeline::open(&out)
+        .unwrap()
+        .filter_obs("label == 'alpha'")
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(filtered.obs.num_rows(), 2);
+    assert_eq!(
+        declared_levels(&filtered.obs, "label"),
+        vec!["alpha"],
+        "a filtered collect prunes to the surviving categories",
+    );
+
+    // The sibling half, which passes pre-fix only in the sense that it has
+    // nothing to assert there: an unfiltered collect keeps the declared list.
+    let whole = QueryPipeline::open(&out).unwrap().collect().unwrap();
+    assert_eq!(
+        declared_levels(&whole.obs, "label"),
+        vec!["alpha", "beta", "gamma", "delta"],
+    );
+}
+
+/// Wall-clock guard for the one shape this change could plausibly slow down:
+/// a **fully interleaved** `merge --sort-by`, where every sorted run is one
+/// row, so `emit`'s `pending` holds one batch per row of the output shard and
+/// every one of them reaches the concat pipeline. `share_dictionary_values`
+/// interns the union of the declared vocabularies, so without the
+/// values-`Arc` dedup that is O(n_batches x vocabulary) per output shard
+/// rather than O(n_distinct x vocabulary).
+///
+/// Measured: 0.06 s here against 0.03 s for the pre-change decoding emitter —
+/// 2x on the deliberately worst-case shape, and the output is smaller
+/// (0.87 MiB against 1.28 MiB) because the categorical stays encoded.
+///
+/// Release-only and `#[ignore]`d — it is a measurement, not a gate:
+///
+/// ```bash
+/// cargo test --release -p scx-ops --test streaming_merge_append \
+///     -- --ignored --nocapture interleaved_sorted_merge_timing
+/// ```
+#[test]
+#[ignore = "timing measurement; run with --release --ignored --nocapture"]
+fn interleaved_sorted_merge_timing() {
+    let dir = tempfile::tempdir().unwrap();
+    const N: usize = 20_000;
+    const LEVELS: usize = 120;
+
+    // Two runs that interleave row-for-row on the sort key, each carrying a
+    // 120-level categorical with a disjoint vocabulary.
+    let build = |path: &std::path::Path, parity: usize, tag: &str| {
+        let cell_ids: Vec<String> = (0..N)
+            .map(|i| format!("cell_{:07}", 2 * i + parity))
+            .collect();
+        let levels: Vec<String> = (0..LEVELS).map(|i| format!("{tag}_{i:03}")).collect();
+        let refs: Vec<&str> = levels.iter().map(|s| s.as_str()).collect();
+        let keys: Int32Array = (0..N).map(|i| (i % LEVELS) as i32).collect();
+        let dict = DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+            keys,
+            Arc::new(StringArray::from(refs)),
+        )
+        .unwrap();
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("label", dict.data_type().clone(), true),
+        ]);
+        let obs = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(cell_ids)), Arc::new(dict)],
+        )
+        .unwrap();
+        write_legacy_input_with_obs(path, &obs, &var_batch());
+    };
+    let p0 = dir.path().join("run0.scx");
+    let p1 = dir.path().join("run1.scx");
+    build(&p0, 0, "a");
+    build(&p1, 1, "b");
+
+    let out = dir.path().join("sorted.scx");
+    let opts = sorted_merge_opts(&["cell_id"], false, false);
+    let t = std::time::Instant::now();
+    scx_ops::merge_with_options(&[p0.as_path(), p1.as_path()], &out, &opts).unwrap();
+    let elapsed = t.elapsed();
+
+    let reader = ScxReader::open(&out).unwrap();
+    let bytes = std::fs::metadata(&out).unwrap().len();
+    println!(
+        "interleaved sorted merge: {} rows, {} obs shards, {:.2} s, output {:.2} MiB",
+        reader.n_obs(),
+        reader.obs_metadata_shard_count(),
+        elapsed.as_secs_f64(),
+        bytes as f64 / (1024.0 * 1024.0),
+    );
+    assert_eq!(reader.n_obs() as usize, 2 * N);
+}
+
+/// Size guard for the cost of keeping declared levels: an arrow slice of a
+/// `DictionaryArray` keeps the whole values array, so every obs shard an
+/// append writes carries the *full* declared vocabulary of the batch it was
+/// sliced from, not just the levels its own rows use. That is deliberate —
+/// pruning per shard is what silently drops a declared-but-unused
+/// `pd.Categorical` level — but it is a real per-shard cost on a
+/// high-cardinality column, and it is the cost worth watching.
+///
+/// Measured at the shape below (5 000 levels over 4 000 rows, 2 shards): obs
+/// sections 160 KiB before, 310 KiB after. The opposite ratio wins —
+/// `interleaved_sorted_merge_timing`'s 240-level / 40 000-row output is
+/// 0.87 MiB against 1.28 MiB. See docs/sharding.md.
+///
+/// Release-only and `#[ignore]`d — a measurement, not a gate.
+#[test]
+#[ignore = "size measurement; run with --release --ignored --nocapture"]
+fn appended_shard_vocabulary_duplication() {
+    let dir = tempfile::tempdir().unwrap();
+    const LEVELS: usize = 5_000;
+    const N: usize = 4_000;
+
+    let levels: Vec<String> = (0..LEVELS).map(|i| format!("barcode_{i:06}")).collect();
+    let refs: Vec<&str> = levels.iter().map(|s| s.as_str()).collect();
+
+    let path = dir.path().join("target.scx");
+    write_legacy_input_with_obs(&path, &dict_obs(0, 8, &refs, 8, false), &var_batch());
+    let before = std::fs::metadata(&path).unwrap().len();
+
+    let (indptr, indices, values) = empty_append_payload(N);
+    scx_ops::append(
+        &path,
+        &dict_obs(8, N, &refs, LEVELS, false),
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &scx_ops::AppendOptions {
+            shard_target_rows: std::num::NonZeroU32::new(500).unwrap(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    let after = std::fs::metadata(&path).unwrap().len();
+    let obs_bytes: u64 = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+        .map(|e| e.length)
+        .sum();
+    println!(
+        "append of {N} rows, {LEVELS}-level categorical, {} obs shards: \
+         file {before} -> {after} B, obs sections {obs_bytes} B \
+         ({:.1} B/row)",
+        reader.obs_metadata_shard_count(),
+        obs_bytes as f64 / (N + 8) as f64,
+    );
+}
+
+#[test]
+fn sorted_merge_keeps_a_declared_but_unused_level_on_narrow_keys() {
+    // `merge_keeps_a_declared_but_unused_level` guards the *unsorted* emitter,
+    // which writes each chunk verbatim and never calls
+    // `unify_dictionary_columns` at all. `merge --sort-by` is the one emitter
+    // that does — `materialize_obs_shard` → `concat_prepared_metadata_batches`
+    // → `unify_dictionary_columns` — so it is the path on which substituting
+    // that function for the deleted decode, or dropping the
+    // `widen_dictionary_keys` step that keeps it on its declared-value-
+    // preserving fast path, actually loses a level.
+    //
+    // Narrow keys are the whole point: on `Int32` the fast path runs and the
+    // level survives either way.
+    for key in [DataType::Int8, DataType::Int16] {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = dir.path().join("a.scx");
+        let p1 = dir.path().join("b.scx");
+        // Disjoint used levels so an output shard spans both inputs, each with
+        // its own declared-but-unused level.
+        write_legacy_input_with_obs(
+            &p0,
+            &rekeyed_dict_obs(0, 2, &["a_used", "a_unused"], 1, false, key.clone()),
+            &var_batch(),
+        );
+        write_legacy_input_with_obs(
+            &p1,
+            &rekeyed_dict_obs(2, 2, &["b_used", "b_unused"], 1, false, key.clone()),
+            &var_batch(),
+        );
+
+        let out = dir.path().join("sorted.scx");
+        let mut opts = sorted_merge_opts(&["cell_id"], false, false);
+        opts.shard_target_rows = Some(4); // one shard, spanning both inputs
+        scx_ops::merge_with_options(&[p0.as_path(), p1.as_path()], &out, &opts).unwrap();
+
+        let reader = ScxReader::open(&out).unwrap();
+        let mut saw_spanning_shard = false;
+        for (i, shard) in reader.obs_shards().enumerate() {
+            let shard = shard.unwrap();
+            let levels = declared_levels(&shard, "label");
+            if levels.contains(&"a_used".to_string()) && levels.contains(&"b_used".to_string()) {
+                saw_spanning_shard = true;
+            }
+            for unused in ["a_unused", "b_unused"] {
+                // Only assert on a shard that actually carries that input's
+                // vocabulary — a shard drawn from one input has no reason to
+                // declare the other's levels.
+                let owner = if unused.starts_with('a') {
+                    "a_used"
+                } else {
+                    "b_used"
+                };
+                if levels.contains(&owner.to_string()) {
+                    assert!(
+                        levels.contains(&unused.to_string()),
+                        "{key:?}-keyed sorted merge: output shard {i} carries {owner} but \
+                         dropped its declared-but-unused level {unused} (levels: {levels:?})"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_spanning_shard,
+            "{key:?}: premise — an output shard must span both inputs, or this \
+             test is not exercising the cross-input concat"
+        );
+        let all = declared_levels(&reader.read_obs().unwrap(), "label");
+        for lvl in ["a_used", "a_unused", "b_used", "b_unused"] {
+            assert!(
+                all.contains(&lvl.to_string()),
+                "{key:?}: assembled read lost {lvl}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zero_row_merge_input_does_not_contribute_its_declared_levels() {
+    // Pins the limit of the declared-level guarantee, rather than leaving a
+    // reader to infer it holds everywhere. `input_obs_chunks` yields nothing
+    // for a 0-row input, so a level only that input declares reaches no output
+    // shard. That is the same rule the Operations doc already states for a
+    // 0-row merge input ("contributes nothing" — it cannot carry layers, obsm
+    // or obsp either), applied to the categorical vocabulary; it is not a
+    // regression from the dictionary change, which only ever promised to keep
+    // the levels of the rows an op actually writes.
+    let dir = tempfile::tempdir().unwrap();
+    let populated = dir.path().join("p.scx");
+    let empty = dir.path().join("e.scx");
+    write_legacy_input_with_obs(
+        &populated,
+        &dict_obs(0, 4, &["alpha", "beta"], 2, false),
+        &var_batch(),
+    );
+    write_legacy_input_with_obs(
+        &empty,
+        &dict_obs(0, 0, &["alpha", "beta", "only_in_empty"], 2, false),
+        &var_batch(),
+    );
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[populated.as_path(), empty.as_path()], &out).unwrap();
+
+    let obs = ScxReader::open(&out).unwrap().read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 4);
+    assert_eq!(
+        declared_levels(&obs, "label"),
+        vec!["alpha", "beta"],
+        "a 0-row input contributes no rows and therefore no vocabulary",
+    );
+}
+
+/// Wall-clock guard for the assembler shape, which is the one the identity
+/// scan punishes: every on-disk obs shard owns its own dictionary values
+/// `Arc`, so every lookup in `share_dictionary_values` misses. A linear
+/// `Vec::position` walk is then O(n_shards^2) per categorical column — on a
+/// few thousand shards that is millions of pointer comparisons spent
+/// discovering there is nothing to share. It is keyed on the pointer instead.
+///
+/// Measured at 9 000 shards: **0.183 s with the linear scan, 0.070 s with the
+/// map** — a constant-factor read cost, not a correctness issue, but 113 ms
+/// per `read_obs` on an atlas-shaped file for nothing.
+///
+/// Release-only and `#[ignore]`d — a measurement, not a gate.
+#[test]
+#[ignore = "timing measurement; run with --release --ignored --nocapture"]
+fn many_shard_read_obs_timing() {
+    let dir = tempfile::tempdir().unwrap();
+    const SHARDS: usize = 9_000;
+    const ROWS_PER_SHARD: usize = 4;
+    const N: usize = SHARDS * ROWS_PER_SHARD;
+
+    let path = dir.path().join("many_shards.scx");
+    let obs = dict_obs(0, N, &["T cell", "B cell", "NK cell"], 2, false);
+    write_sharded_dict_input(&path, &obs, ROWS_PER_SHARD);
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count() as usize, SHARDS);
+    let t = std::time::Instant::now();
+    let assembled = reader.read_obs().unwrap();
+    let elapsed = t.elapsed();
+    println!(
+        "read_obs over {SHARDS} obs shards ({N} rows, 3-level categorical): {:.3} s",
+        elapsed.as_secs_f64()
+    );
+    assert_eq!(assembled.num_rows(), N);
+    assert_eq!(
+        declared_levels(&assembled, "label"),
+        vec!["T cell", "B cell", "NK cell"],
+    );
+}
+
+#[test]
+fn sorted_merge_does_not_widen_keys_on_a_single_run_shard() {
+    // `ObsCursor` widens each chunk's dictionary keys to Int32 at load, so the
+    // per-emit pipeline does not have to redo that per-row work. The
+    // *single-slice* emit path must therefore still narrow on the way out —
+    // otherwise the common shape this k-way merge targets (already-sorted,
+    // non-interleaved inputs, one slice per output shard) writes Int32 keys
+    // where the input had Int8, quadrupling every categorical's code buffer.
+    //
+    // The cross-input tests cannot see this: they deliberately force a shard
+    // to span both inputs, which takes the multi-slice finalizer.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    // Disjoint, already-ordered key ranges: every output shard is one run from
+    // one input.
+    write_legacy_input_with_obs(
+        &p0,
+        &rekeyed_dict_obs(0, 4, &["alpha", "beta"], 2, false, DataType::Int8),
+        &var_batch(),
+    );
+    write_legacy_input_with_obs(
+        &p1,
+        &rekeyed_dict_obs(4, 4, &["alpha", "beta"], 2, false, DataType::Int8),
+        &var_batch(),
+    );
+
+    let out = dir.path().join("sorted.scx");
+    let mut opts = sorted_merge_opts(&["cell_id"], false, false);
+    opts.shard_target_rows = Some(4); // exactly one input's run per shard
+    scx_ops::merge_with_options(&[p0.as_path(), p1.as_path()], &out, &opts).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert!(
+        reader.obs_metadata_shard_count() >= 2,
+        "premise: more than one output shard, each from a single run"
+    );
+    for (i, shard) in reader.obs_shards().enumerate() {
+        let shard = shard.unwrap();
+        let dt = shard.column_by_name("label").unwrap().data_type().clone();
+        let DataType::Dictionary(key, _) = &dt else {
+            panic!("output shard {i} lost the dictionary: {dt:?}");
+        };
+        assert_eq!(
+            **key,
+            DataType::Int8,
+            "output shard {i} widened a 2-level categorical's key to {key:?}; \
+             the minimal fit is Int8"
+        );
+    }
 }

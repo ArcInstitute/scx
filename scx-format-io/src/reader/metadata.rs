@@ -386,15 +386,20 @@ fn finish_deduped_dictionary(
 }
 
 /// Smallest signed Arrow dictionary key (index) type that can address
-/// `n_distinct` values: `Int8` for ≤ `i8::MAX`, `Int16` for ≤ `i16::MAX`,
-/// else `Int32`. Keys are non-negative indices, so the signed maxima are the
-/// addressable counts. Mirrors the compact code widths anndata/pandas use for
+/// `n_distinct` values. Mirrors the compact code widths anndata/pandas use for
 /// categoricals while guaranteeing no overflow.
-fn min_dictionary_key_type(n_distinct: usize) -> arrow::datatypes::DataType {
+///
+/// The capacity of a width is **one more** than its maximum: `n` values are
+/// addressed by keys `0..n-1`, so `Int8` (largest key 127) holds 128 values
+/// and `Int16` holds 32 768. Comparing against `i8::MAX` / `i16::MAX` instead
+/// widened a dictionary at exactly those two counts — never wrong, but 2x the
+/// code buffer for a 128-level categorical, which is an ordinary cell-type
+/// vocabulary size.
+pub(crate) fn min_dictionary_key_type(n_distinct: usize) -> arrow::datatypes::DataType {
     use arrow::datatypes::DataType;
-    if n_distinct <= i8::MAX as usize {
+    if n_distinct <= i8::MAX as usize + 1 {
         DataType::Int8
-    } else if n_distinct <= i16::MAX as usize {
+    } else if n_distinct <= i16::MAX as usize + 1 {
         DataType::Int16
     } else {
         DataType::Int32
@@ -565,13 +570,44 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
             })
             .collect::<Result<_>>()?;
         let values: Vec<&ArrayRef> = dicts.iter().map(|d| d.values()).collect();
-        let Some((shared, maps)) = intern_declared_values(&values)? else {
+        // Dedup by values-`Arc` identity before interning. `merge_sorted`'s
+        // `emit` can hand this one batch per sorted run — up to
+        // `shard_target_rows` of them on a fully interleaved merge — while the
+        // *distinct* vocabularies among them are bounded by the number of
+        // source chunks (in practice, the number of inputs). Interning per
+        // batch would be O(n_batches x vocabulary); this makes it
+        // O(n_distinct x vocabulary).
+        //
+        // Keyed on the pointer, not searched linearly. The assembler's case is
+        // the one that punishes a scan: every on-disk shard owns its own `Arc`,
+        // so every lookup misses and a `Vec::position` walk would be
+        // O(n_shards^2) per categorical column — ~40M comparisons on a
+        // 9,000-shard atlas, on the path that merely wants to discover there is
+        // nothing to share.
+        let mut seen: HashMap<*const u8, usize> = HashMap::with_capacity(values.len());
+        let mut distinct: Vec<&ArrayRef> = Vec::new();
+        let mut batch_to_distinct: Vec<usize> = Vec::with_capacity(values.len());
+        for v in &values {
+            // `Arc<dyn Array>` is a fat pointer; the data address alone is the
+            // identity that matters and is what `Arc::ptr_eq` compares first.
+            let key = Arc::as_ptr(v) as *const u8;
+            match seen.get(&key) {
+                Some(&i) => batch_to_distinct.push(i),
+                None => {
+                    distinct.push(v);
+                    seen.insert(key, distinct.len() - 1);
+                    batch_to_distinct.push(distinct.len() - 1);
+                }
+            }
+        }
+        let Some((shared, distinct_maps)) = intern_declared_values(&distinct)? else {
             continue; // a value type the row encoder cannot key: leave it to arrow
         };
         let rebuilt = dicts
             .iter()
-            .zip(maps)
-            .map(|(d, map)| {
+            .zip(&batch_to_distinct)
+            .map(|(d, &di)| {
+                let map = &distinct_maps[di];
                 // Shard 0's map is the identity by construction, and so is every
                 // shard's when they declare the same vocabulary (the
                 // `from_anndata` case) — skip the O(n_obs) walk and only swap the
@@ -580,7 +616,7 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
                 let keys = if identity {
                     d.keys().clone()
                 } else {
-                    remap_dictionary_keys(d.keys(), &map)?
+                    remap_dictionary_keys(d.keys(), map)?
                 };
                 Ok(
                     Arc::new(DictionaryArray::<Int32Type>::try_new(keys, shared.clone())?)
@@ -695,6 +731,91 @@ pub fn prune_unused_dictionary_values(batch: &RecordBatch) -> Result<RecordBatch
     Ok(RecordBatch::try_new(Arc::new(new_schema), new_columns)?)
 }
 
+/// Prepare metadata shard batches so `arrow::compute::concat_batches` can
+/// accept them without erroring, duplicating a category, or pruning one.
+///
+/// Four steps, and each exists because a specific failure was observed:
+///
+/// 1. [`crate::arrow_compat::upcast_to_large_types`] — concatenating on narrow
+///    `i32` string offsets overflows once the combined payload exceeds
+///    `i32::MAX`.
+/// 2. [`crate::arrow_compat::widen_dictionary_keys`] — per-shard categoricals
+///    are keyed to each shard's *local* vocabulary (`Int8` for <= 127
+///    categories); `concat` offsets the appended keys, so a combined
+///    vocabulary beyond the narrow key's range fails with `Dictionary key
+///    bigger than the key type`.
+/// 3. [`crate::arrow_compat::reconcile_dictionary_representations`] — a batch
+///    set can carry one column as `Dictionary(_, V)` and another as plain `V`
+///    (a file written by an older `append`, or a merge over a mix of inputs),
+///    and `concat_batches` requires one shared schema.
+/// 4. [`share_dictionary_values`] — with distinct values `Arc`s, arrow either
+///    appends the vocabularies verbatim (duplicate categories, which
+///    `pyarrow.Table.to_pandas()` rejects) or, once
+///    `should_merge_dictionary_values` fires, merges and **prunes** them,
+///    dropping declared-but-unused levels in a row-count-dependent way.
+///
+/// Pair with [`concat_prepared_metadata_batches`]. They are two calls rather
+/// than one because [`assemble_sharded_metadata`] has work in between: its
+/// contiguous-cover validation reads the per-shard stamps after this and
+/// before the concat, and `merge_sorted` slices the prepared batches.
+pub(crate) fn prepare_metadata_batches_for_concat(
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    let wide: Vec<RecordBatch> = batches
+        .iter()
+        .map(widen_metadata_batch_for_concat)
+        .collect::<Result<_>>()?;
+    reconcile_and_share_metadata_batches(wide)
+}
+
+/// The **per-batch** half of [`prepare_metadata_batches_for_concat`]: steps 1
+/// and 2, which depend only on the batch in front of them.
+///
+/// Split out for callers that see a batch long before they know which other
+/// batches it will be concatenated with, and would otherwise redo this
+/// per-row work on every grouping. `merge_sorted`'s obs cursor is the one that
+/// needs it: it widens each source chunk once at load, then slices it into
+/// many output shards.
+pub fn widen_metadata_batch_for_concat(batch: &RecordBatch) -> Result<RecordBatch> {
+    let wide = crate::arrow_compat::upcast_to_large_types(batch)?;
+    crate::arrow_compat::widen_dictionary_keys(&wide)
+}
+
+/// The **cross-batch** half of [`prepare_metadata_batches_for_concat`]: steps
+/// 3 and 4, which depend on the whole set and so cannot be hoisted.
+///
+/// Every batch must already have been through
+/// [`widen_metadata_batch_for_concat`]; `share_dictionary_values` only sees
+/// columns already declared `Dictionary(Int32, _)`, and silently leaves a
+/// narrower key alone.
+pub fn reconcile_and_share_metadata_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    let reconciled = crate::arrow_compat::reconcile_dictionary_representations(batches)?;
+    share_dictionary_values(reconciled)
+}
+
+/// Concatenate batches already through [`prepare_metadata_batches_for_concat`],
+/// then collapse each dictionary column to a unified, minimally-keyed
+/// dictionary and narrow the string columns whose combined offsets still fit.
+///
+/// [`unify_dictionary_columns`] is what makes the result safe to hand to
+/// pandas — `concat` does not deduplicate, so N shards each declaring
+/// `["batch1"]` come back with that value N times. It also narrows the `Int32`
+/// key step 2 of the preparation widened.
+///
+/// Errors with `SectionNotFound` on an empty slice: there is no schema to
+/// concatenate against, and a caller that can legitimately have nothing should
+/// say what the 0-row result's schema is (as
+/// [`assemble_filtered_metadata`] does with its template).
+pub fn concat_prepared_metadata_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
+    let first = batches
+        .first()
+        .ok_or_else(|| ScxError::SectionNotFound("metadata concat (no batches)".to_string()))?;
+    let wide_schema = first.schema();
+    let concatenated = arrow::compute::concat_batches(&wide_schema, batches.iter())?;
+    let unified = unify_dictionary_columns(&concatenated)?;
+    crate::arrow_compat::downcast_large_types(&unified)
+}
+
 pub fn assemble_sharded_metadata(
     logical: &str,
     mut raw_batches: Vec<(u32, RecordBatch)>,
@@ -704,43 +825,14 @@ pub fn assemble_sharded_metadata(
     }
     raw_batches.sort_by_key(|(idx, _)| *idx);
 
-    // Force every batch to the wide encoding before concat. The writer's
-    // `write_arrow_ipc` always upcasts to LargeUtf8 / LargeBinary before
-    // serialising, so per-shard reads typically come back wide already;
-    // upcasting is a no-op in that case but covers shards whose individual
-    // payload was narrow on disk. Concatenating on narrow offsets would
-    // otherwise reproduce the original `Offset overflow error` once the
-    // combined string payload exceeds `i32::MAX`.
-    //
-    // Also widen every categorical (dictionary) column's KEY type to Int32
-    // before concat. Per-shard categoricals are written with a key sized to
-    // each shard's *local* vocabulary (e.g. Int8 for ≤127 local categories);
-    // `concat_batches` appends the per-shard dictionaries and offsets their
-    // keys, so once the *combined* vocabulary across shards exceeds the narrow
-    // key's range the key overflows with `Dictionary key bigger than the key
-    // type`. Int32 keys can't overflow at any realistic scale (combined
-    // pre-dedup dictionary length ≤ total rows). `unify_dictionary_columns`
-    // narrows the key back to the minimal fit after deduplication.
-    let batches: Vec<RecordBatch> = raw_batches
-        .iter()
-        .map(|(_, b)| {
-            crate::arrow_compat::upcast_to_large_types(b)
-                .and_then(|b| crate::arrow_compat::widen_dictionary_keys(&b))
-        })
-        .collect::<Result<_>>()?;
-
-    // Reconcile columns that disagree on Dictionary-vs-plain encoding across
-    // shards (an append writes obs categoricals as plain Utf8 while
-    // `from_anndata` writes them as Dictionary, so a sharded axis can carry both
-    // representations). `concat_batches` requires one shared schema, so encode
-    // the plain shards' columns to Dictionary before concat. No-op when every
-    // shard already agrees.
-    let batches = crate::arrow_compat::reconcile_dictionary_representations(batches)?;
-
-    // Give every shard's dictionary column one shared values array, so
-    // `concat` appends keys instead of merging (and pruning) dictionaries — a
-    // declared-but-unused category must survive whatever the row count.
-    let batches = share_dictionary_values(batches)?;
+    // Widen, reconcile and share the dictionaries before the cover check, so
+    // the concat below cannot overflow an offset or a dictionary key, cannot
+    // reject a mixed Dictionary/plain column, and cannot prune a declared
+    // level. See `prepare_metadata_batches_for_concat` for why each step is
+    // there. The cover check runs between the two halves of the pipeline
+    // because it reads the per-shard stamps, which every step above preserves.
+    let batches =
+        prepare_metadata_batches_for_concat(raw_batches.iter().map(|(_, b)| b.clone()).collect())?;
 
     // Verify the shards form a contiguous, ordered cover by walking their
     // stamped metadata. Each shard's `n_rows_total` is the file's logical
@@ -798,18 +890,7 @@ pub fn assemble_sharded_metadata(
         )));
     }
 
-    // Concat on the wide schema (every batch was upcast above), then
-    // opportunistically narrow back to `Utf8`/`Binary` for columns whose
-    // combined offsets still fit in `i32::MAX`.
-    let wide_schema = batches[0].schema();
-    let concatenated = arrow::compute::concat_batches(&wide_schema, batches.iter())?;
-    // Arrow's `concat` appends each shard's dictionary verbatim without
-    // deduplicating, so a categorical column that is `["batch1"]` in every
-    // one of N shards comes back with a dictionary of `["batch1"; N]`. pandas
-    // (`pyarrow.Table.to_pandas()`) rejects non-unique categories, so collapse
-    // every dictionary column to a unified dictionary before narrowing.
-    let unified = unify_dictionary_columns(&concatenated)?;
-    let narrowed = crate::arrow_compat::downcast_large_types(&unified)?;
+    let narrowed = concat_prepared_metadata_batches(&batches)?;
 
     // Strip the per-shard metadata (shard_idx / row_start / n_shard_rows)
     // from the merged batch's schema. Keep n_rows_total and any
@@ -859,28 +940,8 @@ pub fn assemble_filtered_metadata(
         return Ok(RecordBatch::new_empty(template_schema.clone()));
     }
 
-    // Widen exactly as `assemble_sharded_metadata` does so concat can't
-    // overflow narrow string offsets or per-shard dictionary key widths.
-    let wide: Vec<RecordBatch> = batches
-        .iter()
-        .map(|b| {
-            crate::arrow_compat::upcast_to_large_types(b)
-                .and_then(|b| crate::arrow_compat::widen_dictionary_keys(&b))
-        })
-        .collect::<Result<_>>()?;
-
-    // Reconcile Dictionary-vs-plain disagreement across the filtered shards
-    // (see `assemble_sharded_metadata`) so concat can't reject a mixed-encoding
-    // column produced by an append. No-op when shards already agree.
-    let wide = crate::arrow_compat::reconcile_dictionary_representations(wide)?;
-    // One shared values array per dictionary column (see
-    // `assemble_sharded_metadata`), so `concat` cannot prune unused levels.
-    let wide = share_dictionary_values(wide)?;
-
-    let wide_schema = wide[0].schema();
-    let concatenated = arrow::compute::concat_batches(&wide_schema, wide.iter())?;
-    let unified = unify_dictionary_columns(&concatenated)?;
-    let narrowed = crate::arrow_compat::downcast_large_types(&unified)?;
+    let prepared = prepare_metadata_batches_for_concat(batches)?;
+    let narrowed = concat_prepared_metadata_batches(&prepared)?;
 
     // Strip the per-shard metadata keys so the result schema matches a
     // normal (full) read's assembled batch.

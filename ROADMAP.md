@@ -469,7 +469,7 @@ count *matrix*; this is the obs-column half.
   back as the dictionary it arrived as, `scx.categorical.ordered` stamp
   included, so `read_obs()` returns `category` with declared order, unused
   levels and `ordered` intact. Previously every one of them demoted every
-  categorical obs column to plain strings via `unify_dict_columns`. The
+  categorical obs column to plain strings on the way out. The
   sharded-obs assembler also stopped losing declared-but-unused levels on small
   files (arrow's dictionary merge pruned them once the summed per-shard
   vocabularies reached the row count) — for every categorical value type, not
@@ -514,13 +514,35 @@ count *matrix*; this is the obs-column half.
   previews the real outcome. Not done: `varm` payloads on the attach — `varm` has no header
   flag, so a first-ever in-place `varm` has a lifecycle question to settle
   first. See [docs/operations.md § External var import](docs/operations.md#external-var-import).
-- [ ] Dictionary output from `append` / `merge` / `merge_sorted` — they still
-  decode categoricals to plain strings for the rows they add. Only an `append`
-  onto an already-sharded dictionary base leaves a mix the read side reconciles
-  back to `category`; a `merge` output or a legacy-layout `append` is plain
-  throughout, and a filtered `collect()` drawn entirely from appended shards
-  returns plain strings. `scx_format_io`'s `intern_declared_values` (the
-  declared-value union) is the primitive to reuse.
+- [x] Dictionary output from `append` / `merge` / `merge_sorted` — the last
+  three writers that decoded categoricals to plain strings for the rows they
+  add now write them back as the dictionaries they arrived as, declared levels,
+  declared order and the `scx.categorical.ordered` stamp included. So a `merge`
+  output and a legacy-layout `append` read back as `category` rather than
+  `object`, a filtered `collect()` drawn entirely from appended shards carries
+  its surviving categories, and an `append` onto a sharded dictionary base no
+  longer leaves a Dictionary/plain shard mix for the reader to reconcile. The
+  ops stay **representation-preserving** in the other direction too: a plain
+  source column is written back plain, never promoted, so
+  `reconcile_dictionary_representations` remains live for files older scx
+  versions wrote and for a plain-source append onto a dictionary base.
+  `scx_format_io`'s read-side pipeline — `widen_metadata_batch_for_concat`
+  (per batch: upcast → widen keys), `reconcile_and_share_metadata_batches`
+  (cross-batch: reconcile → share values) and
+  `concat_prepared_metadata_batches` (concat → unify → downcast) — is what
+  `merge --sort-by` reuses for the one concat that spans inputs;
+  the other seven sites needed no unification at all, since each batch is one
+  self-contained Arrow IPC section. Two things shipped with it: `merge`'s
+  obs-identity check now compares **logical** types, because a merge output's
+  shards carry the minimal key width and two of them could otherwise differ on
+  `Int8` vs `Int16` and refuse to merge; and `rscx` unpacks a non-string
+  categorical to its plain vector instead of erroring. Known cost: an arrow
+  slice of a dictionary keeps the whole values array, so each output shard
+  carries the full declared vocabulary — the price of not pruning declared
+  levels per shard. Not done: `scx sort --memory-budget`'s spill path
+  re-encodes obs categoricals per spilled shard and rebuilds each shard's
+  vocabulary from its own rows, so it still prunes declared levels and gives
+  each shard a different declared list; the in-memory sort path is correct.
 - [x] `pyscx.export_batches` — one h5ad per batch without materialising the
   pool, guarding **both** identities a tool and the import rely on (`obs_names`
   and the resolved key) for uniqueness *within* each batch.
