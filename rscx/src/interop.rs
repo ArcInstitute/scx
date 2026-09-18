@@ -247,13 +247,22 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType, ordered: bool) -> Res
 /// Dictionary encoding in Arrow maps to R's factor type:
 ///   - dictionary values → factor levels
 ///   - dictionary indices → factor integer codes (1-based in R)
+///
+/// Only `Dictionary<Int8|Int16|Int32, Utf8>` becomes a factor, because R's
+/// factor levels are a character vector. A `pd.Categorical` over integers,
+/// floats or booleans is a dictionary too, and for those the encoding is a
+/// storage detail R has no counterpart for — so the column is **unpacked to
+/// the plain vector it holds** rather than refused. Refusing was the old
+/// behaviour and it became reachable in a new way once `append` / `merge`
+/// started writing the rows they add as dictionaries: a numeric categorical
+/// that used to arrive as a plain numeric vector would otherwise have started
+/// erroring, and the R user would read it as "merge did this".
 fn dictionary_to_factor(
     col: &dyn Array,
     key_type: &DataType,
     value_type: &DataType,
     ordered: bool,
 ) -> Result<Robj> {
-    // We support Dictionary<Int8/16/32, Utf8> which is the common h5ad categorical pattern
     match (key_type, value_type) {
         (DataType::Int8, DataType::Utf8) => {
             typed_dict_to_factor::<arrow::datatypes::Int8Type>(col, ordered)
@@ -264,10 +273,19 @@ fn dictionary_to_factor(
         (DataType::Int32, DataType::Utf8) => {
             typed_dict_to_factor::<arrow::datatypes::Int32Type>(col, ordered)
         }
-        _ => Err(Error::Other(format!(
-            "unsupported Dictionary key/value types: {:?}/{:?}",
-            key_type, value_type
-        ))),
+        // Any other value type: decode to the values array and hand that to
+        // the ordinary converter, so an integer / float / boolean categorical
+        // arrives as the vector it logically is. `cast` on a dictionary only
+        // unpacks the keys, so this is not a reinterpretation of the data.
+        _ => {
+            let decoded = arrow::compute::cast(col, value_type).map_err(|e| {
+                Error::Other(format!(
+                    "could not decode Dictionary({key_type:?}, {value_type:?}) \
+                     for R conversion: {e}"
+                ))
+            })?;
+            arrow_column_to_robj(decoded.as_ref(), value_type, ordered)
+        }
     }
 }
 

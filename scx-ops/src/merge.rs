@@ -11,7 +11,6 @@ use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 
-use crate::append::unify_dict_columns;
 use crate::codec_intent::{framing_for_rewrite, seed_codec};
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
@@ -290,7 +289,7 @@ pub fn merge_with_options(
     // ---------------------------------------------------------------
     // Phase 2: streaming obs across all inputs.
     //
-    // Replace the legacy `read_obs → unify_dict_columns → concat_batches`
+    // Replace the legacy `read_obs → decode-categoricals → concat_batches`
     // chain (which materialised the entire merged obs table and hit
     // Arrow IPC's 2 GB narrow-offset ceiling for atlas-scale workloads)
     // with a shard-by-shard pipeline writing `ObsMetadataShard`
@@ -502,18 +501,24 @@ pub fn merge_with_options(
     let mut cumulative_obs_rows: u64 = 0;
     for reader in &readers {
         for chunk in input_obs_chunks(reader, shard_target_rows)? {
+            // Written verbatim: one `input_obs_chunks` chunk is one source
+            // shard (or one slice of one legacy section), so its dictionary is
+            // already unique and its categoricals go back to disk as the
+            // dictionaries they arrived as, field metadata included. Chunks
+            // from different inputs may disagree on encoding; each is its own
+            // output shard with its own Arrow IPC schema, and the read side's
+            // assembler reconciles the mix.
             let chunk = chunk?;
-            let unified = unify_dict_columns(&chunk)?;
             if let Some(builder) = obs_index_builder.as_mut() {
-                builder.push_shard_split(&unified, cumulative_obs_rows, &predicted_csr_ranges)?;
+                builder.push_shard_split(&chunk, cumulative_obs_rows, &predicted_csr_ranges)?;
             }
-            let n_shard_rows = unified.num_rows() as u64;
+            let n_shard_rows = chunk.num_rows() as u64;
             writer.write_obs_shard(
                 out_shard_idx,
                 cumulative_obs_rows,
                 n_shard_rows,
                 total_n_obs,
-                &unified,
+                &chunk,
             )?;
             out_shard_idx += 1;
             cumulative_obs_rows += n_shard_rows;
@@ -524,14 +529,14 @@ pub fn merge_with_options(
         // without an obs section is unreadable (`read_obs` →
         // `SectionNotFound`), and `carry` cannot catch it because merge's
         // obs family is `Rebuilt`. Write input 0's own 0-row obs as one
-        // legacy section, through the same `unify_dict_columns` every chunk
-        // goes through, so the empty output has exactly the schema a
-        // populated merge of these inputs would have (plain strings for the
-        // categoricals, the `pandas` index envelope intact) — not a
+        // legacy section, written verbatim exactly as every chunk now is, so
+        // the empty output has exactly the schema a populated merge of these
+        // inputs would have (categoricals still dictionary-encoded, the
+        // `pandas` index envelope intact) — not a
         // `RecordBatch::new_empty(schema)`, which is a third shape.
         debug_assert_eq!(total_n_obs, 0);
         let empty_obs = readers[0].read_obs()?;
-        writer.write_obs(&unify_dict_columns(&empty_obs)?)?;
+        writer.write_obs(&empty_obs)?;
     }
 
     writer.write_var(&var)?;
@@ -1162,15 +1167,15 @@ fn merge_multimodal(
     let mut cumulative_obs_rows: u64 = 0;
     for reader in readers {
         for chunk in input_obs_chunks(reader, shard_target_rows)? {
+            // Verbatim, as the single-modality emitter above.
             let chunk = chunk?;
-            let unified = unify_dict_columns(&chunk)?;
-            let n_shard_rows = unified.num_rows() as u64;
+            let n_shard_rows = chunk.num_rows() as u64;
             writer.write_obs_shard(
                 out_shard_idx,
                 cumulative_obs_rows,
                 n_shard_rows,
                 total_n_obs,
-                &unified,
+                &chunk,
             )?;
             out_shard_idx += 1;
             cumulative_obs_rows += n_shard_rows;
@@ -1182,7 +1187,7 @@ fn merge_multimodal(
         // obs section at all.
         debug_assert_eq!(total_n_obs, 0);
         let empty_obs = readers[0].read_obs()?;
-        writer.write_obs(&unify_dict_columns(&empty_obs)?)?;
+        writer.write_obs(&empty_obs)?;
     }
 
     // Phase 3b: stream global obsm shard-by-shard (multimodal). Same
@@ -1708,7 +1713,8 @@ fn validate_var_identity_for_modality(
 /// Validate that every input agrees with the first input on obs
 /// schema (column names + dtypes, normalised through the
 /// logical-lossy schema so `Utf8` and `LargeUtf8` count as the same
-/// column). Each pairwise mismatch produces a
+/// column, and through [`logical_field_type`] so `Dictionary(_, V)`
+/// and plain `V` do too). Each pairwise mismatch produces a
 /// [`OpsError::ObsMismatch`] unless `assume_identical` is true — in
 /// which case the function logs a warning per mismatch and trusts
 /// the caller's assertion that columns line up.
@@ -1727,7 +1733,7 @@ fn validate_obs_identity(
         let other = reader
             .read_obs_schema_logical_lossy()
             .map_err(OpsError::Format)?;
-        if let Some(detail) = schema_field_diff(first_schema, &other) {
+        if let Some(detail) = obs_schema_field_diff(first_schema, &other) {
             if assume_identical {
                 log::warn!(
                     "merge: input {i}'s obs schema differs from input 0 \
@@ -1743,12 +1749,57 @@ fn validate_obs_identity(
     Ok(())
 }
 
-/// Compare two schemas field-by-field (names + dtypes). Returns
-/// `None` when they line up, or a human-readable description of the
-/// first observed difference. Used by both obs identity validation
-/// (where widths are normalised through `read_obs_schema_logical_lossy`)
-/// and dense-mapping schema validation.
-fn schema_field_diff(a: &arrow::datatypes::Schema, b: &arrow::datatypes::Schema) -> Option<String> {
+/// The type a column *logically* holds: a dictionary's value type, or the
+/// type itself. A `pd.Categorical` is stored as `Dictionary(K, V)` with `K`
+/// sized to the vocabulary that happened to be in front of the writer, so two
+/// files holding the same logical column can disagree on the wrapper and on
+/// `K` while agreeing on everything a merge cares about. Merge reads each
+/// input's **shard 0** schema, and an obs shard's key width is the minimal fit
+/// for that shard — which the merge emitter itself now produces, since a
+/// sorted merge writes the union vocabulary. Comparing raw dtypes refused
+/// those merges.
+///
+/// Mirrors `append`'s `effective_type` and `scx_engine`'s `logical_type`. One
+/// layer only: a dictionary of dictionaries is not a thing pandas produces.
+fn logical_field_type(dt: &arrow::datatypes::DataType) -> &arrow::datatypes::DataType {
+    match dt {
+        arrow::datatypes::DataType::Dictionary(_, value_type) => value_type,
+        other => other,
+    }
+}
+
+/// [`schema_field_diff`] for the **obs** axis: identical except that it
+/// compares dtypes through [`logical_field_type`], so a dictionary-encoded
+/// categorical and the plain column holding the same values are the same
+/// column. The reported detail still prints the raw dtypes, so a real
+/// mismatch stays legible.
+///
+/// Deliberately not folded into `schema_field_diff`: that one also validates
+/// dense mappings (`obsm` / `varm`), which are never dictionary-encoded, so a
+/// dictionary there is a genuine anomaly and should still be rejected.
+fn obs_schema_field_diff(
+    a: &arrow::datatypes::Schema,
+    b: &arrow::datatypes::Schema,
+) -> Option<String> {
+    if let Some(detail) = schema_names_diff(a, b) {
+        return Some(detail);
+    }
+    for (af, bf) in a.fields().iter().zip(b.fields().iter()) {
+        if logical_field_type(af.data_type()) != logical_field_type(bf.data_type()) {
+            return Some(format!(
+                "column '{}' dtype differs ({:?} vs {:?})",
+                af.name(),
+                af.data_type(),
+                bf.data_type(),
+            ));
+        }
+    }
+    None
+}
+
+/// The column-count / column-name half of a schema comparison, shared by
+/// [`schema_field_diff`] and [`obs_schema_field_diff`].
+fn schema_names_diff(a: &arrow::datatypes::Schema, b: &arrow::datatypes::Schema) -> Option<String> {
     let a_names: Vec<&str> = a.fields().iter().map(|f| f.name().as_str()).collect();
     let b_names: Vec<&str> = b.fields().iter().map(|f| f.name().as_str()).collect();
     if a_names.len() != b_names.len() {
@@ -1763,6 +1814,17 @@ fn schema_field_diff(a: &arrow::datatypes::Schema, b: &arrow::datatypes::Schema)
             "column names differ ({:?} vs {:?})",
             a_names, b_names,
         ));
+    }
+    None
+}
+
+/// Compare two schemas field-by-field (names + dtypes). Returns
+/// `None` when they line up, or a human-readable description of the
+/// first observed difference. Used by dense-mapping schema validation;
+/// the obs axis takes [`obs_schema_field_diff`] instead.
+fn schema_field_diff(a: &arrow::datatypes::Schema, b: &arrow::datatypes::Schema) -> Option<String> {
+    if let Some(detail) = schema_names_diff(a, b) {
+        return Some(detail);
     }
     for (af, bf) in a.fields().iter().zip(b.fields().iter()) {
         if af.data_type() != bf.data_type() {

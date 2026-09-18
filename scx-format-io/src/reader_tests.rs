@@ -825,11 +825,10 @@ fn test_assemble_dictionary_dedup_many_shards() {
     }
 }
 
-/// Regression: an append writes obs categoricals as plain `Utf8` (its
-/// `unify_dict_columns` decodes them) while `from_anndata` writes the same
-/// column as a `Dictionary`. After an append, a sharded obs axis therefore
-/// carries the column as `Dictionary` in the base shards and plain `Utf8` in
-/// the appended shards. Before the fix, `concat_batches` rejected the mix with
+/// Regression: a sharded obs axis can carry a categorical as `Dictionary` in
+/// some shards and plain `Utf8` in others — a file an older `append` grew (it
+/// decoded categoricals on the way out), or one appended to from a plain-obs
+/// source, which is still how the mix is produced today. Before the fix, `concat_batches` rejected the mix with
 /// *"It is not possible to concatenate arrays of different data types
 /// (Dictionary(Int32, LargeUtf8), LargeUtf8)"* and the file's obs became
 /// unreadable via `to_anndata()`. `reconcile_dictionary_representations` now

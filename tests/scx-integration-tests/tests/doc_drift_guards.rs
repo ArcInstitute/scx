@@ -349,6 +349,59 @@ fn from_anndata_codec_docstring_names_intent_axis() {
     );
 }
 
+/// `append` / `merge` / `merge --sort-by` write obs categoricals back as the
+/// dictionaries they arrived as. Three separate doc paragraphs used to say the
+/// opposite, and that prose has now gone stale twice — once when the in-place
+/// writers stopped decoding, and again when these three did. Pin the retired
+/// phrasings so a doc that reintroduces the claim fails CI.
+///
+/// This is a prose guard, not a behaviour guard: what actually pins the
+/// behaviour is `scx-ops/tests/streaming_merge_append.rs`'s dictionary suite
+/// and the `append_categorical` / `merge_categorical` arms of
+/// `op_output_identity`.
+#[test]
+fn no_doc_claims_append_or_merge_decodes_categoricals() {
+    let root = workspace_root();
+    // Each needle is a phrase that was true before the write doors stopped
+    // decoding and is false now. Kept verbatim so a copy-paste of the old
+    // paragraph is caught, not merely a paraphrase.
+    const RETIRED: &[&str] = &[
+        "still write the rows they add as plain strings",
+        "their dictionary output is a tracked follow-on",
+        "plain-encoded shards comes back as plain strings",
+        "`append` decodes to plain strings",
+    ];
+    let mut docs: Vec<PathBuf> = Vec::new();
+    collect_files(&root.join("docs"), "md", &mut docs);
+    for name in ["README.md", "ROADMAP.md", "AGENTS.md", "CLAUDE.md"] {
+        let p = root.join(name);
+        if p.exists() {
+            docs.push(p);
+        }
+    }
+
+    let mut hits: Vec<String> = Vec::new();
+    for doc in &docs {
+        let Ok(text) = std::fs::read_to_string(doc) else {
+            continue;
+        };
+        for needle in RETIRED {
+            if text.contains(needle) {
+                hits.push(format!(
+                    "{}: {needle:?}",
+                    doc.strip_prefix(&root).unwrap_or(doc).display()
+                ));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "these docs still claim `append` / `merge` decode categoricals to plain \
+         strings, which they stopped doing:\n  {}",
+        hits.join("\n  ")
+    );
+}
+
 /// Extract the quoted members from a workspace `Cargo.toml`'s
 /// `members = [ ... ]` array (single- or multi-line).
 fn parse_members(cargo_toml: &str) -> BTreeSet<String> {

@@ -587,8 +587,9 @@ the mutating ops treat it consistently:
   graphs are all recorded only by shards, so a 0-row input cannot carry them;
   the usual "key missing in input *i*" error (or, for a per-modality key, the
   warn-and-drop) applies to populated inputs only. A merge whose inputs are all empty still writes an
-  `obs` section (input 0's, with the same columns; like every merge output its
-  categoricals come back as plain strings). This holds for the plain, sorted
+  `obs` section (input 0's, with the same columns, and — like every merge
+  output — its categoricals still dictionary-encoded, so an empty output's obs
+  schema matches a populated one's). This holds for the plain, sorted
   (`--sort-by`) and multimodal emitters alike. `varm` / `varp` still come from
   input 0, whatever its row count. A 0-**var** input is an `IncompatibleVars`
   error as before.
@@ -795,13 +796,15 @@ surviving rows use, now deterministically on both obs layouts, while an
 unfiltered `collect()` keeps the declared list like `read_obs()`. A file rewritten in place before that carries the column as a
 dictionary in some obs shards and plain strings in others; that mix still reads
 (the assembler reconciles it) and still takes an attach, which rewrites each
-shard's rows without re-encoding the columns it does not touch. `append` /
-`merge` still write the rows they add as plain strings — their dictionary
-output is a tracked follow-on. Until it lands, only an `append` onto an
-already-sharded dictionary base reads back as `category` (the assembler
-reconciles the mix); a `merge` output or an `append` onto a legacy
-single-section obs is plain strings throughout, and a filtered `collect()`
-whose surviving rows all fall in appended shards returns plain strings too.
+shard's rows without re-encoding the columns it does not touch. Since pyscx
+0.20 `append`, `merge` and `merge --sort-by` write the rows they add as
+dictionaries too, so a merge output and an append onto a legacy single-section
+obs both read back as `category`, and a filtered `collect()` whose surviving
+rows all fall in appended shards carries its surviving categories. They stay
+representation-*preserving*, not representation-*imposing*: a plain source
+column is written back plain rather than promoted to a categorical, so
+appending a plain-obs file onto a dictionary-encoded base still produces the
+mix, and the assembler still reconciles it.
 
 The import writes through `prepare_in_place` / `commit_in_place`: new sections
 are appended at EOF and the catalog is repointed, exactly as `append`,

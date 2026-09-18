@@ -2157,7 +2157,7 @@ fn an_unreadable_uns_section_fails_the_layer_attach_when_there_is_a_payload() {
 // ---------------------------------------------------------------------------
 
 /// The layer op rewrites obs through the same shard writer as the obs op, and
-/// used to run it through the same `unify_dict_columns` cast — so a
+/// used to run it through the same dictionary-decoding cast — so a
 /// `cellbender_import` also turned every obs categorical into plain strings.
 /// Same contract as `external_obs_tests`: dictionary dtype, declared vocabulary
 /// (unused level included), `ordered` stamp, values unchanged, both paths.

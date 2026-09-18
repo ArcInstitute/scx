@@ -99,8 +99,9 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use common::{
-    appendable_rows, fixture_all_families, fixture_all_families_with_categorical_obs,
-    fixture_all_families_without_raw, fixture_with_csr_obsp,
+    appendable_rows, appendable_rows_categorical, fixture_all_families,
+    fixture_all_families_with_categorical_obs, fixture_all_families_without_raw,
+    fixture_all_families_without_raw_with_categorical_obs, fixture_with_csr_obsp,
 };
 use scx_codec::ValueEncoding;
 use scx_testkit::ab::{assert_manifests_eq, resolve_against_env, OpDigestManifest};
@@ -112,14 +113,18 @@ use scx_testkit::fixtures::{mixed_codec_file, mixed_codec_file_with, FixtureOpts
 /// the seven ops PR-01 names, with `compact` and `build_csc` doubled over an
 /// index-carrying input, plus `attach_obs` (the in-place obs attach, added with
 /// the categorical-fidelity change), `attach_var` (its var-axis twin, added
-/// with the var attach) so both in-place attaches are pinned from here on, and
-/// `optimize_framed` and `optimize_csr_obsp` — thirteen in all.
+/// with the var attach) so both in-place attaches are pinned from here on,
+/// `append_categorical` and `merge_categorical` (the two rewrite ops that write
+/// obs the caller can hand them a categorical in, added when they stopped
+/// decoding those to plain strings), and `optimize_framed` and
+/// `optimize_csr_obsp` — fifteen in all.
 /// `optimize_framed` is the **only** arm whose output goes through the
 /// row-group-framed encoder, and `optimize_csr_obsp` the **only** one whose
 /// output carries an `ObspCsrShard`; see their comments in `build_manifest`
 /// before changing either fixture.
 const EXPECTED_OPS: &[&str] = &[
     "append",
+    "append_categorical",
     "attach_obs",
     "attach_var",
     "build_csc",
@@ -128,6 +133,7 @@ const EXPECTED_OPS: &[&str] = &[
     "compact_indexed",
     "delete",
     "merge",
+    "merge_categorical",
     "optimize",
     "optimize_csr_obsp",
     "optimize_framed",
@@ -185,6 +191,20 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     let out = dir.join("merge.scx");
     scx_ops::merge(&[&src, &y], &out).unwrap();
     m.record("merge", &out, Strictness::Content).unwrap();
+
+    // The same merge over a fixture whose `cell_type` is a categorical. The
+    // arm above cannot see this change at all: `fixture_all_families`' obs is
+    // plain `Utf8`, so merge's obs path took its no-dictionary route either
+    // way. What this digest pins is that a merged output's obs shards carry
+    // the dictionary, its declared levels (`"NK cell"` is declared and unused)
+    // and the `scx.categorical.ordered` stamp — the bytes merge used to get
+    // wrong by casting every dictionary column to plain strings.
+    let cat_x = fixture_all_families_with_categorical_obs(dir, "merge_cat_x.scx");
+    let cat_y = fixture_all_families_with_categorical_obs(dir, "merge_cat_y.scx");
+    let out = dir.join("merge_categorical.scx");
+    scx_ops::merge(&[&cat_x, &cat_y], &out).unwrap();
+    m.record("merge_categorical", &out, Strictness::Content)
+        .unwrap();
 
     // --- build-csc, over the three-codec fixture -------------------------
     //
@@ -264,6 +284,30 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     )
     .unwrap();
     m.record("append", &target, Strictness::Content).unwrap();
+
+    // The append twin of `merge_categorical`, and for the same reason: the arm
+    // above runs over a plain-`Utf8` obs and so is blind to whether append
+    // still decodes categoricals. Both sides of the append are dictionaries
+    // here — the target's existing obs and the rows being added — which is what
+    // makes the digest cover the *write* rather than the reader's
+    // dictionary/plain reconciliation.
+    let target = fixture_all_families_without_raw_with_categorical_obs(dir, "append_cat.scx");
+    let (new_obs, indptr, indices, values) = appendable_rows_categorical(5);
+    scx_ops::append(
+        &target,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &scx_ops::AppendOptions {
+            shard_target_rows: NonZeroU32::new(2).unwrap(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    m.record("append_categorical", &target, Strictness::Content)
+        .unwrap();
 
     let target = dir.join("delete.scx");
     std::fs::copy(&src, &target).unwrap();

@@ -139,6 +139,75 @@ pub fn fixture_all_families_with_categorical_obs(dir: &Path, name: &str) -> Path
     build_all_families_with_obs(dir, name, FixtureShape::default(), categorical_obs_batch())
 }
 
+/// The categorical-obs fixture with **no `adata.raw`**.
+///
+/// For the `append_categorical` output-identity arm: `append` refuses a file
+/// carrying `raw` (`OpsError::RawUnsupported`), and the categorical variant is
+/// what makes the arm able to see whether the rows an append adds keep their
+/// dictionary encoding.
+pub fn fixture_all_families_without_raw_with_categorical_obs(dir: &Path, name: &str) -> PathBuf {
+    build_all_families_with_obs(
+        dir,
+        name,
+        FixtureShape {
+            without_raw: true,
+            ..Default::default()
+        },
+        categorical_obs_batch(),
+    )
+}
+
+/// [`appendable_rows`] with `cell_type` as the same `Dictionary(Int8, Utf8)`
+/// the categorical fixture carries — declared levels, order and the
+/// `scx.categorical.ordered` stamp included, `"NK cell"` still declared and
+/// still unused.
+///
+/// A plain-`Utf8` appended batch is accepted too (`validate_obs_schema`
+/// compares through `effective_type`), but it would leave the appended shards
+/// plain and the digest would pin the reconciliation rather than the write.
+pub fn appendable_rows_categorical(n_new: usize) -> (RecordBatch, Vec<u64>, Vec<u32>, Vec<u8>) {
+    use arrow::array::{Array, DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+
+    let (plain, indptr, indices, values) = appendable_rows(n_new);
+    let dict = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from((0..n_new).map(|i| (i % 2) as i8).collect::<Vec<_>>()),
+        Arc::new(StringArray::from(vec!["T cell", "B cell", "NK cell"])),
+    )
+    .unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let fields: Vec<Field> = plain
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == "cell_type" {
+                Field::new("cell_type", dict.data_type().clone(), true).with_metadata(md.clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    let columns = plain
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if plain.schema().field(i).name() == "cell_type" {
+                Arc::new(dict.clone()) as arrow::array::ArrayRef
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    let obs = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    (obs, indptr, indices, values)
+}
+
 /// The same file with an explicit zero stored in X, so that canonicalisation
 /// has something to do and the detection bitmap written alongside is left
 /// describing a matrix that no longer exists.

@@ -14,6 +14,22 @@ use arrow::datatypes::DataType;
 use super::ShardRange;
 
 /// Estimate the number of unique values in an Arrow array.
+///
+/// ⚠️ **Encoding-dependent, deliberately.** For a dictionary this is the
+/// **declared** level count; for a plain column it is the count of values
+/// actually present. So the same logical column can fall on either side of the
+/// `auto_threshold` / `high_cardinality_threshold` cut depending on how it was
+/// stored — a categorical with declared-but-unused levels looks bigger than
+/// the plain column holding the same values. The consequence is only a loss of
+/// pruning power (a column drops out of the auto-detected index), never a
+/// wrong answer, and the dictionary branch is O(1) where the string branch
+/// hashes every row.
+///
+/// Only the **batch-mode** builders reach this; the streaming builder
+/// [`super::stream::ObsPredicateIndexBuilder`] accumulates observed values and
+/// resolves cardinality at `finish`, so `merge` and `append` — which write
+/// dictionaries — are unaffected. `scx upgrade --index-obs` over such a file is
+/// the path that sees the declared count.
 pub(crate) fn estimate_unique_values(col: &ArrayRef) -> usize {
     let dt = col.data_type();
     match dt {

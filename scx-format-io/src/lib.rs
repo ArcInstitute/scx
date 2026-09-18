@@ -85,7 +85,8 @@ pub use profile::{
 };
 pub use reader::{
     assemble_filtered_metadata, assemble_sharded_metadata, compact_key_shard,
-    decode_arrow_ipc_schema, filter_batch_by_keep_mask, prune_unused_dictionary_values,
+    concat_metadata_batches, concat_prepared_metadata_batches, decode_arrow_ipc_schema,
+    filter_batch_by_keep_mask, prepare_metadata_batches_for_concat, prune_unused_dictionary_values,
     scatter_batch_to_physical, ScxReader,
 };
 pub use row_cursor::VisibleRowCursor;

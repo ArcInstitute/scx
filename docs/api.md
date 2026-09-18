@@ -113,7 +113,7 @@ GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
 - `read_obs_shard(idx)` / `read_var_shard(idx)` — Single metadata shard as Arrow RecordBatch
 - `obs_shards()` / `var_shards()` — Iterator over all metadata shards
 - `read_obs_assembled()` / `read_var_assembled()` — Reassemble all metadata shards into one Arrow RecordBatch (transparent on legacy single-section files)
-- `obs_categorical(col)` / `obs_categorical_many(&[cols])` — `(codes: Vec<i32>, categories: Vec<String>)` for string/categorical obs columns, folded **one shard at a time** into a running global dictionary (never concatenates the column, unlike `read_obs_keys`). Null → `-1` (pandas convention), so a literal `"NaN"` string stays a real category; category order is first-seen. Accepts both `Dictionary(_, Utf8|LargeUtf8)` (as `from_anndata` writes) and plain `Utf8`/`LargeUtf8` (as `append` writes), including a file mixing both across shards. `_many` costs **one** projected read per shard for N columns. See [Obs categorical codes](performance.md#obs-categorical-codes-without-pandas-data-load-phase-1-1c).
+- `obs_categorical(col)` / `obs_categorical_many(&[cols])` — `(codes: Vec<i32>, categories: Vec<String>)` for string/categorical obs columns, folded **one shard at a time** into a running global dictionary (never concatenates the column, unlike `read_obs_keys`). Null → `-1` (pandas convention), so a literal `"NaN"` string stays a real category; category order is first-seen. Accepts both `Dictionary(_, Utf8|LargeUtf8)` (as every SCX write door now writes a categorical) and plain `Utf8`/`LargeUtf8` (as an older `append` / `merge` wrote one, and as a plain source column still lands), including a file mixing both across shards. `_many` costs **one** projected read per shard for N columns. See [Obs categorical codes](performance.md#obs-categorical-codes-without-pandas-data-load-phase-1-1c).
 - `debug_counts()` — `ReaderDebugCounts` with `AtomicU64` I/O counters (`cfg(debug_assertions)` only). `read_obs_shard_projected` counts column-scoped shard reads separately from `read_obs_shard`, so a test can assert the cheap path was *taken* rather than only that the materialising ones were avoided.
 - `read_obs_predicate_index_bytes()` / `read_var_predicate_index_bytes()` — Predicate index raw bytes
 - `read_deletion_vectors()` — Roaring Bitmap deletion vectors
@@ -1404,12 +1404,11 @@ QueryPipeline::open("file.scx")?
   behavior (`remove_unused_categories` on a subset), on both obs layouts and
   whatever the result size, an empty result included. An unfiltered
   `collect()`, like `read_obs()` on the file itself, keeps the full declared
-  list. One pre-existing gap: on a file grown by `append` (which still writes
-  the rows it adds as plain strings), a filtered `collect()` whose surviving
-  rows all fall in appended shards sees no dictionary shard to reconcile
-  against and returns that column as plain strings — the values are right, the
-  `category` dtype, declared order and `ordered` bit are not; the fix is
-  dictionary output from `append` (tracked in the ROADMAP). Downstream code that
+  list. This used to have a gap: on a file grown by `append`, which decoded the
+  rows it added to plain strings, a filtered `collect()` whose surviving rows
+  all fell in appended shards saw no dictionary shard to reconcile against and
+  returned that column as plain strings. `append` / `merge` now write
+  dictionaries, so it holds on their output too. Downstream code that
   compares `.cat.categories` against the source file (e.g. plotting that
   assumes a fixed palette) should re-derive categories from the result.
 - **Null semantics — three-valued (Kleene) logic, like a SQL `WHERE`
@@ -1845,12 +1844,14 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   unused levels and its `ordered` bit, exactly as `from_anndata` writes them,
   for string, boolean and numeric levels alike.
   (Before pyscx 0.17 every one of these writers demoted every categorical obs
-  column to plain strings.) `append` / `merge` still write the rows they add as
-  plain strings. Only an `append` onto an already-sharded dictionary base leaves
-  a dictionary/plain mix that a full `read_obs()` reconciles back to `category`
-  (with the union vocabulary); a `merge` output, or an `append` onto a legacy
-  single-section obs, is plain strings throughout and reads back as `object`
-  until the tracked follow-on lands.
+  column to plain strings; `append` / `merge` / `merge --sort-by` did too until
+  0.20.) Every write door now agrees, so a `merge` output and an `append` onto
+  a legacy single-section obs both read back as `category` with the union
+  vocabulary. A dictionary/plain shard mix is still readable — the assembler
+  reconciles it — and still reachable, either on a file an older scx version
+  grew or by appending a plain-obs source onto a dictionary-encoded base, since
+  these ops preserve whichever representation they are handed rather than
+  promoting a plain column.
 - `pyscx.diagnose_obs_key(path, key=None)` — Read-only. Report which obs columns
   could serve as a join key: `n_obs`, `resolved_key`, `resolved_cardinality`,
   `unique_columns`, `unusable_unique_columns`, `unique_pairs` (two-column
@@ -2010,7 +2011,8 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   path (kept for parity / debugging).
   - **Categorical obs/var on append-grown files (handled):** a file whose sharded
     obs/var mixes `Dictionary` (original) and plain (appended) representations for a
-    categorical column — the layout `append`/`append_from_anndata` produces — exports
+    categorical column — the layout an `append` produced before pyscx 0.20, and
+    still produces from a plain-obs source — exports
     a single h5ad categorical with the full unioned, de-duplicated vocabulary,
     matching `pyscx.open(f).to_anndata()`. This holds for string **and** numeric
     (`Int*`/`Float*`) categoricals, and for both `stream=True` and `stream=False`
