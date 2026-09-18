@@ -14,8 +14,8 @@
 # belongs to the scx-convert phase series, not to this one.
 #
 # ⚠️ What is already measured and is NOT what this job is for: the allocation
-# count, by `scx-loader/tests/gather_allocation.rs` — 2,698 -> 101 for a
-# 1,024-row plan, peak live bytes flat. This job answers the question that test
+# count, by `scx-loader/tests/gather_allocation.rs` — 2,698 -> 81 for a
+# 1,024-row plan, with peak live bytes DOWN as well. This job answers the question that test
 # cannot: whether that shows up as throughput on a real fixture, and at what
 # cost in peak RSS, on the scenarios that carry floors.
 #
@@ -266,9 +266,9 @@ pathlib.Path("$OUT/provenance.json").write_text(json.dumps({
                          "single-shard sets produce 4 block-index request groups "
                          "under the per-set walk and 1 under the batch executor"),
     "already_measured_elsewhere": ("the allocation count, by "
-                                   "scx-loader/tests/gather_allocation.rs: 2,698 -> 101 "
-                                   "for a 1,024-row plan, 2.63 -> 0.10 per row, peak "
-                                   "live bytes flat at 421,192 -> 412,480 B"),
+                                   "scx-loader/tests/gather_allocation.rs: 2,698 -> 81 "
+                                   "for a 1,024-row plan, 2.63 -> 0.08 per row, peak "
+                                   "live 421,192 -> 371,304 B"),
     "what_this_is_not": ("not a consumer-side measurement: R2's data-wait fraction "
                          "has never been measured, so what this buys a STATE3-class "
                          "trainer is not answered here"),

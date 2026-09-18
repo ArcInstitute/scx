@@ -3639,7 +3639,54 @@ round, page cache dropped before every run. Ratios are the median of per-round
 ratios, oriented so >1 means the shipped build helped; `p` is an exact two-sided
 sign test with ties dropped.
 
-<!-- PHASE6-TABLE -->
+SLURM **`2969830`**, host `GPU104C`, partition `cpu_batch_high_mem`,
+`phase6-cellset-executor` `c7ca7a26`, `cellset_gather` on
+tabula_sapiens_100k / `scx_auto`, `RAYON_NUM_THREADS=16`. Raw rows under
+`results/raw/phase6_executor/executor_ab_tabula.json`.
+
+| metric | `set` (med) | `plan` (med) | ratio | wins | p |
+|---|---|---|---|---|---|
+| `cellsets_per_sec__gather_random` | 830.2 | 765.8 | 0.973x | 3/12 | 0.146 |
+| `cellsets_per_sec__gather_grouped` | 811 | 812 | 1.01x | 7/12 | 0.774 |
+| `cellsets_per_sec__gather_random_s512` | 91.55 | 90.6 | 1.03x | 7/12 | 0.774 |
+| `cellsets_per_sec__gather_grouped_s512` | 85.35 | 98.65 | **1.15x** | 12/12 | 0.000 |
+| `cellsets_per_sec__gather_shared_control_per_set` | 343.3 | 373.8 | 1.1x | 8/12 | 0.388 |
+| `cellsets_per_sec__gather_hot_control_cold_tail` | 33.8 | 262.9 | **7.76x** | 12/12 | 0.000 |
+| `cellsets_per_sec__downsample_rust` | 107.8 | 423.1 | **3.94x** | 12/12 | 0.000 |
+| `cellsets_per_sec__collate_rust` | 780.4 | 773 | 0.992x | 3/12 | 0.146 |
+| `peak_rss_mb__gather_random` | 2310 | 2320 | 0.995x | 1/12 | 0.006 |
+| `peak_rss_mb__gather_random_s512` | 2340 | 2357 | 0.994x | 2/12 | 0.039 |
+| `peak_rss_mb__gather_shared_control_per_set` | 2570 | 2498 | 1.03x | 12/12 | 0.000 |
+| `peak_rss_mb__gather_hot_control_cold_tail` | 1191 | 1109 | **1.07x** | 12/12 | 0.000 |
+| `peak_rss_mb__tokenize_crop` | 1016 | 915.1 | **1.11x** | 12/12 | 0.000 |
+
+**The two big wins are not the same win.** `gather_hot_control_cold_tail` is
+7.76x because it is the one arm that asks for the block-index route
+(`scatter_block_index=True`) at a budget its plans exceed: one read per plan
+instead of one per set gives the chunked parallel group decode the whole plan's
+run list to overlap, where before it saw one set's worth at a time. Its
+time-to-first-set falls 5.77x with it. `downsample_rust` is 3.94x for an
+unrelated reason: the row transform used to run **serially**, inside the read's
+scatter callback, and now runs on the loader's rayon pool.
+
+**`gather_grouped_s512` is the arm where the executor's own shape shows.** At
+S=512 a covariate group is usually smaller than the set, so
+`rng.choice(..., replace=True)` pads it and the plan repeats rows heavily; one
+wide read plus an exact allocation is 1.15x at 12/12 there against 1.01x on the
+S=64 grouped arm.
+
+**Four of the twelve live `cellsets_per_sec` floors are on this dataset and
+none moves down.** The one negative row that clears the sign test,
+`cellsets_per_sec__gather_random` at 0.973x, does not (3/12, p = 0.146).
+
+**Peak RSS falls almost everywhere**, most on the arms that gather and then run
+a kernel over the batch (`tokenize_*` and `collate_rust`, 1,016 -> 915 MB,
+12/12) — those hold the batch while they work, and the batch is now exactly
+sized rather than an estimate biased up an eighth. ⚠️ Two rows go the other
+way and clear the sign test: `peak_rss_mb__gather_random` 0.995x (1/12,
+p = 0.006) and `__gather_random_s512` 0.994x (2/12, p = 0.039). That is
+**10-17 MB on a 2.3 GB peak** — reported because it is reliable, not because it
+is large, and not suppressed.
 
 #### The allocations, which the A/B cannot see
 
