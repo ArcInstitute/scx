@@ -3292,3 +3292,136 @@ fn obs_spill_rejects_a_shard_with_an_extra_column() {
         "expected the column-count rejection, got: {msg}"
     );
 }
+
+/// A categorical whose **values are a nested type** (`Dictionary(_, List<Utf8>)`).
+///
+/// Raised on PR #547 by **codex - gpt-5.6-sol** as a case the seeded fold would
+/// lose, on the premise that `intern_declared_values` declines nested value
+/// types and so leaves the empty seed as the accumulator. It does not:
+/// `RowConverter::supports_fields` is `true` for `List`, `LargeList`,
+/// `FixedSizeList` and `Struct`, so the union is interned exactly as for a
+/// string. Of the nested types only `Map` is declined — and there neither
+/// writer works, because the decode→re-encode fallback both would fall back to
+/// raises `Unsupported output type for dictionary packing: Map(...)`. Pinned
+/// here so the supported half stays covered.
+#[test]
+fn obs_spill_handles_a_nested_dictionary_value_type() {
+    use arrow::array::{Int32Array, ListArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::Int32Type;
+
+    let dir = tempfile::tempdir().unwrap();
+    let list_dict = |keys: Vec<i32>| -> arrow::array::ArrayRef {
+        let inner = StringArray::from(vec!["a", "b", "c", "d"]);
+        let values = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0, 2, 3, 4].into()),
+            Arc::new(inner) as arrow::array::ArrayRef,
+            None,
+        );
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(keys),
+                Arc::new(values) as arrow::array::ArrayRef,
+            )
+            .unwrap(),
+        )
+    };
+    let inp = write_obs_column_fixture(
+        &dir,
+        "nested_dict.scx",
+        "tags",
+        vec![list_dict(vec![0, 1, 0]), list_dict(vec![1, 1, 0])],
+        HashMap::new(),
+    );
+    let (mem, spilled) = sort_both_obs_paths(&dir, &inp, &["cell_id"]);
+
+    let rm = ScxReader::open(&mem).unwrap();
+    let rs = ScxReader::open(&spilled).unwrap();
+    assert!(matches!(
+        rs.read_obs()
+            .unwrap()
+            .column_by_name("tags")
+            .unwrap()
+            .data_type(),
+        DataType::Dictionary(_, _)
+    ));
+    for i in 0..rs.obs_metadata_shard_count() as u32 {
+        assert_eq!(rm.read_obs_shard(i).unwrap(), rs.read_obs_shard(i).unwrap());
+    }
+}
+
+/// The count-mismatch rejection's *missing* arm, the mirror of
+/// [`obs_spill_rejects_a_shard_with_an_extra_column`]. Noted as untested by
+/// **Cursor Agent - Grok 4.6 High** on PR #547.
+#[test]
+fn obs_spill_rejects_a_shard_with_a_missing_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing_col.scx");
+    let (n_obs, n_vars) = (6usize, 4usize);
+    let header =
+        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, (n_obs * 2) as u64, 3, 0, 0);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for r in 0..n_obs {
+        indices.push(((r * 2) % n_vars) as u32);
+        indices.push(((r * 2 + 1) % n_vars) as u32);
+        values.push(((r + 1) % 256) as u8);
+        values.push(((r + 2) % 256) as u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    w.write_csr_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    w.write_var(
+        &RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "gene_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_vars).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Shard 0 has two columns, shard 1 only `cell_id`.
+    for si in 0..2usize {
+        let rs = si * 3;
+        let ids: Vec<String> = (rs..rs + 3)
+            .map(|i| format!("cell_{:03}", n_obs - 1 - i))
+            .collect();
+        let mut fields = vec![Field::new("cell_id", DataType::Utf8, false)];
+        let mut cols: Vec<arrow::array::ArrayRef> = vec![Arc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))];
+        if si == 0 {
+            fields.push(Field::new("extra", DataType::Utf8, true));
+            cols.push(Arc::new(StringArray::from(vec!["x", "y", "z"])));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+        w.write_obs_shard(si as u32, rs as u64, 3, n_obs as u64, &batch)
+            .unwrap();
+    }
+    w.finish().unwrap();
+
+    let bpr = obs_bytes_per_row(&path);
+    let mut o = opts(&["cell_id"]);
+    o.memory_budget = Some(bpr * 3);
+    let out = dir.path().join("out.scx");
+    let err = sort_with_strategy(&path, &out, &o, Some(SortStrategy::InMemory)).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing: [\"extra\"]"),
+        "expected the missing-column arm of the rejection, got: {msg}"
+    );
+}

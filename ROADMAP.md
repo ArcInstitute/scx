@@ -549,8 +549,10 @@ count *matrix*; this is the obs-column half.
   became a per-shard first-occurrence order while the `scx.categorical.ordered`
   stamp still claimed the column was ordered, every output shard declared a
   different list, and a **boolean** categorical failed the sort outright
-  (arrow has no boolean dictionary packing). Nothing is decoded now: a pass over
-  the obs shards folds the union of their declared values through the same
+  (arrow has no boolean dictionary packing). No categorical is decoded to its
+  value array any more: a footer-only scan finds which columns any shard
+  declares categorical, then one pass over the obs shards folds the union of
+  their declared values through the same
   `scx_format_io` pipeline `read_obs()` uses, each shard's keys are remapped
   onto it, and the spill carries the `Int32` **codes** — 4 B/row instead of the
   value width — which pass 2 rebuilds against the union's values array, `Arc`-

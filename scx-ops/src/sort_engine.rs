@@ -2270,7 +2270,8 @@ fn write_obs_sharded(writer: &mut ScxWriter, obs: &RecordBatch, shard_target: u3
 // (`Unsupported output type for dictionary packing: Boolean`), so the sort
 // failed outright.
 //
-// Nothing is decoded now. Pass 0a reads every shard's Arrow IPC **footer** to
+// No categorical is decoded to its value array any more. Pass 0a reads every
+// shard's Arrow IPC **footer** to
 // learn which columns are categorical anywhere in the file
 // ([`categorical_obs_fields_across_shards`]; reading only shard 0 disagreed
 // with the read side, which promotes a field any shard declares a dictionary).
@@ -2463,8 +2464,9 @@ fn empty_dictionary_seed(
 /// `reconcile_dictionary_representations` promotes it by reading its *rows* and
 /// a 0-row slice would contribute nothing.
 ///
-/// Together with pass 0a this costs two extra passes over the obs sections (the
-/// scatter reads them a third time); obs is the small axis next to X, and the
+/// This is the **one** extra decode of the obs sections a categorical file
+/// pays; pass 0a ahead of it is an Arrow IPC footer walk, and a plain-obs file
+/// skips this fold entirely. Obs is the small axis next to X, and the
 /// alternative — holding every shard's vocabulary at once — is the bound this
 /// path exists to avoid.
 fn build_obs_vocabulary_template(
@@ -2543,7 +2545,7 @@ struct ObsSpillLayout {
 /// Build the spill layout: categorical columns spill as their `Int32` codes,
 /// every other string type is widened to 64-bit offsets.
 ///
-/// `categorical` is [`categorical_obs_columns_across_shards`] — the one source
+/// `declared` is [`categorical_obs_fields_across_shards`]' map — the one source
 /// of truth for which columns this path treats as dictionaries, shared with
 /// [`build_obs_vocabulary_template`] so the fold and the layout cannot
 /// disagree. Field *order* and every non-categorical field still come from

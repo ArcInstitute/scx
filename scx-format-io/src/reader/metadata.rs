@@ -1894,22 +1894,9 @@ impl ScxReader {
     /// Schemas come back **physical**, so a column the writer upcast is
     /// reported `LargeUtf8` where [`Self::obs_shards`] would narrow it.
     pub fn obs_shard_schemas(&self) -> impl Iterator<Item = Result<arrow::datatypes::Schema>> + '_ {
-        let mut entries: Vec<(u32, &FullCatalogEntry)> = self
-            .full_catalog
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::ObsMetadataShard)
-            .filter_map(|e| {
-                e.name
-                    .strip_prefix("obs_metadata/shard_")
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .map(|idx| (idx, e))
-            })
-            .collect();
-        entries.sort_by_key(|(idx, _)| *idx);
-        entries
+        self.metadata_shard_entries(SectionType::ObsMetadataShard, "obs_metadata/shard_")
             .into_iter()
-            .map(move |(_, e)| self.read_arrow_ipc_schema_physical(e))
+            .map(move |e| self.read_arrow_ipc_schema_physical(e))
     }
 
     /// Iterate var metadata shards in `shard_idx` order. Mirror of
@@ -1927,6 +1914,20 @@ impl ScxReader {
         shard_type: SectionType,
         name_prefix: &'static str,
     ) -> impl Iterator<Item = Result<RecordBatch>> + '_ {
+        self.metadata_shard_entries(shard_type, name_prefix)
+            .into_iter()
+            .map(move |e| self.read_arrow_ipc(e))
+    }
+
+    /// The catalog entries for one metadata-shard family, in `shard_idx`
+    /// order. The `section_type` + prefix + parse + sort every shard-family
+    /// iterator starts from, in one place so a second consumer cannot drift
+    /// from the first.
+    fn metadata_shard_entries(
+        &self,
+        shard_type: SectionType,
+        name_prefix: &'static str,
+    ) -> Vec<&FullCatalogEntry> {
         let mut entries: Vec<(u32, &FullCatalogEntry)> = self
             .full_catalog
             .entries
@@ -1939,9 +1940,7 @@ impl ScxReader {
             })
             .collect();
         entries.sort_by_key(|(idx, _)| *idx);
-        entries
-            .into_iter()
-            .map(move |(_, e)| self.read_arrow_ipc(e))
+        entries.into_iter().map(|(_, e)| e).collect()
     }
 
     /// Read a named obsm embedding as an Arrow RecordBatch.
