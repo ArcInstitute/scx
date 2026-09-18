@@ -248,14 +248,19 @@ fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType, ordered: bool) -> Res
 ///   - dictionary values → factor levels
 ///   - dictionary indices → factor integer codes (1-based in R)
 ///
-/// Only a string-valued dictionary becomes a factor, because R's factor levels
-/// are a character vector — `Utf8` and `LargeUtf8` alike, since SCX leaves a
-/// dictionary's values wide when their offsets exceed `i32::MAX` and that is
-/// still a string categorical. A `pd.Categorical` over integers,
-/// floats or booleans is a dictionary too, and for those the encoding is a
-/// storage detail R has no counterpart for — so the column is **unpacked to
-/// the plain vector it holds** rather than refused. Refusing was the old
-/// behaviour and it became reachable in a new way once `append` / `merge`
+/// **A string-valued dictionary is always a factor**, at either offset width
+/// and at every key width Arrow allows. `Utf8` and `LargeUtf8` are both string
+/// category types — SCX leaves a dictionary's values wide when their offsets
+/// exceed `i32::MAX` — and the key width is a storage detail the R side has no
+/// counterpart for. An unhandled *string* key width **errors** rather than
+/// falling through to the unpack arm below: silently returning a character
+/// vector would drop the factor class, the declared levels and the `ordered`
+/// bit, which is a wrong semantic type rather than a missing feature.
+///
+/// A `pd.Categorical` over integers, floats or booleans is a dictionary too,
+/// and for those the encoding really is a storage detail R cannot express — so
+/// the column is **unpacked to the plain vector it holds**. Refusing was the
+/// old behaviour and it became reachable in a new way once `append` / `merge`
 /// started writing the rows they add as dictionaries: a numeric categorical
 /// that used to arrive as a plain numeric vector would otherwise have started
 /// erroring, and the R user would read it as "merge did this".
@@ -265,71 +270,54 @@ fn dictionary_to_factor(
     value_type: &DataType,
     ordered: bool,
 ) -> Result<Robj> {
-    match (key_type, value_type) {
-        (DataType::Int8, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int8Type, i32>(col, ordered)
-        }
-        (DataType::Int16, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int16Type, i32>(col, ordered)
-        }
-        (DataType::Int32, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int32Type, i32>(col, ordered)
-        }
-        // `LargeUtf8` is a *string* category type, not a non-string one. SCX
-        // leaves a dictionary's values wide when their offsets exceed
-        // `i32::MAX` (`fits_in_narrow_offsets`), so a large enough categorical
-        // arrives here as `Dictionary(_, LargeUtf8)`. Falling through to the
-        // decode arm below would hand R a plain character vector and silently
-        // drop the factor class, its levels and its `ordered` bit.
-        (DataType::Int8, DataType::LargeUtf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int8Type, i64>(col, ordered)
-        }
-        (DataType::Int16, DataType::LargeUtf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int16Type, i64>(col, ordered)
-        }
-        (DataType::Int32, DataType::LargeUtf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int32Type, i64>(col, ordered)
-        }
-        // Any other value type: decode to the values array and hand that to
-        // the ordinary converter, so an integer / float / boolean categorical
-        // arrives as the vector it logically is. `cast` on a dictionary only
-        // unpacks the keys, so this is not a reinterpretation of the data.
+    // One classification, consulted once. An earlier version carried a
+    // separate `dictionary_becomes_factor` predicate beside this match, which
+    // meant the tests validated the copy rather than the dispatch — and the
+    // copy disagreed with it on unsigned keys.
+    let large_offsets = match value_type {
+        DataType::Utf8 => false,
+        DataType::LargeUtf8 => true,
+        // Not a string categorical: unpack to the values array and hand that
+        // to the ordinary converter. `cast` on a dictionary only resolves the
+        // keys, so this is not a reinterpretation of the data.
         _ => {
-            // Only a non-string categorical may reach here: unpacking a string
-            // one loses the factor class, its levels and its `ordered` bit
-            // without erroring, which is how `LargeUtf8` regressed once this
-            // arm existed.
-            debug_assert!(
-                !dictionary_becomes_factor(key_type, value_type),
-                "a string categorical must not reach the unpack arm: \
-                 Dictionary({key_type:?}, {value_type:?})"
-            );
             let decoded = arrow::compute::cast(col, value_type).map_err(|e| {
                 Error::Other(format!(
                     "could not decode Dictionary({key_type:?}, {value_type:?}) \
                      for R conversion: {e}"
                 ))
             })?;
-            arrow_column_to_robj(decoded.as_ref(), value_type, ordered)
+            return arrow_column_to_robj(decoded.as_ref(), value_type, ordered);
         }
-    }
-}
+    };
 
-/// Whether a `Dictionary(K, V)` becomes an R **factor** rather than being
-/// unpacked to the plain vector it holds.
-///
-/// R factor levels are a character vector, so the test is "is `V` a string
-/// type" — **both** widths. SCX leaves a dictionary's values `LargeUtf8` when
-/// their offsets exceed `i32::MAX`, and that is still a string categorical;
-/// treating it as a non-string one loses the factor class, the levels and the
-/// `ordered` bit without erroring. Key width is a storage detail, but only the
-/// three signed widths arrow uses for a `pd.Categorical` are handled.
-///
-/// Kept as a predicate so the property is unit-testable without an R runtime:
-/// what matters is the *classification*, not the `Robj` it produces.
-fn dictionary_becomes_factor(key_type: &DataType, value_type: &DataType) -> bool {
-    matches!(key_type, DataType::Int8 | DataType::Int16 | DataType::Int32)
-        && matches!(value_type, DataType::Utf8 | DataType::LargeUtf8)
+    macro_rules! by_offsets {
+        ($k:ty) => {
+            if large_offsets {
+                typed_dict_to_factor::<$k, i64>(col, ordered)
+            } else {
+                typed_dict_to_factor::<$k, i32>(col, ordered)
+            }
+        };
+    }
+    // Every Arrow dictionary key type, because every one of them can reach
+    // here: `scx-convert`'s categorical writer dispatches all eight, and a
+    // third-party Arrow file can carry any of them.
+    match key_type {
+        DataType::Int8 => by_offsets!(arrow::datatypes::Int8Type),
+        DataType::Int16 => by_offsets!(arrow::datatypes::Int16Type),
+        DataType::Int32 => by_offsets!(arrow::datatypes::Int32Type),
+        DataType::Int64 => by_offsets!(arrow::datatypes::Int64Type),
+        DataType::UInt8 => by_offsets!(arrow::datatypes::UInt8Type),
+        DataType::UInt16 => by_offsets!(arrow::datatypes::UInt16Type),
+        DataType::UInt32 => by_offsets!(arrow::datatypes::UInt32Type),
+        DataType::UInt64 => by_offsets!(arrow::datatypes::UInt64Type),
+        other => Err(Error::Other(format!(
+            "unsupported dictionary key type {other:?} for a string categorical; \
+             refusing rather than returning a plain character vector, which would \
+             silently drop the factor levels and the `ordered` bit"
+        ))),
+    }
 }
 
 /// Helper: extract factor levels and codes from a typed DictionaryArray.
@@ -2430,49 +2418,6 @@ mod tests {
         assert!(matches!(
             validate_csr_for_dgcmatrix(&csr),
             Err(Error::Other(_))
-        ));
-    }
-
-    /// A string categorical must become a factor at **both** offset widths.
-    /// `LargeUtf8` is what SCX leaves on disk when a dictionary's values
-    /// exceed `i32::MAX` offsets, and it used to fall through the non-string
-    /// fallback added for numeric/boolean categoricals — returning a plain
-    /// character vector and silently dropping the factor class, the declared
-    /// levels and `ordered`. Asserted on the classification rather than on the
-    /// `Robj`, so it runs without an R runtime.
-    #[test]
-    fn a_string_categorical_is_a_factor_at_either_offset_width() {
-        for key in [DataType::Int8, DataType::Int16, DataType::Int32] {
-            for value in [DataType::Utf8, DataType::LargeUtf8] {
-                assert!(
-                    dictionary_becomes_factor(&key, &value),
-                    "Dictionary({key:?}, {value:?}) must become a factor"
-                );
-            }
-        }
-    }
-
-    /// The other half: a non-string categorical is deliberately unpacked to
-    /// the vector it holds rather than refused, which is what stopped a
-    /// numeric `pd.Categorical` from raising once the write doors started
-    /// emitting dictionaries.
-    #[test]
-    fn a_non_string_categorical_is_not_a_factor() {
-        for value in [
-            DataType::Int64,
-            DataType::Float64,
-            DataType::Boolean,
-            DataType::Binary,
-        ] {
-            assert!(
-                !dictionary_becomes_factor(&DataType::Int8, &value),
-                "Dictionary(Int8, {value:?}) must unpack, not become a factor"
-            );
-        }
-        // An unsupported key width is not a factor either.
-        assert!(!dictionary_becomes_factor(
-            &DataType::UInt8,
-            &DataType::Utf8
         ));
     }
 

@@ -142,9 +142,8 @@ pub(crate) use matrix::{check_decoded_lengths, plan_row_major_layout, X_LABELS};
 pub use metadata::{
     assemble_filtered_metadata, assemble_sharded_metadata, compact_key_shard,
     concat_prepared_metadata_batches, decode_arrow_ipc_schema, filter_batch_by_keep_mask,
-    prepare_metadata_batches_for_concat, prune_unused_dictionary_values,
-    reconcile_and_share_metadata_batches, scatter_batch_to_physical,
-    widen_metadata_batch_for_concat,
+    prune_unused_dictionary_values, reconcile_and_share_metadata_batches,
+    scatter_batch_to_physical, widen_metadata_batch_for_concat,
 };
 pub(crate) use metadata::{LegacyRowCount, MappingLayout, MappingShardLayoutEntry};
 

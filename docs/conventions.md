@@ -209,7 +209,7 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   [Test Organization](#test-organization) and `scx-testkit/src/digest.rs`.
 
   For the `scx-ops` rewrite paths the harness is already built and committed:
-  `tests/scx-integration-tests/tests/op_output_identity.rs` runs twelve arms over
+  `tests/scx-integration-tests/tests/op_output_identity.rs` runs fifteen arms over
   nine single-modality rewrite ops into one `scx_testkit::ab::OpDigestManifest`
   and pins it against a checked-in golden, and the same target does a cross-tree
   A/B under `SCX_TESTKIT_AB_DUMP=<path>` / `SCX_TESTKIT_AB_BASE=<path>`. Cite

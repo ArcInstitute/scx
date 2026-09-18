@@ -386,15 +386,20 @@ fn finish_deduped_dictionary(
 }
 
 /// Smallest signed Arrow dictionary key (index) type that can address
-/// `n_distinct` values: `Int8` for ≤ `i8::MAX`, `Int16` for ≤ `i16::MAX`,
-/// else `Int32`. Keys are non-negative indices, so the signed maxima are the
-/// addressable counts. Mirrors the compact code widths anndata/pandas use for
+/// `n_distinct` values. Mirrors the compact code widths anndata/pandas use for
 /// categoricals while guaranteeing no overflow.
-fn min_dictionary_key_type(n_distinct: usize) -> arrow::datatypes::DataType {
+///
+/// The capacity of a width is **one more** than its maximum: `n` values are
+/// addressed by keys `0..n-1`, so `Int8` (largest key 127) holds 128 values
+/// and `Int16` holds 32 768. Comparing against `i8::MAX` / `i16::MAX` instead
+/// widened a dictionary at exactly those two counts — never wrong, but 2x the
+/// code buffer for a 128-level categorical, which is an ordinary cell-type
+/// vocabulary size.
+pub(crate) fn min_dictionary_key_type(n_distinct: usize) -> arrow::datatypes::DataType {
     use arrow::datatypes::DataType;
-    if n_distinct <= i8::MAX as usize {
+    if n_distinct <= i8::MAX as usize + 1 {
         DataType::Int8
-    } else if n_distinct <= i16::MAX as usize {
+    } else if n_distinct <= i16::MAX as usize + 1 {
         DataType::Int16
     } else {
         DataType::Int32
@@ -753,7 +758,9 @@ pub fn prune_unused_dictionary_values(batch: &RecordBatch) -> Result<RecordBatch
 /// than one because [`assemble_sharded_metadata`] has work in between: its
 /// contiguous-cover validation reads the per-shard stamps after this and
 /// before the concat, and `merge_sorted` slices the prepared batches.
-pub fn prepare_metadata_batches_for_concat(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+pub(crate) fn prepare_metadata_batches_for_concat(
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
     let wide: Vec<RecordBatch> = batches
         .iter()
         .map(widen_metadata_batch_for_concat)

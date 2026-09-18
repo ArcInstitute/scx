@@ -3805,3 +3805,27 @@ fn obs_categorical_filtered_agrees_with_read_obs_filtered_column() {
     let (physical, _) = reader.obs_categorical("cell_id").unwrap();
     assert_eq!(physical.len(), 10, "the physical fold keeps every row");
 }
+
+/// The key width a dictionary is narrowed to is chosen by **capacity**, not by
+/// the type's maximum: `n` values are addressed by keys `0..n-1`, so `Int8`
+/// (largest key 127) holds 128 of them. Comparing against `i8::MAX` widened at
+/// exactly 128 and 32 768 — never wrong, but 2x the code buffer at a perfectly
+/// ordinary cell-type vocabulary size. Both boundaries and both sides.
+#[test]
+fn test_min_dictionary_key_type_uses_capacity_not_max() {
+    use crate::reader::metadata::min_dictionary_key_type;
+    use arrow::datatypes::DataType;
+    assert_eq!(min_dictionary_key_type(1), DataType::Int8);
+    assert_eq!(
+        min_dictionary_key_type(128),
+        DataType::Int8,
+        "Int8 holds 128"
+    );
+    assert_eq!(min_dictionary_key_type(129), DataType::Int16);
+    assert_eq!(
+        min_dictionary_key_type(32_768),
+        DataType::Int16,
+        "Int16 holds 32768"
+    );
+    assert_eq!(min_dictionary_key_type(32_769), DataType::Int32);
+}
