@@ -3786,3 +3786,155 @@ fn appended_shard_vocabulary_duplication() {
         obs_bytes as f64 / (N + 8) as f64,
     );
 }
+
+#[test]
+fn sorted_merge_keeps_a_declared_but_unused_level_on_narrow_keys() {
+    // `merge_keeps_a_declared_but_unused_level` guards the *unsorted* emitter,
+    // which writes each chunk verbatim and never calls
+    // `unify_dictionary_columns` at all. `merge --sort-by` is the one emitter
+    // that does — `materialize_obs_shard` → `concat_prepared_metadata_batches`
+    // → `unify_dictionary_columns` — so it is the path on which substituting
+    // that function for the deleted decode, or dropping the
+    // `widen_dictionary_keys` step that keeps it on its declared-value-
+    // preserving fast path, actually loses a level.
+    //
+    // Narrow keys are the whole point: on `Int32` the fast path runs and the
+    // level survives either way.
+    for key in [DataType::Int8, DataType::Int16] {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = dir.path().join("a.scx");
+        let p1 = dir.path().join("b.scx");
+        // Disjoint used levels so an output shard spans both inputs, each with
+        // its own declared-but-unused level.
+        write_legacy_input_with_obs(
+            &p0,
+            &rekeyed_dict_obs(0, 2, &["a_used", "a_unused"], 1, false, key.clone()),
+            &var_batch(),
+        );
+        write_legacy_input_with_obs(
+            &p1,
+            &rekeyed_dict_obs(2, 2, &["b_used", "b_unused"], 1, false, key.clone()),
+            &var_batch(),
+        );
+
+        let out = dir.path().join("sorted.scx");
+        let mut opts = sorted_merge_opts(&["cell_id"], false, false);
+        opts.shard_target_rows = Some(4); // one shard, spanning both inputs
+        scx_ops::merge_with_options(&[p0.as_path(), p1.as_path()], &out, &opts).unwrap();
+
+        let reader = ScxReader::open(&out).unwrap();
+        let mut saw_spanning_shard = false;
+        for (i, shard) in reader.obs_shards().enumerate() {
+            let shard = shard.unwrap();
+            let levels = declared_levels(&shard, "label");
+            if levels.contains(&"a_used".to_string()) && levels.contains(&"b_used".to_string()) {
+                saw_spanning_shard = true;
+            }
+            for unused in ["a_unused", "b_unused"] {
+                // Only assert on a shard that actually carries that input's
+                // vocabulary — a shard drawn from one input has no reason to
+                // declare the other's levels.
+                let owner = if unused.starts_with('a') {
+                    "a_used"
+                } else {
+                    "b_used"
+                };
+                if levels.contains(&owner.to_string()) {
+                    assert!(
+                        levels.contains(&unused.to_string()),
+                        "{key:?}-keyed sorted merge: output shard {i} carries {owner} but \
+                         dropped its declared-but-unused level {unused} (levels: {levels:?})"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_spanning_shard,
+            "{key:?}: premise — an output shard must span both inputs, or this \
+             test is not exercising the cross-input concat"
+        );
+        let all = declared_levels(&reader.read_obs().unwrap(), "label");
+        for lvl in ["a_used", "a_unused", "b_used", "b_unused"] {
+            assert!(
+                all.contains(&lvl.to_string()),
+                "{key:?}: assembled read lost {lvl}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zero_row_merge_input_does_not_contribute_its_declared_levels() {
+    // Pins the limit of the declared-level guarantee, rather than leaving a
+    // reader to infer it holds everywhere. `input_obs_chunks` yields nothing
+    // for a 0-row input, so a level only that input declares reaches no output
+    // shard. That is the same rule the Operations doc already states for a
+    // 0-row merge input ("contributes nothing" — it cannot carry layers, obsm
+    // or obsp either), applied to the categorical vocabulary; it is not a
+    // regression from the dictionary change, which only ever promised to keep
+    // the levels of the rows an op actually writes.
+    let dir = tempfile::tempdir().unwrap();
+    let populated = dir.path().join("p.scx");
+    let empty = dir.path().join("e.scx");
+    write_legacy_input_with_obs(
+        &populated,
+        &dict_obs(0, 4, &["alpha", "beta"], 2, false),
+        &var_batch(),
+    );
+    write_legacy_input_with_obs(
+        &empty,
+        &dict_obs(0, 0, &["alpha", "beta", "only_in_empty"], 2, false),
+        &var_batch(),
+    );
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[populated.as_path(), empty.as_path()], &out).unwrap();
+
+    let obs = ScxReader::open(&out).unwrap().read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 4);
+    assert_eq!(
+        declared_levels(&obs, "label"),
+        vec!["alpha", "beta"],
+        "a 0-row input contributes no rows and therefore no vocabulary",
+    );
+}
+
+/// Wall-clock guard for the assembler shape, which is the one the identity
+/// scan punishes: every on-disk obs shard owns its own dictionary values
+/// `Arc`, so every lookup in `share_dictionary_values` misses. A linear
+/// `Vec::position` walk is then O(n_shards^2) per categorical column — on a
+/// few thousand shards that is millions of pointer comparisons spent
+/// discovering there is nothing to share. It is keyed on the pointer instead.
+///
+/// Measured at 9 000 shards: **0.183 s with the linear scan, 0.070 s with the
+/// map** — a constant-factor read cost, not a correctness issue, but 113 ms
+/// per `read_obs` on an atlas-shaped file for nothing.
+///
+/// Release-only and `#[ignore]`d — a measurement, not a gate.
+#[test]
+#[ignore = "timing measurement; run with --release --ignored --nocapture"]
+fn many_shard_read_obs_timing() {
+    let dir = tempfile::tempdir().unwrap();
+    const SHARDS: usize = 9_000;
+    const ROWS_PER_SHARD: usize = 4;
+    const N: usize = SHARDS * ROWS_PER_SHARD;
+
+    let path = dir.path().join("many_shards.scx");
+    let obs = dict_obs(0, N, &["T cell", "B cell", "NK cell"], 2, false);
+    write_sharded_dict_input(&path, &obs, ROWS_PER_SHARD);
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count() as usize, SHARDS);
+    let t = std::time::Instant::now();
+    let assembled = reader.read_obs().unwrap();
+    let elapsed = t.elapsed();
+    println!(
+        "read_obs over {SHARDS} obs shards ({N} rows, 3-level categorical): {:.3} s",
+        elapsed.as_secs_f64()
+    );
+    assert_eq!(assembled.num_rows(), N);
+    assert_eq!(
+        declared_levels(&assembled, "label"),
+        vec!["T cell", "B cell", "NK cell"],
+    );
+}

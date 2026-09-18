@@ -589,7 +589,11 @@ the mutating ops treat it consistently:
   warn-and-drop) applies to populated inputs only. A merge whose inputs are all empty still writes an
   `obs` section (input 0's, with the same columns, and — like every merge
   output — its categoricals still dictionary-encoded, so an empty output's obs
-  schema matches a populated one's). This holds for the plain, sorted
+  schema matches a populated one's). "Contributes nothing" covers the
+  categorical **vocabulary** too: a level that only a 0-row input declares
+  does not reach the output, because that input yields no obs chunk to carry
+  it. The declared-level guarantee is about the rows an op writes, not about
+  every vocabulary it saw. This holds for the plain, sorted
   (`--sort-by`) and multimodal emitters alike. `varm` / `varp` still come from
   input 0, whatever its row count. A 0-**var** input is an `IncompatibleVars`
   error as before.
@@ -796,9 +800,8 @@ surviving rows use, now deterministically on both obs layouts, while an
 unfiltered `collect()` keeps the declared list like `read_obs()`. A file rewritten in place before that carries the column as a
 dictionary in some obs shards and plain strings in others; that mix still reads
 (the assembler reconciles it) and still takes an attach, which rewrites each
-shard's rows without re-encoding the columns it does not touch. Since pyscx
-0.20 `append`, `merge` and `merge --sort-by` write the rows they add as
-dictionaries too, so a merge output and an append onto a legacy single-section
+shard's rows without re-encoding the columns it does not touch. `append`,
+`merge` and `merge --sort-by` write the rows they add as dictionaries too, so a merge output and an append onto a legacy single-section
 obs both read back as `category`, and a filtered `collect()` whose surviving
 rows all fall in appended shards carries its surviving categories. They stay
 representation-*preserving*, not representation-*imposing*: a plain source

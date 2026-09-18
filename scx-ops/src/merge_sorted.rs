@@ -15,7 +15,7 @@
 //! merge does.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -253,6 +253,17 @@ impl<'a> ObsCursor<'a> {
                     self.chunks.next().transpose()?.ok_or_else(|| {
                         OpsError::InvalidInput("merge order exceeds obs rows".into())
                     })?;
+                // Widen here, **once per chunk**, not once per emit. These two
+                // steps are per-row (`upcast_to_large_types` rewrites string
+                // buffers; `widen_dictionary_keys` re-keys) and they depend
+                // only on the chunk, so paying them inside `materialize_obs_shard`
+                // would re-widen every row of every still-open parent on every
+                // output shard — amplified by the input count on a high-fan-in
+                // merge, where each emit takes a few rows from each of many
+                // 16K-row chunks. The cross-batch half (reconcile + share)
+                // genuinely depends on which chunks meet in a given shard and
+                // stays there.
+                let chunk = scx_format_io::widen_metadata_batch_for_concat(&chunk)?;
                 self.cur = Some(Arc::new(chunk));
                 self.local = 0;
             }
@@ -287,7 +298,9 @@ impl<'a> ObsCursor<'a> {
 ///
 /// It runs over the **distinct source chunks**, not over the slices: after
 /// preparation every chunk shares one values array per dictionary column, so
-/// slicing preserves that and `concat` takes its cheap keys-only path.
+/// slicing preserves that and `concat` takes its cheap keys-only path. The
+/// per-row half of the preparation (widening) already happened once, when
+/// `ObsCursor` loaded the chunk.
 fn materialize_obs_shard(pending: &[ObsSlice]) -> Result<RecordBatch> {
     if pending.len() == 1 {
         // One slice of one chunk: already unique, nothing to reconcile. Keeps
@@ -299,18 +312,28 @@ fn materialize_obs_shard(pending: &[ObsSlice]) -> Result<RecordBatch> {
     // Identity, not equality: two slices share a parent iff they name the same
     // `Arc`. Comparing the batches themselves would be both wrong (a clone is
     // a different pointer) and expensive.
+    //
+    // Pointer-keyed rather than a linear scan: `pending` holds one entry per
+    // sorted run, so a fully interleaved merge fills it with
+    // `shard_target_rows` entries (16 384 by default), and a high-fan-in merge
+    // pushes the distinct-chunk count up with the input count — the product is
+    // what a `Vec::position` walk would pay per emit.
+    let mut seen: HashMap<*const RecordBatch, usize> = HashMap::with_capacity(pending.len());
     let mut distinct: Vec<Arc<RecordBatch>> = Vec::new();
     let mut owner: Vec<usize> = Vec::with_capacity(pending.len());
     for s in pending {
-        match distinct.iter().position(|d| Arc::ptr_eq(d, &s.chunk)) {
-            Some(i) => owner.push(i),
+        let key = Arc::as_ptr(&s.chunk);
+        match seen.get(&key) {
+            Some(&i) => owner.push(i),
             None => {
                 distinct.push(Arc::clone(&s.chunk));
+                seen.insert(key, distinct.len() - 1);
                 owner.push(distinct.len() - 1);
             }
         }
     }
-    let prepared = scx_format_io::prepare_metadata_batches_for_concat(
+    // Already widened at chunk load; only the cross-batch half is left.
+    let prepared = scx_format_io::reconcile_and_share_metadata_batches(
         distinct.iter().map(|b| (**b).clone()).collect(),
     )?;
     let slices: Vec<RecordBatch> = pending

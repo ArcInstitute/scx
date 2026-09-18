@@ -113,7 +113,7 @@ GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
 - `read_obs_shard(idx)` / `read_var_shard(idx)` — Single metadata shard as Arrow RecordBatch
 - `obs_shards()` / `var_shards()` — Iterator over all metadata shards
 - `read_obs_assembled()` / `read_var_assembled()` — Reassemble all metadata shards into one Arrow RecordBatch (transparent on legacy single-section files)
-- `obs_categorical(col)` / `obs_categorical_many(&[cols])` — `(codes: Vec<i32>, categories: Vec<String>)` for string/categorical obs columns, folded **one shard at a time** into a running global dictionary (never concatenates the column, unlike `read_obs_keys`). Null → `-1` (pandas convention), so a literal `"NaN"` string stays a real category; category order is first-seen. Accepts both `Dictionary(_, Utf8|LargeUtf8)` (as every SCX write door now writes a categorical) and plain `Utf8`/`LargeUtf8` (as an older `append` / `merge` wrote one, and as a plain source column still lands), including a file mixing both across shards. `_many` costs **one** projected read per shard for N columns. See [Obs categorical codes](performance.md#obs-categorical-codes-without-pandas-data-load-phase-1-1c).
+- `obs_categorical(col)` / `obs_categorical_many(&[cols])` — `(codes: Vec<i32>, categories: Vec<String>)` for string/categorical obs columns, folded **one shard at a time** into a running global dictionary (never concatenates the column, unlike `read_obs_keys`). Null → `-1` (pandas convention), so a literal `"NaN"` string stays a real category; category order is first-seen. Accepts both `Dictionary(_, Utf8|LargeUtf8)` (as `from_anndata`, the in-place obs writers and — since this change — `append` / `merge` write a categorical) and plain `Utf8`/`LargeUtf8` (as an older `append` / `merge` wrote one, and as a plain source column still lands), including a file mixing both across shards. `_many` costs **one** projected read per shard for N columns. See [Obs categorical codes](performance.md#obs-categorical-codes-without-pandas-data-load-phase-1-1c).
 - `debug_counts()` — `ReaderDebugCounts` with `AtomicU64` I/O counters (`cfg(debug_assertions)` only). `read_obs_shard_projected` counts column-scoped shard reads separately from `read_obs_shard`, so a test can assert the cheap path was *taken* rather than only that the materialising ones were avoided.
 - `read_obs_predicate_index_bytes()` / `read_var_predicate_index_bytes()` — Predicate index raw bytes
 - `read_deletion_vectors()` — Roaring Bitmap deletion vectors
@@ -1845,9 +1845,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   for string, boolean and numeric levels alike.
   (Before pyscx 0.17 every one of these writers demoted every categorical obs
   column to plain strings; `append` / `merge` / `merge --sort-by` did too until
-  0.20.) Every write door now agrees, so a `merge` output and an `append` onto
-  a legacy single-section obs both read back as `category` with the union
-  vocabulary. A dictionary/plain shard mix is still readable — the assembler
+  this change.) So a `merge` output and an `append` onto a legacy single-section obs
+  both read back as `category` with the union vocabulary. One writer still
+  decodes: `scx sort --memory-budget`'s spill path re-encodes obs categoricals
+  per spilled shard and rebuilds each shard's vocabulary from its own rows, so
+  it prunes declared levels — the in-memory sort path does not. A dictionary/plain shard mix is still readable — the assembler
   reconciles it — and still reachable, either on a file an older scx version
   grew or by appending a plain-obs source onto a dictionary-encoded base, since
   these ops preserve whichever representation they are handed rather than
@@ -2011,7 +2013,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   path (kept for parity / debugging).
   - **Categorical obs/var on append-grown files (handled):** a file whose sharded
     obs/var mixes `Dictionary` (original) and plain (appended) representations for a
-    categorical column — the layout an `append` produced before pyscx 0.20, and
+    categorical column — the layout an `append` produced before this change, and
     still produces from a plain-obs source — exports
     a single h5ad categorical with the full unioned, de-duplicated vocabulary,
     matching `pyscx.open(f).to_anndata()`. This holds for string **and** numeric

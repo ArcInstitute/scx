@@ -571,16 +571,26 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
         // *distinct* vocabularies among them are bounded by the number of
         // source chunks (in practice, the number of inputs). Interning per
         // batch would be O(n_batches x vocabulary); this makes it
-        // O(n_distinct x vocabulary). In the assembler's case every shard owns
-        // its own `Arc`, the scan finds nothing to share, and it costs one
-        // pointer comparison per batch.
+        // O(n_distinct x vocabulary).
+        //
+        // Keyed on the pointer, not searched linearly. The assembler's case is
+        // the one that punishes a scan: every on-disk shard owns its own `Arc`,
+        // so every lookup misses and a `Vec::position` walk would be
+        // O(n_shards^2) per categorical column — ~40M comparisons on a
+        // 9,000-shard atlas, on the path that merely wants to discover there is
+        // nothing to share.
+        let mut seen: HashMap<*const u8, usize> = HashMap::with_capacity(values.len());
         let mut distinct: Vec<&ArrayRef> = Vec::new();
         let mut batch_to_distinct: Vec<usize> = Vec::with_capacity(values.len());
         for v in &values {
-            match distinct.iter().position(|d| Arc::ptr_eq(d, v)) {
-                Some(i) => batch_to_distinct.push(i),
+            // `Arc<dyn Array>` is a fat pointer; the data address alone is the
+            // identity that matters and is what `Arc::ptr_eq` compares first.
+            let key = Arc::as_ptr(v) as *const u8;
+            match seen.get(&key) {
+                Some(&i) => batch_to_distinct.push(i),
                 None => {
                     distinct.push(v);
+                    seen.insert(key, distinct.len() - 1);
                     batch_to_distinct.push(distinct.len() - 1);
                 }
             }
@@ -739,20 +749,41 @@ pub fn prune_unused_dictionary_values(batch: &RecordBatch) -> Result<RecordBatch
 ///    `should_merge_dictionary_values` fires, merges and **prunes** them,
 ///    dropping declared-but-unused levels in a row-count-dependent way.
 ///
-/// Pair with [`concat_prepared_metadata_batches`], or use
-/// [`concat_metadata_batches`] when nothing needs to happen in between.
-/// [`assemble_sharded_metadata`] is the caller that does: its contiguous-cover
-/// validation reads the per-shard stamps after this and before the concat.
+/// Pair with [`concat_prepared_metadata_batches`]. They are two calls rather
+/// than one because [`assemble_sharded_metadata`] has work in between: its
+/// contiguous-cover validation reads the per-shard stamps after this and
+/// before the concat, and `merge_sorted` slices the prepared batches.
 pub fn prepare_metadata_batches_for_concat(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
     let wide: Vec<RecordBatch> = batches
         .iter()
-        .map(|b| {
-            crate::arrow_compat::upcast_to_large_types(b)
-                .and_then(|b| crate::arrow_compat::widen_dictionary_keys(&b))
-        })
+        .map(widen_metadata_batch_for_concat)
         .collect::<Result<_>>()?;
-    let wide = crate::arrow_compat::reconcile_dictionary_representations(wide)?;
-    share_dictionary_values(wide)
+    reconcile_and_share_metadata_batches(wide)
+}
+
+/// The **per-batch** half of [`prepare_metadata_batches_for_concat`]: steps 1
+/// and 2, which depend only on the batch in front of them.
+///
+/// Split out for callers that see a batch long before they know which other
+/// batches it will be concatenated with, and would otherwise redo this
+/// per-row work on every grouping. `merge_sorted`'s obs cursor is the one that
+/// needs it: it widens each source chunk once at load, then slices it into
+/// many output shards.
+pub fn widen_metadata_batch_for_concat(batch: &RecordBatch) -> Result<RecordBatch> {
+    let wide = crate::arrow_compat::upcast_to_large_types(batch)?;
+    crate::arrow_compat::widen_dictionary_keys(&wide)
+}
+
+/// The **cross-batch** half of [`prepare_metadata_batches_for_concat`]: steps
+/// 3 and 4, which depend on the whole set and so cannot be hoisted.
+///
+/// Every batch must already have been through
+/// [`widen_metadata_batch_for_concat`]; `share_dictionary_values` only sees
+/// columns already declared `Dictionary(Int32, _)`, and silently leaves a
+/// narrower key alone.
+pub fn reconcile_and_share_metadata_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    let reconciled = crate::arrow_compat::reconcile_dictionary_representations(batches)?;
+    share_dictionary_values(reconciled)
 }
 
 /// Concatenate batches already through [`prepare_metadata_batches_for_concat`],
@@ -776,22 +807,6 @@ pub fn concat_prepared_metadata_batches(batches: &[RecordBatch]) -> Result<Recor
     let concatenated = arrow::compute::concat_batches(&wide_schema, batches.iter())?;
     let unified = unify_dictionary_columns(&concatenated)?;
     crate::arrow_compat::downcast_large_types(&unified)
-}
-
-/// [`prepare_metadata_batches_for_concat`] followed by
-/// [`concat_prepared_metadata_batches`] — the whole pipeline, for callers with
-/// nothing to do between the two.
-///
-/// This is the one safe way to concatenate metadata batches that may carry
-/// categoricals. In particular it is **not** equivalent to calling
-/// [`unify_dictionary_columns`] on the concat result: that function's fast path
-/// only keys `Dictionary(Int32, _)` and falls back to decode-and-re-encode for
-/// any other key width, which rebuilds the vocabulary from the *rows* and so
-/// drops every declared-but-unused level. The `widen_dictionary_keys` step of
-/// the preparation is what keeps it on the fast path.
-pub fn concat_metadata_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
-    let prepared = prepare_metadata_batches_for_concat(batches)?;
-    concat_prepared_metadata_batches(&prepared)
 }
 
 pub fn assemble_sharded_metadata(
@@ -918,7 +933,8 @@ pub fn assemble_filtered_metadata(
         return Ok(RecordBatch::new_empty(template_schema.clone()));
     }
 
-    let narrowed = concat_metadata_batches(batches)?;
+    let prepared = prepare_metadata_batches_for_concat(batches)?;
+    let narrowed = concat_prepared_metadata_batches(&prepared)?;
 
     // Strip the per-shard metadata keys so the result schema matches a
     // normal (full) read's assembled batch.

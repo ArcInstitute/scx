@@ -171,7 +171,8 @@ where
 
 /// Build a per-shard local categorical view `(local_codes, local_values)` for
 /// the streaming categorical writer, accepting **both** a `Dictionary(_, V)`
-/// array (what every SCX write door now emits for a categorical) and a **plain
+/// array (what every write door but `scx sort`'s spill path now emits for a
+/// categorical) and a **plain
 /// `V`** array (shards an older `append` / `merge` wrote, which decoded the
 /// dictionary to its value type first; shards the in-place writers rewrote
 /// before they stopped doing the same; and shards appended from a source that

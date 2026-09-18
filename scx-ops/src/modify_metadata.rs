@@ -552,8 +552,9 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         // `resolve_obs_row_space`): a dictionary (categorical) column is sliced
         // per shard and lands as a dictionary carrying its field metadata, so
         // `read_obs()` gives the caller's categoricals back. (This used to run
-        // the shared `unify_dict_columns` cast, which decoded every dictionary column to plain
-        // strings; `append` / `merge` still do, after a concat.)
+        // a shared cast that decoded every dictionary column to plain strings.
+        // `append` / `merge` used to as well; they no longer do, though a
+        // plain-source append onto a dictionary base still leaves a mix.)
         let obs_pass = if carry_obs {
             &carried_pass
         } else {

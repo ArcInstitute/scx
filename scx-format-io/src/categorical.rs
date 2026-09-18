@@ -34,7 +34,8 @@
 //!   which matches `astype("category")` retaining unused levels and matches
 //!   [`crate::distinct`]'s documented superset behaviour.
 //! - **Both on-disk representations are accepted** — `Dictionary(_, Utf8)`, as
-//!   every SCX write door now writes a categorical, and plain
+//!   every write door but `scx sort`'s spill path now writes a
+//!   categorical, and plain
 //!   `Utf8`/`LargeUtf8`, as an older `append` / `merge` wrote one and as a
 //!   plain source column still lands. A file grown by one of those older
 //!   writers, or rewritten in place before they stopped casting, carries

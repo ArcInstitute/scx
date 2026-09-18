@@ -1,6 +1,6 @@
 //! The committed byte-identity A/B matrix: what does each rewriting op write?
 //!
-//! Thirteen arms over nine ops, one manifest of per-section digests, three ways
+//! Fifteen arms over nine ops, one manifest of per-section digests, three ways
 //! to use it:
 //!
 //! * **default** — assert against the checked-in golden. A refactor that
@@ -43,7 +43,7 @@
 //! ## What this cannot see
 //!
 //! Read this before citing a green run as "the rewrite did not change bytes".
-//! It is true of these twelve arms and of nothing else.
+//! It is true of these fifteen arms and of nothing else.
 //!
 //! **Regions of the file.** `FileHeader::file_checksum` is deliberately outside
 //! the digest (it covers the `Provenance` section, which is itself excluded),
