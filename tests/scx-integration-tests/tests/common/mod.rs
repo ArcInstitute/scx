@@ -325,12 +325,18 @@ fn build_all_families_with_obs(
     // the same section the ops read.
     //
     // **No CSC sidecar.** An earlier version of this comment said the fixture
-    // added one "via its real op" alongside the deletion vector; it never did,
-    // and it cannot — the only thing that writes a CSC sidecar is `build-csc`,
-    // which would strip varm/obsp/varp/raw/bitmaps/group-index from this fixture
-    // on the way. `XCsc` and `LayerCsc` are therefore excluded from
+    // added one "via its real op" alongside the deletion vector; it never did.
+    // The reason it gave next — that the only thing writing a CSC sidecar is
+    // `build-csc`, "which would strip varm/obsp/varp/raw/bitmaps/group-index
+    // from this fixture on the way" — was true before Phase 5b and is false
+    // now: all six are `Carry::Verbatim`, which is exactly what
+    // `section_carry.rs::build_csc_carries_what_optimize_carries` runs this
+    // fixture through build-csc to prove. So the sidecar is simply absent
+    // rather than unobtainable. `XCsc` and `LayerCsc` stay excluded from
     // `the_fixture_carries_every_family_an_op_can_decide_about`, and the CSC
-    // `Dropped` arms are pinned by the pre-existing CLI tests rather than here.
+    // `Dropped` arms stay pinned by the pre-existing CLI tests rather than here
+    // — adding one here would make every op's digest carry a sidecar it has
+    // nothing to say about.
     scx_ops::mark_deleted(&path, &[2, 5]).unwrap();
     path
 }
