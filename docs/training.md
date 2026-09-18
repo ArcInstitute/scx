@@ -569,37 +569,48 @@ thread with no prefetch, so it is not the way to stream.
 ### How a batch is gathered
 
 Both routes run the same executor, and it works over the **whole batch** rather
-than one set at a time:
+than one set at a time. Which of two shapes it takes depends on the plan.
+
+**The direct path** — one file, and `remap_tables` / `downsample` both off:
+
+1. **One read** over the plan's rows, in plan order, through
+   `BackedCsrReader::read_row_indices_with_admission`, which prescans each
+   touched shard's indptr so the rows land in one exactly-sized allocation.
+2. The clip and any `normalize` / `log1p` applied **in place**, in parallel.
+3. The read *is* the batch — it is moved out whole. One allocation for the
+   entire gather, and no copy of it anywhere.
+
+**The assembled path** — more than one file, or a transform that can change a
+row's length (a remap drops and coalesces, a downsample truncates):
 
 1. An **occurrence table** over the plan's emitted positions: unique
-   `(file_id, row)` in first-occurrence order, and, per position, which of those
-   it names.
-2. **One read per file**, over that file's deduplicated rows, through
-   `BackedCsrReader::read_row_indices_with_admission` — which prescans each
-   touched shard's indptr, so the rows land in one exactly-sized allocation and
-   the gather never grows a buffer.
-3. Each unique row **transformed once**, in place, in parallel: remap, the
-   non-negativity clip, the seeded downsample, `normalize`/`log1p`. Every stage
-   either shrinks a row or preserves it, so a row's output fits its own span.
+   `(file_id, row)` in first-occurrence order, and which of those each position
+   names.
+2. **One read per file**, over that file's deduplicated rows.
+3. Each unique row **transformed once**, in place within its own span, in
+   parallel.
 4. The batch written from the measured lengths, each position's span filled in
-   parallel. A single-file plan with no repeated rows and no length-changing
-   transform skips this step entirely — the read's own buffers *are* the batch.
+   parallel.
 
-Two consequences worth planning around:
+Three consequences worth planning around:
 
-- **A repeated row costs a memcpy, not a decode.** A control pool carried by
-  every set, a neighbour shared between centres, a covariate group sampled with
-  replacement — each distinct `(file, row)` is read and transformed once however
-  many positions name it. This is safe rather than approximate: the row
-  transform is a pure function of `(file_id, row, indices, data)`, and the
-  downsample draw is keyed on the file's content identity and the *physical*
-  row, never on batch position, so the copies are bit-identical to what separate
-  reads would have produced.
-- **Two buffers, briefly, on the general path.** When the batch cannot be the
-  read — duplicates, more than one file, or a transform that changes nnz — the
-  deduplicated read and the batch are live together for the span of the gather.
-  `memory_budget()["breakdown"]["transient_bytes"]` charges it where it is
-  unavoidable; see [Sizing the shard cache](#sizing-the-shard-cache).
+- **On the assembled path a repeated row costs a memcpy, not a transform.** A
+  control pool carried by every set, a neighbour shared between centres, a
+  covariate group sampled with replacement — each distinct `(file, row)` is
+  read and transformed once however many positions name it. This is safe rather
+  than approximate: the row transform is a pure function of
+  `(file_id, row, indices, data)`, and the downsample draw is keyed on the
+  file's content identity and the *physical* row, never on batch position, so
+  the copies are bit-identical to what separate reads would have produced.
+- **The direct path does not deduplicate, on purpose.** Deduplicating it would
+  force the assembly above — a second batch-sized allocation and a second full
+  copy — to save one memcpy per repeat from an already-resident shard, because
+  a raw-local row's whole transform is an elementwise clip. Measured: it cost
+  15 % of `cellsets_per_sec` on a random-plan gather.
+- **Two buffers, briefly, on the assembled path.** The deduplicated read and
+  the batch are live together for the span of the gather;
+  `memory_budget()["breakdown"]["transient_bytes"]` charges it. See
+  [Sizing the shard cache](#sizing-the-shard-cache).
 
 `SCX_CELLSET_EXECUTOR=set` restores the previous per-set walk — one read per
 set, a per-row buffer, a copy of every row into the batch. It exists as a

@@ -4168,11 +4168,20 @@ absolute_floors:
 #         floor on a skipped arm synthesises a "missing metric" violation.
 #     (d) The phase merges on parity and allocations, not on a rate. What the
 #         change is known to move is the ALLOCATION COUNT, measured by
-#         `scx-loader/tests/gather_allocation.rs` rather than here: 2,698 ->
-#         101 for a 1,024-row plan, 2.63 -> 0.10 per row, with peak live bytes
-#         flat (421,192 -> 412,480 B). Whether that shows up as sets/s on a
-#         real fixture is what the A/B measures; it is not assumed, and until
-#         it is measured there is no number to floor.
+#         `scx-loader/tests/gather_allocation.rs` rather than here: 2,698 -> 81
+#         for a 1,024-row plan, 2.63 -> 0.08 per row, peak live 421,192 ->
+#         371,304 B. Whether that shows up as sets/s on a real fixture is what
+#         the A/B measures; it is not assumed, and until it is measured there
+#         is no number to floor.
+#
+#         ⚠️ This arm's shape is duplicate-heavy, and the executor
+#         **deliberately does not deduplicate** the configuration it runs on
+#         (raw-local, one file): deduplicating there forces the batch to be
+#         assembled from a separate read and was measured at 0.85x on
+#         `gather_random`. So a reader must not take a flat result here as
+#         "dedup does not pay" — it is not being exercised. The arm's job is
+#         to price the gather on a duplicate-heavy plan, and its duplication is
+#         what `unique_row_fraction__*` records.
 #
 #     ⚠️ `unique_row_fraction__*` is a property of the PLAN, not of the loader,
 #     and it is emitted so the rate beside it is interpretable at all: the same
