@@ -985,6 +985,119 @@ def _hot_cold_premises(n_obs: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# W11: shared-control arm — the shape the batch executor was written for
+# ---------------------------------------------------------------------------
+#
+# Every existing arm duplicates rows only by accident, and the accidents pull in
+# different directions:
+#
+#   * `gather_random*` draws from `n_obs` WITH replacement, so a 1,024-row batch
+#     on a 100k-row file collides about ten times — nothing.
+#   * `gather_grouped_s512` duplicates heavily, but only because
+#     `rng.choice(..., replace=g.size < S)` pads an under-full covariate group;
+#     that is a property of the fixture's group sizes rather than of the
+#     workload, and it moves with the dataset.
+#   * the W10 hot-control arm draws its control sets INDEPENDENTLY per set
+#     (`_hot_cold_plans`), so its controls are shared across *batches* — which is
+#     what a cache reuse signal needs — and only ~1.6 % duplicated *within* one.
+#
+# The shape W11 is for is the other one: a perturbation screen where every set in
+# a batch carries the SAME control block, so the batch names each control row
+# once per set. There a gather that reads and transforms each unique
+# `(file, row)` once does strictly less work, and here that is true by
+# construction rather than by luck.
+#
+# Cells per set match the S=64 scenarios so `us_per_cell` is comparable to them.
+_SHARED_CONTROL_PER_SET = 32
+_SHARED_PERT_PER_SET = 32
+_SHARED_SET_SIZE = _SHARED_CONTROL_PER_SET + _SHARED_PERT_PER_SET
+# The control pool is a contiguous prefix, as in the W10 arm and for the same
+# reason: that is what a screen looks like after `scx sort --group-by
+# perturbation`, and a pool drawn uniformly from a 100k-row file touches nearly
+# every row group in it.
+_SHARED_CONTROL_POOL = 2048
+_SHARED_N_BATCHES = 12
+_SHARED_SEED = 20260918
+# The bar the premise check holds the shape to. At the pinned numbers a batch is
+# 32 unique control rows across 16 sets plus 16 x 32 fresh perturbation rows, so
+# about 53 % of its positions name a distinct row. A shape that drifted above
+# this would be timing a random gather under a shared-control name.
+_SHARED_MAX_UNIQUE_FRACTION = 0.65
+
+
+def _shared_control_plans(
+    n_obs: int,
+    n_batches: int = _SHARED_N_BATCHES,
+    seed: int = _SHARED_SEED,
+) -> Iterator[tuple]:
+    """Batches whose every set is `_SHARED_CONTROL_PER_SET` fixed control rows
+    plus `_SHARED_PERT_PER_SET` fresh ones."""
+    rng = np.random.default_rng(seed)
+    sets_per_batch = max(1, ML_BATCH_SIZE // _SHARED_SET_SIZE)
+    pool_end = min(n_obs, _SHARED_CONTROL_POOL)
+    controls = rng.integers(
+        0, pool_end, size=min(_SHARED_CONTROL_PER_SET, pool_end)
+    ).astype(np.uint64)
+    for _ in range(n_batches):
+        sets = [
+            np.concatenate(
+                [
+                    controls.copy(),
+                    rng.integers(0, n_obs, size=_SHARED_PERT_PER_SET).astype(np.uint64),
+                ]
+            )
+            for _ in range(sets_per_batch)
+        ]
+        yield _pack_plan(sets)
+
+
+def _shared_control_premises(n_obs: int) -> dict[str, Any]:
+    """Raise unless the arm is measuring what its name says.
+
+    Computed from the PLAN LIST, never from the loader: asking the gather how
+    many rows it deduplicated would be asking the subject under test to certify
+    its own premise, which is the shape that let phase 4's overlap premise pass
+    on a random-plan control.
+    """
+    batches = list(_shared_control_plans(n_obs, n_batches=2))
+    if not batches:
+        raise RuntimeError("shared-control arm produced no batches")
+    fractions = []
+    for _file_ids, rows, _role_tags, offsets in batches:
+        n_sets = len(offsets) - 1
+        if n_sets < 2:
+            raise RuntimeError(
+                f"shared-control arm needs at least two sets per batch, got {n_sets}"
+            )
+        per_set = [
+            set(rows[offsets[s] : offsets[s + 1]].tolist()) for s in range(n_sets)
+        ]
+        shared = set.intersection(*per_set)
+        if len(shared) < _SHARED_CONTROL_PER_SET // 2:
+            raise RuntimeError(
+                f"shared-control arm: only {len(shared)} rows are in every set, so "
+                "the control block is not shared and this would time a random gather"
+            )
+        fractions.append(len(set(rows.tolist())) / len(rows))
+    unique_fraction = max(fractions)
+    if unique_fraction > _SHARED_MAX_UNIQUE_FRACTION:
+        raise RuntimeError(
+            f"shared-control arm: {unique_fraction:.2f} of the batch's positions "
+            f"name a distinct row (bar {_SHARED_MAX_UNIQUE_FRACTION}), so there is "
+            "almost nothing to deduplicate and the arm measures a random gather"
+        )
+    _, rows, _, offsets = batches[0]
+    return {
+        "control_per_set": _SHARED_CONTROL_PER_SET,
+        "pert_per_set": _SHARED_PERT_PER_SET,
+        "control_pool": min(n_obs, _SHARED_CONTROL_POOL),
+        "sets_per_batch": len(offsets) - 1,
+        "plan_rows": int(len(rows)),
+        "unique_row_fraction": round(unique_fraction, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
 # W7: neighbourhood plan builder arms
 # ---------------------------------------------------------------------------
 #
@@ -2393,6 +2506,73 @@ def run(
         if hot_hit_rates:
             summary["median_row_group_hit_rate"] = round(statistics.median(hot_hit_rates), 4)
         result.metadata["hot_control_cold_tail"] = summary
+        gc.collect()
+
+    # --- W11: shared-control arm ------------------------------------------
+    shared_sc = "gather_shared_control_per_set"
+    try:
+        shared_premises = _shared_control_premises(n_obs)
+    except Exception as e:  # noqa: BLE001
+        # Recorded and dropped, as the W10 arm does: every failure the premise
+        # check can report is a property of the FIXTURE (too few rows to hold a
+        # control pool apart from the perturbation draw), which this function
+        # cannot fix and which must not fail a whole cohort job for one optional
+        # arm.
+        result.metadata["shared_control_per_set"] = {
+            "applicable": False,
+            "reason": str(e),
+        }
+    else:
+        shared_rates: list[float] = []
+        shared_err: str | None = None
+        for _ in range(n_runs):
+            cache_policy = drop_file_cache(scx_path) if cold_cache else "warm"
+            try:
+                out = _run_gather(scx_path, lambda: _shared_control_plans(n_obs))
+            except Exception as e:  # noqa: BLE001
+                shared_err = str(e)
+                break
+            sps = out.n_sets / out.wall_s if out.wall_s else 0.0
+            us_per_cell = out.wall_s * 1e6 / out.n_cells if out.n_cells else 0.0
+            result.add_run(
+                wall_s=out.wall_s,
+                peak_rss_mb=out.peak_rss_mb,
+                scenario=shared_sc,
+                set_size=_SHARED_SET_SIZE,
+                n_sets=out.n_sets,
+                n_cells=out.n_cells,
+                # Beside the rate, because none of it is comparable across a
+                # change in the shape: a floor authored from these numbers binds
+                # to this control/perturbation split.
+                sets_per_batch=shared_premises["sets_per_batch"],
+                control_per_set=_SHARED_CONTROL_PER_SET,
+                pert_per_set=_SHARED_PERT_PER_SET,
+                cache_policy=cache_policy,
+                **{
+                    f"cellsets_per_sec__{shared_sc}": round(sps, 1),
+                    f"us_per_cell__{shared_sc}": round(us_per_cell, 3),
+                    f"peak_rss_mb__{shared_sc}": round(out.peak_rss_mb, 1),
+                    f"ttfb_first_set_s__{shared_sc}": round(out.ttfb_s, 4),
+                    # What the arm exists for, and it is a property of the PLAN,
+                    # not of the loader: the fraction of the batch's positions
+                    # that name a distinct row. Without it the rate above is
+                    # uninterpretable — the same number means different things
+                    # at 0.53 and at 0.99.
+                    f"unique_row_fraction__{shared_sc}": shared_premises[
+                        "unique_row_fraction"
+                    ],
+                },
+            )
+            shared_rates.append(sps)
+        summary: dict[str, Any] = {"applicable": True, **shared_premises}
+        if shared_err is not None:
+            summary["error"] = shared_err
+        if shared_rates:
+            summary["n_runs"] = len(shared_rates)
+            summary["median_cellsets_per_sec"] = round(
+                statistics.median(shared_rates), 1
+            )
+        result.metadata["shared_control_per_set"] = summary
         gc.collect()
 
     # --- W7: neighbourhood plan arms --------------------------------------

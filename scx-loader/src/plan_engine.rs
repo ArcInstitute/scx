@@ -238,8 +238,25 @@ impl PrefetchEngine {
 
     /// Deduplicate a plan's `(file, row)` pairs into per-`(file, shard)` buckets.
     ///
-    /// The gather passes the same deduplicated set to `read_rows_with`, so each
-    /// bucket's length is the `group_len` the block-index decision sees.
+    /// Each bucket's length is the `group_len` the block-index decision sees,
+    /// and that is an agreement between two different pieces of code, not a
+    /// property of one.
+    ///
+    /// ⚠️ It has been wrong twice. Before W11 the gather walked the plan one
+    /// set at a time and passed each set's raw rows, so a shard could read as
+    /// dense here and sparse there. W11's batch executor reads the whole plan
+    /// at once but passes **every occurrence** on its direct path, and
+    /// `plan_row_groups` counted those occurrences — so a plan whose distinct
+    /// rows are sparse and whose positions are dense was sized and admitted as
+    /// row groups here and then read as a whole shard, whose bytes this sum
+    /// never counted (a whole-shard insert ignores `Admit`). What closes it is
+    /// `plan_row_groups` counting **distinct rows**, the same unit this
+    /// function dedups to. The test that sits in the disagreeing window is
+    /// `a_plan_that_repeats_rows_keeps_the_block_index_route`;
+    /// `cellset_plan_admission_ignores_plan_level_density` is the
+    /// plan-dense/set-sparse guard and names distinct rows only, so it cannot
+    /// see this one.
+    /// `IndexPlanLoader` still reads per plan-item.
     /// An out-of-range `file_id` is skipped rather than panicked on: the
     /// gather's own validation is what reports it, and this runs first.
     pub(crate) fn bucket_plan_rows(

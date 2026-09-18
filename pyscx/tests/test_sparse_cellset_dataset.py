@@ -994,3 +994,148 @@ def test_memory_budget_reports_reader_limit(two_scx):
 def test_reader_limit_zero_is_refused(two_scx):
     with pytest.raises(ValueError, match="reader_limit must be >= 1"):
         pyscx.SparseCellSetDataset(paths=two_scx, reader_limit=0)
+
+
+# ---------------------------------------------------------------------------
+# W11 — the multi-set batch executor
+# ---------------------------------------------------------------------------
+
+# Three single-file sets (a set may not span files without a remap): row 4
+# repeated NON-ADJACENTLY inside set 0 and again in set 2, row 12 repeated
+# across sets 0 and 2. Eight positions, five unique `(file, row)` pairs.
+_DUP_FILE_IDS = [0, 0, 0, 1, 1, 0, 0, 0]
+_DUP_ROWS = [4, 12, 4, 9, 2, 12, 4, 7]
+_DUP_ROLE_TAGS = [0, 1, 2, 3, 4, 5, 6, 7]
+_DUP_SET_OFFSETS = [0, 3, 5, 8]
+_DUP_PLAN = (_DUP_FILE_IDS, _DUP_ROWS, _DUP_ROLE_TAGS, _DUP_SET_OFFSETS)
+
+# The same shape on ONE file, which is the configuration the executor's
+# move-the-read-out fast path is gated on — so a fast path that fired on a plan
+# with repeats would corrupt this one and leave the two-file plan above intact.
+_DUP1_FILE_IDS = [0, 0, 0, 0, 0, 0]
+_DUP1_ROWS = [4, 12, 4, 7, 12, 4]
+_DUP1_ROLE_TAGS = [0, 1, 2, 3, 4, 5]
+_DUP1_SET_OFFSETS = [0, 3, 6]
+_DUP1_PLAN = (_DUP1_FILE_IDS, _DUP1_ROWS, _DUP1_ROLE_TAGS, _DUP1_SET_OFFSETS)
+
+
+def test_repeated_rows_match_the_backed_reference_at_every_position(two_scx):
+    """A `(file, row)` the plan names more than once is read and transformed
+    once and emitted at each of its positions.
+
+    Compared against `to_anndata(backed=True).X[row]` rather than against the
+    batch's own other copy, so a dedup that served the *wrong* row consistently
+    at both positions cannot pass.
+    """
+    p0, p1 = two_scx
+    refs = {
+        0: pyscx.open(p0).to_anndata(backed=True).X,
+        1: pyscx.open(p1).to_anndata(backed=True).X,
+    }
+    for label, paths, plan in (
+        ("one file", [p0], _DUP1_PLAN),
+        ("two files", [p0, p1], _DUP_PLAN),
+    ):
+        ds = pyscx.SparseCellSetDataset(paths)
+        b = ds.gather(*plan)
+        file_ids, rows, role_tags, _ = plan
+        got = sp.csr_matrix(
+            (b["data"], b["indices"], b["indptr"]), shape=tuple(b["shape"])
+        )
+        assert b["shape"][0] == len(rows), label
+        for j, (fid, row) in enumerate(zip(file_ids, rows)):
+            np.testing.assert_array_equal(
+                got[j].toarray(),
+                refs[fid][row].toarray(),
+                err_msg=f"{label}, position {j}",
+            )
+        np.testing.assert_array_equal(b["cell_indices"], rows, err_msg=label)
+        np.testing.assert_array_equal(b["file_ids"], file_ids, err_msg=label)
+        np.testing.assert_array_equal(b["role_tags"], role_tags, err_msg=label)
+        ds.close()
+
+
+def test_the_pre_w11_executor_gathers_the_same_bytes(two_scx):
+    """`SCX_CELLSET_EXECUTOR=set` is the same-build A/B arm, and it must be an
+    arm and not a variant: same bytes, same dtypes, same everything.
+
+    The switch is memoized in a `OnceLock`, so the comparison runs in a fresh
+    interpreter and the two arms are compared through their serialized arrays.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    p0, p1 = two_scx
+    src = textwrap.dedent(
+        f"""
+        import numpy as np, pyscx, sys
+        ds = pyscx.SparseCellSetDataset([{p0!r}, {p1!r}])
+        out = {{}}
+        for tag, plan in (("two", {_DUP_PLAN!r}), ("one", {_DUP1_PLAN!r})):
+            b = ds.gather(*plan)
+            for k, v in b.items():
+                out[tag + "_" + k] = np.asarray(v)
+        np.savez(sys.argv[1], **out)
+        """
+    )
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        arms = {}
+        for arm in ("plan", "set"):
+            dest = f"{td}/{arm}.npz"
+            env = {**os.environ, "SCX_CELLSET_EXECUTOR": arm}
+            r = subprocess.run(
+                [sys.executable, "-c", src, dest],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            assert r.returncode == 0, r.stderr
+            arms[arm] = dict(np.load(dest))
+        assert arms["plan"].keys() == arms["set"].keys()
+        for key in arms["plan"]:
+            assert arms["plan"][key].dtype == arms["set"][key].dtype, key
+            np.testing.assert_array_equal(arms["plan"][key], arms["set"][key], err_msg=key)
+
+
+def test_batch_arrays_own_their_memory_and_outlive_the_dataset(two_scx):
+    """The batch's arrays are **moves** of Rust `Vec`s, not views into loader
+    state, so they stay valid after the dataset and its iterator are gone.
+
+    Nothing pinned this before W11 and nothing would have caught a switch to
+    borrowed arrays — which the batch executor makes tempting, since it now has
+    a whole deduplicated read sitting beside the batch it could have handed out
+    slices of instead.
+    """
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    it = iter(ds.iter_with_plans(iter([_DUP_PLAN])))
+    b = next(it)
+    arrays = {k: v for k, v in b.items() if isinstance(v, np.ndarray)}
+    assert set(arrays) == {
+        "indptr",
+        "indices",
+        "data",
+        "cell_indices",
+        "file_ids",
+        "set_offsets",
+        "role_tags",
+    }
+    # `OWNDATA` is False on all seven and that is correct: `PyArray1::from_vec`
+    # is `into_pyarray`, which hands numpy the Rust `Vec`'s own pointer under a
+    # pyo3 container object. The container is what must own it — never the
+    # loader, the iterator or an mmap — so the claim is `base is not None` plus
+    # the read-back below, not the flag.
+    for key, arr in arrays.items():
+        assert arr.base is not None, f"{key} has no owning container"
+    before = {k: v.copy() for k, v in arrays.items()}
+
+    ds.close()
+    del ds, it, b
+    gc.collect()
+
+    for key, arr in arrays.items():
+        np.testing.assert_array_equal(arr, before[key], err_msg=key)

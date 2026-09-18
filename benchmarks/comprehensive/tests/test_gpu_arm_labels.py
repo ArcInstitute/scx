@@ -290,6 +290,21 @@ def test_row_group_cache_kill_switch_is_forwarded_to_workers(monkeypatch):
         for c in _slurm_setup_cmds("scx-bench")
     ), "unset on the orchestrator must stay unset (parallel, the shipped default)"
 
+    # W11's arm is the loader layer rather than the reader layer, and is
+    # `OnceLock`-cached in exactly the same way: `SCX_CELLSET_EXECUTOR=set`
+    # restores the pre-W11 per-set cell-set gather.
+    monkeypatch.setenv("SCX_CELLSET_EXECUTOR", "set")
+    cmds = _slurm_setup_cmds("scx-bench", "scx_compact_trial_g256")
+    assert "export SCX_CELLSET_EXECUTOR='set'" in cmds
+    knob = cmds.index("export SCX_CELLSET_EXECUTOR='set'")
+    activate = next(i for i, c in enumerate(cmds) if c.startswith("conda activate"))
+    assert knob < activate
+
+    monkeypatch.delenv("SCX_CELLSET_EXECUTOR", raising=False)
+    assert not any(
+        c.startswith("export SCX_CELLSET_EXECUTOR=") for c in _slurm_setup_cmds("scx-bench")
+    ), "unset on the orchestrator must stay unset (the batch executor, the shipped default)"
+
     # The same-build A/B also points the workers at a specific checkout; the
     # `.so` a worker imports is the one the orchestrator's PYTHONPATH names.
     monkeypatch.setenv("PYTHONPATH", "/some/repo/pyscx/python")

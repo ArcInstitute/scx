@@ -1067,6 +1067,7 @@ impl BackedCsrReader {
     /// prescan between planning and warming cannot change which groups
     /// [`Self::block_index_eligible`] admits.
     fn shard_indptr(&self, shard_idx: usize) -> Result<Vec<i64>> {
+        note_indptr_decode();
         let lite = self
             .shard_entry(shard_idx)
             .ok_or(ScxError::ShardIndexOutOfBounds {
@@ -1437,6 +1438,30 @@ impl BackedCsrReader {
     /// row group decoding — not a per-row `ScxCsr` per requested row and a
     /// second copy of the result, as before.
     pub fn read_row_indices(&self, rows: &[u64]) -> Result<ScxCsr> {
+        self.read_row_indices_with_admission(rows, None)
+    }
+
+    /// [`Self::read_row_indices`] with the row-group admission decided by the
+    /// caller, exactly as [`Self::read_rows_with_admission`] is to
+    /// [`Self::read_rows_with`].
+    ///
+    /// `None` decides per gather (this call's groups must fit the whole byte
+    /// budget); `Some(admit)` is a verdict taken over a larger working set —
+    /// `scx-loader`'s plan engine decides once per plan and the cell-set gather
+    /// carries that verdict in here, so the L1 gather and the L2 warm cannot
+    /// disagree. Without it a caller holding a plan-wide verdict would have to
+    /// choose between the exact prescan here and carrying that verdict, which
+    /// is why this variant exists rather than a second prescan in the loader.
+    ///
+    /// ⚠️ `rows` may contain **duplicates**, and the cell-set gather's direct
+    /// path passes them: each occurrence is its own output row. The route
+    /// decision in [`Self::plan_row_groups`] counts distinct rows for exactly
+    /// that reason.
+    pub fn read_row_indices_with_admission(
+        &self,
+        rows: &[u64],
+        admit_row_groups: Option<&Admit>,
+    ) -> Result<ScxCsr> {
         if rows.is_empty() {
             return Ok(Self::empty_csr(self.n_vars));
         }
@@ -1445,9 +1470,41 @@ impl BackedCsrReader {
         let groups = self.plan_row_groups(&sorted)?;
 
         // Phase 1 — exact per-row lengths in request order, then prefix-sum.
+        //
+        // ⚠️ From the RESIDENT shard when there is one. `shard_indptr` decodes
+        // the indptr stream afresh every call by design (it must not touch the
+        // LRU, or a prescan between planning and warming could change what
+        // `block_index_eligible` admits) — but when the shard is already
+        // decoded its indptr is in memory and decoding it again is pure waste.
+        // Measured on a 100k-row synthetic, 16 sets x 64 rows, every shard
+        // warm: 2.73 -> 0.55 ms per gather, i.e. seven re-decodes of a
+        // 16,384-entry indptr were 80 % of the call. The peek counts nothing
+        // and touches neither recency nor the hit/miss counters: no read is
+        // being served here.
         let mut indptr = vec![0i64; rows.len() + 1];
         for g in &groups {
-            let ip = self.shard_indptr(g.shard_idx)?;
+            let resident = self
+                .shard_cache
+                .peek_cached(CacheKey::Shard(self.file_id, g.shard_idx))
+                // ⚠️ `shard_indptr` runs `check_decoded_shard_rows` before it
+                // returns and the peek must not skip it, or a cached entry
+                // short of the catalog's row count panics on the index below
+                // instead of raising `InvalidCatalog`. Checked rather than
+                // asserted: a resident entry that does not describe the shard
+                // is not something to trust and then index. (Review on #542,
+                // Cursor Agent - Grok 4.6 High.)
+                .filter(|csr| {
+                    self.check_decoded_shard_rows(g.shard_idx, csr.indptr.len().saturating_sub(1))
+                        .is_ok()
+                });
+            let decoded;
+            let ip: &[i64] = match resident.as_deref() {
+                Some(csr) => &csr.indptr,
+                None => {
+                    decoded = self.shard_indptr(g.shard_idx)?;
+                    &decoded
+                }
+            };
             for &(row, pos) in &sorted[g.start..g.end] {
                 let local = (row - g.s_start) as usize;
                 indptr[pos + 1] = ip[local + 1] - ip[local];
@@ -1463,7 +1520,7 @@ impl BackedCsrReader {
         let mut data = vec![0f32; nnz];
         let mut fired = 0usize;
         let mut copied = 0usize;
-        self.scatter_groups(&sorted, &groups, None, |pos, idx, val| {
+        self.scatter_groups(&sorted, &groups, admit_row_groups, |pos, idx, val| {
             let lo = indptr[pos] as usize;
             let hi = indptr[pos + 1] as usize;
             if idx.len() != hi - lo || val.len() != hi - lo {
@@ -1615,7 +1672,26 @@ impl BackedCsrReader {
             // engines leave block-index-eligible cold sparse shards un-warmed, so an
             // eligible predicate returns true here and the O(rows) path is taken;
             // dense/cached/unframed groups still go full-shard.
-            let use_block_index = self.block_index_eligible(shard_idx, group_len);
+            //
+            // ⚠️ **DISTINCT rows, not request positions.** The predicate asks
+            // whether the request is a small fraction of the shard, and a
+            // repeated row costs a second memcpy out of the same decoded span —
+            // never another row group. Counting occurrences also put this
+            // decision at odds with the one the prefetch engine makes:
+            // `bucket_plan_rows` deduplicates `(file, row)` before sizing, so a
+            // plan whose distinct rows are sparse and whose positions are dense
+            // was planned and admitted as row groups and then read as a whole
+            // shard — and a whole-shard insert ignores `Admit`, so the bytes the
+            // engine checked its budget against were not the bytes the read took.
+            // `sorted_pairs` is sorted by row, so the duplicates of a row are
+            // adjacent and the count is one pass. (Review on #542, found
+            // independently by two reviewers.)
+            let distinct_rows = sorted_pairs[start..end]
+                .windows(2)
+                .filter(|w| w[0].0 != w[1].0)
+                .count()
+                + 1;
+            let use_block_index = self.block_index_eligible(shard_idx, distinct_rows);
             groups.push(RowGroup {
                 start,
                 end,
@@ -2555,4 +2631,23 @@ impl BackedCsrReader {
     pub(crate) fn set_row_group_cache(&mut self, enabled: bool) {
         self.row_group_cache = enabled;
     }
+}
+
+/// Record that [`BackedCsrReader::shard_indptr`] decoded, for the test that
+/// pins the prescan reading a **resident** shard instead.
+///
+/// ⚠️ Two definitions rather than a `#[cfg(test)]` at the call site, and the
+/// reason is the guards above: `shard_indptr` sits at ~line 1090, ahead of the
+/// `get_or_decode` calls the I-ORG-1 dedup guards count, and those guards read
+/// production code as `sed '/#\[cfg(test)\]/,$d'`. A `#[cfg(test)]` there
+/// truncates their view of the file and fails "All three backed readers share
+/// one ShardCache" on an invariant that holds — which is what happened on #528
+/// round 2, and again here. In a non-test build this is an empty inline call.
+#[cfg(not(test))]
+#[inline(always)]
+fn note_indptr_decode() {}
+
+#[cfg(test)]
+fn note_indptr_decode() {
+    tests::note_indptr_decode();
 }

@@ -159,20 +159,28 @@ fn cellset_plan_admission_is_per_plan_not_per_set() {
     );
 }
 
-/// **Review on #528 round 2 (codex).** The plan's admission sum must not key
-/// on the plan-level density window either: the engine buckets a plan's rows
-/// per shard, but the cell-set loader gathers one set at a time, so a shard
-/// that is dense over the whole plan (`block_index_eligible` false — the sum
-/// would skip it) is sparse per set, and every set's gather takes the
-/// row-group path. Sixteen rows of one 64-row shard across four sets of four:
-/// dense as a plan, sparse per set. Four groups exceed the budget, so the plan
-/// must be refused; a density-filtered sum (0 bytes) would admit it and the
-/// four gathers would insert. Falsifier: any `row_group_bytes_inserted`.
+/// **Review on #528 round 2 (codex), re-pinned for W11.** The plan's admission
+/// sum must not key on the plan-level density window. Sixteen rows of one
+/// 64-row shard across four sets of four: dense as a plan, sparse per set. Four
+/// groups exceed the budget, so the plan must be refused; a density-filtered
+/// sum (0 bytes) would admit it and the gathers would insert. Falsifier: any
+/// `row_group_bytes_inserted`, under **either** executor.
+///
+/// ⚠️ The two executors take **different routes** on this shape, and that is
+/// the finding rather than a defect. The per-set walk gathers four rows at a
+/// time, so the shard reads as sparse and every set takes the row-group path —
+/// which is the mismatch this test was written to expose, since the engine's
+/// sum had already bucketed the same rows as dense. The W11 batch executor
+/// reads the plan's rows in one call, so its bucketing **is** the sum's: the
+/// shard reads as dense and the gather takes the full-shard path. The hole is
+/// closed by construction there rather than by the sum's behaviour, so both
+/// arms are asserted — the `set` arm keeps the original guard alive for
+/// `SCX_CELLSET_EXECUTOR=set`.
 ///
 /// `lookahead = 0` on purpose: with prefetch on, the dense plan-level bucket
 /// makes the prefetcher warm the shard **whole**, and the gathers then slice
-/// the resident shard (`full_shard_groups`) — the hole only opens when nothing
-/// warmed the shard first, which is exactly the no-prefetch path.
+/// the resident shard (`full_shard_groups`) — the per-set hole only opens when
+/// nothing warmed the shard first, which is exactly the no-prefetch path.
 #[test]
 fn cellset_plan_admission_ignores_plan_level_density() {
     use crate::plan_engine::tests::{framed_expected, write_framed_fixture, FRAMED_GROUP_BYTES};
@@ -236,15 +244,72 @@ fn cellset_plan_admission_ignores_plan_level_density() {
     let m = loader.cache_metrics();
     assert_eq!(
         m.block_index_groups.load(AtomicOrdering::Relaxed),
-        4,
-        "premise: every set's gather took the row-group route (cold shard, sparse per set)"
+        0,
+        "the batch executor reads the plan in one call, so the shard is dense for \
+         the gather too and the full-shard route is taken"
     );
+    assert_eq!(m.full_shard_groups.load(AtomicOrdering::Relaxed), 1);
     assert_eq!(
         m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
         0,
-        "four sets, sparse each, dense together: the plan is over budget and retains nothing"
+        "the plan is over budget and retains nothing"
     );
     assert_eq!(m.row_group_hits.load(AtomicOrdering::Relaxed), 0);
+
+    // --- the `SCX_CELLSET_EXECUTOR=set` arm, on its own cold cache ----------
+    //
+    // A second loader, because the first arm left the shard resident and
+    // `block_index_eligible` tests `!cached`. The verdict is computed the way
+    // `gather` computes it, so the two arms are admitted identically and only
+    // the executor differs.
+    let per_set_loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        16,
+        Some(budget),
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        true,
+        None,
+    )
+    .unwrap();
+    let buckets = per_set_loader
+        .engine
+        .bucket_plan_rows(plan.file_ids.iter().copied().zip(plan.rows.iter().copied()));
+    let (planned, share) = per_set_loader
+        .engine
+        .plan_footprint(&buckets, None)
+        .unwrap();
+    assert!(planned > share, "premise: the plan is over its share");
+    let per_set = per_set_loader
+        .gather_per_set(
+            &per_set_loader.engine,
+            &plan,
+            Some(crate::sparse_cellset::Admit::from(false)),
+        )
+        .unwrap();
+    assert_eq!(
+        per_set.indptr, batches[0].indptr,
+        "same bytes, either executor"
+    );
+    assert_eq!(per_set.indices, batches[0].indices);
+    assert_eq!(per_set.data, batches[0].data);
+    let pm = per_set_loader.cache_metrics();
+    assert_eq!(
+        pm.block_index_groups.load(AtomicOrdering::Relaxed),
+        4,
+        "the per-set walk gathers four rows at a time, so the shard reads as sparse"
+    );
+    assert_eq!(
+        pm.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "four sets, sparse each, dense together: the plan is over budget and retains nothing"
+    );
+    assert_eq!(pm.row_group_hits.load(AtomicOrdering::Relaxed), 0);
 }
 
 /// **Pin (9b).** `SparseCellSetLoader::new` must pass `scatter_block_index`
@@ -437,7 +502,15 @@ fn empty_set_keeps_boundary_without_rows() {
 fn remap_row_maps_drops_sentinels_and_coalesces() {
     // cols 0→10, 1→(-1 drop), 2→20, 3→10 (duplicate of col0's global).
     let table = vec![10, -1, 20, 10];
-    let (idx, dat) = remap_row(&[0, 1, 2, 3], &[1.0, 9.0, 2.0, 4.0], &table);
+    let (mut pairs, mut idx, mut dat) = (Vec::new(), Vec::new(), Vec::new());
+    remap_row_into(
+        &[0, 1, 2, 3],
+        &[1.0, 9.0, 2.0, 4.0],
+        &table,
+        &mut pairs,
+        &mut idx,
+        &mut dat,
+    );
     // global 10 gets col0 (1.0) + col3 (4.0) = 5.0; col1 dropped; global 20 = 2.0.
     assert_eq!(idx, vec![10, 20]);
     assert_eq!(dat, vec![5.0, 2.0]);
@@ -1265,6 +1338,7 @@ fn closed_form_agrees_with_the_shared_driver() {
     let model = SparseCellSetBudgetModel {
         shard_decoded_bytes: SHARD,
         batch_bytes: 0,
+        transient_bytes: 0,
     };
     let py = crate::budget::PYTHON_OVERHEAD_BYTES;
     let budgets = [
@@ -1305,6 +1379,7 @@ fn the_sparse_reduction_chain_is_monotone() {
             &SparseCellSetBudgetModel {
                 shard_decoded_bytes,
                 batch_bytes: 0,
+                transient_bytes: 0,
             },
             SparseCellSetParams { cache_shards: 128 },
         );
@@ -2055,20 +2130,27 @@ fn write_ragged_fixture(path: &std::path::Path, n_obs: usize, n_vars: usize, n_s
     writer.finish().unwrap();
 }
 
-/// W1: the pre-size is an estimate, and is wrong in both directions by design.
+/// W11 supersedes W1's estimate: the gather allocates **exactly**, on a fixture
+/// built to make an estimate wrong in both directions.
 ///
-/// The capacity comes from the manifest's mean density, so a plan that selects
-/// denser-than-average rows under-shoots (one reallocation, which the caller
-/// would have paid anyway) and one that selects sparser rows over-shoots (a few
-/// transient bytes). Neither can affect the output, and that is the whole
-/// argument for preferring the estimate to the exact indptr prescan it
-/// replaced (`BackedCsrReader::nnz_for_rows`, added and then deleted in this
-/// series) —
-/// `with_capacity` is a hint, so nothing here needs a bound, and buying one
-/// cost an indptr decode per touched shard per plan (~9 % of
-/// `gather_grouped_s512` on tabula in the two-build A/B).
+/// ⚠️ This test used to assert the opposite, and said why: the capacity came
+/// from the manifest's mean density, so a densest-rows plan under-shot and a
+/// sparsest-rows plan over-shot. Its own closing comment asked to be told if
+/// that ever changed — "pinned so a silent return to an exact indptr prescan,
+/// which would make this case free, is visible" — and W11 is that return. The
+/// batch executor reads the plan's rows through
+/// `BackedCsrReader::read_row_indices_with_admission`, which prescans each
+/// touched shard's indptr and carves the output exactly, so there is no
+/// estimate left to be wrong. `presize_nnz` survives as the **budget** charge
+/// only (see `the_batch_is_uncharged_until_max_plan_rows_is_declared`), where a
+/// per-plan figure is not available at construction time.
+///
+/// The prescan is the ~9 % of `gather_grouped_s512` W1 measured and removed. It
+/// bought a capacity hint then; it buys the exact spans, the removal of every
+/// per-row `Vec` and the removal of one whole copy of the batch now. That trade
+/// is what the phase-6 capture measures.
 #[test]
-fn gather_presize_is_an_estimate_on_a_non_uniform_fixture() {
+fn gather_allocates_exactly_on_a_non_uniform_fixture() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ragged.scx");
     // Rows 0..64, row r has (r % 4) + 1 non-zeros ⇒ mean 2.5.
@@ -2109,23 +2191,21 @@ fn gather_presize_is_an_estimate_on_a_non_uniform_fixture() {
     let n_dense = dense.len();
     let b = gather(dense);
     assert_eq!(b.indices.len(), n_dense * 4, "4 nnz per selected row");
-    assert!(
-        b.indices.capacity() >= b.indices.len(),
-        "capacity {} < len {} — a Vec cannot hold less than it holds",
-        b.indices.capacity(),
-        b.indices.len()
-    );
-    // Even with the bias, a densest-rows plan exceeds the estimate — the one
-    // case the estimate cannot serve without reading the data, and the reason
-    // the assertion above is `>=` rather than an equality. Pinned so a silent
-    // return to an exact indptr prescan, which would make this case free, is
-    // visible.
+    // The case the estimate could not serve without reading the data: the
+    // biased mean still falls short of a densest-rows plan, and the exact
+    // allocation covers it with no reallocation at all.
     assert!(
         crate::sparse_cellset::presize_nnz(n_dense, 2.5) < b.indices.len(),
-        "a densest-rows plan should still exceed the biased estimate: {} vs {}",
+        "premise: a densest-rows plan exceeds the biased estimate ({} vs {})",
         crate::sparse_cellset::presize_nnz(n_dense, 2.5),
         b.indices.len()
     );
+    assert_eq!(
+        b.indices.capacity(),
+        b.indices.len(),
+        "exact, not estimated"
+    );
+    assert_eq!(b.data.capacity(), b.data.len(), "exact, not estimated");
 
     // Sparsest rows only (r % 4 == 0 ⇒ 1 nnz each): the mean over-shoots.
     let sparse: Vec<u64> = (0..64).filter(|r| r % 4 == 0).collect();
@@ -2133,42 +2213,41 @@ fn gather_presize_is_an_estimate_on_a_non_uniform_fixture() {
     let b = gather(sparse);
     assert_eq!(b.indices.len(), n_sparse, "1 nnz per selected row");
     assert!(
-        b.indices.capacity() > b.indices.len(),
-        "the mean should over-estimate a sparsest-rows plan: capacity {} vs len {}",
-        b.indices.capacity(),
+        crate::sparse_cellset::presize_nnz(n_sparse, 2.5) > b.indices.len(),
+        "premise: the mean over-estimates a sparsest-rows plan ({} vs {})",
+        crate::sparse_cellset::presize_nnz(n_sparse, 2.5),
         b.indices.len()
     );
-
-    // Whole file: the mean is exact over every row, so the estimate before the
-    // bias is the truth — and the bias is then pure headroom, which is what
-    // keeps even this plan free of a reallocation.
-    let b = gather((0..64).collect());
-    assert_eq!(b.indices.len(), 160, "sum of (r % 4) + 1 over 64 rows");
     assert_eq!(
         b.indices.capacity(),
-        crate::sparse_cellset::presize_nnz(64, 2.5),
-        "the whole-file plan should not have reallocated"
+        b.indices.len(),
+        "exact, not estimated"
     );
-    assert!(b.indices.capacity() > b.indices.len(), "bias is headroom");
+    assert_eq!(b.data.capacity(), b.data.len(), "exact, not estimated");
+
+    // Whole file: the only shape the mean could ever get right, and the exact
+    // allocation is still tighter than the biased estimate.
+    let b = gather((0..64).collect());
+    assert_eq!(b.indices.len(), 160, "sum of (r % 4) + 1 over 64 rows");
+    assert_eq!(b.indices.capacity(), 160, "exact, not estimated");
+    assert!(
+        crate::sparse_cellset::presize_nnz(64, 2.5) > b.indices.capacity(),
+        "premise: the biased estimate would have over-allocated even here"
+    );
 }
 
-/// W1: the gather pre-sizes `indices`/`data`, so the append loop never
-/// reallocates.
+/// W11: the raw-local fast path allocates `indices`/`data` **once, exactly** —
+/// there is no append loop left to reallocate.
 ///
-/// The assertion is `capacity() == presize_nnz(rows, mean)` — the capacity the
-/// policy asks for, untouched — rather than `capacity() == len()`. Those were
-/// the same thing while the estimate was unbiased, and pinning the wrong one
-/// hid a defect: the estimate then landed just *under* the truth about half the
-/// time, taking one reallocation at full size, which measured slower than
-/// growing from empty. An equality against the policy catches any growth
-/// (a realloc lands on a different, larger capacity) without re-asserting the
-/// arithmetic, so it keeps working when the bias changes.
-///
-/// Watched failing before the pre-sizing existed: with `Vec::new()` the
-/// finished `indices` has a power-of-two capacity, the signature of geometric
-/// growth.
+/// ⚠️ Supersedes W1's assertion, which was `capacity() == presize_nnz(rows,
+/// mean)` — the capacity the estimate asked for. A single-file plan with no
+/// duplicate rows and no length-changing transform is now served by moving the
+/// `ScxCsr` that `read_row_indices_with_admission` returns straight out as the
+/// batch, so `capacity() == len()` is the whole claim: one allocation for the
+/// gather, sized by the indptr prescan rather than guessed from the manifest
+/// mean.
 #[test]
-fn gather_presizes_indices_and_data_exactly_on_the_raw_local_path() {
+fn gather_allocates_indices_and_data_exactly_on_the_raw_local_path() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("presize.scx");
     write_fixture(&path, 640, 32, 4);
@@ -2205,28 +2284,23 @@ fn gather_presizes_indices_and_data_exactly_on_the_raw_local_path() {
     let b = &batches[0];
 
     assert_eq!(b.indices.len(), 640, "one nnz per row in this fixture");
-    // Every row carries one non-zero, so the manifest mean is 1.0 and the
-    // policy asks for 640 + 640/8. Anything else means the vector grew.
-    let want = crate::sparse_cellset::presize_nnz(640, 1.0);
     assert_eq!(
         b.indices.capacity(),
-        want,
-        "indices reallocated: capacity {} != the {} it was pre-sized to (len {})",
-        b.indices.capacity(),
-        want,
+        640,
+        "indices should be exactly sized, not estimated (len {})",
         b.indices.len()
     );
     assert_eq!(
         b.data.capacity(),
-        want,
-        "data reallocated: capacity {} != the {} it was pre-sized to (len {})",
-        b.data.capacity(),
-        want,
+        640,
+        "data should be exactly sized, not estimated (len {})",
         b.data.len()
     );
-    // And the bias is an over-allocation, never an under-one: a capacity below
-    // the length is the shape that costs a full-size copy.
-    assert!(b.indices.capacity() > b.indices.len());
+    assert_eq!(b.indptr.len(), 641);
+    // `presize_nnz` is no longer what sizes the gather; it survives only as the
+    // budget charge, where no per-plan figure exists at construction time. The
+    // estimate would have over-allocated this plan by an eighth.
+    assert!(crate::sparse_cellset::presize_nnz(640, 1.0) > b.indices.capacity());
 }
 
 /// The pre-size must be a *bound*, never a truncation: `capacity >= len` on a
@@ -2666,5 +2740,1068 @@ fn collate_gathered_refuses_a_gene_id_that_would_collide_with_gene_mask() {
     assert!(
         err.to_string().contains("outside the vocabulary"),
         "unexpected error: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W11 — the multi-set batch executor
+// ---------------------------------------------------------------------------
+
+/// Every field of a batch, for a field-for-field comparison of the two
+/// executors.
+///
+/// Destructured rather than listed: `SparseCellSetBatch` has no `PartialEq`,
+/// and a field added later is a compile error here instead of a field that
+/// silently stops being compared. (`bounded_and_unbounded_gathers_are_byte_identical`
+/// in `tests/test_reader_registry.rs` omitted `set_offsets` and `role_tags` for
+/// exactly that reason.)
+#[allow(clippy::type_complexity)]
+fn batch_fields(
+    b: &SparseCellSetBatch,
+) -> (
+    &[i64],
+    &[i32],
+    &[f32],
+    (usize, usize),
+    &[u64],
+    &[u32],
+    &[i64],
+    &[i32],
+) {
+    let SparseCellSetBatch {
+        indptr,
+        indices,
+        data,
+        shape,
+        cell_indices,
+        file_ids,
+        set_offsets,
+        role_tags,
+    } = b;
+    (
+        indptr,
+        indices,
+        data,
+        *shape,
+        cell_indices,
+        file_ids,
+        set_offsets,
+        role_tags,
+    )
+}
+
+/// Run one plan through both executors, each on its own cold loader, and assert
+/// every field agrees. The verdict is held at `Admit::All` so the only variable
+/// is the executor.
+fn assert_executors_agree(
+    make: &dyn Fn() -> StdArc<SparseCellSetLoader>,
+    plan: &SparseCellSetPlan,
+    label: &str,
+) -> SparseCellSetBatch {
+    let a = make();
+    let whole = a
+        .gather_whole_plan(&a.engine, plan, Some(Admit::All))
+        .unwrap_or_else(|e| panic!("{label}: whole-plan executor: {e}"));
+    let b = make();
+    let per_set = b
+        .gather_per_set(&b.engine, plan, Some(Admit::All))
+        .unwrap_or_else(|e| panic!("{label}: per-set walk: {e}"));
+    assert_eq!(batch_fields(&whole), batch_fields(&per_set), "{label}");
+    whole
+}
+
+/// A loader factory, so each executor arm gets its own cold cache.
+type MakeLoader<'a> = Box<dyn Fn() -> StdArc<SparseCellSetLoader> + 'a>;
+
+fn ragged_loader(
+    path: &std::path::Path,
+    remap: Option<Vec<Vec<i32>>>,
+    n_global: Option<usize>,
+    normalize: bool,
+    log1p: bool,
+    downsample: Option<crate::downsample::DownsampleConfig>,
+) -> StdArc<SparseCellSetLoader> {
+    SparseCellSetLoader::new(
+        vec![open(path)],
+        /*cache_shards*/ 8,
+        None,
+        /*lookahead*/ 4,
+        remap,
+        n_global,
+        normalize,
+        log1p,
+        /*target_sum*/ 1e4,
+        downsample,
+        /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
+    )
+    .unwrap()
+}
+
+fn plan_of(rows: Vec<u64>, set_offsets: Vec<i64>) -> SparseCellSetPlan {
+    let n = rows.len();
+    SparseCellSetPlan {
+        file_ids: vec![0; n],
+        // Distinct per position, so a batch that emits the right rows in the
+        // wrong order still fails.
+        role_tags: (0..n as i32).collect(),
+        rows,
+        set_offsets,
+    }
+}
+
+/// The parity table: every plan shape the two executors must agree on, under
+/// every transform configuration.
+///
+/// The fixture is **ragged** (row `r` carries `(r % 4) + 1` non-zeros) on
+/// purpose — a one-nnz-per-row fixture cannot tell a correct span from an
+/// off-by-one one, because every span is the same width.
+#[test]
+fn whole_plan_gather_matches_the_per_set_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("parity.scx");
+    write_ragged_fixture(&path, 64, 16, 2);
+
+    // Local col 0 -> the `-1` drop sentinel; cols 1 and 2 collide on one global
+    // gene, so the remap arm exercises the drop AND the coalesce.
+    let mut table: Vec<i32> = (0..16).collect();
+    table[0] = -1;
+    table[2] = 1;
+
+    let configs: Vec<(&str, MakeLoader<'_>)> = vec![
+        (
+            "raw-local",
+            Box::new(|| ragged_loader(&path, None, None, false, false, None)),
+        ),
+        (
+            "remap (drops + coalesce)",
+            Box::new(|| {
+                ragged_loader(
+                    &path,
+                    Some(vec![table.clone()]),
+                    Some(16),
+                    false,
+                    false,
+                    None,
+                )
+            }),
+        ),
+        (
+            "normalize + log1p",
+            Box::new(|| ragged_loader(&path, None, None, true, true, None)),
+        ),
+        (
+            "downsample",
+            Box::new(|| {
+                ragged_loader(
+                    &path,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Some(ds_cfg(
+                        3,
+                        crate::downsample::DownsampleMethod::Multinomial,
+                        11,
+                        vec![777],
+                    )),
+                )
+            }),
+        ),
+    ];
+
+    let shapes: Vec<(&str, SparseCellSetPlan)> = vec![
+        (
+            "distinct rows, four sets",
+            plan_of((0..16).collect(), vec![0, 4, 8, 12, 16]),
+        ),
+        (
+            "adjacent duplicate inside one set",
+            plan_of(vec![5, 3, 0, 7, 7, 31], vec![0, 3, 6]),
+        ),
+        (
+            "non-adjacent duplicate inside one set",
+            plan_of(vec![7, 3, 7, 0, 31, 7], vec![0, 3, 6]),
+        ),
+        (
+            "the same row in two different sets",
+            plan_of(vec![9, 2, 40, 9, 17, 40], vec![0, 3, 6]),
+        ),
+        (
+            "a shared block in every set (the STATE3 shape)",
+            plan_of(
+                vec![1, 2, 3, 20, 1, 2, 3, 21, 1, 2, 3, 22],
+                vec![0, 4, 8, 12],
+            ),
+        ),
+        (
+            "empty set in the middle",
+            plan_of(vec![4, 5, 6], vec![0, 2, 2, 3]),
+        ),
+        (
+            "empty sets at both ends",
+            plan_of(vec![4, 5, 6], vec![0, 0, 3, 3]),
+        ),
+        (
+            "set_offsets covering only part of the plan",
+            plan_of(vec![10, 11, 12, 13, 14], vec![1, 3]),
+        ),
+        ("no sets at all", plan_of(vec![1, 2, 3], vec![0])),
+        // `set_offsets` is not required to be non-empty either, and
+        // `validate_plan`'s loop accepts it, so both executors must.
+        ("no set_offsets at all", plan_of(vec![1, 2, 3], vec![])),
+        ("one empty set", plan_of(vec![1, 2, 3], vec![0, 0])),
+        (
+            "cross-shard, descending, with repeats",
+            plan_of(vec![63, 1, 63, 32, 31, 1], vec![0, 6]),
+        ),
+        (
+            "a zero-nnz row after the remap drop",
+            // Rows whose only column is local 0 map to nothing under `table`.
+            plan_of(vec![0, 16, 32, 48, 1], vec![0, 5]),
+        ),
+    ];
+
+    for (cfg_name, make) in &configs {
+        for (shape_name, plan) in &shapes {
+            assert_executors_agree(make.as_ref(), plan, &format!("{cfg_name} / {shape_name}"));
+        }
+    }
+}
+
+/// A `(file, row)` named by two different sets of one plan comes back at both
+/// positions, with the same bytes, from **one** shard decode.
+///
+/// No Rust test covered a cross-set duplicate before W11: every multi-set plan
+/// literal in this file used disjoint `(file, row)` pairs across its sets, and
+/// the one duplicate that existed (`[5, 3, 0, 7, 7, 31]`) was adjacent inside a
+/// single set.
+///
+/// ⚠️ It says nothing about **row** deduplication, because on this
+/// configuration there is none: a raw-local single-file plan takes the direct
+/// path, where a repeat costs one more memcpy from the resident shard and the
+/// batch is the read. `duplicate_occurrences_draw_the_same_downsample` and
+/// `the_occurrence_table_dedups_across_sets_and_within_them` cover the
+/// configuration that does deduplicate.
+#[test]
+fn a_row_in_two_sets_comes_back_at_both_positions() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dup_across_sets.scx");
+    write_ragged_fixture(&path, 64, 16, 2);
+
+    // Row 9 in both sets; every other row distinct. Eight positions, six
+    // distinct rows ({2, 5, 9, 17, 33, 40}).
+    let plan = plan_of(vec![9, 2, 40, 5, 9, 17, 40, 33], vec![0, 4, 8]);
+
+    let loader = ragged_loader(&path, None, None, false, false, None);
+    let b = loader
+        .gather_whole_plan(&loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+
+    // Both occurrences are present, in plan order, with the same bytes.
+    assert_eq!(b.cell_indices, plan.rows);
+    assert_eq!(batch_row(&b, 0), batch_row(&b, 4), "row 9 twice");
+    assert_eq!(batch_row(&b, 2), batch_row(&b, 6), "row 40 twice");
+    for (j, &row) in plan.rows.iter().enumerate() {
+        let nnz = (row as usize % 4) + 1;
+        assert_eq!(batch_row(&b, j).0.len(), nnz, "position {j} (row {row})");
+    }
+
+    // And the plan issued exactly one read: one whole-shard miss per shard, not
+    // one per set. (Six distinct rows over eight positions — the direct path
+    // does not deduplicate them, and does not need to: each repeat is another
+    // memcpy out of the same decoded span.)
+    let m = loader.cache_metrics();
+    assert_eq!(
+        m.misses.load(AtomicOrdering::Relaxed),
+        2,
+        "two shards, decoded once each for the whole plan"
+    );
+}
+
+/// Duplicate occurrences must draw the **same** downsample.
+///
+/// They do because `row_seed` keys on the file's content identity and the
+/// physical row, never on batch position — which is what makes it safe to
+/// transform a row once and memcpy it into each of its positions. Guarded from
+/// the other side by `gather_downsample_is_invariant_to_row_order_within_a_plan`.
+#[test]
+fn duplicate_occurrences_draw_the_same_downsample() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dup_downsample.scx");
+    write_ragged_fixture(&path, 64, 16, 2);
+    let loader = ragged_loader(
+        &path,
+        None,
+        None,
+        false,
+        false,
+        Some(ds_cfg(
+            2,
+            crate::downsample::DownsampleMethod::Multinomial,
+            99,
+            vec![4242],
+        )),
+    );
+    // Row 3 carries four non-zeros, so a target of 2 really does resample it.
+    let plan = plan_of(vec![3, 11, 3, 27, 3], vec![0, 2, 5]);
+    let b = loader
+        .gather_whole_plan(&loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+    // Against the per-set walk, which transforms every occurrence separately:
+    // if the draw were keyed on anything but the physical row, the two
+    // executors would disagree even though all three copies still matched.
+    let ref_loader = ragged_loader(
+        &path,
+        None,
+        None,
+        false,
+        false,
+        Some(ds_cfg(
+            2,
+            crate::downsample::DownsampleMethod::Multinomial,
+            99,
+            vec![4242],
+        )),
+    );
+    let per_set = ref_loader
+        .gather_per_set(&ref_loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+    assert_eq!(batch_fields(&b), batch_fields(&per_set));
+    assert_eq!(batch_row(&b, 0), batch_row(&b, 2));
+    assert_eq!(batch_row(&b, 0), batch_row(&b, 4));
+    let (_, dat) = batch_row(&b, 0);
+    assert_eq!(
+        dat.iter().sum::<f32>(),
+        2.0,
+        "premise: the row really was downsampled"
+    );
+}
+
+/// An empty set must not shift the fields that are indexed by **plan** position
+/// rather than by set-local position.
+///
+/// `empty_set_keeps_boundary_without_rows` asserts `set_offsets`,
+/// `cell_indices` and the row count — but not `role_tags` or `file_ids`, and
+/// `role_tags` is the one field the per-set walk reads as `plan.role_tags[lo + j]`.
+#[test]
+fn an_empty_set_does_not_shift_role_tags_or_file_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty_set.scx");
+    write_ragged_fixture(&path, 64, 16, 2);
+    let loader = ragged_loader(&path, None, None, false, false, None);
+
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; 5],
+        rows: vec![4, 5, 6, 7, 8],
+        role_tags: vec![10, 11, 12, 13, 14],
+        // Two empty sets, one of them between two populated ones.
+        set_offsets: vec![0, 2, 2, 4, 4, 5],
+    };
+    let b = loader
+        .gather_whole_plan(&loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+    assert_eq!(b.role_tags, vec![10, 11, 12, 13, 14]);
+    assert_eq!(b.file_ids, vec![0; 5]);
+    assert_eq!(b.cell_indices, vec![4, 5, 6, 7, 8]);
+    assert_eq!(b.set_offsets, plan.set_offsets);
+}
+
+/// A cross-file plan with **several** rows per file keeps plan order.
+///
+/// `gather_cross_file_set_concatenates_in_global_space` is the weakest instance
+/// the shape allows: one row per file, and only `indices` asserted. Both
+/// executors group a plan's rows by file, so a bug that emitted the per-file
+/// concatenation instead of the plan order needs more than one row per file to
+/// show.
+#[test]
+fn a_cross_file_plan_with_many_rows_per_file_keeps_plan_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("cf0.scx");
+    let p1 = dir.path().join("cf1.scx");
+    write_ragged_fixture(&p0, 32, 8, 2);
+    write_ragged_fixture(&p1, 32, 8, 2);
+
+    // Identity on file 0; file 1's genes shifted into a disjoint global block,
+    // so a row attributed to the wrong file is visible in the indices.
+    let t0: Vec<i32> = (0..8).collect();
+    let t1: Vec<i32> = (0..8).map(|g| g + 8).collect();
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        Some(vec![t0, t1]),
+        Some(16),
+        false,
+        false,
+        0.0,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+
+    // Interleaved files, several rows each, one row repeated across files.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 1, 0, 1, 1, 0, 1, 0],
+        rows: vec![3, 3, 11, 20, 3, 27, 11, 3],
+        role_tags: (0..8).collect(),
+        set_offsets: vec![0, 4, 8],
+    };
+
+    let a = loader.clone();
+    let whole = a
+        .gather_whole_plan(&a.engine, &plan, Some(Admit::All))
+        .unwrap();
+    let b = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        Some(vec![(0..8).collect(), (0..8).map(|g| g + 8).collect()]),
+        Some(16),
+        false,
+        false,
+        0.0,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    let per_set = b
+        .gather_per_set(&b.engine, &plan, Some(Admit::All))
+        .unwrap();
+    assert_eq!(batch_fields(&whole), batch_fields(&per_set));
+
+    // Every position's genes must sit in its own file's global block.
+    for (j, &fid) in plan.file_ids.iter().enumerate() {
+        let (idx, _) = batch_row(&whole, j);
+        let in_block = idx.iter().all(|&g| if fid == 0 { g < 8 } else { g >= 8 });
+        assert!(in_block, "position {j} (file {fid}) got genes {idx:?}");
+    }
+    assert_eq!(whole.file_ids, plan.file_ids);
+    assert_eq!(whole.cell_indices, plan.rows);
+}
+
+/// `set_offsets` need not cover the whole plan, and the rows it does not cover
+/// must not be **read** — not merely not emitted.
+///
+/// Reading them would move the plan's footprint, and with it the admission
+/// verdict and every counter the capture reads, while leaving the output
+/// identical. So the claim is asserted on the shard misses, not on the batch.
+#[test]
+fn rows_no_set_covers_are_not_read() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("partial_cover.scx");
+    // Four shards of 16 rows.
+    write_ragged_fixture(&path, 64, 16, 4);
+    let loader = ragged_loader(&path, None, None, false, false, None);
+
+    // Covered: positions 1..3, rows 1 and 17 (shards 0 and 1). Uncovered: rows
+    // 33 and 49, which are the only rows naming shards 2 and 3.
+    let plan = plan_of(vec![33, 1, 17, 49], vec![1, 3]);
+    let b = loader
+        .gather_whole_plan(&loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+    assert_eq!(b.cell_indices, vec![1, 17]);
+    assert_eq!(b.shape.0, 2);
+
+    let m = loader.cache_metrics();
+    assert_eq!(
+        m.misses.load(AtomicOrdering::Relaxed),
+        2,
+        "only the two shards the emitted rows name should have been decoded"
+    );
+}
+
+/// The occurrence table itself: dedup across sets **and** within one.
+///
+/// Asserted directly rather than through a gather, because dedup is an
+/// optimisation and not a behaviour — an executor that deduplicated nothing
+/// still produces a byte-identical batch, so no output assertion anywhere can
+/// see it. (Confirmed by mutation: disabling the dedup outright leaves all 525
+/// other tests green.)
+#[test]
+fn the_occurrence_table_dedups_across_sets_and_within_them() {
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 1, 0, 0, 1, 0],
+        //            ^  ^  ^  ^  ^  ^
+        // (0,9) twice — positions 0 and 3, in different sets; (1,9) is a
+        // DIFFERENT pair and must not collide with it; (0,4) twice inside set 1.
+        rows: vec![9, 9, 4, 9, 2, 4],
+        role_tags: vec![0; 6],
+        set_offsets: vec![0, 3, 6],
+    };
+    let occ = Occurrences::build(&plan, 0, 6);
+    assert_eq!(occ.slots, vec![(0, 9), (1, 9), (0, 4), (1, 2)]);
+    assert_eq!(occ.slot_of_pos, vec![0, 1, 2, 0, 3, 2]);
+    assert_eq!(occ.by_file, vec![(0, vec![0, 2]), (1, vec![1, 3])]);
+    // slot -> (bucket, local row in that bucket's read)
+    assert_eq!(occ.slot_loc, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+
+    // A plan with no repeats maps every position to its own slot.
+    let clean = SparseCellSetPlan {
+        file_ids: vec![0, 0, 0],
+        rows: vec![7, 1, 4],
+        role_tags: vec![0; 3],
+        set_offsets: vec![0, 3],
+    };
+    let occ = Occurrences::build(&clean, 0, 3);
+    assert_eq!(occ.slot_of_pos, vec![0, 1, 2]);
+
+    // And the table covers the EMITTED range only.
+    let occ = Occurrences::build(&plan, 1, 4);
+    assert_eq!(occ.slots, vec![(1, 9), (0, 4), (0, 9)]);
+    assert_eq!(occ.slot_of_pos, vec![0, 1, 2]);
+}
+
+/// W11: the batch executor's unique-row read is charged **only** on the
+/// configurations that must take the general path.
+///
+/// A single-file raw-local loader is handed the read's own buffers as the
+/// batch, so it holds one; a remap, a downsample or a manifest of more than one
+/// file forces the assemble-from-a-second-buffer path on every plan, so those
+/// hold two. The charge is one batch either way, which is the ceiling: a plan's
+/// unique rows are at most its rows.
+#[test]
+fn the_unique_row_read_is_charged_only_where_it_can_happen() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("t0.scx");
+    let p1 = dir.path().join("t1.scx");
+    write_fixture(&p0, 8192, 64, 4);
+    write_fixture(&p1, 8192, 64, 4);
+
+    let build = |paths: Vec<&std::path::Path>,
+                 remap: Option<Vec<Vec<i32>>>,
+                 downsample: Option<crate::downsample::DownsampleConfig>,
+                 max_plan_rows: Option<usize>| {
+        let n = paths.len();
+        SparseCellSetLoader::new(
+            paths.into_iter().map(open).collect(),
+            8,
+            None,
+            4,
+            remap,
+            if n > 1 { Some(64) } else { None },
+            false,
+            false,
+            0.0,
+            downsample,
+            false,
+            max_plan_rows,
+        )
+        .unwrap()
+    };
+
+    let bd = |l: &StdArc<SparseCellSetLoader>| l.budget_breakdown();
+
+    // The fast configuration: one file, raw-local. One buffer, so no transient.
+    let fast = build(vec![&p0], None, None, Some(4096));
+    assert!(
+        bd(&fast).batch_buffer_bytes > 0,
+        "premise: the batch is charged"
+    );
+    assert_eq!(bd(&fast).transient_bytes, 0);
+
+    // Each of the three facts that forces the general path, on its own.
+    let two_files = build(
+        vec![&p0, &p1],
+        Some(vec![(0..64).collect(), (0..64).collect()]),
+        None,
+        Some(4096),
+    );
+    assert_eq!(
+        bd(&two_files).transient_bytes,
+        bd(&two_files).batch_buffer_bytes,
+        "a multi-file manifest assembles from a second buffer"
+    );
+    let remapped = build(vec![&p0], Some(vec![(0..64).collect()]), None, Some(4096));
+    assert_eq!(
+        bd(&remapped).transient_bytes,
+        bd(&remapped).batch_buffer_bytes
+    );
+    let downsampled = build(
+        vec![&p0],
+        None,
+        Some(ds_cfg(
+            100,
+            crate::downsample::DownsampleMethod::Multinomial,
+            1,
+            vec![7],
+        )),
+        Some(4096),
+    );
+    assert_eq!(
+        bd(&downsampled).transient_bytes,
+        bd(&downsampled).batch_buffer_bytes
+    );
+
+    // And nothing is charged at all without `max_plan_rows`, on either shape —
+    // the byte-identity promise the term was added under.
+    let uncharged = build(vec![&p0], Some(vec![(0..64).collect()]), None, None);
+    assert_eq!(bd(&uncharged).batch_buffer_bytes, 0);
+    assert_eq!(bd(&uncharged).transient_bytes, 0);
+}
+
+/// Both executors refuse a cross-file **set** without remap tables, with the
+/// same message.
+///
+/// They refuse at different moments and that is deliberate: the per-set walk
+/// discovers it inside the set loop, having already read every earlier set, and
+/// the batch executor checks every set before any read. Same error, same words;
+/// only the wasted I/O differs. Nothing compared the two, and the message is
+/// what `test_gather_raises_the_same_errors_as_the_iterator` asserts on the
+/// Python side.
+#[test]
+fn both_executors_refuse_a_cross_file_set_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("x0.scx");
+    let p1 = dir.path().join("x1.scx");
+    write_ragged_fixture(&p0, 32, 8, 2);
+    write_ragged_fixture(&p1, 32, 8, 2);
+    let mk = || {
+        SparseCellSetLoader::new(
+            vec![open(&p0), open(&p1)],
+            8,
+            None,
+            4,
+            /*remap*/ None,
+            None,
+            false,
+            false,
+            0.0,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    };
+    // Set 0 is single-file and would be gathered before the per-set walk ever
+    // looks at set 1 — which is the moment the two executors differ.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 0, 0, 1],
+        rows: vec![1, 2, 3, 4],
+        role_tags: vec![0; 4],
+        set_offsets: vec![0, 2, 4],
+    };
+    let a = mk();
+    let whole = a
+        .gather_whole_plan(&a.engine, &plan, Some(Admit::All))
+        .unwrap_err()
+        .to_string();
+    let b = mk();
+    let per_set = b
+        .gather_per_set(&b.engine, &plan, Some(Admit::All))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(whole, per_set);
+    assert!(whole.contains("cross-file cell set"), "{whole}");
+
+    // And the batch executor refused before touching a shard, where the
+    // per-set walk had already decoded set 0's.
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    assert_eq!(a.cache_metrics().misses.load(AtomicOrdering::Relaxed), 0);
+    assert!(b.cache_metrics().misses.load(AtomicOrdering::Relaxed) > 0);
+}
+
+/// The routing rule: which plans have to be assembled from a separate read.
+///
+/// This is the phase's one real configuration decision and it was made by
+/// measurement, so it is pinned directly rather than inferred from a timing.
+/// Deduplicating a raw-local single-file plan forces the assembly — a second
+/// batch-sized allocation and a second full copy — to save one memcpy per
+/// repeated row from an already-resident shard, and the A/B priced that at
+/// 0.85x on `gather_random`.
+#[test]
+fn only_a_multi_file_or_length_changing_plan_is_assembled() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("r0.scx");
+    let p1 = dir.path().join("r1.scx");
+    write_ragged_fixture(&p0, 32, 8, 2);
+    write_ragged_fixture(&p1, 32, 8, 2);
+
+    let one_file = SparseCellSetPlan {
+        file_ids: vec![0; 4],
+        // Repeats on purpose: a repeat is NOT a reason to assemble.
+        rows: vec![3, 7, 3, 7],
+        role_tags: vec![0; 4],
+        set_offsets: vec![0, 2, 4],
+    };
+    let two_files = SparseCellSetPlan {
+        file_ids: vec![0, 0, 1, 1],
+        rows: vec![3, 7, 3, 7],
+        role_tags: vec![0; 4],
+        set_offsets: vec![0, 2, 4],
+    };
+
+    let raw = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !raw.plan_needs_assembly(&one_file, 0, 4),
+        "raw-local, one file"
+    );
+    assert!(raw.plan_needs_assembly(&two_files, 0, 4), "two files");
+
+    // `normalize` / `log1p` are elementwise, so they do NOT force it.
+    let scaled = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        None,
+        None,
+        /*normalize*/ true,
+        /*log1p*/ true,
+        1e4,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !scaled.plan_needs_assembly(&one_file, 0, 4),
+        "value-only transforms"
+    );
+
+    // A remap drops and coalesces; a downsample truncates. Both can shrink a
+    // row, so neither can be written where it landed.
+    let remapped = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        Some(vec![(0..8).collect(), (0..8).collect()]),
+        Some(8),
+        false,
+        false,
+        0.0,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(remapped.plan_needs_assembly(&one_file, 0, 4), "remap");
+
+    let downsampled = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        8,
+        None,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        Some(ds_cfg(
+            2,
+            crate::downsample::DownsampleMethod::Multinomial,
+            5,
+            vec![1, 2],
+        )),
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(
+        downsampled.plan_needs_assembly(&one_file, 0, 4),
+        "downsample"
+    );
+
+    // And the rule the budget charges on is the loader-level form of the same
+    // one: it must not charge the configuration that never assembles.
+    assert_eq!(raw.budget_breakdown().transient_bytes, 0);
+}
+
+/// A multi-file plan with **no** transform is assembled too, and takes the
+/// assembled path's length-preserving branch.
+///
+/// That branch existed only because of this shape and nothing covered it: every
+/// other assembled-path test configures a remap or a downsample, and every
+/// raw-local test uses one file. A multi-file raw-local plan is legal — the
+/// cross-file refusal is per *set*, not per plan — so each set may name its own
+/// file without any global vocabulary.
+#[test]
+fn a_multi_file_raw_local_plan_is_assembled_without_a_transform() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("m0.scx");
+    let p1 = dir.path().join("m1.scx");
+    write_ragged_fixture(&p0, 32, 8, 2);
+    write_ragged_fixture(&p1, 32, 8, 2);
+    let mk = || {
+        SparseCellSetLoader::new(
+            vec![open(&p0), open(&p1)],
+            8,
+            None,
+            4,
+            /*remap*/ None,
+            None,
+            false,
+            false,
+            0.0,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    };
+    // Each set is single-file; the sets differ. Repeats inside and across.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 0, 0, 1, 1, 1, 0, 0],
+        rows: vec![3, 11, 3, 5, 20, 5, 11, 27],
+        role_tags: (0..8).collect(),
+        set_offsets: vec![0, 3, 6, 8],
+    };
+    let a = mk();
+    assert!(
+        a.plan_needs_assembly(&plan, 0, 8),
+        "premise: more than one file, so it cannot be the read"
+    );
+    let whole = a
+        .gather_whole_plan(&a.engine, &plan, Some(Admit::All))
+        .unwrap();
+    let b = mk();
+    let per_set = b
+        .gather_per_set(&b.engine, &plan, Some(Admit::All))
+        .unwrap();
+    assert_eq!(batch_fields(&whole), batch_fields(&per_set));
+
+    // Raw-local means the two files' rows are in the same index space, so the
+    // only thing distinguishing them is the row content. Check every position
+    // against a direct read of its own file.
+    let readers = [open(&p0), open(&p1)];
+    for (j, (&fid, &row)) in plan.file_ids.iter().zip(plan.rows.iter()).enumerate() {
+        let r = BackedCsrReader::new(ScxReader::open(readers[fid as usize].path()).unwrap(), 4);
+        let want = r.read_row_indices(&[row]).unwrap();
+        assert_eq!(batch_row(&whole, j).0, &want.indices[..], "position {j}");
+        assert_eq!(batch_row(&whole, j).1, &want.data[..], "position {j}");
+    }
+}
+
+/// The clip runs on the **assembled** path too, with no transform configured.
+///
+/// `gather_clips_negatives_in_the_emitted_csr` covers a single-file raw-local
+/// plan, which is now the direct path, and `gather_clip_runs_after_coalescing_not_before`
+/// covers the remap. Nothing covered the length-preserving branch of the
+/// assembled path — a multi-file raw-local plan — and removing the clip there
+/// left every other test green.
+#[test]
+fn a_multi_file_raw_local_gather_still_clips_negatives() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("neg0.scx");
+    let p1 = dir.path().join("neg1.scx");
+    // Row 5 of each file carries a negative at position 1.
+    write_float_fixture(&p0, 8, 4, 2, 3, Some((5, 1)));
+    write_float_fixture(&p1, 8, 4, 2, 3, Some((5, 1)));
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        4,
+        None,
+        2,
+        /*remap*/ None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    // One set per file, so no set spans files and no remap is required.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 1],
+        rows: vec![5, 5],
+        role_tags: vec![0, 1],
+        set_offsets: vec![0, 1, 2],
+    };
+    assert!(
+        loader.plan_needs_assembly(&plan, 0, 2),
+        "premise: two files, so this is the assembled path"
+    );
+    let b = loader
+        .gather_whole_plan(&loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+    for j in 0..2 {
+        let (idx, dat) = batch_row(&b, j);
+        assert!(
+            dat.iter().all(|&v| v >= 0.0),
+            "negative leaked at {j}: {dat:?}"
+        );
+        assert_eq!(idx.len(), 3, "clip must not change nnz: {idx:?}");
+        assert_eq!(dat[1], 0.0, "the clipped entry should be an explicit zero");
+    }
+}
+
+/// A plan that **repeats** rows must not lose the block-index route the
+/// prefetch engine already planned and warmed for it.
+///
+/// ⚠️ Found by review (codex - gpt-5.6-sol and Cursor Agent - Grok 4.6 High,
+/// independently). `PrefetchEngine::bucket_plan_rows` deduplicates `(file,
+/// row)` before sizing, so `plan_footprint` decides the route — and the
+/// admission budget — from **distinct** rows. The direct executor passes every
+/// occurrence, and `plan_row_groups` took the occurrence count as its density
+/// input, so a plan whose distinct rows are sparse but whose positions are
+/// dense planned one route and read the other: the engine warmed and retained
+/// four row groups, then the gather decoded and inserted the whole shard on top
+/// of them. Whole-shard inserts ignore `Admit`, so the footprint the engine
+/// checked was missing that shard's bytes entirely — on a ~188 MB census shard
+/// that is a cache-budget hole, not a metric nit.
+///
+/// The window is `unique * 4 < shard_rows <= positions * 4`. Sixteen positions
+/// over four distinct rows of a 64-row shard sits in it exactly: 4*4 < 64 and
+/// 16*4 == 64.
+#[test]
+fn a_plan_that_repeats_rows_keeps_the_block_index_route() {
+    use crate::plan_engine::tests::{write_framed_fixture, FRAMED_GROUP_BYTES};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("repeat.scx");
+    write_framed_fixture(&p0);
+
+    // Four distinct rows, one per row group of the 64-row shard, each named by
+    // all four sets.
+    let distinct = [0u64, 16, 32, 48];
+    let rows: Vec<u64> = (0..4).flat_map(|_| distinct.iter().copied()).collect();
+    let n = rows.len();
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        /*cache_shards*/ 16,
+        Some(8 * FRAMED_GROUP_BYTES),
+        /*lookahead*/ 4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        /*scatter_block_index*/ true,
+        None,
+    )
+    .unwrap();
+    let reader = loader.engine.lease(0).unwrap();
+    assert!(
+        reader.block_index_eligible(0, distinct.len()),
+        "premise: the plan's DISTINCT rows are sparse enough for the route"
+    );
+    assert!(
+        !reader.block_index_eligible(0, n),
+        "premise: its POSITION count is not — this is the disagreeing window"
+    );
+    drop(reader);
+
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; n],
+        rows: rows.clone(),
+        role_tags: (0..n as i32).collect(),
+        set_offsets: vec![0, 4, 8, 12, 16],
+    };
+
+    // The other half of the disagreement, and the one with the budget in it:
+    // the engine's footprint is the four row groups, NOT the whole shard. If
+    // the gather takes the full-shard route it inserts bytes this sum never
+    // counted, because a whole-shard insert ignores `Admit`.
+    let buckets = loader
+        .engine
+        .bucket_plan_rows(plan.file_ids.iter().copied().zip(plan.rows.iter().copied()));
+    let (planned, _share) = loader.engine.plan_footprint(&buckets, None).unwrap();
+    assert_eq!(
+        planned,
+        4 * FRAMED_GROUP_BYTES,
+        "premise: the engine sized this plan as four row groups, not a shard"
+    );
+
+    let b = loader
+        .gather_whole_plan(&loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+    assert_eq!(b.cell_indices, rows, "every occurrence is still emitted");
+
+    let m = loader.cache_metrics();
+    assert_eq!(
+        m.full_shard_groups.load(AtomicOrdering::Relaxed),
+        0,
+        "the gather must not fall back to a whole-shard decode: the engine sized \
+         and admitted this plan as row groups"
+    );
+    assert!(m.block_index_groups.load(AtomicOrdering::Relaxed) > 0);
+    assert_eq!(
+        m.misses.load(AtomicOrdering::Relaxed),
+        0,
+        "no whole shard should have been decoded or inserted"
+    );
+
+    // ⚠️ The other half of what round 1 asked for, and the half a direct
+    // `gather_whole_plan` call cannot show: that the groups the ENGINE warmed
+    // are the ones the gather then reads. Driven through `iter_with_plans`, on
+    // its own loader so the cache starts cold, the prefetch decodes the four
+    // groups and the gather serves them as hits. (codex - gpt-5.6-sol asked for
+    // exactly this; Cursor Agent - Grok 4.6 High noted round 1's fix left it
+    // unproven.)
+    //
+    // ⚠️ It took three attempts to make this arm able to see its own claim,
+    // and the reason is worth keeping: `warm_row_groups` fires only on a plan
+    // admitted against its `budget / (lookahead + 1)` share, and
+    // `resolve_sparse_cache_shards` removes the 50 MB interpreter constant
+    // before any share is computed — so every *small explicit* budget leaves a
+    // zero share, refuses the plan, and the prefetch warms nothing. The
+    // assertion then fails on a build with no defect in it. Caught by running
+    // the test, not by reading it.
+    let piped = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        16,
+        // `None` = the adaptive budget, deliberately. A small explicit budget
+        // never admits anything here: `resolve_sparse_cache_shards` takes the
+        // 50 MB interpreter constant out first, so a few-KB budget leaves a
+        // zero share and the plan is refused however many groups it is.
+        None,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        true,
+        None,
+    )
+    .unwrap();
+    let batches: Vec<_> = StdArc::clone(&piped)
+        .iter_with_plans(vec![Ok(plan.clone())].into_iter(), /*lookahead*/ 2)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batch_fields(&batches[0]), batch_fields(&b));
+    let pm = piped.cache_metrics();
+    assert_eq!(
+        pm.full_shard_groups.load(AtomicOrdering::Relaxed),
+        0,
+        "the gather must take the route the prefetch warmed for it"
+    );
+    assert_eq!(pm.misses.load(AtomicOrdering::Relaxed), 0);
+    assert_eq!(
+        pm.row_group_hits.load(AtomicOrdering::Relaxed),
+        4,
+        "the four groups the prefetch decoded must be served as hits, not re-decoded"
+    );
+    assert_eq!(
+        pm.row_group_misses.load(AtomicOrdering::Relaxed),
+        4,
+        "and decoded exactly once, by the prefetch"
     );
 }

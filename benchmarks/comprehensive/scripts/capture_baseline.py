@@ -179,6 +179,9 @@ def capture_environment() -> dict[str, Any]:
             "SCX_ROW_GROUP_SERIAL_DECODE": os.environ.get(
                 "SCX_ROW_GROUP_SERIAL_DECODE", "unset"
             ),
+            # Loader-layer arm selector (W11): `set` restores the pre-W11
+            # per-set cell-set gather.
+            "SCX_CELLSET_EXECUTOR": os.environ.get("SCX_CELLSET_EXECUTOR", "unset"),
         },
     }
     env["system"] = collect_system_info()

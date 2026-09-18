@@ -3950,6 +3950,31 @@ thread_local! {
 #[cfg(feature = "parallel")]
 static WARM_NONCES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 
+thread_local! {
+    /// How many times `shard_indptr` decoded **on this thread**.
+    ///
+    /// Thread-local rather than a global counter because libtest runs tests in
+    /// parallel on their own threads, and the prescan this pins runs on the
+    /// calling thread. A shared counter would make the assertion depend on what
+    /// else happened to be running.
+    // Fully qualified: `Cell` is imported here only under
+    // `#[cfg(feature = "parallel")]`, and this counter is not feature-gated —
+    // the `--no-default-features` clippy leg is what says so.
+    static INDPTR_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Called from `BackedCsrReader::shard_indptr`, unconditionally in the
+/// production body — see `note_indptr_decode` at the end of `backed/csr.rs` for
+/// why it cannot be a `#[cfg(test)]` at the call site.
+pub(super) fn note_indptr_decode() {
+    INDPTR_DECODES.with(|c| c.set(c.get() + 1));
+}
+
+/// This thread's `shard_indptr` decode count.
+fn indptr_decodes() -> usize {
+    INDPTR_DECODES.with(|c| c.get())
+}
+
 /// Called from `BackedCsrReader::warm_one_shard` on whatever thread rayon chose.
 #[cfg(feature = "parallel")]
 pub(super) fn note_warm_thread() {
@@ -5332,4 +5357,266 @@ fn a_mixed_request_scatters_full_shard_groups_before_block_index_groups() {
         order, sorted,
         "premise: the fixture actually exercises out-of-row-order scatter"
     );
+}
+
+/// `read_row_indices` can carry a caller's plan-wide admission verdict.
+///
+/// W11's cell-set executor reads a whole plan's **deduplicated** row list
+/// through this method, for the exact indptr prescan and the disjoint output
+/// spans it already has. Without this variant the caller would have to choose
+/// between that prescan and the plan-wide verdict its prefetch engine already
+/// took — `read_row_indices` passed a literal `None` and decided for itself.
+#[test]
+fn read_row_indices_carries_the_callers_admission_verdict() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    // 2 shards x 32 rows, 8 row groups of 4 per shard. Two rows in shard 0 is
+    // 2 * 4 < 32, so the request takes the block-index route.
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let rows = [0u64, 5];
+    let budget = RG_GROUP_BYTES * 8;
+
+    let open = |p: &std::path::Path| {
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(p).unwrap(), 4, budget)
+    };
+
+    // Self-deciding (`None`): the two groups fit the budget, so both are kept.
+    let mut a = open(&path);
+    let ma = a.enable_metrics();
+    let got = a.read_row_indices(&rows).unwrap();
+    assert_eq!(
+        ma.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES * 2,
+        "premise: left to itself this read retains both groups"
+    );
+
+    // The bytes are right, and are the reference's.
+    for (out, &r) in rows.iter().enumerate() {
+        let want = full.row_slice(r as usize, r as usize + 1).unwrap();
+        let lo = got.indptr[out] as usize;
+        let hi = got.indptr[out + 1] as usize;
+        assert_eq!(&got.indices[lo..hi], &want.indices[..], "row {r}");
+        assert_eq!(&got.data[lo..hi], &want.data[..], "row {r}");
+    }
+
+    // `Admit::None` over the same read: identical output, nothing retained.
+    let mut b = open(&path);
+    let mb = b.enable_metrics();
+    let refused = b
+        .read_row_indices_with_admission(&rows, Some(&Admit::None))
+        .unwrap();
+    assert_eq!(refused.indptr, got.indptr);
+    assert_eq!(refused.indices, got.indices);
+    assert_eq!(refused.data, got.data);
+    assert_eq!(
+        mb.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "the caller's verdict refused every group"
+    );
+    assert_eq!(b.cache_bytes_used(), 0);
+
+    // `Admit::Groups` keeps exactly the named key. Row 0 is group 0 of shard 0,
+    // row 5 is group 1; naming only the first retains one group's bytes.
+    let mut c = open(&path);
+    let mc = c.enable_metrics();
+    let keys: std::collections::HashSet<RowGroupKey> =
+        [(0u32, 0usize, 0usize)].into_iter().collect();
+    let partial = c
+        .read_row_indices_with_admission(&rows, Some(&Admit::groups(keys)))
+        .unwrap();
+    assert_eq!(partial.indices, got.indices);
+    assert_eq!(partial.data, got.data);
+    assert_eq!(
+        mc.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES,
+        "one named key, one group's bytes"
+    );
+}
+
+/// The sibling guard, and it was missing: `read_rows_with_admission` must
+/// honour the caller's verdict too.
+///
+/// ⚠️ Found while mutation-testing the `read_row_indices` split above. Passing
+/// a literal `None` in place of `admit_row_groups` here — i.e. ignoring every
+/// caller's verdict outright — left **all 475** of this crate's tests green;
+/// only `scx-loader` reddened (10 `plan_engine` / `sparse_cellset` tests). The
+/// crate that owns the API could not see its own contract break, so this is
+/// the accept-side test for it rather than a restatement of the loader's.
+#[test]
+fn read_rows_with_admission_honours_the_callers_verdict() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let rows = [0u64, 5];
+    let budget = RG_GROUP_BYTES * 8;
+    let open = |p: &std::path::Path| {
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(p).unwrap(), 4, budget)
+    };
+
+    let collect = |backed: &BackedCsrReader, admit: Option<&Admit>| {
+        let mut out: Vec<(usize, Vec<i32>, Vec<f32>)> = Vec::new();
+        backed
+            .read_rows_with_admission(&rows, admit, |pos, idx, val| {
+                out.push((pos, idx.to_vec(), val.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        out.sort_by_key(|&(p, _, _)| p);
+        out
+    };
+
+    let mut a = open(&path);
+    let ma = a.enable_metrics();
+    let want = collect(&a, None);
+    assert_eq!(
+        ma.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES * 2,
+        "premise: left to itself this read retains both groups"
+    );
+
+    let mut b = open(&path);
+    let mb = b.enable_metrics();
+    assert_eq!(collect(&b, Some(&Admit::None)), want, "same bytes");
+    assert_eq!(
+        mb.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "the caller's verdict refused every group"
+    );
+    assert_eq!(b.cache_bytes_used(), 0);
+}
+
+/// The indptr prescan reads a **resident** shard's indptr rather than decoding
+/// it again, and does so without counting a read that did not happen.
+///
+/// `shard_indptr` decodes the stream afresh every call by design — it must not
+/// touch the LRU, or a prescan between planning and warming could change what
+/// `block_index_eligible` admits. That is right when the shard is cold and pure
+/// waste when it is not, and `read_row_indices` paid it on every call: measured
+/// at 2.73 -> 0.55 ms per gather on a 100k-row synthetic with every shard warm,
+/// i.e. seven re-decodes of a 16,384-entry indptr were 80 % of the call.
+///
+/// The observable is the **hit count**: the peek must add none. A `get_cached`
+/// in its place would count one per shard group and inflate the
+/// `shard_cache_hit_rate` the loader reports with lookups no read performed —
+/// which is the mutation this is watched failing against.
+#[test]
+fn the_indptr_prescan_reads_a_resident_shard_without_counting_a_hit() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    // Unframed and multi-shard, so every request group takes the full-shard
+    // path and the prescan is the only other thing touching the cache.
+    let (mut backed, full) = write_test_file_and_open(&dir, 64, 40, 4, 8);
+    let m = backed.enable_metrics();
+    let rows = [1u64, 17, 33, 49];
+    // libtest may reuse a thread, so this is a delta and not an absolute.
+    let decodes0 = indptr_decodes();
+
+    // Cold: the prescan takes the decode branch, and the answer is right.
+    let cold = backed.read_row_indices(&rows).unwrap();
+    for (out, &r) in rows.iter().enumerate() {
+        let want = full.row_slice(r as usize, r as usize + 1).unwrap();
+        let (lo, hi) = (cold.indptr[out] as usize, cold.indptr[out + 1] as usize);
+        assert_eq!(&cold.indices[lo..hi], &want.indices[..], "cold row {r}");
+        assert_eq!(&cold.data[lo..hi], &want.data[..], "cold row {r}");
+    }
+    let hits_after_cold = m.hits.load(Ordering::Relaxed);
+    let misses_after_cold = m.misses.load(Ordering::Relaxed);
+    assert_eq!(
+        misses_after_cold, 4,
+        "premise: four shards, decoded once each"
+    );
+    assert_eq!(
+        indptr_decodes() - decodes0,
+        4,
+        "premise: cold, the prescan decodes one indptr per shard"
+    );
+
+    // Warm: the prescan peeks instead, so the only hits are the scatter's own —
+    // one `read_shard_cached_arc` per shard request group.
+    let warm = backed.read_row_indices(&rows).unwrap();
+    assert_eq!(warm.indptr, cold.indptr);
+    assert_eq!(warm.indices, cold.indices);
+    assert_eq!(warm.data, cold.data);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        misses_after_cold,
+        "nothing should have been decoded twice"
+    );
+    assert_eq!(
+        m.hits.load(Ordering::Relaxed) - hits_after_cold,
+        4,
+        "one hit per shard request group — the prescan's peek must add none"
+    );
+    // The claim the hit count cannot make: no second decode happened at all.
+    // `shard_indptr` is invisible to the cache metrics by design, so it is
+    // counted directly, in test builds only.
+    assert_eq!(
+        indptr_decodes() - decodes0,
+        4,
+        "the warm gather must not have decoded a single indptr"
+    );
+}
+
+/// The block-index density predicate counts **distinct rows**, not request
+/// positions.
+///
+/// ⚠️ Found by review on #542, independently by two reviewers, and it is a
+/// defect in this crate rather than in its caller: the predicate asks whether
+/// a request is a small fraction of the shard, and a repeated row costs one
+/// more memcpy out of the same decoded span — never another row group. Counting
+/// occurrences also put this decision at odds with the one `scx-loader`'s
+/// prefetch engine makes, which deduplicates before sizing, so a plan could be
+/// planned and admitted as row groups and then read as a whole shard whose
+/// bytes the admission sum never counted.
+///
+/// The window is `unique * 4 < shard_rows <= positions * 4`. Sixteen positions
+/// over four distinct rows of a 64-row shard sits in it exactly.
+#[test]
+fn the_block_index_route_counts_distinct_rows_not_request_positions() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    // 1 shard x 64 rows, 4 row groups of 16.
+    let (path, full) = write_framed_file(&dir, 64, 100, 1, 16, CodecId::None);
+    let distinct = [0u64, 16, 32, 48];
+    let rows: Vec<u64> = (0..4).flat_map(|_| distinct.iter().copied()).collect();
+
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, usize::MAX);
+    assert!(
+        backed.block_index_eligible(0, distinct.len()),
+        "premise: the distinct rows are sparse enough for the route"
+    );
+    assert!(
+        !backed.block_index_eligible(0, rows.len()),
+        "premise: the position count is not — this is the disagreeing window"
+    );
+    let m = backed.enable_metrics();
+
+    let got = backed.read_row_indices(&rows).unwrap();
+
+    assert_eq!(
+        m.full_shard_groups.load(Ordering::Relaxed),
+        0,
+        "sixteen positions over four distinct rows must not read as a dense request"
+    );
+    assert_eq!(m.block_index_groups.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        0,
+        "no whole shard should have been decoded"
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        4,
+        "one decode per distinct row group"
+    );
+
+    // And every occurrence is still its own output row, with the right bytes.
+    assert_eq!(got.indptr.len(), rows.len() + 1);
+    for (out, &r) in rows.iter().enumerate() {
+        let want = full.row_slice(r as usize, r as usize + 1).unwrap();
+        let (lo, hi) = (got.indptr[out] as usize, got.indptr[out + 1] as usize);
+        assert_eq!(&got.indices[lo..hi], &want.indices[..], "position {out}");
+        assert_eq!(&got.data[lo..hi], &want.data[..], "position {out}");
+    }
 }

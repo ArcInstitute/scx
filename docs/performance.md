@@ -3621,6 +3621,138 @@ The ordered and random-control figures are reproducible from the fixture in
 seconds with `pyscx.batch_plans` and carry no timing, so they need no capture;
 the shuffled one is read off the committed artifact.
 
+### The multi-set batch executor: what a cell-set gather costs (phase 6)
+
+The cell-set gather walked a plan **one set at a time** — a per-set
+`Vec<Option<(Vec<i32>, Vec<f32>)>>`, its own read call, two owned `Vec`s per row
+inside the row transform, and a copy of every row into a batch pre-sized from a
+catalog estimate. It is now one executor over the whole batch, in one of two
+shapes: a raw-local single-file plan is read in plan order and **moved out as
+the batch**, and a plan spanning files or carrying a length-changing transform
+(a remap drops and coalesces, a downsample truncates) is **assembled** from a
+deduplicated read.
+
+Two-arm same-build A/B, one build with the executor selected by
+`SCX_CELLSET_EXECUTOR` (`set` = the pre-change per-set walk, `plan` = shipped),
+12 interleaved rounds with the arm order alternated by round, one timed run per
+round, page cache dropped before every run. Ratios are the median of per-round
+ratios, oriented so >1 means the shipped build helped; `p` is an exact two-sided
+sign test with ties dropped.
+
+SLURM **`2969830`**, host `GPU104C`, partition `cpu_batch_high_mem`,
+`phase6-cellset-executor` `c7ca7a26`, `cellset_gather` on
+tabula_sapiens_100k / `scx_auto`, `RAYON_NUM_THREADS=16`. Raw rows under
+`results/raw/phase6_executor/executor_ab_tabula.json`.
+
+| metric | `set` (med) | `plan` (med) | ratio | wins | p |
+|---|---|---|---|---|---|
+| `cellsets_per_sec__gather_random` | 830.2 | 765.8 | 0.973x | 3/12 | 0.146 |
+| `cellsets_per_sec__gather_grouped` | 811 | 812 | 1.01x | 7/12 | 0.774 |
+| `cellsets_per_sec__gather_random_s512` | 91.55 | 90.6 | 1.03x | 7/12 | 0.774 |
+| `cellsets_per_sec__gather_grouped_s512` | 85.35 | 98.65 | **1.15x** | 12/12 | 0.000 |
+| `cellsets_per_sec__gather_shared_control_per_set` | 343.3 | 373.8 | 1.1x | 8/12 | 0.388 |
+| `cellsets_per_sec__gather_hot_control_cold_tail` | 33.8 | 262.9 | **7.76x** | 12/12 | 0.000 |
+| `cellsets_per_sec__downsample_rust` | 107.8 | 423.1 | **3.94x** | 12/12 | 0.000 |
+| `cellsets_per_sec__collate_rust` | 780.4 | 773 | 0.992x | 3/12 | 0.146 |
+| `peak_rss_mb__gather_random` | 2310 | 2320 | 0.995x | 1/12 | 0.006 |
+| `peak_rss_mb__gather_random_s512` | 2340 | 2357 | 0.994x | 2/12 | 0.039 |
+| `peak_rss_mb__gather_shared_control_per_set` | 2570 | 2498 | 1.03x | 12/12 | 0.000 |
+| `peak_rss_mb__gather_hot_control_cold_tail` | 1191 | 1109 | **1.07x** | 12/12 | 0.000 |
+| `peak_rss_mb__tokenize_crop` | 1016 | 915.1 | **1.11x** | 12/12 | 0.000 |
+
+**The two big wins are not the same win.** `gather_hot_control_cold_tail` is
+7.76x because it is the one arm that asks for the block-index route
+(`scatter_block_index=True`) at a budget its plans exceed: one read per plan
+instead of one per set gives the chunked parallel group decode the whole plan's
+run list to overlap, where before it saw one set's worth at a time. Its
+time-to-first-set falls 5.77x with it. `downsample_rust` is 3.94x for an
+unrelated reason: the row transform used to run **serially**, inside the read's
+scatter callback, and now runs on the loader's rayon pool.
+
+**`gather_grouped_s512` is the arm where the executor's own shape shows.** At
+S=512 a covariate group is usually smaller than the set, so
+`rng.choice(..., replace=True)` pads it and the plan repeats rows heavily; one
+wide read plus an exact allocation is 1.15x at 12/12 there against 1.01x on the
+S=64 grouped arm.
+
+**Four of the twelve live `cellsets_per_sec` floors are on this dataset and
+none moves down.** The one negative row that clears the sign test,
+`cellsets_per_sec__gather_random` at 0.973x, does not (3/12, p = 0.146).
+
+**Peak RSS falls almost everywhere**, most on the arms that gather and then run
+a kernel over the batch (`tokenize_*` and `collate_rust`, 1,016 -> 915 MB,
+12/12) — those hold the batch while they work, and the batch is now exactly
+sized rather than an estimate biased up an eighth. ⚠️ Two rows go the other
+way and clear the sign test: `peak_rss_mb__gather_random` 0.995x (1/12,
+p = 0.006) and `__gather_random_s512` 0.994x (2/12, p = 0.039). That is
+**10-17 MB on a 2.3 GB peak** — reported because it is reliable, not because it
+is large, and not suppressed.
+
+#### The allocations, which the A/B cannot see
+
+Counting-allocator test (`scx-loader/tests/gather_allocation.rs`), a 1,024-row
+plan of 32,768 non-zeros, same fixture and same plan on both arms, measured
+after an unmeasured warm-up so what it sees is the assembly rather than the
+decode:
+
+| arm | allocations | per row | peak live bytes | × the result |
+|---|---|---|---|---|
+| `set` | 2,698 | 2.63 | 421,192 | 1.56 |
+| `plan` | **81** | **0.08** | **371,304** | **1.37** |
+
+Forcing the assembled path on that plan takes the peak to 2.35× the result and
+fails the test's budget, which is how the direct path is pinned.
+
+#### ⚠️ census_500k was attempted and abandoned, with its own counters as the reason
+
+The phase's gate names census_500k as the second fixture. The cell was
+submitted (`2969831`) and **cancelled after one arm of one round**, which is
+shipped as `census_500k_single_run_probe.json` — not as a measurement of the
+executor, but as the evidence for dropping it.
+
+That one run took **1,267 s** across its 15 timed sub-runs, so the 12-round
+two-arm design needed about **8.5 hours**. More to the point, it would not have
+been measuring the gather. The four floored scenarios read a
+`shard_cache_hit_rate` of **0.296** (`gather_random`), 0.343 (`gather_grouped`),
+0.300 (`gather_random_s512`) and 0.730 (`gather_grouped_s512`), and the loader's
+own sizing warning asks for `max_memory_mb >= 5704` to hold 31 shards of
+~188 MB against the 21 the default budget affords. At a 0.30 hit rate the cell
+prices the shard cache re-decoding shards it just evicted:
+`cellsets_per_sec__gather_random` reads **2.7** there against ~766 on tabula.
+
+Raising the budget would make it measurable and also make it a different
+scenario from the one the floors are authored against, so it is recorded as not
+measurable at this shape rather than measured at another. Phase 1's driver had
+already excluded census from `cellset_gather` after a census_500k cell was
+killed at 205 minutes; this is the same finding with the cell's own counters
+attached.
+
+#### ⚠️ Three captures, and two of them are superseded
+
+Both superseded artifacts ship, because each is the evidence for the change that
+superseded it.
+
+`2969631` put the executor at **0.811×** on `cellsets_per_sec__gather_random`
+(0/12, p = 0.000) and 0.820× on `__gather_grouped`, while the duplicate- and
+transform-heavy arms won (`gather_hot_control_cold_tail` 7.92×,
+`downsample_rust` 3.71×, both 12/12). The cause was not the executor: the
+`read_row_indices` prescan re-decoded a **resident** shard's indptr on every
+call — deliberate, so that a prescan between planning and warming cannot change
+what the block-index route admits, and pure waste once the shard is decoded. A
+local probe on a 100k-row synthetic with every shard warm read 0.47 ms/batch on
+the per-set walk against 2.73 ms on the executor; after the fix, 0.47 against
+0.29.
+
+`2969753`, with that fixed, left a residual **0.926× / 0.910×** — the dedup
+itself. Deduplicating forces the batch to be assembled from the read, which
+costs a second batch-sized allocation and a second full copy, to save one memcpy
+per repeated row from an already-resident shard. That is all it ever saved on a
+raw-local plan, whose whole row transform is an elementwise clip. So the shipped
+rule deduplicates only where a repeat costs real work, and the phase-4
+measurement above says how often that is: a neighbourhood batch's duplicate
+factor is **1.108** and a random-plan control's is **1.129** — about a tenth of
+the rows, nowhere near enough to pay for a second buffer.
+
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 
 The pathology that motivated this work: STATE3 measured **143 s/batch** on a scattered
