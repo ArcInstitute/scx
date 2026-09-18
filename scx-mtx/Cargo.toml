@@ -1,6 +1,6 @@
 [package]
 name = "scx-mtx"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2021"
 description = "Matrix Market (MTX) I/O for SCX: read/write Cell Ranger MTX directories"
 license.workspace = true
