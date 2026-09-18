@@ -207,9 +207,11 @@ Two things to know:
   while it assembles (see [How a batch is gathered](#how-a-batch-is-gathered)),
   on the configurations that cannot avoid one: a remap, a downsample, or a
   manifest of more than one file. A single-file raw-local loader is charged 0
-  there, and a plan that happens to repeat a row on that configuration pays an
-  uncharged transient — a floor rather than a bound, said here rather than left
-  to be discovered.
+  there and holds one buffer — **including for a plan that repeats rows**,
+  which is the point of the rule in
+  [How a batch is gathered](#how-a-batch-is-gathered). The charge is
+  conservative at construction: the model sees a multi-file manifest, while a
+  particular plan over it may name one file and take the direct path.
 - **Bound the manifest itself when it is very large.**
   `SparseCellSetDataset(paths, reader_limit=N)` keeps at most `N` of the
   manifest's files open at a time, reopening on demand. Default `None` opens
@@ -577,8 +579,8 @@ than one set at a time. Which of two shapes it takes depends on the plan.
    `BackedCsrReader::read_row_indices_with_admission`, which prescans each
    touched shard's indptr so the rows land in one exactly-sized allocation.
 2. The clip and any `normalize` / `log1p` applied **in place**, in parallel.
-3. The read *is* the batch — it is moved out whole. One allocation for the
-   entire gather, and no copy of it anywhere.
+3. The read *is* the batch — it is moved out whole: one exactly-sized CSR
+   result, no second nnz-sized buffer, and no copy of it anywhere.
 
 **The assembled path** — more than one file, or a transform that can change a
 row's length (a remap drops and coalesces, a downsample truncates):

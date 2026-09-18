@@ -251,9 +251,11 @@ impl PrefetchEngine {
     /// row groups here and then read as a whole shard, whose bytes this sum
     /// never counted (a whole-shard insert ignores `Admit`). What closes it is
     /// `plan_row_groups` counting **distinct rows**, the same unit this
-    /// function dedups to. Asserted from both ends by
-    /// `a_plan_that_repeats_rows_keeps_the_block_index_route` and
-    /// `cellset_plan_admission_ignores_plan_level_density`.
+    /// function dedups to. The test that sits in the disagreeing window is
+    /// `a_plan_that_repeats_rows_keeps_the_block_index_route`;
+    /// `cellset_plan_admission_ignores_plan_level_density` is the
+    /// plan-dense/set-sparse guard and names distinct rows only, so it cannot
+    /// see this one.
     /// `IndexPlanLoader` still reads per plan-item.
     /// An out-of-range `file_id` is skipped rather than panicked on: the
     /// gather's own validation is what reports it, and this runs first.

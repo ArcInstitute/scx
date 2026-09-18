@@ -2990,8 +2990,8 @@ fn a_row_in_two_sets_comes_back_at_both_positions() {
     let path = dir.path().join("dup_across_sets.scx");
     write_ragged_fixture(&path, 64, 16, 2);
 
-    // Row 9 in both sets; every other row distinct. Eight positions, seven
-    // unique rows.
+    // Row 9 in both sets; every other row distinct. Eight positions, six
+    // distinct rows ({2, 5, 9, 17, 33, 40}).
     let plan = plan_of(vec![9, 2, 40, 5, 9, 17, 40, 33], vec![0, 4, 8]);
 
     let loader = ragged_loader(&path, None, None, false, false, None);
@@ -3744,5 +3744,64 @@ fn a_plan_that_repeats_rows_keeps_the_block_index_route() {
         m.misses.load(AtomicOrdering::Relaxed),
         0,
         "no whole shard should have been decoded or inserted"
+    );
+
+    // ⚠️ The other half of what round 1 asked for, and the half a direct
+    // `gather_whole_plan` call cannot show: that the groups the ENGINE warmed
+    // are the ones the gather then reads. Driven through `iter_with_plans`, on
+    // its own loader so the cache starts cold, the prefetch decodes the four
+    // groups and the gather serves them as hits. (codex - gpt-5.6-sol asked for
+    // exactly this; Cursor Agent - Grok 4.6 High noted round 1's fix left it
+    // unproven.)
+    //
+    // ⚠️ It took three attempts to make this arm able to see its own claim,
+    // and the reason is worth keeping: `warm_row_groups` fires only on a plan
+    // admitted against its `budget / (lookahead + 1)` share, and
+    // `resolve_sparse_cache_shards` removes the 50 MB interpreter constant
+    // before any share is computed — so every *small explicit* budget leaves a
+    // zero share, refuses the plan, and the prefetch warms nothing. The
+    // assertion then fails on a build with no defect in it. Caught by running
+    // the test, not by reading it.
+    let piped = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        16,
+        // `None` = the adaptive budget, deliberately. A small explicit budget
+        // never admits anything here: `resolve_sparse_cache_shards` takes the
+        // 50 MB interpreter constant out first, so a few-KB budget leaves a
+        // zero share and the plan is refused however many groups it is.
+        None,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        true,
+        None,
+    )
+    .unwrap();
+    let batches: Vec<_> = StdArc::clone(&piped)
+        .iter_with_plans(vec![Ok(plan.clone())].into_iter(), /*lookahead*/ 2)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batch_fields(&batches[0]), batch_fields(&b));
+    let pm = piped.cache_metrics();
+    assert_eq!(
+        pm.full_shard_groups.load(AtomicOrdering::Relaxed),
+        0,
+        "the gather must take the route the prefetch warmed for it"
+    );
+    assert_eq!(pm.misses.load(AtomicOrdering::Relaxed), 0);
+    assert_eq!(
+        pm.row_group_hits.load(AtomicOrdering::Relaxed),
+        4,
+        "the four groups the prefetch decoded must be served as hits, not re-decoded"
+    );
+    assert_eq!(
+        pm.row_group_misses.load(AtomicOrdering::Relaxed),
+        4,
+        "and decoded exactly once, by the prefetch"
     );
 }

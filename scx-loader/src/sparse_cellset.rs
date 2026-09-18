@@ -385,11 +385,10 @@ pub(crate) struct SparseCellSetBudgetModel {
     batch_bytes: usize,
     /// Bytes the batch executor's unique-row read holds **beside** the batch.
     ///
-    /// W11 reads a plan's deduplicated rows into one exactly-sized `ScxCsr` and
-    /// then writes the batch from it, so for the span of a gather two buffers
-    /// are live. Not always, though: a single-file plan with no repeated rows
-    /// and no length-changing transform is handed the read's own buffers as the
-    /// batch, and holds one.
+    /// The assembled path reads a plan's deduplicated rows into one
+    /// exactly-sized `ScxCsr` and then writes the batch from it, so for the
+    /// span of a gather two buffers are live. The direct path is handed the
+    /// read's own buffers as the batch and holds one.
     ///
     /// Which of the two a gather takes is [`SparseCellSetLoader::plan_needs_assembly`],
     /// and it is decided by facts this model also knows at construction: a
@@ -400,6 +399,10 @@ pub(crate) struct SparseCellSetBudgetModel {
     /// is 0 there and there is no uncharged second buffer to warn about. The
     /// charged figure is one batch, which is the ceiling: a plan's unique rows
     /// are at most its rows, and are fewer exactly when it repeats them.
+    ///
+    /// Conservative at construction, because that is all it can be: the model
+    /// sees a manifest of several files, while a particular plan over it may
+    /// name only one and take the direct path.
     transient_bytes: usize,
 }
 
@@ -1235,8 +1238,8 @@ impl SparseCellSetLoader {
     ///
     /// **Direct** — a raw-local single-file plan ([`Self::plan_needs_assembly`]
     /// is false): one read over the plan's rows in plan order, clipped and
-    /// value-transformed in place, moved out whole. One allocation for the
-    /// entire gather and no copy of the batch anywhere.
+    /// value-transformed in place, moved out whole. One exactly-sized CSR
+    /// result, no second nnz-sized buffer, and no copy of the batch anywhere.
     ///
     /// **Assembled** — a plan spanning files, or one whose remap or downsample
     /// can shrink a row: an occurrence table over the batch, one read per file
@@ -1269,8 +1272,12 @@ impl SparseCellSetLoader {
         //
         // One file and no stage that can change a row's length: the plan's rows
         // are read in plan order at their final lengths, so the `ScxCsr` is
-        // moved out whole. **One allocation for the entire gather**, sized by
-        // the read's own indptr prescan.
+        // moved out whole — **one exactly-sized CSR result and no second
+        // nnz-sized assembly**, from the read's own indptr prescan. (Not
+        // literally one allocation: the three CSR components are allocated
+        // separately, and the counting-allocator test measures 81 for a
+        // 1,024-row plan. What the direct path removes is the per-row growth
+        // and the second full-size buffer, not every allocation.)
         //
         // ⚠️ Deliberately taken WITHOUT deduplicating, and the measurement is
         // why. Deduplicating forces the batch to be assembled from the read
@@ -1298,10 +1305,7 @@ impl SparseCellSetLoader {
             if self.normalize || self.log1p {
                 // Per row, because `normalize` divides by that row's library
                 // size. In place, into the spans the indptr already names.
-                let bounds: Vec<(usize, usize)> = (0..n_out)
-                    .map(|l| (csr.indptr[l] as usize, csr.indptr[l + 1] as usize))
-                    .collect();
-                let rows = spans_mut(&mut csr.data, &bounds);
+                let rows = spans_mut(&mut csr.data, &csr.indptr);
                 crate::pool::cpu_pool().install(|| {
                     rows.into_par_iter().for_each(|d| {
                         apply_sparse_transforms(d, self.normalize, self.log1p, self.target_sum)
@@ -1352,11 +1356,9 @@ impl SparseCellSetLoader {
         let mut lens: Vec<u32> = vec![0; occ.slots.len()];
         for (bucket, (fid, slots)) in occ.by_file.iter().enumerate() {
             let csr = &mut per_file[bucket];
-            let bounds: Vec<(usize, usize)> = (0..slots.len())
-                .map(|l| (csr.indptr[l] as usize, csr.indptr[l + 1] as usize))
-                .collect();
-            let idx_spans = spans_mut(&mut csr.indices, &bounds);
-            let dat_spans = spans_mut(&mut csr.data, &bounds);
+            let (indptr, indices, data) = (&csr.indptr, &mut csr.indices, &mut csr.data);
+            let idx_spans = spans_mut(indices, indptr);
+            let dat_spans = spans_mut(data, indptr);
             let fid = *fid;
             // `cpu_pool().install`, never rayon's global registry: this runs on
             // the consumer thread, which in a forked DataLoader worker has no
@@ -1407,11 +1409,8 @@ impl SparseCellSetLoader {
         let nnz = acc as usize;
         let mut indices: Vec<i32> = vec![0; nnz];
         let mut data: Vec<f32> = vec![0.0; nnz];
-        let bounds: Vec<(usize, usize)> = (0..n_out)
-            .map(|p| (indptr[p] as usize, indptr[p + 1] as usize))
-            .collect();
-        let out_idx = spans_mut(&mut indices, &bounds);
-        let out_dat = spans_mut(&mut data, &bounds);
+        let out_idx = spans_mut(&mut indices, &indptr);
+        let out_dat = spans_mut(&mut data, &indptr);
         let occ_ref = &occ;
         let per_file_ref = &per_file;
         crate::pool::cpu_pool().install(|| {
@@ -2190,21 +2189,29 @@ impl Occurrences {
     }
 }
 
-/// Split `buf` into the disjoint spans `bounds` names, for a parallel scatter.
+/// Split `buf` into the disjoint spans `indptr` names, for a parallel scatter:
+/// one span per adjacent pair, so `n + 1` offsets give `n` spans.
 ///
-/// `bounds` must be ascending and non-overlapping, which is what a prefix sum
-/// over row lengths produces — that is the whole reason the spans can be written
-/// in parallel without synchronisation. Asserted in debug rather than merely
-/// assumed; in release an overlap makes `split_at_mut` panic on the negative
-/// stride, so it cannot silently alias.
-fn spans_mut<'a, T>(buf: &'a mut [T], bounds: &[(usize, usize)]) -> Vec<&'a mut [T]> {
-    let mut out = Vec::with_capacity(bounds.len());
+/// Takes the `indptr` itself rather than a `Vec<(lo, hi)>` because all three
+/// callers derive their bounds from adjacent entries of one, and materialising
+/// the pairs first cost a `n x 16 B` allocation per call to unpack them again
+/// here. (Review on #542, Antigravity - Gemini 3.8 Flash.)
+///
+/// `indptr` must be non-decreasing, which is what a prefix sum over row lengths
+/// produces — that is the whole reason the spans can be written in parallel
+/// without synchronisation. Asserted in debug rather than merely assumed; in
+/// release an overlap makes `split_at_mut` panic on the negative stride, so it
+/// cannot silently alias.
+fn spans_mut<'a, T>(buf: &'a mut [T], indptr: &[i64]) -> Vec<&'a mut [T]> {
+    let n = indptr.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(n);
     let mut rest = buf;
     let mut base = 0usize;
-    for &(lo, hi) in bounds {
+    for w in indptr.windows(2) {
+        let (lo, hi) = (w[0] as usize, w[1] as usize);
         debug_assert!(
             lo >= base && hi >= lo,
-            "spans must be ascending and non-overlapping: ({lo}, {hi}) after {base}"
+            "indptr must be non-decreasing: ({lo}, {hi}) after {base}"
         );
         let (_, tail) = rest.split_at_mut(lo - base);
         let (span, tail) = tail.split_at_mut(hi - lo);
