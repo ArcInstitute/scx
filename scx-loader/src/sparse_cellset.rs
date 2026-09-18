@@ -1223,14 +1223,24 @@ impl SparseCellSetLoader {
         plan.file_ids[lo..hi].iter().any(|&f| f != first)
     }
 
-    /// W11 — the multi-set batch executor.
+    /// W11 — the multi-set batch executor. Works over the whole batch rather
+    /// than one set at a time, in one of two shapes.
     ///
-    /// One occurrence table over the whole plan, **one read per file** over that
-    /// file's deduplicated rows, each unique `(file, row)` transformed once, and
-    /// the output allocated exactly once from the measured lengths. Against the
-    /// per-set walk this removes, per plan: `n_sets - n_files` reads, two `Vec`
-    /// allocations per row, one full copy of the batch, and every duplicate
-    /// occurrence's decode and transform.
+    /// **Direct** — a raw-local single-file plan ([`Self::plan_needs_assembly`]
+    /// is false): one read over the plan's rows in plan order, clipped and
+    /// value-transformed in place, moved out whole. One allocation for the
+    /// entire gather and no copy of the batch anywhere.
+    ///
+    /// **Assembled** — a plan spanning files, or one whose remap or downsample
+    /// can shrink a row: an occurrence table over the batch, one read per file
+    /// over that file's **deduplicated** rows, each unique `(file, row)`
+    /// transformed once in parallel, and each output position's span filled in
+    /// parallel from the measured lengths.
+    ///
+    /// Against the per-set walk both shapes remove, per plan: `n_sets - n_files`
+    /// reads, two `Vec` allocations per row, and one full copy of the batch.
+    /// Assembly adds the dedup on top, which is why it is taken only where a
+    /// repeat costs a transform rather than a memcpy.
     ///
     /// **Dedup cannot change the output.** [`Self::transform_row`] is a pure
     /// function of `(file_id, row, indices, data)` — the remap table is indexed
@@ -2114,10 +2124,11 @@ pub(crate) fn validate_indptr(indptr: &[i64], nnz: usize) -> Result<()> {
 
 /// Where every output position's row comes from, over the whole batch.
 ///
-/// Built once per plan, over the **emitted** positions only. The point of it is
-/// that a `(file, row)` the plan names more than once — a control pool repeated
-/// in every set, a shared neighbour, a group sampled with replacement — is read
-/// and transformed once and memcpy'd into each of its positions.
+/// Built once per plan, over the **emitted** positions only, and only on the
+/// assembled path — see [`SparseCellSetLoader::plan_needs_assembly`]. The point
+/// of it is that a `(file, row)` the plan names more than once — a control pool
+/// repeated in every set, a shared neighbour, a group sampled with replacement
+/// — is read and transformed once and memcpy'd into each of its positions.
 struct Occurrences {
     /// Unique `(file_id, row)` in first-occurrence order.
     slots: Vec<(u32, u64)>,
