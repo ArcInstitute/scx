@@ -68,12 +68,17 @@ pub struct LeidenConfig {
     /// Sequential (default, `false`) reproduces C++ libleidenalg's move-node
     /// *ordering* (not a guarantee of overall-algorithm parity — see
     /// `refine_partition`).
-    /// Parallel (`true`) converges to a different local optimum due to
-    /// stale-read approximation, but to a local optimum of the *same* move
-    /// kernel: a node that declines an evaluation stays eligible for
-    /// re-evaluation when a neighbour moves, exactly as the sequential path
-    /// does. (It did not before — decliners were retired after a single
-    /// evaluation, costing ~22 % of the RB quality sequential reaches.)
+    /// Parallel (`true`) reaches a different partition, because batching reads
+    /// a partition that later moves in the same batch may have stale. What it
+    /// now shares with the sequential path is the *queue discipline*: a node
+    /// that declines an evaluation stays eligible for re-evaluation when a
+    /// neighbour moves. (It did not before — decliners were retired after a
+    /// single evaluation, costing ~22 % of the RB quality sequential reaches.)
+    ///
+    /// Neither path guarantees that no beneficial move remains when local
+    /// moving returns. Both requeue a neighbour only when it is not already in
+    /// the destination community, so a node whose neighbourhood changes after
+    /// its last evaluation can be left holding one.
     pub parallel: bool,
 }
 
@@ -794,15 +799,18 @@ impl ConflictFreeBatcher {
         Self { max_batch_size }
     }
 
-    /// Partition `nodes` into conflict-free batches, skipping stable nodes.
-    fn create_batches(
-        &self,
-        nodes: &[usize],
-        graph: &LeidenGraph,
-        is_stable: &[bool],
-    ) -> Vec<Vec<usize>> {
+    /// Partition `nodes` into conflict-free batches.
+    ///
+    /// Every node handed in is batched. This used to also filter out nodes with
+    /// `is_stable[n]`, which was a *second* reader of that flag under a
+    /// different meaning than the requeue guard's ("already optimal" vs "not in
+    /// the queue") — the disagreement that produced the retirement bug. Under
+    /// the restored invariant the filter is a no-op anyway: `pending` is grown
+    /// only by the requeue arm, which clears the bit before pushing. The caller
+    /// asserts that.
+    fn create_batches(&self, nodes: &[usize], graph: &LeidenGraph) -> Vec<Vec<usize>> {
         let mut batches = Vec::new();
-        let mut remaining: Vec<usize> = nodes.iter().copied().filter(|&n| !is_stable[n]).collect();
+        let mut remaining: Vec<usize> = nodes.to_vec();
         let mut locked = vec![false; graph.node_count()];
 
         while !remaining.is_empty() {
@@ -1052,7 +1060,11 @@ impl LeidenOptimizer {
         let epsilon = 10.0 * f64::EPSILON;
         while !pending.is_empty() {
             let current: Vec<usize> = pending.drain(..).collect();
-            let batches = batcher.create_batches(&current, &graph, &is_stable);
+            debug_assert!(
+                current.iter().all(|&n| !is_stable[n]),
+                "queue invariant: everything in `pending` must be unstable"
+            );
+            let batches = batcher.create_batches(&current, &graph);
 
             let mut made_move = false;
             for batch in batches {
@@ -1369,6 +1381,8 @@ impl LeidenOptimizer {
 ///   uses sequential moving that reproduces C++ libleidenalg's move-node
 ///   *ordering* (the refinement omits the paper's well-connectedness
 ///   admissibility conditions — see `LeidenConfig::refine_partition`).
+///   `true` reaches a different partition; see `LeidenConfig::parallel` for
+///   what it does and does not share with the sequential path.
 #[allow(clippy::too_many_arguments)]
 pub fn leiden(
     indptr: &[i64],
@@ -2137,22 +2151,18 @@ mod tests {
         );
     }
 
-    /// Deterministic planted-partition graph: `n_comm` blocks of `sz` nodes,
-    /// intra-block edge probability `p_in`, inter-block `p_out`, unit weights.
-    fn planted_graph(
-        seed: u64,
-        n_comm: usize,
-        sz: usize,
-        p_in: f64,
-        p_out: f64,
-    ) -> (LeidenGraph, usize) {
+    /// Deterministic planted-partition graph: 4 blocks of 12 nodes, unit
+    /// weights, intra-block edge probability 0.45 and inter-block 0.06.
+    fn planted_graph(seed: u64) -> (LeidenGraph, usize) {
         use rand::Rng;
-        let n = n_comm * sz;
+        const N_COMM: usize = 4;
+        const SZ: usize = 12;
+        let n = N_COMM * SZ;
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut edges = Vec::new();
         for u in 0..n {
             for v in (u + 1)..n {
-                let p = if u / sz == v / sz { p_in } else { p_out };
+                let p = if u / SZ == v / SZ { 0.45 } else { 0.06 };
                 if rng.gen::<f64>() < p {
                     edges.push((u, v, 1.0));
                 }
@@ -2184,9 +2194,9 @@ mod tests {
             resolution: 1.0,
             seed: Some(seed),
             parallel,
-            consider_empty_community: false,
             ..Default::default()
         };
+        let consider_empty = cfg.consider_empty_community;
         let mut optimizer = LeidenOptimizer::new(cfg);
         let mut partition = RBPartition::new_with_membership(graph.clone(), membership, 1.0);
         if parallel {
@@ -2194,20 +2204,39 @@ mod tests {
         } else {
             optimizer.move_nodes_sequential(&mut partition).unwrap();
         }
+        // Offer the stranded-node probe the same candidate set the optimizer
+        // had, empty community included — the empty-community arm also returns
+        // `None`, so it produces decliners too and would otherwise be invisible
+        // here while `leiden()` leaves it on.
+        let empty_comm = consider_empty.then(|| partition.get_empty_community());
         let stranded = (0..n)
-            .filter(|&v| evaluate_node(v, &partition, None).is_some())
+            .filter(|&v| evaluate_node(v, &partition, empty_comm).is_some())
             .collect();
         (partition.quality(), stranded)
     }
 
     /// 32 seeded planted graphs, each started from a scrambled (non-singleton)
     /// membership, run through both local-moving paths.
+    ///
+    /// Bit-reproducible: the graphs and memberships come from a seeded
+    /// `ChaCha8Rng`, `evaluate_batch` is an order-preserving
+    /// `par_iter().collect()`, and the apply loop that follows is serial.
+    /// Verified identical at `RAYON_NUM_THREADS` 1, 2, 4, 8 and 16, which is
+    /// why the assertions below sit close to the measured values rather than
+    /// leaving flake margin.
+    ///
+    /// Caveat on coverage: `consider_empty_community` is left at its
+    /// `leiden()` default of `true` so the optimizer sees the same candidate
+    /// set production does, but on this fixture that arm never changes an
+    /// outcome — the totals are identical with it off. The empty-community
+    /// decline path is exercised by the production code change, not by this
+    /// sweep.
     fn parallel_vs_sequential_sweep() -> (f64, f64, usize, usize) {
         use rand::Rng;
         let (mut q_par, mut q_seq) = (0.0, 0.0);
         let (mut stranded_par, mut stranded_seq) = (0usize, 0usize);
         for seed in 0u64..32 {
-            let (graph, n) = planted_graph(seed, 4, 12, 0.45, 0.06);
+            let (graph, n) = planted_graph(seed);
             let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x5eed);
             let membership: Vec<usize> = (0..n).map(|_| rng.gen_range(0..4)).collect();
 
@@ -2238,10 +2267,14 @@ mod tests {
     fn test_parallel_local_move_quality_matches_sequential() {
         let (q_par, q_seq, _, _) = parallel_vs_sequential_sweep();
         let ratio = q_par / q_seq;
+        // Measured 0.9936. The bar sits just under it rather than at the ~0.95
+        // a "clearly better than the 0.78 regression" reading would suggest:
+        // the sweep is bit-reproducible (see above), so a loose bar buys no
+        // robustness and would pass a large partial regression.
         assert!(
-            ratio >= 0.95,
+            ratio >= 0.99,
             "parallel local moving reached only {:.2}% of sequential RB quality \
-             ({q_par:.1} vs {q_seq:.1}); pre-fix this was ~78%",
+             ({q_par:.1} vs {q_seq:.1}); measured 99.36%, pre-fix 77.97%",
             ratio * 100.0
         );
     }
@@ -2257,10 +2290,15 @@ mod tests {
     #[test]
     fn test_parallel_local_move_reevaluates_decliners() {
         let (_, _, stranded_par, stranded_seq) = parallel_vs_sequential_sweep();
+        // Measured 34 against sequential's 32. An additive slack of 8, not a
+        // 2x multiple: the sweep is bit-reproducible, and `2 * stranded_seq`
+        // would still pass at 64 stranded nodes — most of the way back to the
+        // pre-fix 153.
         assert!(
-            stranded_par <= 2 * stranded_seq,
+            stranded_par <= stranded_seq + 8,
             "parallel local moving stranded {stranded_par} nodes with a beneficial move \
-             still available against sequential's {stranded_seq}; pre-fix this was 153 vs 32"
+             still available against sequential's {stranded_seq}; measured 34 vs 32, \
+             pre-fix 153 vs 32"
         );
     }
 }
