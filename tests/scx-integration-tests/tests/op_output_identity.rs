@@ -188,13 +188,19 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
 
     // --- build-csc, over the three-codec fixture -------------------------
     //
-    // Not the all-families fixture. `fixture_all_families` carries no CSC
-    // sidecar (nothing but build-csc writes one) and build-csc strips
-    // varm/obsp/varp/raw/bitmaps/group-index on the way, so most of that
-    // fixture's richness never reaches the output. What build-csc's diff
-    // actually touches is its per-shard CSR re-emit loop, and
-    // `mixed_codec_file` is the only fixture in the tree that exercises all
-    // three encoder paths (unframed integer, row-group-framed integer, float).
+    // Not the all-families fixture, and no longer for the reason this comment
+    // used to give: it said build-csc "strips varm/obsp/varp/raw/bitmaps/
+    // group-index on the way", which was true before Phase 5b and is false now
+    // — those six are all `Carry::Verbatim` (`scx_ops::carry::build_csc`), and
+    // `section_carry.rs::build_csc_carries_what_optimize_carries` pins it.
+    //
+    // The reason that survives is what build-csc's diff actually touches: its
+    // per-shard CSR re-emit loop. `mixed_codec_file` is the only fixture in the
+    // tree that exercises all three encoder paths (unframed integer,
+    // row-group-framed integer, float). `build_csc_indexed` below covers the
+    // rich families — all but `.raw`, the bitmaps and the group index, which
+    // its input loses to the `compact` it is laundered through, not to
+    // build-csc.
     let csc_src = mixed_codec_file(&dir.join("csc_src.scx")).unwrap();
     let out = dir.join("build_csc.scx");
     scx_ops::run_build_csc(&csc_src, &out, "1G", false, 1024, None).unwrap();

@@ -67,11 +67,12 @@ skill via [`AGENTS.md`](AGENTS.md).
 - **Fast at every scale** — on 1M cells SCX is **17× faster** than the gzipped h5ad most researchers ship, 1.5× faster than Zarr, and produces a file 4–5× smaller than anndata's default uncompressed h5ad. Single file, BLAKE3-checksummed, mmap-friendly, and HPC-safe: no `HDF5_USE_FILE_LOCKING=FALSE` workaround on NFS / Lustre / GPFS.
 - **Scales on CPU and GPU** — shard-level parallelism via rayon delivers up to **7× read** and **3.2× write** scaling. The GPU path (rapids-singlecell for PCA · kNN · UMAP · preprocessing, cuGraph for Leiden, plus native CUDA kernels for HVG · DE · Harmony) gives **3.8× end-to-end** on PCA → kNN → UMAP → Leiden at 1M cells; the training loader hits **1,405 batches/s** — 82× faster than TileDB-SOMA-ML.
 - **Atlas-scale memory footprint** — backed mode + `MADV_DONTNEED` streaming. A full 1M-cell preprocess-to-cluster pipeline (open → QC → normalize → log1p → HVG → PCA → kNN → UMAP → Leiden) runs at **~11 GB peak RSS** vs ~22 GB materialised (51% less; lazy preprocessing alone peaks at ~3.5 GB). Backed mode lets you open a 10M-cell atlas without allocating the full matrix.
-- **Rust-native analysis accelerators** — drop-in replacements for `sc.pp.*` / `sc.tl.*`: PCA, kNN, UMAP, Leiden, differential expression, pseudobulk, and [Harmony2 batch integration](https://www.biorxiv.org/content/10.64898/2026.03.16.711825v1). Same scanpy-shaped API, 3–40× faster; every op has a `device="auto"` switch that picks GPU when available.
-- **Mutable without rewriting** — append new cells, mark-delete doublets, compact, merge, or roll back in milliseconds. Append writes new matrix shards in O(new cells); obs metadata is rewritten as a merged Arrow IPC covering all cells (see [docs/operations.md](docs/operations.md)). Delete is a logical mask, not a data rewrite.
-- **Multimodal native** — CITE-seq, 10x Multiome, and TEA-seq carried in a single v2 file on a shared cell axis. Per-modality codec selection (Scx1 for RNA UMI, Zstd for ADT, Lz4Shuffle/Zstd for ATAC), per-modality `scx merge`/`compact`/`subset --modality`, CSC sidecars preserved through `scx append`, and a `MultimodalTrainingDataset` that yields cell-aligned RNA+ADT+ATAC batches. Round-trips with `mudata.MuData` (Python), Seurat v5 multi-assay, and Bioconductor `MultiAssayExperiment` (R). See [docs/multimodal.md](docs/multimodal.md).
-- **Lazy query engine** — predicate pushdown skips ~55% of shards on realistic queries; selective reads land in under **5 ms**. Filter by cell type, tissue, donor, etc. before paying to read.
-- **Drop-in for scverse and Seurat** — works with AnnData, scanpy, and scVI (Python), and Seurat v5 + SingleCellExperiment (R). Round-trips cleanly with h5ad, 10x HDF5, and Cell Ranger MTX.
+- **Rust-native analysis accelerators** — drop-in replacements for `sc.pp.*` / `sc.tl.*`: PCA, kNN, UMAP, Leiden, differential expression (Wilcoxon and DESeq2-style replicate-aware negative-binomial GLM), pseudobulk, [Harmony2 batch integration](https://www.biorxiv.org/content/10.64898/2026.03.16.711825v1), cell-by-cell exact LISI, and PFlog (v4) shifted-log normalization with out-of-core baseline-aware PCA. Same scanpy-shaped API, 3–68× faster; every op has a `device="auto"` switch that picks GPU when available.
+- **Foundation model training and tokenisation engine** — triple-buffered streaming loader, multi-set batch executor for cell-set models (7.76× faster, 33× fewer allocations), reuse-signal row-group LRU caching, compiled transformer tokenisation kernels (`pyscx.tokenize` for Geneformer, scGPT, UCE, STATE3, CellFM), and spatial neighbourhood plan builders (15,000 plans/s).
+- **Mutable without rewriting** — append new cells, mark-delete doublets, attach cell and gene annotations in-place (`attach_obs_columns`, `attach_var_columns`), compact, merge, or roll back in milliseconds. Append writes new matrix shards in O(new cells); obs metadata is rewritten as a merged Arrow IPC covering all cells (see [docs/operations.md](docs/operations.md)). Delete is a logical mask via compressed Roaring Bitmaps, not a data rewrite.
+- **Multimodal native** — CITE-seq, 10x Multiome, and TEA-seq carried in a single v2 file on a shared cell axis. Per-modality codec selection (Scx1 for RNA UMI, Zstd for ADT, Lz4Shuffle/Zstd for ATAC), per-modality `scx merge`/`compact`/`subset --modality`, CSC sidecars preserved through `scx append`, and a synchronized `MultimodalTrainingDataset` that yields cell-aligned RNA+ADT+ATAC batches with zero-copy NumPy handoff. Round-trips with `mudata.MuData` (Python), Seurat v5 multi-assay, and Bioconductor `MultiAssayExperiment` (R). See [docs/multimodal.md](docs/multimodal.md).
+- **Lazy query engine & detection indexing** — predicate pushdown skips ~55% of shards on realistic queries; selective reads land in under **5 ms**. Detection bitmap sidecars (`BitmapShard`) evaluate boolean presence queries and non-zero counts instantly in $O(\text{cardinality})$ without reading CSR values. Condition-grouped sharding (`GroupIndex`) packs perturbation cohorts contiguously into single shards.
+- **Drop-in for scverse and Seurat** — works with AnnData, scanpy, and scVI (Python), and Seurat v5 + SingleCellExperiment (native R via `rscx`, compiled with `extendr` without Python/reticulate). Round-trips cleanly with h5ad, 10x HDF5, and Cell Ranger MTX.
 - **Cloud-native** — streaming push/pull to S3, GCS, and Azure with selective download (only the shards you need) and a direct `open_cloud()` path that skips the full download.
 
 ## Why SCX?
@@ -111,13 +112,18 @@ time. Open a 10M-cell atlas without allocating the full matrix:
 adata = pyscx.open("atlas.scx").to_anndata(backed=True)
 
 # X stays on disk — only the accessed shard is decoded
+# Row slicing leverages whole-shard skipping, bypassing shards with 0 selected cells:
 subset = adata[adata.obs["cell_type"] == "T cell"].copy()
 
 # Now subset is a regular AnnData — preprocess normally
-# Or use SCX accelerators for compute-heavy steps (3-10× faster at scale)
+# Or use SCX accelerators for compute-heavy steps (3-68× faster at scale)
 sc.pp.normalize_total(subset, target_sum=1e4)
 sc.pp.log1p(subset)
 sc.pp.pca(subset)
+
+# In-flight column projection during eager load (8.3× less peak RAM):
+# Extracts HVG/marker panels directly without full-width matrix expansion in RAM
+hvg_adata = pyscx.open("atlas.scx").to_anndata(var_names=hvg_genes, obsp=[])
 ```
 
 Layers, deletion vectors, and `anndata.abc.CSRDataset` registration all work
@@ -149,6 +155,43 @@ dataset = pyscx.TrainingDataset(
 for batch in dataset:
     x = torch.from_numpy(batch["X"]).to(device)
     # model.forward(), loss.backward(), ...
+```
+
+#### Compiled transformer tokenisation (`pyscx.tokenize`)
+
+Single-cell foundation models (Geneformer, scGPT, UCE, STATE3, CellFM) bottleneck
+heavily on interpreted Python tokenisation loops. SCX provides compiled, lock-free
+Rust kernels that operate directly on batch tensors with the GIL released:
+
+```python
+import pyscx.tokenize as tok
+
+# Rank-based gene tokenisation (Geneformer, TranscriptFormer):
+tokens = tok.rank_tokens(batch["X"], max_len=2048)
+
+# Non-zero quantile expression binning (scGPT, CellFM):
+binned = tok.bin_values(batch["X"], n_bins=51)
+
+# Expression-weighted stochastic gene sampling (UCE):
+sampled = tok.sample_genes(batch["X"], n_sample=1024)
+
+# Top-k feature cropping with sentinel padding:
+cropped = tok.top_k(batch["X"], k=1024, pad_token_id=0)
+```
+
+#### Cell-set and spatial microenvironment gathering
+
+For cell-set transformers and spatial graph neural networks, [`pyscx.SparseCellSetDataset`](docs/api.md#sparsecellsetdataset)
+uses a **multi-set batch executor** that pre-allocates exact CSR batches, caches recurrent
+control groups, and parallelizes row-level transformations across Rayon threads — yielding
+a **7.76× throughput gain** and slashing heap allocations from 2,698 to **81 per batch**:
+
+```python
+# Gather variable-length cell sets across files with zero-copy NumPy handoff
+dataset = pyscx.SparseCellSetDataset("atlas.scx", plan=cell_set_plan)
+
+# Synthesize 15,000 spatial microenvironment plans/sec directly from coordinates:
+spatial_plans = pyscx.neighborhood_plans_from_coords(coords, k=15)
 ```
 
 For ML workloads where each batch is a list of `(perturbed_cell, control_cell)`
@@ -184,28 +227,50 @@ result = (pyscx.open("atlas.scx")
 
 adata = result.to_anndata()   # only matching cells, zero-copy
 print(f"Skipped {result.skipped_shards}/{result.total_shards} shards")
+
+# Instant O(cardinality) boolean queries via Detection Bitmaps (Roaring Bitmaps):
+# Evaluates presence queries without scanning CSR index or value arrays
+exp = pyscx.open("atlas.scx")
+expressing_cells = exp.cells_expressing("CD3D")
+counts = exp.detection_counts(["CD3D", "MS4A1", "GNLY"])
+
+# Condition-grouped physical locality (scx sort --group-by):
+# Reads an entire perturbation cohort in 1 contiguous disk read
+cohort = exp.read_group("BRCA1_sg1")
+
+# Lossless typed queries (avoids float32 mantissa loss for counts > 2^24):
+exact_counts = exp.query().collect(data_dtype="uint32")
 ```
 
 Average shard skip rate: **55%** on realistic queries. Selective query latency: **<5 ms**.
 
 ### You need to update your dataset without rewriting it
 
-SCX supports append, delete, compact, merge, and rollback — no need to rewrite
-the entire file when adding new cells or removing doublets.
+SCX supports in-place annotation, append, delete, compact, merge, and rollback — no need
+to rewrite multi-gigabyte expression matrices when adding cell annotations or removing doublets.
 
 ```python
+# In-place annotation attachment (instant, zero matrix rewrite, automatic index updates)
+pyscx.attach_obs_columns("atlas.scx", cell_annotations_df)
+pyscx.attach_var_columns("atlas.scx", gene_annotations_df)
+
 # Append new cells (new CSR shards at EOF; obs metadata rewritten for all cells)
 pyscx.append("atlas.scx", "new_batch.scx")
 
-# Logical deletion (instant, no data rewrite)
+# Logical deletion via compressed Roaring Bitmaps (instant O(1), no data rewrite)
 pyscx.mark_deleted("atlas.scx", doublet_indices)
 
-# Reclaim space when convenient
+# Reclaim space when convenient (drops orphaned sections, canonicalizes shards)
 pyscx.compact("atlas.scx", "atlas_clean.scx")
 
-# Oops? Roll back to the previous version (header-only update)
+# Oops? Roll back to the previous version instantly (header pointer update)
 pyscx.rollback("atlas.scx")
 ```
+
+Categorical columns retain strict dictionary fidelity, ordering, and unused factor levels
+through all mutations — never demoted to plain strings. Carry invariant enforcement
+([`carry.rs`](docs/operations.md)) guarantees that auxiliary mappings (`obsm`, `obsp`,
+`varm`, `varp`) and sidecars are never silently lost during mutating operations.
 
 ### Your data is multimodal (CITE-seq, 10x Multiome, TEA-seq)
 
@@ -267,9 +332,9 @@ print(exp.n_obs, exp.n_vars)
 
 ### Your analysis pipeline is too slow for atlas-scale
 
-At >1M cells, even optimized CPU code for PCA, kNN, and UMAP takes minutes.
-SCX provides GPU-accelerated analysis via [rapids-singlecell](https://rapids-singlecell.readthedocs.io/) — PCA (`rsc.pp.pca`), kNN (`rsc.pp.neighbors`), and UMAP (`rsc.tl.umap`) run in-VRAM on the GPU, with native CUDA kernels for HVG, DE, and Harmony.
-All accessed through the same Python API with a single `device="gpu"` parameter:
+At >1M cells, even optimized CPU code for PCA, kNN, and UMAP takes minutes, and batch integration or replicate-aware differential expression can stall for hours.
+SCX provides GPU-accelerated analysis via [rapids-singlecell](https://rapids-singlecell.readthedocs.io/) — PCA (`rsc.pp.pca`), kNN (`rsc.pp.neighbors`), and UMAP (`rsc.tl.umap`) run in-VRAM on the GPU, with native CUDA and Rust kernels for HVG, DE, Harmony2, LISI, and PFlog.
+All accessed through the same Python API with a single `device="auto"|"cpu"|"gpu"` parameter:
 
 ```python
 import pyscx
@@ -280,6 +345,19 @@ adata = pyscx.open("atlas.scx").to_anndata(backed=True)
 pyscx.accel.pca(adata, n_comps=50, device="gpu")
 pyscx.accel.neighbors(adata, n_neighbors=15, device="gpu")
 pyscx.accel.umap(adata, device="gpu")
+
+# Clean-room Harmony2 batch integration (17× CPU / 68× GPU speedup, no GPL copyleft):
+pyscx.accel.harmony_integrate(adata, key="batch")
+
+# Cell-by-cell exact LISI diversity scores (14×–114× faster, exact harmonypy parity):
+pyscx.accel.compute_lisi(adata, keys=["batch", "cell_type"])
+
+# Replicate-aware negative-binomial GLM DE (native Rust DESeq2 equivalent):
+res = pyscx.accel.pseudobulk_dex(adata, groupby="cell_type", condition="disease", backend="nb_glm")
+
+# PFlog (v4) shifted-log normalization on raw counts (avoids depth-division bias):
+# Runs out-of-core PCA on 1M cells using 1.4 GB RAM instead of 246 GB dense OOM:
+pyscx.accel.pflog_pca(adata, n_comps=50)
 
 import scanpy as sc
 sc.tl.leiden(adata)  # downstream scanpy works identically
@@ -310,9 +388,9 @@ results = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
 pyscx.accel.knockdown_efficiency(adata, pert_col="perturbation", control="control")
 # → adata.obs["KnockDownEfficiency"], adata.obs["KnockDownGeneFC"]
 
-# Energy distance: faer-gemm + f32 default (use backend="scalar" / dtype="f64"
-# for legacy bit-exact reproduction).
-corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+# Energy distance: faer-gemm + f32 default (or bounded Gram-block GPU kernel):
+# Evaluates >50,000 control cells on GPU without CUDA Out-of-Memory (<512 MB VRAM):
+corr = pyscx.accel.energy_distance(adata_real, adata_pred, device="gpu")
 
 # Clustering agreement: native-Rust HNSW + Leiden (no scanpy under the hood).
 score = pyscx.accel.clustering_agreement(adata_real, adata_pred, metric="ami")
@@ -480,12 +558,17 @@ sizes in our benchmarks.
 | Integrity verification | Partial | None | Per-fragment | Per-fragment | **Full** (BLAKE3: catalog verified on open; `validate()` re-hashes all section payloads) |
 | Parallel reads | No (GIL) | Chunk-level | Tile-level | Fragment-level | **Shard-level** (rayon) |
 | Append without rewrite | No | No | Yes (fragments) | Yes (fragments) | **Yes** (append sections) |
-| Cloud-native access | No | Yes | Yes | Yes | **Yes** (explode/pack, selective pull) |
-| Built-in query engine | No | No | Yes | **Yes (SQL)** | **Yes** (predicate pushdown) |
-| Domain-specific compression | No | No | No | No | **Yes** (Scx1 codec, 2-5× better) |
-| Integer-aware storage | No (float32) | No (float32) | No (float64) | u16 per-cell | **Yes** (uint8/uint16 auto-detect) |
-| ML training loader | No | No | Yes (tiledbsoma-ml) | Yes (slow) | **Yes** (1,405 batches/s) |
+| In-place annotation attachment | No (full rewrite) | Fragmented | Fragment bloat | Fragment bloat | **Yes** (`attach_obs/var_columns`) |
+| Transactional rollback | No | No | No | No | **Yes** (instant $O(1)$ header revert) |
+| Cloud-native access | No | Yes | Yes | Yes | **Yes** (single-GET root, selective pull) |
+| Built-in query engine | No | No | Yes | **Yes (SQL)** | **Yes** (predicate pushdown + Roaring bitmaps) |
+| Domain-specific compression | No | No | No | No | **Yes** (Scx1 & ShufDeltaZstd) |
+| Integer-aware storage | No (float32) | No (float32) | No (float64) | u16 per-cell | **Yes** (lossless uint8/16/32 auto-detect) |
+| ML training loader | No | No | Yes (tiledbsoma-ml) | Yes (slow) | **Yes** (1,405 batches/s, zero-copy) |
+| Foundation model tokenisation | No | No | No | No | **Yes** (compiled `pyscx.tokenize`) |
 | Out-of-core / backed reads | Partial (r+) | Partial | Partial | No (full materialize) | **Yes** (streaming + backed) |
+| Normalization without densifying | No | No | No | No | **Yes** (PFlog baseline-aware PCA) |
+| Native dual Python + R stack | Python only | Python only | C++ wrapped | Python only | **Yes** (native `pyscx` + `rscx`) |
 
 ## Installation
 
