@@ -808,9 +808,8 @@ impl ConflictFreeBatcher {
     /// the restored invariant the filter is a no-op anyway: `pending` is grown
     /// only by the requeue arm, which clears the bit before pushing. The caller
     /// asserts that.
-    fn create_batches(&self, nodes: &[usize], graph: &LeidenGraph) -> Vec<Vec<usize>> {
+    fn create_batches(&self, mut remaining: Vec<usize>, graph: &LeidenGraph) -> Vec<Vec<usize>> {
         let mut batches = Vec::new();
-        let mut remaining: Vec<usize> = nodes.to_vec();
         let mut locked = vec![false; graph.node_count()];
 
         while !remaining.is_empty() {
@@ -1064,7 +1063,7 @@ impl LeidenOptimizer {
                 current.iter().all(|&n| !is_stable[n]),
                 "queue invariant: everything in `pending` must be unstable"
             );
-            let batches = batcher.create_batches(&current, &graph);
+            let batches = batcher.create_batches(current, &graph);
 
             let mut made_move = false;
             for batch in batches {
@@ -2175,14 +2174,32 @@ mod tests {
     /// Run one local-moving pass from a **non-singleton** start membership and
     /// report `(final quality, nodes that still have a beneficial move)`.
     ///
-    /// The non-singleton start is the whole point. At `resolution = 1.0` a
-    /// singleton with no self-loop provably always has a strictly improving
-    /// move — `diff_move` reduces to `2·(w(v,C) − γ·k_v·k_C/2m)` and summing
-    /// over the communities holding v's neighbours gives `≥ 2·k_v²/2m > 0` —
-    /// so no node can decline and the retirement path is unreachable. Real
-    /// runs hit it from the second inner iteration onward, where
-    /// `refine_and_collapse` hands the next level a `new_with_membership`
-    /// partition.
+    /// The non-singleton start is the whole point, and it is what makes this
+    /// deterministic rather than what makes it possible. At `resolution = 1.0`
+    /// a **non-isolated** node whose community is still a singleton, with no
+    /// self-loop, has a strictly improving move: `diff_move` reduces to
+    /// `2·(w(v,C) − γ·k_v·k_C/2m)`, and summing over the communities holding
+    /// v's neighbours gives `≥ 2·k_v²/2m > 0`. So the *first* evaluation of
+    /// every such node moves it, and an all-singleton first pass produces no
+    /// decliner to retire. (An isolated node — `k_v == 0` — is the exception,
+    /// and is also the case that loses nothing by being retired.)
+    ///
+    /// That bound says nothing about later passes. Once pass 1 has moved
+    /// nodes, communities are no longer singletons, the *leave* term is live,
+    /// and a node requeued by a neighbour's move can decline and be retired —
+    /// at the first level, not only at the aggregate levels where
+    /// `refine_and_collapse` hands down a `new_with_membership` partition. So
+    /// the public `leiden(..., parallel = true)` path does reach the bug; it
+    /// just reaches it after a shuffle, a batching pass and a requeue, which
+    /// is not a fixture you can pin. Injecting the start membership puts a
+    /// decliner in front of the first batch on purpose.
+    ///
+    /// It is also where the signal is. End to end through `leiden()` the
+    /// multilevel loop re-runs local moving on every level and recovers most
+    /// of the damage: over 60 planted graphs across five block shapes, the
+    /// worst pre-fix parallel-vs-sequential modularity ratio was 0.986 (0.9983
+    /// after), against the 0.78 this sweep sees on a single pass. That is why
+    /// the regression lives here and not on the public entry point.
     fn local_move_outcome(
         graph: &LeidenGraph,
         membership: &[usize],
@@ -2254,8 +2271,9 @@ mod tests {
     /// on the applied-move branch. A node that declined therefore kept
     /// `is_stable == false` — which under this invariant means "still queued" —
     /// while having already been drained out of `pending`, so the neighbour
-    /// requeue guard could never fire for it and `create_batches` (which skips
-    /// stable nodes) never saw it again. It was retired after exactly one
+    /// requeue guard could never fire for it, and the `create_batches` of the
+    /// time, which skipped stable nodes, never saw it again. (That filter is
+    /// gone; it was the second, contradictory reader of the flag.) It was retired after exactly one
     /// evaluation, against unbounded re-evaluation in the sequential
     /// reference.
     ///
@@ -2283,7 +2301,8 @@ mod tests {
     /// the nodes left holding a beneficial move once local moving has
     /// returned. The sequential reference is not at zero either — its requeue
     /// guard also skips a neighbour already sitting in the destination
-    /// community — so the bar is "no worse than sequential", not "none".
+    /// community — so the bar is "within an additive 8 of sequential", not
+    /// "none".
     ///
     /// Pre-fix: 153 stranded on the parallel path against sequential's 32.
     /// Post-fix: 34 against 32.
