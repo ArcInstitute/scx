@@ -3525,3 +3525,123 @@ fn only_a_multi_file_or_length_changing_plan_is_assembled() {
     // one: it must not charge the configuration that never assembles.
     assert_eq!(raw.budget_breakdown().transient_bytes, 0);
 }
+
+/// A multi-file plan with **no** transform is assembled too, and takes the
+/// assembled path's length-preserving branch.
+///
+/// That branch existed only because of this shape and nothing covered it: every
+/// other assembled-path test configures a remap or a downsample, and every
+/// raw-local test uses one file. A multi-file raw-local plan is legal — the
+/// cross-file refusal is per *set*, not per plan — so each set may name its own
+/// file without any global vocabulary.
+#[test]
+fn a_multi_file_raw_local_plan_is_assembled_without_a_transform() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("m0.scx");
+    let p1 = dir.path().join("m1.scx");
+    write_ragged_fixture(&p0, 32, 8, 2);
+    write_ragged_fixture(&p1, 32, 8, 2);
+    let mk = || {
+        SparseCellSetLoader::new(
+            vec![open(&p0), open(&p1)],
+            8,
+            None,
+            4,
+            /*remap*/ None,
+            None,
+            false,
+            false,
+            0.0,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    };
+    // Each set is single-file; the sets differ. Repeats inside and across.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 0, 0, 1, 1, 1, 0, 0],
+        rows: vec![3, 11, 3, 5, 20, 5, 11, 27],
+        role_tags: (0..8).collect(),
+        set_offsets: vec![0, 3, 6, 8],
+    };
+    let a = mk();
+    assert!(
+        a.plan_needs_assembly(&plan, 0, 8),
+        "premise: more than one file, so it cannot be the read"
+    );
+    let whole = a
+        .gather_whole_plan(&a.engine, &plan, Some(Admit::All))
+        .unwrap();
+    let b = mk();
+    let per_set = b
+        .gather_per_set(&b.engine, &plan, Some(Admit::All))
+        .unwrap();
+    assert_eq!(batch_fields(&whole), batch_fields(&per_set));
+
+    // Raw-local means the two files' rows are in the same index space, so the
+    // only thing distinguishing them is the row content. Check every position
+    // against a direct read of its own file.
+    let readers = [open(&p0), open(&p1)];
+    for (j, (&fid, &row)) in plan.file_ids.iter().zip(plan.rows.iter()).enumerate() {
+        let r = BackedCsrReader::new(ScxReader::open(readers[fid as usize].path()).unwrap(), 4);
+        let want = r.read_row_indices(&[row]).unwrap();
+        assert_eq!(batch_row(&whole, j).0, &want.indices[..], "position {j}");
+        assert_eq!(batch_row(&whole, j).1, &want.data[..], "position {j}");
+    }
+}
+
+/// The clip runs on the **assembled** path too, with no transform configured.
+///
+/// `gather_clips_negatives_in_the_emitted_csr` covers a single-file raw-local
+/// plan, which is now the direct path, and `gather_clip_runs_after_coalescing_not_before`
+/// covers the remap. Nothing covered the length-preserving branch of the
+/// assembled path — a multi-file raw-local plan — and removing the clip there
+/// left every other test green.
+#[test]
+fn a_multi_file_raw_local_gather_still_clips_negatives() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("neg0.scx");
+    let p1 = dir.path().join("neg1.scx");
+    // Row 5 of each file carries a negative at position 1.
+    write_float_fixture(&p0, 8, 4, 2, 3, Some((5, 1)));
+    write_float_fixture(&p1, 8, 4, 2, 3, Some((5, 1)));
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        4,
+        None,
+        2,
+        /*remap*/ None,
+        None,
+        false,
+        false,
+        0.0,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    // One set per file, so no set spans files and no remap is required.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 1],
+        rows: vec![5, 5],
+        role_tags: vec![0, 1],
+        set_offsets: vec![0, 1, 2],
+    };
+    assert!(
+        loader.plan_needs_assembly(&plan, 0, 2),
+        "premise: two files, so this is the assembled path"
+    );
+    let b = loader
+        .gather_whole_plan(&loader.engine, &plan, Some(Admit::All))
+        .unwrap();
+    for j in 0..2 {
+        let (idx, dat) = batch_row(&b, j);
+        assert!(
+            dat.iter().all(|&v| v >= 0.0),
+            "negative leaked at {j}: {dat:?}"
+        );
+        assert_eq!(idx.len(), 3, "clip must not change nnz: {idx:?}");
+        assert_eq!(dat[1], 0.0, "the clipped entry should be an explicit zero");
+    }
+}

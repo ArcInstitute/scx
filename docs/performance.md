@@ -3621,6 +3621,67 @@ The ordered and random-control figures are reproducible from the fixture in
 seconds with `pyscx.batch_plans` and carry no timing, so they need no capture;
 the shuffled one is read off the committed artifact.
 
+### The multi-set batch executor: what a cell-set gather costs (phase 6)
+
+The cell-set gather walked a plan **one set at a time** — a per-set
+`Vec<Option<(Vec<i32>, Vec<f32>)>>`, its own read call, two owned `Vec`s per row
+inside the row transform, and a copy of every row into a batch pre-sized from a
+catalog estimate. It is now one executor over the whole batch, in one of two
+shapes: a raw-local single-file plan is read in plan order and **moved out as
+the batch**, and a plan spanning files or carrying a length-changing transform
+(a remap drops and coalesces, a downsample truncates) is **assembled** from a
+deduplicated read.
+
+Two-arm same-build A/B, one build with the executor selected by
+`SCX_CELLSET_EXECUTOR` (`set` = the pre-change per-set walk, `plan` = shipped),
+12 interleaved rounds with the arm order alternated by round, one timed run per
+round, page cache dropped before every run. Ratios are the median of per-round
+ratios, oriented so >1 means the shipped build helped; `p` is an exact two-sided
+sign test with ties dropped.
+
+<!-- PHASE6-TABLE -->
+
+#### The allocations, which the A/B cannot see
+
+Counting-allocator test (`scx-loader/tests/gather_allocation.rs`), a 1,024-row
+plan of 32,768 non-zeros, same fixture and same plan on both arms, measured
+after an unmeasured warm-up so what it sees is the assembly rather than the
+decode:
+
+| arm | allocations | per row | peak live bytes | × the result |
+|---|---|---|---|---|
+| `set` | 2,698 | 2.63 | 421,192 | 1.56 |
+| `plan` | **81** | **0.08** | **371,304** | **1.37** |
+
+Forcing the assembled path on that plan takes the peak to 2.35× the result and
+fails the test's budget, which is how the direct path is pinned.
+
+#### ⚠️ Three captures, and two of them are superseded
+
+Both superseded artifacts ship, because each is the evidence for the change that
+superseded it.
+
+`2969631` put the executor at **0.811×** on `cellsets_per_sec__gather_random`
+(0/12, p = 0.000) and 0.820× on `__gather_grouped`, while the duplicate- and
+transform-heavy arms won (`gather_hot_control_cold_tail` 7.92×,
+`downsample_rust` 3.71×, both 12/12). The cause was not the executor: the
+`read_row_indices` prescan re-decoded a **resident** shard's indptr on every
+call — deliberate, so that a prescan between planning and warming cannot change
+what the block-index route admits, and pure waste once the shard is decoded. A
+local probe on a 100k-row synthetic with every shard warm read 0.47 ms/batch on
+the per-set walk against 2.73 ms on the executor; after the fix, 0.47 against
+0.29.
+
+`2969753`, with that fixed, left a residual **0.926× / 0.910×** — the dedup
+itself. Deduplicating forces the batch to be assembled from the read, which
+costs a second batch-sized allocation and a second full copy, to save one memcpy
+per repeated row from an already-resident shard. That is all it ever saved on a
+raw-local plan, whose whole row transform is an elementwise clip. So the shipped
+rule deduplicates only where a repeat costs real work, and the phase-4
+measurement above says how often that is: a neighbourhood batch's duplicate
+factor is **1.108** and a random-plan control's is **1.129** — about a tenth of
+the rows, nowhere near enough to pay for a second buffer.
+
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 
 The pathology that motivated this work: STATE3 measured **143 s/batch** on a scattered

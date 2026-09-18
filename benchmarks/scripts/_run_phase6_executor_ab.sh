@@ -2,9 +2,10 @@
 # Phase 6 (W11) — TWO-arm A/B for the multi-set batch executor, on one build.
 #
 # Arms, both one build, selected by `SCX_CELLSET_EXECUTOR`:
-#   plan — shipped: one occurrence table over the whole batch, one read per
-#          file over its deduplicated rows, each unique `(file, row)`
-#          transformed once, output allocated exactly once
+#   plan — shipped: one executor over the whole batch. A raw-local single-file
+#          plan is read verbatim in plan order and moved out AS the batch; a
+#          plan spanning files or carrying a remap/downsample is assembled from
+#          a deduplicated read, each unique `(file, row)` transformed once.
 #   set  — the pre-W11 walk: one read per set, a per-set
 #          `Vec<Option<(Vec<i32>, Vec<f32>)>>`, an `extend_from_slice` copy of
 #          every row, and no dedup at all
@@ -251,7 +252,9 @@ pathlib.Path("$OUT/provenance.json").write_text(json.dumps({
     "cpus": os.environ.get("SLURM_CPUS_PER_TASK"),
     "rounds": $ROUNDS, "n_runs": $N_RUNS,
     "arms": {
-      "plan": "shipped: whole-plan occurrence table, one read per file, dedup, exact allocation",
+      "plan": ("shipped: whole-batch executor. Raw-local single-file plans are read "
+               "verbatim and moved out as the batch; plans spanning files or carrying a "
+               "remap/downsample are assembled from a deduplicated read."),
       "set":  "SCX_CELLSET_EXECUTOR=set (the pre-W11 per-set walk)",
     },
     "contrasts": {"executor": "plan vs set"},
