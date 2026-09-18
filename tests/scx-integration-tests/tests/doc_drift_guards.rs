@@ -349,18 +349,22 @@ fn from_anndata_codec_docstring_names_intent_axis() {
     );
 }
 
-/// `append` / `merge` / `merge --sort-by` write obs categoricals back as the
-/// dictionaries they arrived as. Three separate doc paragraphs used to say the
-/// opposite, and that prose has now gone stale twice — once when the in-place
-/// writers stopped decoding, and again when these three did. Pin the retired
-/// phrasings so a doc that reintroduces the claim fails CI.
+/// Every obs write door — the in-place attaches, `append`, `merge`,
+/// `merge --sort-by` and both of `scx sort`'s obs writers — writes categoricals
+/// back as the dictionaries they arrived as. The docs have now gone stale on
+/// this **three** times: once when the in-place writers stopped decoding, again
+/// when the three streaming ones did, and again when `scx sort`'s spill path
+/// did. Each round left prose asserting the previous state, and each round the
+/// prose outlived the code. Pin the retired phrasings so a doc that
+/// reintroduces one fails CI.
 ///
 /// This is a prose guard, not a behaviour guard: what actually pins the
-/// behaviour is `scx-ops/tests/streaming_merge_append.rs`'s dictionary suite
-/// and the `append_categorical` / `merge_categorical` arms of
+/// behaviour is `scx-ops/tests/streaming_merge_append.rs`'s dictionary suite,
+/// `scx-ops`' `obs_spill_*` suite, and the `append_categorical` /
+/// `merge_categorical` / `sort_categorical_spilled` arms of
 /// `op_output_identity`.
 #[test]
-fn no_doc_claims_append_or_merge_decodes_categoricals() {
+fn no_doc_claims_a_write_door_decodes_categoricals() {
     let root = workspace_root();
     // Each needle is a phrase that was true before the write doors stopped
     // decoding and is false now. Kept verbatim so a copy-paste of the old
@@ -370,6 +374,12 @@ fn no_doc_claims_append_or_merge_decodes_categoricals() {
         "their dictionary output is a tracked follow-on",
         "plain-encoded shards comes back as plain strings",
         "`append` decodes to plain strings",
+        // Retired when `scx sort`'s obs spill path stopped decoding.
+        "One writer still decodes",
+        "Every write door but `scx sort",
+        "re-encodes obs categoricals",
+        "the in-memory sort path is correct",
+        "the in-memory sort path does not",
     ];
     let mut docs: Vec<PathBuf> = Vec::new();
     collect_files(&root.join("docs"), "md", &mut docs);
@@ -396,8 +406,8 @@ fn no_doc_claims_append_or_merge_decodes_categoricals() {
     }
     assert!(
         hits.is_empty(),
-        "these docs still claim `append` / `merge` decode categoricals to plain \
-         strings, which they stopped doing:\n  {}",
+        "these docs still claim a write door decodes categoricals to plain \
+         strings, which none of them does:\n  {}",
         hits.join("\n  ")
     );
 }

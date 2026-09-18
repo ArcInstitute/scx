@@ -3198,6 +3198,317 @@
           "blake3": "5e2ac057040e27855ac968b3d97a514bb4908bc80d69d498a654b74943773ee5"
         }
       ]
+    },
+    "sort_categorical_spilled": {
+      "strictness": "Content",
+      "excluded_section_types": [
+        11
+      ],
+      "header": {
+        "format_version": 3,
+        "flags": 12,
+        "n_obs": 6,
+        "n_vars": 6,
+        "nnz": 12,
+        "n_csr_shards": 3,
+        "n_csc_shards": 0,
+        "shard_target_rows": 2,
+        "codec_id": 1,
+        "index_dtype": 0,
+        "manifest_sequence": 0,
+        "n_modalities": 0
+      },
+      "catalog": {
+        "catalog_version": 4,
+        "manifest_sequence": 0,
+        "n_obs": 6,
+        "data_generation": 3,
+        "csc_build_generation": 0
+      },
+      "sections": [
+        {
+          "name": "X_shard_0",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 131,
+          "blake3": "8a9b9333a4dd33af7012269ef949f59435d662d589e48563e65944979d34d7c1",
+          "stats": {
+            "row_start": 0,
+            "row_end": 2,
+            "col_start": 0,
+            "col_end": 6,
+            "nnz": 4,
+            "value_min": 3,
+            "value_max": 6,
+            "value_sum": 18,
+            "n_indexed_columns": 1,
+            "column_stats": [
+              "bitset:93e733c480a287d4:48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+            ]
+          }
+        },
+        {
+          "name": "X_shard_1",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 132,
+          "blake3": "aaa872a82316011b5a75f8b70e11b5d39283c42b639399ad00816dac473ee1bd",
+          "stats": {
+            "row_start": 2,
+            "row_end": 4,
+            "col_start": 0,
+            "col_end": 6,
+            "nnz": 4,
+            "value_min": 2,
+            "value_max": 10,
+            "value_sum": 24,
+            "n_indexed_columns": 1,
+            "column_stats": [
+              "bitset:93e733c480a287d4:e1e0e81d6ea39b0cf8b86ffd440921011f57400cbc3f76a8a171906a9b8d7505"
+            ]
+          }
+        },
+        {
+          "name": "X_shard_2",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 132,
+          "blake3": "1b4930ca10dba14555bda45daa87f42f63f582abb7098ef9161c82bcbbf98329",
+          "stats": {
+            "row_start": 4,
+            "row_end": 6,
+            "col_start": 0,
+            "col_end": 6,
+            "nnz": 4,
+            "value_min": 6,
+            "value_max": 9,
+            "value_sum": 30,
+            "n_indexed_columns": 1,
+            "column_stats": [
+              "bitset:93e733c480a287d4:ab13bedf42e84bae0f7c62c7dd6a8ada571e8829bed6ea558217f0361b5e25d0"
+            ]
+          }
+        },
+        {
+          "name": "obs_metadata/shard_0",
+          "section_type": 24,
+          "modality_id": 0,
+          "length": 2354,
+          "blake3": "24a51a9b8637080210ca38efe8955c49b1ced1f82eec85868bac81f2db530458",
+          "stats": {
+            "row_start": 0,
+            "row_end": 2,
+            "col_start": 0,
+            "col_end": 0,
+            "nnz": 0,
+            "value_min": 0,
+            "value_max": 0,
+            "value_sum": 0,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "obs_metadata/shard_1",
+          "section_type": 24,
+          "modality_id": 0,
+          "length": 2354,
+          "blake3": "af2919afa7a37e6c7917cd29dcd7e53b4eab80a2763306d428faa9b506e46232",
+          "stats": {
+            "row_start": 2,
+            "row_end": 4,
+            "col_start": 0,
+            "col_end": 0,
+            "nnz": 0,
+            "value_min": 0,
+            "value_max": 0,
+            "value_sum": 0,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "obs_metadata/shard_2",
+          "section_type": 24,
+          "modality_id": 0,
+          "length": 2354,
+          "blake3": "40d7b71b7a3d01229ae3fa76a5a1fe76544cd0b287d23a83d2767b56f03cb58e",
+          "stats": {
+            "row_start": 4,
+            "row_end": 6,
+            "col_start": 0,
+            "col_end": 0,
+            "nnz": 0,
+            "value_min": 0,
+            "value_max": 0,
+            "value_sum": 0,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "obs_predicate_index",
+          "section_type": 13,
+          "modality_id": 0,
+          "length": 87,
+          "blake3": "839b04630cd6f2dbe126ef63cbb163ab4900ec53a6bcfebc09697f578d1c3234"
+        },
+        {
+          "name": "obsm/X_pca_shard_0",
+          "section_type": 20,
+          "modality_id": 0,
+          "length": 1322,
+          "blake3": "66efdac8b110d22f56fc2e52d89ed3eb1f407d2f8735afe7a9dc8d42b7358371"
+        },
+        {
+          "name": "obsm/X_pca_shard_1",
+          "section_type": 20,
+          "modality_id": 0,
+          "length": 1322,
+          "blake3": "c4ceea9ad4c02c728b45356e959be46c35e4e678f98b2b1e4e2032ab8a1a641a"
+        },
+        {
+          "name": "obsm/X_pca_shard_2",
+          "section_type": 20,
+          "modality_id": 0,
+          "length": 1322,
+          "blake3": "bf961d8bb9bf0485d4c27af2243dca2ca9cf51cb4c9804ebd90fc7cff5659bd2"
+        },
+        {
+          "name": "obsp/connectivities_shard_0",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "3625fa18a9f5582809e162e4cffa46b599a0749698ad7117e4a9318588ae3f5e"
+        },
+        {
+          "name": "obsp/connectivities_shard_1",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "45314b50a13b798cb4ba0849862f9bc7c05e00d7ebb76924655d91e08f491360"
+        },
+        {
+          "name": "obsp/connectivities_shard_2",
+          "section_type": 22,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "4f920b513ce7747bfdd3215e2e962fa636564be4855298ca9ca7f482a4c1ee6d"
+        },
+        {
+          "name": "spliced_shard_0",
+          "section_type": 7,
+          "modality_id": 0,
+          "length": 132,
+          "blake3": "d35becb9bed38cc3b8d131b965bd5aea11055ebb450e5b65aa4f91dcaa9abc7d",
+          "stats": {
+            "row_start": 0,
+            "row_end": 2,
+            "col_start": 0,
+            "col_end": 6,
+            "nnz": 4,
+            "value_min": 5,
+            "value_max": 8,
+            "value_sum": 26,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "spliced_shard_1",
+          "section_type": 7,
+          "modality_id": 0,
+          "length": 132,
+          "blake3": "a3e6be4b5f84bd9a9a19623ca9327967cd4efb6a12514ba8ac51c78cfba77982",
+          "stats": {
+            "row_start": 2,
+            "row_end": 4,
+            "col_start": 0,
+            "col_end": 6,
+            "nnz": 4,
+            "value_min": 4,
+            "value_max": 12,
+            "value_sum": 32,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "spliced_shard_2",
+          "section_type": 7,
+          "modality_id": 0,
+          "length": 161,
+          "blake3": "7052d09990098521ca4d1ff96175ff9791c9f1b55ff6585d5038e6af1da56417",
+          "stats": {
+            "row_start": 4,
+            "row_end": 6,
+            "col_start": 0,
+            "col_end": 6,
+            "nnz": 4,
+            "value_min": 8,
+            "value_max": 11,
+            "value_sum": 38,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "uns",
+          "section_type": 10,
+          "modality_id": 0,
+          "length": 22,
+          "blake3": "9206771d93d0b2a8f127b2427e6a0c96092153115f05553e465aa5daaeadf7dd"
+        },
+        {
+          "name": "var",
+          "section_type": 2,
+          "modality_id": 0,
+          "length": 1138,
+          "blake3": "694e7da91331e7f95fda16d1d1faba12c491a6726243c6084ecf58b21c78c28c"
+        },
+        {
+          "name": "varm/PCs_shard_0",
+          "section_type": 21,
+          "modality_id": 0,
+          "length": 1322,
+          "blake3": "409f47c0560fde6d63fb3ef84db60a338e84b45bea3951ece2b172f5dee1c1fa"
+        },
+        {
+          "name": "varm/PCs_shard_1",
+          "section_type": 21,
+          "modality_id": 0,
+          "length": 1322,
+          "blake3": "30de18243e88ee42d6ad1ef22025234e1031be27f9980e52f17cd87d764b9396"
+        },
+        {
+          "name": "varm/PCs_shard_2",
+          "section_type": 21,
+          "modality_id": 0,
+          "length": 1322,
+          "blake3": "2a2b09eed445fca63ea981fc3f6f36e3e0ef3467e6a6cac566a7c9fa9ed349a4"
+        },
+        {
+          "name": "varp/gene_corr_shard_0",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "09ce44b3f84a9cbb01efd56ad2680f12b58e977fe15770a794c068f4f1363f2d"
+        },
+        {
+          "name": "varp/gene_corr_shard_1",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "14514aee708c6864263a68c5bced1dc8e5f11d32d0096ff3a61bbda942402512"
+        },
+        {
+          "name": "varp/gene_corr_shard_2",
+          "section_type": 23,
+          "modality_id": 0,
+          "length": 1778,
+          "blake3": "c1d9cd7ae9df0919ddc0d1ff6f5e482c390e3515e76b7dba18be6f3009bba341"
+        }
+      ]
     }
   }
 }
