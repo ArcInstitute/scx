@@ -333,6 +333,16 @@ pub(super) fn nbglm_options_from_dict(
             Some(v.extract()?)
         };
     }
+    // Reject out-of-domain numerics **here**, at parse time, rather than mapping
+    // the core API's `AccelError::InvalidInput` to `ValueError` at dispatch.
+    // The latter is the obvious move and it silently reclassifies every *other*
+    // `InvalidInput` this entry point can raise — `too few samples` among them,
+    // which `test_nb_glm_too_few_samples_errors` pins as `RuntimeError`. A bad
+    // *option value* is a bad argument and gets `ValueError`, matching
+    // `DispersionMethod::parse` above; nothing else moves. `validate_options`
+    // still guards the Rust and GPU entry points independently.
+    // Found by codex - gpt-5.6-sol.
+    scx_accel::nb_glm_validate_options(&o).map_err(|e| PyValueError::new_err(e.to_string()))?;
     if let Some(v) = d.get_item("cooks_filtering")? {
         o.cooks_filtering = v.extract()?;
     }

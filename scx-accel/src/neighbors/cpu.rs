@@ -673,53 +673,50 @@ const MAX_BRACKET_DOUBLINGS: usize = 1100;
 /// iterations just spin on rounding noise. The count is fixed, so the search is
 /// still a deterministic pure function of `(distances, rho, target)`.
 fn find_sigma(distances: &[f64], rho: f64, target: f64) -> SigmaSearch {
+    let mut lo = 1e-10_f64;
+    let mut hi = 1000.0_f64;
+
+    // ── Bracket checks: they set the FLAG, they do not short-circuit the search ──
+    //
+    // Returning early from either check would be the obvious shape and it is a
+    // trap. `compute_connectivities` keys a membership shortcut on
+    // `sigma <= 1e-10`, and the pre-§7.3 search never returned a value that
+    // small: bisecting `[1e-10, 1000]` 50 times bottoms out at
+    // `1.0044408920985003e-10`, just *above* the sentinel. An early
+    // `return SigmaSearch { sigma: lo, .. }` hands back exactly `1e-10`, trips
+    // the shortcut, and gives every neighbour — not just the tied ones — full
+    // strength, turning a duplicate-cell row into a clique. That is a change to
+    // the graph, not to a diagnostic. Found by codex - gpt-5.6-sol after an
+    // earlier round shipped exactly that regression and pinned it in a test.
+    //
+    // So: compute the flags, then run the same bisection regardless. σ is what
+    // the pre-§7.3 search would have returned on every input except the ones
+    // the ceiling expansion genuinely rescues; only `converged` is new.
+
     // A non-finite input has no bandwidth to find, and `connectivity_sum` will
     // not reveal it: `f64::max` returns the *non-NaN* operand, so
     // `(NaN - ρ).max(0.0)` is `0.0` and the sum comes back finite and plausible.
-    // Check the inputs directly. This is also exactly the case that poisons the
-    // caller — `compute_connectivities`' membership strength has no `.max(0.0)`,
-    // so a NaN distance propagates a NaN connectivity.
-    if !rho.is_finite() || distances.iter().any(|d| !d.is_finite()) {
-        return SigmaSearch {
-            sigma: 1000.0,
-            converged: false,
-        };
-    }
-
-    let mut lo = 1e-10_f64;
-    let mut hi = 1000.0_f64;
+    // Check the inputs directly. This is also the case that poisons the caller —
+    // `compute_connectivities`' membership strength has no `.max(0.0)`.
+    let inputs_finite = rho.is_finite() && distances.iter().all(|d| d.is_finite());
 
     // The target must be reachable from **below** too. `connectivity_sum` rises
     // from `|{d : d ≤ ρ}|` as σ → 0⁺, not from 0: every neighbour tied with the
     // nearest contributes a full `exp(0) = 1` at any σ. So on a point with
-    // enough zero-distance ties — duplicate cells, which single-cell data has
-    // — the sum exceeds `log2(k)` for *every* σ and the root does not exist.
-    //
-    // Checking only the upper end would call that converged: the bisection
-    // collapses `hi` onto `lo`, returns ≈ 1e-10, and reports `converged: true`
-    // for a target it never reached, which is exactly the silence §7.3 is about.
-    // The returned σ is still the right answer downstream (`σ ≤ 1e-10` makes
-    // `compute_connectivities` give every neighbour full strength, which is what
-    // a cloud of identical points should get) — it is the *flag* that would be
-    // lying, and the flag is what drives the warning.
-    if connectivity_sum(distances, rho, lo) > target {
-        return SigmaSearch {
-            sigma: lo,
-            converged: false,
-        };
-    }
+    // enough zero-distance ties — duplicate cells, which single-cell data has —
+    // the sum exceeds `log2(k)` for *every* σ and the root does not exist.
+    // Found by Antigravity - Gemini 3.8 Flash.
+    let bracketed_below = connectivity_sum(distances, rho, lo) <= target;
 
-    // Expand `hi` until it brackets the root.
+    // Expand `hi` until it brackets the root from above.
     //
-    // On the `compute_connectivities` path this always succeeds: the sum tends to
-    // `distances.len()` as σ → ∞ and the target is `log2(distances.len())`, which
-    // is smaller for every k ≥ 1. The bail-outs below are for direct callers with
-    // a degenerate slice (empty, or a target the data cannot reach), so the
-    // function is total rather than looping or returning a fabricated σ.
-    let mut converged = false;
+    // The expansion starts **at** 1000, not at 1, so every input the old search
+    // already bracketed keeps exactly the bracket it had — and therefore exactly
+    // the bits it had.
+    let mut bracketed_above = false;
     for _ in 0..MAX_BRACKET_DOUBLINGS {
         if connectivity_sum(distances, rho, hi) >= target {
-            converged = true;
+            bracketed_above = true;
             break;
         }
         let next = hi * 2.0;
@@ -731,16 +728,14 @@ fn find_sigma(distances: &[f64], rho: f64, target: f64) -> SigmaSearch {
         lo = hi;
         hi = next;
     }
-    if !converged {
-        return SigmaSearch {
-            sigma: hi,
-            converged: false,
-        };
-    }
 
+    // Midpoint form, not `(lo + hi) / 2.0`. After a full expansion `lo` and `hi`
+    // are both ~9e307 and their sum overflows to infinity, which the bisection
+    // then propagates into σ. Caught by
+    // `find_sigma_gives_up_on_an_unreachable_target`.
     let mut mid;
     for _ in 0..50 {
-        mid = (lo + hi) / 2.0;
+        mid = lo + (hi - lo) / 2.0;
 
         if connectivity_sum(distances, rho, mid) > target {
             hi = mid;
@@ -750,8 +745,8 @@ fn find_sigma(distances: &[f64], rho: f64, target: f64) -> SigmaSearch {
     }
 
     SigmaSearch {
-        sigma: (lo + hi) / 2.0,
-        converged: true,
+        sigma: lo + (hi - lo) / 2.0,
+        converged: inputs_finite && bracketed_below && bracketed_above,
     }
 }
 
@@ -1212,38 +1207,39 @@ mod tests {
             "an unreachable target must be reported, not answered with σ ≈ {}",
             search.sigma
         );
-        assert!(search.sigma <= 1e-10, "got {}", search.sigma);
+        // σ is the pre-§7.3 bisection result, **not** `lo`. Returning `lo`
+        // exactly would trip `compute_connectivities`' `sigma <= 1e-10`
+        // membership shortcut and clique the row — see
+        // `a_mixed_tie_row_keeps_its_far_neighbours_at_zero`.
+        assert_eq!(
+            search.sigma.to_bits(),
+            1.004_440_892_098_500_3e-10_f64.to_bits(),
+            "got {}",
+            search.sigma
+        );
+        assert!(search.sigma > 1e-10);
     }
 
-    /// What a `converged: false` row actually produces downstream — pinned as a
-    /// **known limitation**, not as the right answer.
+    /// A `converged: false` row keeps its far neighbours at 0 — the pre-§7.3
+    /// graph, unchanged.
     ///
-    /// An earlier version of the test above asserted that σ ≤ 1e-10 "is still
-    /// the right one for a cloud of identical points". That is true of an
-    /// **all-tied** row and false of the mixed-tie row the fixture actually
-    /// builds: `compute_connectivities`' `d <= rho || sigma <= 1e-10` shortcut
-    /// gives strength 1.0 to *every* neighbour once σ collapses, so the row
-    /// becomes a clique — the far neighbours get the same weight as the
-    /// duplicates. Caught by Cursor Agent - Grok 4.6 High.
+    /// This test previously asserted the **opposite**, pinning a clique as a
+    /// "known limitation". It was not a limitation; it was a regression the
+    /// lower-bracket fix had just introduced, by returning exactly `1e-10` and
+    /// tripping `compute_connectivities`' `sigma <= 1e-10` shortcut. The
+    /// pre-§7.3 search bottomed out at `1.0044408920985003e-10`, just above
+    /// that sentinel, so the far neighbours took the exponential arm and
+    /// underflowed to 0. Found by codex - gpt-5.6-sol.
     ///
-    /// umap-learn does not reach this state at all: `smooth_knn_dist` floors σ
-    /// at `MIN_K_DIST_SCALE * mean(distances)`, so its far neighbours get a
-    /// small positive strength rather than either 1.0 or 0.0. Adopting that
-    /// floor is the full `smooth_knn_dist` parity that was deliberately left out
-    /// of this change, because it moves **every** dataset's connectivities and
-    /// not just the saturating ones. Dropping the `sigma <= 1e-10` arm on its own
-    /// would be half of upstream's rule, swapping one wrong answer (1.0) for
-    /// another (0.0).
-    ///
-    /// So this pins the current behaviour and names the mitigation: the
-    /// aggregated `converged: false` warning fires on exactly these rows. The
-    /// assertion is written so that adopting the σ floor later *reds* it.
+    /// Running the bisection even on an unbracketed row restores that value, so
+    /// the graph is untouched and only the diagnostic flag is new. The
+    /// assertion is written to red if σ ever crosses the sentinel again.
     #[test]
-    fn a_mixed_tie_row_currently_collapses_to_a_clique() {
+    fn a_mixed_tie_row_keeps_its_far_neighbours_at_zero() {
         // Three identical points plus one far point, k = 4. Each duplicate's
         // neighbour list is [three 0-distance ties, one far], so its
         // `|{d ≤ ρ}|` is 3 against a target of `log2(4) = 2` — unreachable from
-        // below, hence a collapsed σ. The far point's own row brackets normally.
+        // below, hence `converged: false`. The far point's own row brackets.
         let n_obs = 4;
         let k = 4;
         let knn_indices = vec![
@@ -1260,26 +1256,48 @@ mod tests {
         ];
         let target = (k as f64).ln() / std::f64::consts::LN_2;
 
-        // Premise: this row's target really is unreachable from below, so σ
-        // collapses and `converged` is false.
+        // Premise: the row is unbracketed, and its σ is nonetheless the value
+        // the pre-§7.3 search returned — strictly above the shortcut sentinel.
         let search = find_sigma(&knn_distances[0..k], 0.0, target);
         assert!(!search.converged, "premise: the row must be unbracketed");
-
-        let (_indptr, _indices, data) =
-            compute_connectivities(&knn_indices, &knn_distances, n_obs, k);
-        // Premise: the far point's own row is *not* collapsed, so any 1.0 on the
-        // (dup, far) pairs comes from the duplicates' rows dominating the fuzzy
-        // union — not from both sides agreeing the pair is close.
-        let far = find_sigma(&knn_distances[3 * k..4 * k], 0.0, target);
-        assert!(far.converged, "premise: the far point's row must bracket");
-
-        // Every stored membership is 1.0 — the far neighbours included. When the
-        // σ floor lands, the far entries become strictly less than 1 and this
-        // reds, which is the point of pinning it.
-        assert!(
-            data.iter().all(|&v| (v - 1.0).abs() < 1e-12),
-            "known limitation: a collapsed σ gives every neighbour full strength;              got {data:?}"
+        assert_eq!(
+            search.sigma.to_bits(),
+            1.004_440_892_098_500_3e-10_f64.to_bits(),
+            "σ must be the pre-fix bisection result, got {}",
+            search.sigma
         );
+        assert!(
+            search.sigma > 1e-10,
+            "σ must stay above `compute_connectivities`' 1e-10 shortcut sentinel"
+        );
+
+        let (indptr, indices, data) =
+            compute_connectivities(&knn_indices, &knn_distances, n_obs, k);
+
+        // The duplicates are fully connected to each other. Their side of a
+        // (dup, far) pair is `exp(-9 / 1.004e-10)`, which underflows to 0; the
+        // far point's own row brackets at σ = 9/ln(3) and contributes exactly
+        // 1/3, so the fuzzy union `μ + ν − μν` is 1/3.
+        //
+        // 1/3, not 1.0, is the whole point: under the regression every one of
+        // these was 1.0 and the row was indistinguishable from the duplicate
+        // block.
+        for r in 0..3usize {
+            for idx in indptr[r] as usize..indptr[r + 1] as usize {
+                let (c, v) = (indices[idx] as usize, data[idx]);
+                if c < 3 {
+                    assert!(
+                        (v - 1.0).abs() < 1e-12,
+                        "duplicate pair ({r}, {c}) should be fully connected, got {v}"
+                    );
+                } else {
+                    assert!(
+                        (v - 1.0 / 3.0).abs() < 1e-12,
+                        "(dup {r}, far {c}) should carry only the far row's 1/3, got {v}"
+                    );
+                }
+            }
+        }
     }
 
     /// A non-finite distance has no bandwidth to find, and the sum will not

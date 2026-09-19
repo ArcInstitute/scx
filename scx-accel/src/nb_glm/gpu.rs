@@ -20,7 +20,7 @@ use scx_gpu::{
 };
 
 use super::dispersion::{
-    dispersion_outlier_mask, estimate_prior_var, fit_dispersion_trend, median_of_sorted,
+    dispersion_outlier_mask, estimate_prior_var, fit_dispersion_trend, shrinkage_log_targets,
 };
 use super::size_factors::median_ratio_size_factors;
 use super::validate::{validate_contrast, validate_inputs, validate_options};
@@ -201,40 +201,8 @@ pub fn gpu_nb_glm_fit_states(
         } else {
             None
         };
-        // Per-gene log target: trend value, else global median of valid MLEs.
-        let log_targets: Vec<f64> = match &trend {
-            Some(t) => base_means
-                .iter()
-                .map(|&mu| t.eval(mu).max(options.min_disp).ln())
-                .collect(),
-            None => {
-                let mut valid_alphas: Vec<f64> = (0..n_genes)
-                    .filter(|&g| valid[g] && alpha_mle[g] > 0.0)
-                    .map(|g| alpha_mle[g])
-                    .collect();
-                // `median_of_sorted`, not `valid_alphas[len / 2]`. This is the
-                // same upper-median convention the MAD just retired for
-                // pydeseq2 parity, and leaving it here would mean a run with no
-                // trend shrinks toward a different centre than the prior width
-                // is calibrated against. `fit_dispersion_trend` defaults to
-                // true, which is what hid it. Flagged independently by
-                // Cursor Agent - Grok 4.6 High and Antigravity - Gemini 3.8 Flash.
-                //
-                // The median is taken on the alpha scale, as before — for an odd
-                // count that is identical to a median of the logs, and for an
-                // even count the two differ; nothing here calls for changing
-                // *which* quantity is summarised, only for summarising it the
-                // way numpy does.
-                let median = if valid_alphas.is_empty() {
-                    options.min_disp
-                } else {
-                    valid_alphas
-                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    median_of_sorted(&valid_alphas)
-                };
-                vec![median.max(options.min_disp).ln(); n_genes]
-            }
-        };
+        let log_targets =
+            shrinkage_log_targets(trend.as_ref(), &base_means, &alpha_mle, &valid, options);
         let prior = estimate_prior_var(
             &log_targets,
             &alpha_mle,

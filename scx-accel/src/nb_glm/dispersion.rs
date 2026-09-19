@@ -546,6 +546,52 @@ pub(crate) fn dispersion_outlier_mask(
         .collect()
 }
 
+/// The per-gene shrinkage target, in log space.
+///
+/// The fitted trend where there is one; otherwise a flat global median of the
+/// valid MLEs. Both arms clamp at `min_disp` before the `ln`.
+///
+/// Extracted because it was **copied** into `nb_glm/mod.rs` and `nb_glm/gpu.rs`,
+/// and the copies drifted: the MAD was moved onto numpy's averaging median for
+/// pydeseq2 parity and both fallbacks kept the old `values[len / 2]`, so a run
+/// with `fit_dispersion_trend = false` shrank toward a different centre than the
+/// prior width was calibrated against. Default-on trend fitting hid it, and no
+/// test could reach it, because the computation was inline in two places rather
+/// than being a function. One definition now. Flagged by
+/// Cursor Agent - Grok 4.6 High and Antigravity - Gemini 3.8 Flash.
+///
+/// The median is taken on the alpha scale, as it always was: for an odd count
+/// that is identical to a median of the logs, and for an even count they differ.
+/// Only *how* it is summarised changed, not which quantity.
+pub(crate) fn shrinkage_log_targets(
+    trend: Option<&DispersionTrend>,
+    base_means: &[f64],
+    alpha_mle: &[f64],
+    valid: &[bool],
+    options: &NbGlmOptions,
+) -> Vec<f64> {
+    let n_genes = alpha_mle.len();
+    match trend {
+        Some(t) => base_means
+            .iter()
+            .map(|&mu| t.eval(mu).max(options.min_disp).ln())
+            .collect(),
+        None => {
+            let mut valid_alphas: Vec<f64> = (0..n_genes)
+                .filter(|&g| valid[g] && alpha_mle[g] > 0.0)
+                .map(|g| alpha_mle[g])
+                .collect();
+            let median = if valid_alphas.is_empty() {
+                options.min_disp
+            } else {
+                valid_alphas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                median_of_sorted(&valid_alphas)
+            };
+            vec![median.max(options.min_disp).ln(); n_genes]
+        }
+    }
+}
+
 /// Robust empirical-Bayes prior variance of `log(alpha)` about a per-gene target
 /// (trend value or global median), via the MAD of log-residuals (spec §7.6).
 ///
@@ -583,11 +629,31 @@ pub(crate) fn estimate_prior_var(
             valid[g] && alpha_mle[g].is_finite() && alpha_mle[g] > 0.0 && alpha_mle[g] >= floor
         })
         .map(|g| alpha_mle[g].ln() - log_targets[g])
+        // A non-finite residual survives the sort — `partial_cmp` returns `None`
+        // and the comparator maps that to `Equal` — and then silently corrupts
+        // the median. `log_targets` comes from `trend.eval(mu).max(min_disp).ln()`,
+        // so a caller passing `min_disp = 0` with a zero trend value puts `-inf`
+        // there and the subtraction yields `NaN`. Drop them rather than sort
+        // them. Found by codex - gpt-5.6-sol / Antigravity - Gemini 3.8 Flash.
+        .filter(|r| r.is_finite())
         .collect();
-    if resid.len() < 3 {
+    // Only the *empty* pool short-circuits, and it returns `squared_logres: 0.0`
+    // rather than the prior floor.
+    //
+    // This used to bail at `len < 3` and set **both** fields to `MIN_PRIOR_VAR`.
+    // They are not interchangeable: `prior_var` is floored at 0.25 by design,
+    // while `squared_logres` is the raw scaled-MAD² that the outlier threshold
+    // takes the square root of. Substituting 0.25 turns a threshold pydeseq2
+    // computes as `2·√0 = 0` into `2·√0.25 = 1`, so a gene pydeseq2 exempts
+    // from shrinkage gets shrunk — reopening the very false-positive mechanism
+    // the carve-out closes. pydeseq2 applies `mean_absolute_deviation` to one or
+    // two residuals like any other pool, and this now does too; the pool can be
+    // small after gene projection or after `above_min_disp`. Found by
+    // codex - gpt-5.6-sol.
+    if resid.is_empty() {
         return DispersionPriorFit {
             prior_var: MIN_PRIOR_VAR,
-            squared_logres: MIN_PRIOR_VAR,
+            squared_logres: 0.0,
         };
     }
     resid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

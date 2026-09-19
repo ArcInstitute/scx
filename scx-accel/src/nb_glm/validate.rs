@@ -192,5 +192,22 @@ pub fn validate_options(options: &NbGlmOptions) -> Result<()> {
             )));
         }
     }
+    // `min_disp` reaches `trend.eval(mu).max(min_disp).ln()`, so a zero or
+    // negative clamp puts `-inf` / `NaN` into every log target. The residual
+    // filter in `estimate_prior_var` drops those, but a poisoned *target* also
+    // drives the shrinkage itself, which no filter downstream can repair.
+    if !options.min_disp.is_finite() || options.min_disp <= 0.0 {
+        return Err(AccelError::InvalidInput(format!(
+            "min_disp must be finite and strictly positive (DESeq2 uses 1e-8); \
+             got {}. It is log-transformed to form the shrinkage target.",
+            options.min_disp
+        )));
+    }
+    if !options.max_disp.is_finite() || options.max_disp < options.min_disp {
+        return Err(AccelError::InvalidInput(format!(
+            "max_disp must be finite and >= min_disp; got max_disp={} min_disp={}",
+            options.max_disp, options.min_disp
+        )));
+    }
     Ok(())
 }

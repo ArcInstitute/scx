@@ -274,3 +274,126 @@ fn the_residual_filter_excludes_min_disp_pinned_genes() {
          {thresh_filtered} -> {thresh_unfiltered}"
     );
 }
+
+/// `squared_logres` on a small pool is the **raw** MAD², not the prior floor.
+///
+/// The two fields are not interchangeable: `prior_var` is floored at
+/// `MIN_PRIOR_VAR = 0.25` by design, while `squared_logres` is what the outlier
+/// threshold takes the square root of. Substituting the floor turns a threshold
+/// pydeseq2 computes as `2·√0 = 0` into `2·√0.25 = 1`, so a gene pydeseq2
+/// exempts from shrinkage gets shrunk instead. pydeseq2 0.5.4 runs
+/// `mean_absolute_deviation` on one or two residuals like any other pool.
+/// Reachable after gene projection or when `above_min_disp` leaves few genes.
+/// Found by codex - gpt-5.6-sol.
+#[test]
+fn a_small_residual_pool_reports_its_real_mad_not_the_prior_floor() {
+    const MIN_DISP: f64 = 1e-8;
+    // One usable gene: residual 0.2 about a zero target, so MAD = 0.
+    let fit_one = estimate_prior_var(&[0.0], &[0.2_f64.exp()], &[true], 2, 2, MIN_DISP);
+    assert_eq!(
+        fit_one.squared_logres, 0.0,
+        "a single residual has zero deviation; pydeseq2 reports 0, not the floor"
+    );
+    assert_eq!(
+        fit_one.prior_var, MIN_PRIOR_VAR,
+        "the *prior* is still floored — that part was always right"
+    );
+    // And the classifier follows: with a zero threshold the gene is an outlier,
+    // which is pydeseq2's answer. Under the old `len < 3` branch the threshold
+    // was `2·√0.25 = 1` and 0.2 was shrunk.
+    let mask = dispersion_outlier_mask(
+        &[0.0],
+        &[0.2_f64.exp()],
+        &[true],
+        fit_one.squared_logres,
+        2.0,
+    );
+    assert_eq!(mask, vec![true]);
+
+    // Two genes: a real, non-degenerate MAD.
+    let resid = [0.1_f64, 0.5];
+    let alphas: Vec<f64> = resid.iter().map(|r| r.exp()).collect();
+    let fit_two = estimate_prior_var(&[0.0, 0.0], &alphas, &[true, true], 2, 2, MIN_DISP);
+    let expected = (1.4826_f64 * 0.2).powi(2); // scaled MAD of [0.1, 0.5] about 0.3
+    assert!(
+        (fit_two.squared_logres - expected).abs() < 1e-3,
+        "two-gene MAD² {} should be ≈ {expected}",
+        fit_two.squared_logres
+    );
+
+    // Empty stays explicit, and still reports 0 rather than the floor.
+    let fit_none = estimate_prior_var(&[], &[], &[], 2, 2, MIN_DISP);
+    assert_eq!(fit_none.squared_logres, 0.0);
+    assert_eq!(fit_none.prior_var, MIN_PRIOR_VAR);
+}
+
+/// A non-finite residual never reaches the sort.
+///
+/// `partial_cmp` returns `None` on a `NaN` and the comparator maps that to
+/// `Equal`, so the sort silently accepts it and the median is whatever the
+/// unstable ordering left in the middle.
+#[test]
+fn non_finite_residuals_are_dropped_before_the_median() {
+    // A `-inf` log target (what `min_disp = 0` with a zero trend would produce)
+    // makes gene 1's residual `+inf`; gene 2's `NaN`.
+    let log_targets = vec![0.0, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let alpha_mle = vec![0.2_f64.exp(), 1.0, 0.0];
+    let valid = vec![true; 3];
+    let fit = estimate_prior_var(&log_targets, &alpha_mle, &valid, 2, 2, 1e-8);
+    assert!(
+        fit.squared_logres.is_finite() && fit.prior_var.is_finite(),
+        "a non-finite residual must not reach the statistic: {fit:?}"
+    );
+    // Only gene 0 survives the filter, so this is the single-residual case.
+    assert_eq!(fit.squared_logres, 0.0);
+}
+
+/// The no-trend shrinkage target uses the averaging median.
+///
+/// The MAD moved onto numpy's median for pydeseq2 parity; this fallback kept
+/// `values[len / 2]` in two copied blocks, so a run with
+/// `fit_dispersion_trend = false` shrank toward a different centre than the
+/// prior width was calibrated against. No test could reach it while the
+/// computation was inline in `mod.rs` and `gpu.rs`, which is why it is a
+/// function now. Flagged by Cursor Agent - Grok 4.6 High and
+/// Antigravity - Gemini 3.8 Flash.
+#[test]
+fn the_no_trend_shrinkage_target_uses_the_averaging_median() {
+    let opts = NbGlmOptions::default();
+    // Even-length pool — the only case where the two conventions differ.
+    let alpha_mle = vec![0.1_f64, 0.2, 0.4, 0.8];
+    let valid = vec![true; 4];
+    let base_means = vec![100.0; 4];
+
+    let targets = shrinkage_log_targets(None, &base_means, &alpha_mle, &valid, &opts);
+
+    let averaging = 0.3_f64; // (0.2 + 0.4) / 2
+    let upper = 0.4_f64; // values[len / 2]
+    assert!(
+        (averaging - upper).abs() > 1e-9,
+        "premise: the two conventions must differ on this pool"
+    );
+    assert!(
+        targets.iter().all(|&t| (t - averaging.ln()).abs() < 1e-12),
+        "target should be ln({averaging}) = {}, got {:?}",
+        averaging.ln(),
+        &targets[..2]
+    );
+
+    // Odd length: the two rules agree, and the target is the middle element.
+    let odd = vec![0.1_f64, 0.2, 0.4];
+    let t_odd = shrinkage_log_targets(None, &base_means[..3], &odd, &valid[..3], &opts);
+    assert!(t_odd.iter().all(|&t| (t - 0.2_f64.ln()).abs() < 1e-12));
+
+    // The `min_disp` clamp still applies below the floor.
+    let tiny = vec![1e-30_f64, 1e-30];
+    let t_tiny = shrinkage_log_targets(None, &base_means[..2], &tiny, &valid[..2], &opts);
+    assert!(t_tiny
+        .iter()
+        .all(|&t| (t - opts.min_disp.ln()).abs() < 1e-12));
+
+    // With a trend, the target is the trend value and the median is unused.
+    let trend = DispersionTrend { a0: 0.05, a1: 4.0 };
+    let t_trend = shrinkage_log_targets(Some(&trend), &base_means, &alpha_mle, &valid, &opts);
+    assert!((t_trend[0] - trend.eval(100.0).ln()).abs() < 1e-12);
+}
