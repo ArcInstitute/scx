@@ -486,7 +486,9 @@ fn get_cuvs() -> Result<&'static CuvsLibrary, GpuError> {
 ///
 /// Returns `Ok(true)` when `cuvsStreamSet` was available and succeeded, so
 /// every CAGRA launch is ordered against this crate's allocations, kernels and
-/// downloads with no explicit synchronization at all. Returns `Ok(false)` when
+/// downloads with no explicit synchronization at all. Measured on an H100 with
+/// cuVS 26.02, this moves the resources from `cudaStreamPerThread` (`0x2`) to
+/// cudarc's legacy NULL stream (`0x0`). Returns `Ok(false)` when
 /// the loaded libcuvs has no `cuvsStreamSet`: the caller then falls back to
 /// draining both sides explicitly, which is correct but costs two extra device
 /// syncs per call. A non-zero return from the symbol is also `Ok(false)` — it
@@ -758,10 +760,14 @@ pub fn gpu_knn_cagra_device(
     // Put cuVS on the stream this crate already uses, so build and search are
     // ordered against the allocations and kernels around them.
     //
-    // They were not. `cuvsResourcesCreate` builds RAFT resources on their own
-    // stream, and cudarc's `default_stream()` is the legacy NULL stream
-    // (`cu_stream: null_mut()`), which has no implicit dependency on the
-    // non-blocking stream RMM creates. Nothing here called `cuvsStreamSync`,
+    // They were not, and this is **measured**, not inferred: on an H100 with
+    // cuVS 26.02, `cuvsResourcesCreate` leaves the resources on `0x2` —
+    // `cudaStreamPerThread`, the per-thread default stream — while cudarc's
+    // `default_stream()` is `0x0`, the legacy NULL stream
+    // (`cu_stream: null_mut()`). Those two are precisely the pair that does
+    // **not** implicitly synchronize: PTDS exists to opt out of the legacy
+    // default stream's cross-stream serialization. So the hazard was live here,
+    // not merely structural. Nothing called `cuvsStreamSync`,
     // so the hazard ran in **both** directions: `d_data` is written by cudarc
     // kernels and then read by `cuvsCagraBuild` with no edge between them, and
     // `d_neighbors` / `d_distances` are stream-ordered `alloc_zeros` on the
@@ -1111,9 +1117,13 @@ mod tests {
     /// ordering edge in either direction, and nothing in the tree called
     /// `cuvsStreamSync` (review §8.5).
     ///
-    /// This reports both stream pointers rather than inferring the fix from a
-    /// downstream result: with the binding in place cuVS reads back cudarc's
-    /// stream, which is `null` (`0x0`) because that is what cudarc hands out.
+    /// This reports the streams rather than inferring the fix from a downstream
+    /// result, and reads cuVS's **before** binding as well as after — the
+    /// before is the premise. Measured on an H100 with cuVS 26.02:
+    /// `before Some(0x2), after Some(0x0)`, against a cudarc stream of `0x0`.
+    /// `0x2` is `cudaStreamPerThread` and `0x0` is the legacy NULL stream, and
+    /// those two do not implicitly synchronize with each other — which is what
+    /// makes §8.5 a live defect on this hardware rather than a latent one.
     #[test]
     #[ignore = "requires a CUDA GPU + cuVS"]
     fn cagra_runs_on_the_same_stream_as_the_rest_of_the_crate() {
