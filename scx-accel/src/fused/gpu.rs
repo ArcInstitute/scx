@@ -316,9 +316,10 @@ mod tests {
         // CAGRA is approximate, so this is a floor, not an equality. This
         // fixture (400 points in 12 PCA components; `n_cols = 60` is the gene
         // axis, not the embedding width) measures **1.0000** on an H100 (job
-        // 2979644), and the floor is left at 0.90 rather than pinned to that:
-        // recall is a property of the ANN index build, so another card or cuVS
-        // version may land a shade under 1.0 without anything being wrong.
+        // 2979930, on the current code), and the floor is left at 0.90 rather
+        // than pinned to that: recall is a property of the ANN index build, so
+        // another card or cuVS version may land a shade under 1.0 without
+        // anything being wrong.
         // What the floor has to separate is coarse — an unsynchronized read
         // returns every neighbour as index 0, which scores ~0.0025 here.
         // Printed so a run reports the number rather than only pass/fail.

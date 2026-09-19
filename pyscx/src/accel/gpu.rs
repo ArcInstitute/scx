@@ -101,7 +101,12 @@ fn resolve_info_device(device: Option<&str>) -> PyResult<Option<usize>> {
     let Some(device) = device else {
         return Ok(Some(0));
     };
-    if device.eq_ignore_ascii_case("cpu") {
+    // Exact match, not case-insensitive: the shared grammar is
+    // `if device == "cpu"` (`scx-accel/src/device.rs`), so `"CPU"` is a
+    // *vocabulary* error there with pinned text. Accepting it here would give
+    // it a category error instead, and this surface would be the only one in
+    // the API where `"CPU"` means something.
+    if device == "cpu" {
         return Err(PyValueError::new_err(
             "device='cpu' selects the CPU; this call reports on a GPU. \
              Pass 'auto', 'gpu', 'gpu:N', or omit it for device 0.",

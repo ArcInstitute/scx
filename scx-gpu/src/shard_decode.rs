@@ -474,11 +474,12 @@ fn decode_scx1_gpu(
     let (d_indices_u32, _row_lengths) =
         forbp_decode_gpu_with_hint(dev, indices_bytes, n_rows, nnz, index_dtype_u16)?;
     // FOR-BP sizes its output from the stream's own per-row nnz varints, so this
-    // is where it can disagree with the header. `nnz` goes in as a *bound* on a
-    // zero-payload run, not as the output length (`rice_decode_gpu` below is
-    // given `nnz` and returns exactly that), so the two can still differ and the
-    // check stays load-bearing: unchecked, the two device buffers of a `GpuCsr`
-    // would have different lengths.
+    // is where it can disagree with the header. `nnz` goes in as a *bound* on
+    // the cumulative decoded index count, not as the output length
+    // (`rice_decode_gpu` below is given `nnz` and returns exactly that), so the
+    // two can still differ — a stream may decode to *fewer* indices than it
+    // declares — and the check stays load-bearing: unchecked, the two device
+    // buffers of a `GpuCsr` would have different lengths.
     check_device_len(d_indices_u32.len(), nnz, "unframed Scx1 indices")?;
     // FOR-BP indices (scalar + BitPacker4x rows, Task 4.4b) and Rice values both
     // decode on the device — the gpu_decode bucket covers the bitstream upload +
@@ -639,9 +640,9 @@ fn decode_framed_scx1_gpu(
             // `place` carries the length check: this is one of only two paths
             // where it has content, because the FOR-BP decode sizes its output
             // from the bitstream's own per-row nnz varints rather than from
-            // `g_nnz` — which it takes only as a bound on a zero-payload run.
-            // It also carries the bounds check, which was a `slice_mut` panic
-            // here before.
+            // `g_nnz` — which it takes as an upper bound on the cumulative
+            // count, so a short decode still reaches here. It also carries the
+            // bounds check, which was a `slice_mut` panic here before.
             combined.place(
                 dev,
                 Placement {

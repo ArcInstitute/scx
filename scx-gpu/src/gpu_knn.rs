@@ -520,17 +520,6 @@ fn bind_cuvs_stream(
     check_cuvs(unsafe { (cuvs.stream_set)(res, stream) }, "cuvsStreamSet")
 }
 
-/// Block until cuVS's resources' stream has drained.
-///
-/// Called once, after the search. With the stream bound this is *almost*
-/// redundant — `DeviceKnnGraph::to_host` synchronizes `dev.stream()`, which is
-/// now the same stream — and it is kept for the case that reasoning does not
-/// cover: RAFT may fan work onto an internal stream pool, and this is the
-/// documented way to join it. One device drain per kNN build.
-fn sync_cuvs_stream(cuvs: &CuvsLibrary, res: CuvsResources, context: &str) -> Result<(), GpuError> {
-    check_cuvs(unsafe { (cuvs.stream_sync)(res) }, context)
-}
-
 /// The stream cuVS's resources are on, as a raw pointer, for diagnostics.
 ///
 /// `None` when the loaded libcuvs has no `cuvsStreamGet` or the call fails.
@@ -887,7 +876,7 @@ pub fn gpu_knn_cagra_device(
     // `SyncOnDrop` guards from `device_ptr_mut` are dropped before the caller's
     // download. Those guards record an event on **cudarc's** stream and say
     // nothing about cuVS's work, so they were never the edge that made this
-    // safe — `bind_cuvs_stream` and `sync_cuvs_stream` are.
+    // safe — `bind_cuvs_stream` and the post-search `cuvsStreamSync` are.
     {
         // Neighbors tensor (u32, CUDA)
         let (neighbors_ptr, _ng_guard) = d_neighbors.device_ptr_mut(dev.stream());
@@ -954,7 +943,17 @@ pub fn gpu_knn_cagra_device(
 
     // Join any RAFT stream pool before the guard destroys the resources.
     // `cudaStreamDestroy` is non-blocking, so the guard is not a substitute.
-    sync_cuvs_stream(cuvs, res, "after cuvsCagraSearch")?;
+    //
+    // With the stream bound this is *almost* redundant — `to_host` synchronizes
+    // `dev.stream()`, which is now the stream CAGRA ran on — and it is kept for
+    // the case that reasoning does not cover: RAFT may fan work onto an internal
+    // stream pool. Only the search needs it, not the build: the build's output
+    // is consumed by cuVS itself on the same resources, which orders it; the
+    // search's output is consumed by *us*, through cudarc.
+    check_cuvs(
+        unsafe { (cuvs.stream_sync)(res) },
+        "cuvsStreamSync after cuvsCagraSearch",
+    )?;
 
     // Return the raw CAGRA output device-resident. The self-hit filter, u32→i64
     // conversion, and sqrt (L2² → Euclidean) live in `DeviceKnnGraph::to_host`,

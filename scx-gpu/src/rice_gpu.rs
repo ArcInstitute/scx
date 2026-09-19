@@ -13,6 +13,39 @@ use crate::error::GpuError;
 /// Compiled PTX for the Rice decode kernel (produced by build.rs via nvcc --ptx).
 const RICE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/rice_decode.ptx"));
 
+/// The largest Rice sub-stream this decoder accepts, in bytes.
+///
+/// `prescan_rice_blocks` records byte offsets as `u32` and the kernel receives
+/// `bitstream_len` the same way, so `u32::MAX` is the point past which both
+/// narrowings truncate.
+///
+/// Unlike FOR-BP's ceiling this is **not** reachable from an SCX file: Rice
+/// stores a *byte* offset where FOR-BP stores a bit offset (position × 8), and
+/// a shard's value sub-stream is bounded by `values_length`, a `u32` header
+/// field. That argument covers the two in-tree callers — and only them.
+/// `rice_decode_gpu` is `pub` and re-exported from the crate, so an out-of-tree
+/// caller can hand it a slice larger than any shard could hold, and both casts
+/// would then truncate silently (found by codex and Antigravity, refining a
+/// round-1 rejection that had proved safety for the shard path and stopped
+/// there).
+pub(crate) const MAX_RICE_SUBSTREAM_BYTES: usize = u32::MAX as usize;
+
+/// Reject a Rice sub-stream whose byte length makes the `u32` block offsets and
+/// `bitstream_len` unrepresentable.
+///
+/// A free function over the *length*, as on the FOR-BP side, so the boundary is
+/// testable without materialising four gigabytes.
+pub(crate) fn check_rice_substream_len(len: usize) -> Result<(), GpuError> {
+    if len > MAX_RICE_SUBSTREAM_BYTES {
+        return Err(GpuError::UnsupportedLayout(format!(
+            "Rice decode: sub-stream is {len} bytes, above the \
+             {MAX_RICE_SUBSTREAM_BYTES}-byte GPU ceiling (block offsets and \
+             `bitstream_len` reach the kernel as 32-bit); decode it on the CPU"
+        )));
+    }
+    Ok(())
+}
+
 /// Pre-scan the Rice-encoded bitstream on CPU to extract per-block metadata.
 ///
 /// Returns `(block_byte_offsets, block_k_values)` where:
@@ -51,12 +84,13 @@ fn prescan_rice_blocks(
 
         // Record the byte offset right after the header byte.
         //
-        // No ceiling here, unlike FOR-BP's `check_forbp_substream_len`, and the
-        // asymmetry is deliberate: FOR-BP stores a *bit* offset, so it multiplies
-        // the position by 8 and overflows `u32` at 512 MiB. This stores a *byte*
-        // offset, and `data` is a sub-stream of `header.values_length`, a `u32`
-        // field — so `bit_pos / 8 <= data.len() <= u32::MAX` and the narrowing
-        // below cannot truncate. Same reasoning covers `bitstream_len`.
+        // The ceiling here is four gigabytes, not FOR-BP's 512 MiB, and the
+        // asymmetry is deliberate: FOR-BP stores a *bit* offset, so it
+        // multiplies the position by 8 and overflows `u32` eight times sooner.
+        // This stores a *byte* offset. `check_rice_substream_len` at the public
+        // entry is what makes the narrowing below sound for **any** caller; for
+        // an SCX shard it can never fire, since `values_length` is itself a
+        // `u32` field.
         let bit_pos = reader.position();
         debug_assert!(
             bit_pos.is_multiple_of(8),
@@ -128,6 +162,7 @@ pub fn rice_decode_gpu(
     if n_values == 0 {
         return dev.alloc_zeros::<u32>(0);
     }
+    check_rice_substream_len(data.len())?;
     // CPU pre-scan to find block byte offsets and k parameters
     let (block_offsets, block_k) = prescan_rice_blocks(data, n_values, block_size)?;
     rice_decode_gpu_core(dev, data, n_values, block_size, block_offsets, block_k)
@@ -235,6 +270,40 @@ mod tests {
             matches!(&err, GpuError::InvalidShard(m) if m.contains("reserved high nibble")),
             "expected the reserved-nibble guard, got {err:?}"
         );
+    }
+
+    /// `rice_decode_gpu` is `pub`, so "an SCX shard cannot be this large" is
+    /// not a precondition it can rely on.
+    ///
+    /// A round-1 rejection established that `values_length` is a `u32` header
+    /// field and stopped there — true for the two in-tree shard callers, and
+    /// silent about every other caller of an exported function. codex and
+    /// Antigravity both pointed that out independently in round 2.
+    ///
+    /// Checked through the guard the public entry calls, over a length rather
+    /// than a slice, so the boundary is pinned without materialising 4 GiB.
+    #[test]
+    fn the_public_rice_entry_rejects_a_substream_past_the_u32_ceiling() {
+        assert_eq!(
+            MAX_RICE_SUBSTREAM_BYTES,
+            u32::MAX as usize,
+            "premise: the ceiling is where a u32 byte offset stops fitting"
+        );
+        assert!(
+            check_rice_substream_len(MAX_RICE_SUBSTREAM_BYTES).is_ok(),
+            "the boundary length itself is still decodable"
+        );
+
+        let Err(err) = check_rice_substream_len(MAX_RICE_SUBSTREAM_BYTES + 1) else {
+            panic!("one byte past the ceiling must be rejected, not silently truncated");
+        };
+        assert!(
+            matches!(&err, GpuError::UnsupportedLayout(m) if m.contains("32-bit")),
+            "expected the Rice sub-stream ceiling, got {err:?}"
+        );
+        // Same classification as FOR-BP's: the stream is well-formed and only
+        // this route cannot address it, so a host decode still answers.
+        assert!(err.alternate_route_may_succeed());
     }
 
     /// The kernel reconstructs `(q << k) | r` in 32 bits and wraps silently in

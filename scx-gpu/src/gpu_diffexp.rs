@@ -176,19 +176,30 @@ impl GpuDeChunkScratch {
         })
     }
 
-    /// Grow the ping-pong aux buffer to hold at least `n_elements` f32 keys.
+    /// Grow the ping-pong aux buffer for a chunk loop of `chunk_size` genes
+    /// whose largest per-gene sort has span `span`.
+    ///
+    /// ⚠️ **`span` is a per-gene span, not an element count.** Pass
+    /// [`gpu_de_aux_span`] of the **largest** `n_per_gene` in the loop — not
+    /// [`gpu_de_aux_elems`], which is already `chunk × span` and would be
+    /// multiplied by the chunk a second time here. The two were one argument
+    /// until this signature split, and the doc kept pointing at the wrong one
+    /// (found by codex); the units now differ by a factor of `chunk_size`, so
+    /// following the old advice over-allocates by exactly that much or
+    /// overflows. `gpu_de_aux_elems` is the *validation* unit — what
+    /// [`gpu_de_block_sort`] demands of the buffer — and is not interchangeable
+    /// with this one.
     ///
     /// **The caller must size this before a multi-tile sort** — despite the
     /// name, [`gpu_de_block_sort`] does NOT call it. It cannot: it takes `slab`
     /// and `aux` as two separate `&mut CudaSlice<f32>` (so a caller can thread
     /// two disjoint `GpuDeChunkScratch` fields at once) and so holds no handle
     /// to the scratch. An undersized aux is rejected there with
-    /// `ShapeMismatch`, not grown. Use [`gpu_de_aux_elems`] to compute
-    /// `n_elements`, and read its doc for which sort's `n_per_gene` governs.
+    /// `ShapeMismatch`, not grown.
     ///
     /// No-op when the aux is already large enough.
     ///
-    /// Takes `chunk_size` and `span` separately, and rounds the **span** — not
+    /// Rounds the **span** — not
     /// their product — to `next_power_of_two`, so the allocation is exactly
     /// `chunk_size × p2(span)` and [`gpu_de_per_gene_scratch_bytes`]'s
     /// `p2(n_aux)` charge is the per-gene truth rather than an approximation.

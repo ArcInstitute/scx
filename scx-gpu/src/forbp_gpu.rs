@@ -90,10 +90,13 @@ pub(crate) fn check_forbp_substream_len(len: usize) -> Result<(), GpuError> {
 /// - `all_row_lengths` contains nnz for every row including empty ones (for CSR)
 /// - `total_nnz` is the sum of all row nnz values
 ///
-/// `nnz_hint` is the declared nnz the caller expects (`0` = unknown), and it is
-/// the bound on a zero-payload run — see the `frame_bits == 0` arm below. It
+/// `nnz_hint` is the declared nnz the caller expects (`0` = unknown), and it
+/// bounds the **cumulative decoded index count across every non-empty row** —
+/// not only a zero-payload run, which is all the CPU twin needs to bound. It
 /// mirrors `scx_codec::forbp::forbp_decode_with_hint`'s parameter of the same
-/// name; this prescan is the third copy of that per-row parse.
+/// name; this prescan is the third copy of that per-row parse, and the only one
+/// that pre-allocates from the summed varints, which is why its bound is the
+/// wider one.
 fn preparse_forbp(
     data: &[u8],
     n_rows: usize,
@@ -298,9 +301,10 @@ pub fn forbp_decode_gpu(
 /// answer should be, mirroring `scx_codec::forbp::forbp_decode_with_hint`. The
 /// hint is a bound, never an output size: the decode still derives its length
 /// from the stream's own per-row varints, and the caller still compares the two
-/// (`check_device_len` / `CombinedCsr::place`). What it buys is that a
-/// zero-payload run — the one shape that carries no payload bytes to bound it —
-/// is rejected during the prescan rather than after a multi-GB `alloc_zeros`.
+/// (`check_device_len` / `CombinedCsr::place`). What it buys is that a row
+/// claiming more indices than the header declares — whether it carries payload
+/// bytes or not — is rejected during the prescan rather than after a multi-GB
+/// `alloc_zeros`.
 ///
 /// Output is **bit-identical** to [`forbp_decode_gpu`] for any stream both accept.
 pub fn forbp_decode_gpu_with_hint(
