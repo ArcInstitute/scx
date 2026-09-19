@@ -228,7 +228,13 @@ fn run_rust_leiden(
     params_dict.set_item("ignored", ignored)?;
     leiden_dict.set_item("params", params_dict)?;
     leiden_dict.set_item("backend", "scx-accel")?;
+    // `modularity` is normalized (`quality / 2m`, in [-0.5, 1]) so it is
+    // comparable across graphs and with the cuGraph backend below, which writes
+    // cuGraph's own normalized value into the same key. `quality` is the raw RB
+    // objective, comparable only between partitions of the same graph; it is
+    // `None` on the cuGraph branch because cuGraph does not expose it.
     leiden_dict.set_item("modularity", result.modularity)?;
+    leiden_dict.set_item("quality", result.quality)?;
     leiden_dict.set_item("n_communities", result.n_communities)?;
 
     let uns = adata.getattr("uns")?;
@@ -402,6 +408,10 @@ fn try_cugraph_leiden(
         leiden_dict.set_item("params", params_dict)?;
         leiden_dict.set_item("backend", "cugraph")?;
         leiden_dict.set_item("modularity", modularity)?;
+        // cuGraph returns only the normalized modularity, so the raw RB
+        // objective is absent rather than fabricated. The key is still written
+        // so both backends have the same key set.
+        leiden_dict.set_item("quality", py.None())?;
         leiden_dict.set_item("n_communities", n_communities)?;
 
         let uns = adata.getattr("uns")?;

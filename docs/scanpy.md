@@ -2613,7 +2613,25 @@ pyscx.accel.leiden(adata, resolution=1.0)
 #                                     (cugraph), and `ignored` list of
 #                                     kwargs the chosen backend dropped
 #   adata.uns["leiden"]["backend"]   — "scx-accel" or "cugraph"
+#   adata.uns["leiden"]["modularity"] — normalized RB modularity in
+#                                     [-0.5, 1] (Newman modularity at
+#                                     resolution=1.0). Comparable across
+#                                     graphs and across the two backends.
+#   adata.uns["leiden"]["quality"]   — the raw, un-normalized RB objective
+#                                     Σ_c [2·w_in(c) − γ·k_c²/2m], i.e.
+#                                     `modularity × 2m`. Scales with total
+#                                     edge weight, so it is comparable only
+#                                     between partitions of the *same* graph.
+#                                     `None` on the cuGraph backend, which
+#                                     does not expose it.
 ```
+
+> **Changed in 0.20.** `uns["leiden"]["modularity"]` used to carry the *raw* RB
+> quality on the CPU backend — leidenalg's internal `quality()`, which returns
+> ~10⁶ on a 1M-edge graph — while the cuGraph backend wrote a genuinely
+> normalized value into the same key. Any threshold or cross-dataset comparison
+> on the old CPU number was meaningless. It is now `quality / 2m` on both
+> backends; the old value is still available as `uns["leiden"]["quality"]`.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|

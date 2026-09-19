@@ -6,7 +6,7 @@
 
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
-use rand_distr::Normal;
+use rand_distr::Uniform;
 
 // ---------------------------------------------------------------------------
 // find_ab_params
@@ -172,26 +172,32 @@ pub fn compute_epochs_per_sample(weights: &[f64], n_epochs: usize) -> Vec<f64> {
 // random_init
 // ---------------------------------------------------------------------------
 
-/// Random initialization for UMAP: small Gaussian noise (f64).
+/// Random initialization for UMAP: uniform over `[-10, 10]` (f64).
 ///
-/// Produces an `n_obs × n_components` embedding with effective std dev ≈ 1e-3.
+/// Matches umap-learn, whose `init="random"` draws
+/// `random_state.uniform(low=-10.0, high=10.0, size=(n, d))` — the same ±10
+/// span the spectral path is expanded to.
+///
+/// This used to be `N(0, 1e-4) × 10`, an effective std of ~1e-3: about 10⁴ too
+/// small (review §7.11, the same defect as the spectral scaling). At that scale
+/// the layout began far below the SGD's `clip_val = 4.0` and the optimizer had to
+/// spend its early epochs merely inflating the cloud.
 pub fn random_init_f64(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let normal = Normal::new(0.0_f64, 1e-4).unwrap();
+    let uniform = Uniform::new(-10.0_f64, 10.0);
     (0..n_obs * n_components)
-        .map(|_| rng.sample(normal) * 10.0)
+        .map(|_| rng.sample(uniform))
         .collect()
 }
 
-/// Random initialization for UMAP: small Gaussian noise (f32).
+/// Random initialization for UMAP: uniform over `[-10, 10]` (f32).
 ///
-/// Produces an `n_obs × n_components` embedding with effective std dev ≈ 1e-3.
 /// Same distribution as [`random_init_f64`] but in single precision for GPU use.
 pub fn random_init_f32(n_obs: usize, n_components: usize, seed: u64) -> Vec<f32> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let normal = Normal::new(0.0_f32, 1e-4).unwrap();
+    let uniform = Uniform::new(-10.0_f32, 10.0);
     (0..n_obs * n_components)
-        .map(|_| rng.sample(normal) * 10.0)
+        .map(|_| rng.sample(uniform))
         .collect()
 }
 

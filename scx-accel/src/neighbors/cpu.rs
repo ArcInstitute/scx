@@ -458,10 +458,11 @@ pub(crate) fn compute_connectivities(
     let target = (n_neighbors as f64).ln() / std::f64::consts::LN_2; // log2(k)
 
     // Compute per-point bandwidths (σ). Each point is independent (its own
-    // distance slice + ρ) and `find_sigma` is a deterministic fixed-iteration
-    // binary search, so the parallel map is order-preserving and bit-identical
-    // to the serial loop.
-    let sigmas: Vec<f64> = (0..n_obs)
+    // distance slice + ρ) and `find_sigma` is a deterministic pure function of
+    // that slice — the bracket expansion and the 50 bisections both depend only
+    // on the input — so the parallel map is order-preserving and bit-identical to
+    // the serial loop.
+    let searches: Vec<SigmaSearch> = (0..n_obs)
         .into_par_iter()
         .map(|i| {
             let offset = i * n_neighbors;
@@ -469,6 +470,20 @@ pub(crate) fn compute_connectivities(
             find_sigma(&knn_distances[offset..offset + n_neighbors], rho, target)
         })
         .collect();
+
+    // One aggregated warning, not one per point: a per-point `log::warn!` inside
+    // the parallel map would emit up to `n_obs` lines in nondeterministic order.
+    let n_unbracketed = searches.iter().filter(|s| !s.converged).count();
+    if n_unbracketed > 0 {
+        log::warn!(
+            "smooth-kNN bandwidth search failed to bracket the target \
+             perplexity for {n_unbracketed} of {n_obs} cells; their σ is a bound, \
+             not a solution, and their connectivities are correspondingly \
+             unreliable. This normally means non-finite distances reached the \
+             graph builder — check `use_rep` for NaN/inf."
+        );
+    }
+    let sigmas: Vec<f64> = searches.iter().map(|s| s.sigma).collect();
 
     // Build the directed membership matrix A in CSR form (row i → μ(i,j)), with
     // each row's columns sorted ascending (the kNN list is distance-ordered, not
@@ -592,36 +607,122 @@ pub(crate) fn compute_connectivities(
     (indptr, indices, data)
 }
 
+/// `Σ exp(-max(d − ρ, 0) / σ)` — the quantity [`find_sigma`] brackets and then
+/// bisects on.
+///
+/// Monotonically **increasing** in σ: every term is `exp(-a/σ)` with `a ≥ 0`, so
+/// raising σ raises the term. It runs from "the number of distances equal to ρ"
+/// as σ → 0⁺ up to `distances.len()` as σ → ∞. That monotonicity is what makes
+/// both the bracket expansion and the bisection below valid.
+fn connectivity_sum(distances: &[f64], rho: f64, sigma: f64) -> f64 {
+    distances
+        .iter()
+        .map(|&d| {
+            let adjusted = (d - rho).max(0.0);
+            (-adjusted / sigma).exp()
+        })
+        .sum()
+}
+
+/// One point's bandwidth search: the σ found, and whether the search actually
+/// bracketed the target rather than giving up.
+#[derive(Debug, Clone, Copy)]
+struct SigmaSearch {
+    sigma: f64,
+    converged: bool,
+}
+
+/// Upper bound on bracket doublings. `1000 · 2^1020` already exceeds `f64::MAX`,
+/// so the `next.is_finite()` test below fires first on any real input; this is a
+/// belt-and-braces termination bound, not a tuning knob.
+const MAX_BRACKET_DOUBLINGS: usize = 1100;
+
 /// Binary search for σ such that Σ exp(-max(d - ρ, 0) / σ) = target.
 ///
-/// 50 iterations is enough: starting bounds [1e-10, 1000], the interval
-/// width drops below 1e-12 by iteration 50 — tighter than f64's ~52-bit
-/// mantissa for typical σ magnitudes. Additional iterations just spin on
-/// rounding noise.
-fn find_sigma(distances: &[f64], rho: f64, target: f64) -> f64 {
+/// # Bracket, then bisect
+///
+/// The upper bound used to be a hard `1000.0` with no expansion (review §7.3).
+/// [`connectivity_sum`] rises monotonically with σ, so `hi = 1000` is an upper
+/// bound on the root only when the target is already reachable there. When it is
+/// not — unscaled/uncentered PCA embeddings, raw count space, any `use_rep` on
+/// unnormalized data — the bisection saturated at ≈1000 with the sum still short
+/// of the target, and returned it with no signal: silently over-flat
+/// connectivities for the affected cells, hence a wrong UMAP *and* a wrong
+/// Leiden partition. umap-learn's `smooth_knn_dist` starts at `hi = ∞` and
+/// doubles while the target is unmet; this does the same from 1000.
+///
+/// Starting the expansion **at** 1000 rather than at 1 is deliberate: every
+/// input that already converged keeps exactly the bracket it had, so its 50
+/// bisections land on exactly the same bits as before. Only inputs that used to
+/// saturate see a different answer.
+///
+/// # Iteration count
+///
+/// 50 bisections is enough: once bracketed, the interval width drops by 2^50 —
+/// tighter than f64's ~52-bit mantissa for typical σ magnitudes. Additional
+/// iterations just spin on rounding noise. The count is fixed, so the search is
+/// still a deterministic pure function of `(distances, rho, target)`.
+fn find_sigma(distances: &[f64], rho: f64, target: f64) -> SigmaSearch {
+    // A non-finite input has no bandwidth to find, and `connectivity_sum` will
+    // not reveal it: `f64::max` returns the *non-NaN* operand, so
+    // `(NaN - ρ).max(0.0)` is `0.0` and the sum comes back finite and plausible.
+    // Check the inputs directly. This is also exactly the case that poisons the
+    // caller — `compute_connectivities`' membership strength has no `.max(0.0)`,
+    // so a NaN distance propagates a NaN connectivity.
+    if !rho.is_finite() || distances.iter().any(|d| !d.is_finite()) {
+        return SigmaSearch {
+            sigma: 1000.0,
+            converged: false,
+        };
+    }
+
     let mut lo = 1e-10_f64;
     let mut hi = 1000.0_f64;
-    let mut mid;
 
+    // Expand `hi` until it brackets the root.
+    //
+    // On the `compute_connectivities` path this always succeeds: the sum tends to
+    // `distances.len()` as σ → ∞ and the target is `log2(distances.len())`, which
+    // is smaller for every k ≥ 1. The bail-outs below are for direct callers with
+    // a degenerate slice (empty, or a target the data cannot reach), so the
+    // function is total rather than looping or returning a fabricated σ.
+    let mut converged = false;
+    for _ in 0..MAX_BRACKET_DOUBLINGS {
+        if connectivity_sum(distances, rho, hi) >= target {
+            converged = true;
+            break;
+        }
+        let next = hi * 2.0;
+        if !next.is_finite() {
+            break;
+        }
+        // Everything at or below the old `hi` is below the target, so the root is
+        // above it — tighten `lo` as well as raising `hi`.
+        lo = hi;
+        hi = next;
+    }
+    if !converged {
+        return SigmaSearch {
+            sigma: hi,
+            converged: false,
+        };
+    }
+
+    let mut mid;
     for _ in 0..50 {
         mid = (lo + hi) / 2.0;
 
-        let sum: f64 = distances
-            .iter()
-            .map(|&d| {
-                let adjusted = (d - rho).max(0.0);
-                (-adjusted / mid).exp()
-            })
-            .sum();
-
-        if sum > target {
+        if connectivity_sum(distances, rho, mid) > target {
             hi = mid;
         } else {
             lo = mid;
         }
     }
 
-    (lo + hi) / 2.0
+    SigmaSearch {
+        sigma: (lo + hi) / 2.0,
+        converged: true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,7 +864,7 @@ mod tests {
         let sigmas: Vec<f64> = (0..n_obs)
             .map(|i| {
                 let off = i * k;
-                find_sigma(&knn_distances[off..off + k], knn_distances[off], target)
+                find_sigma(&knn_distances[off..off + k], knn_distances[off], target).sigma
             })
             .collect();
         // Dense directed membership μ(i,j); last-write-wins per (i,j) like the map.
@@ -920,7 +1021,12 @@ mod tests {
         let rho = 0.0;
         let target = (5.0_f64).ln() / std::f64::consts::LN_2;
 
-        let sigma = find_sigma(&distances, rho, target);
+        let search = find_sigma(&distances, rho, target);
+        assert!(
+            search.converged,
+            "the target must be bracketed on this fixture"
+        );
+        let sigma = search.sigma;
         assert!(sigma > 0.0, "sigma should be positive");
 
         // Verify the sum is close to target
@@ -931,6 +1037,155 @@ mod tests {
         assert!(
             (sum - target).abs() < 0.01,
             "sum ({sum}) should be close to target ({target})"
+        );
+    }
+
+    // ── Review §7.3 — bandwidth-search bracket expansion ──────────────
+
+    /// The pre-§7.3 search, written out independently: a hard `[1e-10, 1000]`
+    /// bracket and 50 bisections, with no expansion.
+    ///
+    /// This is the oracle for two opposite claims — that the fix changed nothing
+    /// where the old search already worked, and that it changed the answer where
+    /// the old search saturated. Reusing `find_sigma` for either would prove
+    /// neither.
+    fn fixed_ceiling_find_sigma(distances: &[f64], rho: f64, target: f64) -> f64 {
+        let mut lo = 1e-10_f64;
+        let mut hi = 1000.0_f64;
+        for _ in 0..50 {
+            let mid = (lo + hi) / 2.0;
+            let sum: f64 = distances
+                .iter()
+                .map(|&d| (-(d - rho).max(0.0) / mid).exp())
+                .sum();
+            if sum > target {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        (lo + hi) / 2.0
+    }
+
+    /// Distances whose required σ lands well above the old 1000 ceiling
+    /// (the review names the `[500, 5000]` regime).
+    fn wide_distance_fixture() -> (Vec<f64>, f64, f64) {
+        let distances: Vec<f64> = (0..11).map(|i| 500.0 + 450.0 * i as f64).collect();
+        let rho = distances[0];
+        let target = (distances.len() as f64).ln() / std::f64::consts::LN_2;
+        (distances, rho, target)
+    }
+
+    /// Premise: the fixture really does defeat the old search. Without this the
+    /// test below could pass because the fixture is easy, not because the fix works.
+    #[test]
+    fn the_fixed_ceiling_search_saturates_on_wide_distances() {
+        let (distances, rho, target) = wide_distance_fixture();
+        let sigma = fixed_ceiling_find_sigma(&distances, rho, target);
+        assert!(
+            sigma > 999.0 && sigma <= 1000.0,
+            "the old search should pin at its ceiling, got {sigma}"
+        );
+        let sum: f64 = distances
+            .iter()
+            .map(|&d| (-(d - rho).max(0.0) / sigma).exp())
+            .sum();
+        assert!(
+            sum < target - 0.5,
+            "the old search should fall short of the target: sum {sum} vs target {target}"
+        );
+    }
+
+    #[test]
+    fn find_sigma_expands_past_the_old_ceiling() {
+        let (distances, rho, target) = wide_distance_fixture();
+        let search = find_sigma(&distances, rho, target);
+        assert!(search.converged, "the expanded bracket should converge");
+        assert!(
+            search.sigma > 1000.0,
+            "σ must be allowed above the retired ceiling, got {}",
+            search.sigma
+        );
+        let sum: f64 = distances
+            .iter()
+            .map(|&d| (-(d - rho).max(0.0) / search.sigma).exp())
+            .sum();
+        assert!(
+            (sum - target).abs() < 1e-6,
+            "sum ({sum}) should reach the target ({target})"
+        );
+    }
+
+    /// The expansion starts **at** 1000, so every input the old search already
+    /// bracketed keeps exactly the bracket it had — and therefore exactly the
+    /// bits it had. Bit equality, not a tolerance: a tolerance would not notice a
+    /// bracket change.
+    #[test]
+    fn find_sigma_is_bit_identical_below_the_old_ceiling() {
+        let fixtures: [(Vec<f64>, f64); 4] = [
+            (vec![0.0, 1.0, 2.0, 3.0, 4.0], 0.0),
+            (vec![0.0, 0.1, 0.15, 0.2, 0.9, 1.4], 0.0),
+            (vec![2.5, 2.5, 3.0, 7.25, 19.0], 2.5),
+            (vec![0.0, 40.0, 90.0, 150.0, 220.0, 300.0, 410.0], 0.0),
+        ];
+        for (distances, rho) in fixtures {
+            let target = (distances.len() as f64).ln() / std::f64::consts::LN_2;
+            let want = fixed_ceiling_find_sigma(&distances, rho, target);
+            // Only a meaningful comparison where the old search was in range.
+            assert!(want < 999.0, "fixture must not saturate: {want}");
+            let got = find_sigma(&distances, rho, target);
+            assert!(got.converged);
+            assert_eq!(
+                got.sigma.to_bits(),
+                want.to_bits(),
+                "σ moved for an already-converging fixture: {} vs {}",
+                got.sigma,
+                want
+            );
+        }
+    }
+
+    /// A non-finite distance has no bandwidth to find, and the sum will not
+    /// reveal it: `f64::max` returns the non-NaN operand, so `(NaN - ρ).max(0.0)`
+    /// is `0.0` and `connectivity_sum` comes back finite and plausible. Pinned
+    /// here because it is the reason the guard reads the inputs rather than the sum.
+    #[test]
+    fn a_nan_distance_is_invisible_to_the_connectivity_sum() {
+        let distances = vec![0.0, 1.0, f64::NAN, 3.0, 4.0];
+        let sum = connectivity_sum(&distances, 0.0, 1000.0);
+        assert!(sum.is_finite(), "premise: the sum hides the NaN, got {sum}");
+    }
+
+    #[test]
+    fn find_sigma_reports_non_finite_distances() {
+        let target = (5.0_f64).ln() / std::f64::consts::LN_2;
+        for distances in [
+            vec![0.0, 1.0, f64::NAN, 3.0, 4.0],
+            vec![0.0, 1.0, f64::INFINITY, 3.0, 4.0],
+        ] {
+            let search = find_sigma(&distances, 0.0, target);
+            assert!(
+                !search.converged,
+                "a non-finite distance must be reported as unbracketed: {distances:?}"
+            );
+            assert!(search.sigma.is_finite());
+        }
+        // A non-finite ρ is the same defect from the other side.
+        let search = find_sigma(&[0.0, 1.0, 2.0], f64::NAN, target);
+        assert!(!search.converged, "a NaN ρ must be reported as unbracketed");
+    }
+
+    /// An empty slice can never reach a positive target, so the expansion runs
+    /// out rather than looping. Direct callers only —
+    /// `compute_connectivities` always passes a length-k slice.
+    #[test]
+    fn find_sigma_gives_up_on_an_unreachable_target() {
+        let search = find_sigma(&[], 0.0, 1.0);
+        assert!(!search.converged);
+        assert!(
+            search.sigma.is_finite(),
+            "the reported bound must still be finite, got {}",
+            search.sigma
         );
     }
 
