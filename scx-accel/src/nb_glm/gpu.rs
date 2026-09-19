@@ -234,8 +234,15 @@ pub fn gpu_nb_glm_fit_states(
         // CPU arm uses (review §7.15). It is a host-side decision on both arms:
         // the device still shrinks every gene, and the exempted ones have their
         // MLE state restored in the assembly loop below, exactly as the CPU pass
-        // returns `mle[g]` unchanged. Applying it on one arm only would diverge
-        // the `gpu_cpu_parity_cox_reid_shrunk_*` tests.
+        // returns `mle[g]` unchanged.
+        //
+        // `gpu_cpu_parity_cox_reid_shrunk_small_nsub` is the guard against this
+        // landing on one arm only, and it is a real one rather than an assumed
+        // one: its `synth(400, 6, 42)` fixture trips the gate on **185 of 400**
+        // genes, and a one-armed build would report `max_rel_disp = 1.0000`
+        // against that test's `5e-2` bar and `max_rel_lfc = 0.4165` against its
+        // `2e-3` bar. Measured, not inferred — a parity test's existence is not
+        // coverage, its bar is.
         let disp_outlier: Vec<bool> = match options.disp_outlier_sd {
             Some(sd) => {
                 dispersion_outlier_mask(&log_targets, &alpha_mle, &valid, prior.squared_logres, sd)
