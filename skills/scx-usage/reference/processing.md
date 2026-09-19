@@ -153,8 +153,8 @@ this envelope, including `harmony_integrate` (`gpu_dense` / `cpu_dense`).
 - Restrict to a gene subset first with `dataset[:, cols]` (a projected handle, no decode) rather than materialising.
 
 **GPU helpers:**
-- `gpu_info() -> dict | None` — `{device, total_vram_gb, free_vram_gb}` or `None` if unavailable.
-- `estimate_gpu_memory(adata, operation, **kwargs) -> {required_gb, fits_in_vram}` — `operation` ∈ `"pca"` / `"knn"` / `"umap"` / `"leiden"`.
+- `gpu_info(device=None) -> dict | None` — `{device, total_vram_gb, free_vram_gb}` or `None` if unavailable. `device` picks the card (`"gpu:N"`); `None` = device 0.
+- `estimate_gpu_memory(adata, operation, *, device=None, **kwargs) -> {required_gb, fits_in_vram}` — `operation` ∈ `"pca"` / `"knn"` / `"umap"` / `"leiden"`. `fits_in_vram` keeps a 1.2× headroom over free VRAM.
 
 ## Streaming write-back (copy-on-write, no full materialization)
 - `pyscx.preprocess(source, target, ops, target_sum=None)` — shard-by-shard transform to a new file.

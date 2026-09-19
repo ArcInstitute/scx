@@ -313,12 +313,14 @@ mod tests {
             })
             .sum();
         let recall = hits as f64 / (n_rows * n_neighbors) as f64;
-        // CAGRA is approximate, so this is a floor, not an equality. The value
-        // is reset from what this fixture (400 points, k=60) actually scores on
-        // a GPU node — it is printed so a run reports it rather than only
-        // passing or failing. What the floor has to separate is coarse: an
-        // unsynchronized read returns every neighbour as index 0 and scores
-        // about 1/n_neighbors, two orders below any real answer.
+        // CAGRA is approximate, so this is a floor, not an equality. This
+        // fixture (400 points, k=60) measures **1.0000** on an H100 (job
+        // 2979644), and the floor is left at 0.90 rather than pinned to that:
+        // recall is a property of the ANN index build, so another card or cuVS
+        // version may land a shade under 1.0 without anything being wrong.
+        // What the floor has to separate is coarse — an unsynchronized read
+        // returns every neighbour as index 0, which scores ~0.0025 here.
+        // Printed so a run reports the number rather than only pass/fail.
         println!("fused CAGRA recall against exact CPU kNN: {recall:.4}");
         assert!(
             recall >= 0.90,

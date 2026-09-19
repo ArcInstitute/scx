@@ -545,17 +545,28 @@ fn cuvs_stream_ptr(cuvs: &CuvsLibrary, res: CuvsResources) -> Option<*mut std::f
     (unsafe { stream_get(res, &mut out) } == CUVS_SUCCESS).then_some(out)
 }
 
-/// Create cuVS resources, bind them to `dev`'s stream, and report both stream
-/// pointers plus whether the bind took.
+/// What a fresh `cuvsResources_t` looks like before and after this crate binds
+/// its stream.
 ///
-/// Test-only, and the premise check for review §8.5: it *shows* that cuVS and
-/// cudarc are on one stream instead of asserting it. On an unfixed build the
-/// two differ — cudarc's is the legacy NULL stream, RMM's is a non-blocking
-/// stream with no implicit dependency on it.
+/// Test-only, and the premise check for review §8.5. `before` is the stream
+/// `cuvsResourcesCreate` chose on its own — that is the one that had no
+/// ordering edge with anything this crate queues, and reading it is the only
+/// way to say whether the hazard was *live* on a given device or merely
+/// structural. `after` is what the binding leaves.
 #[cfg(test)]
-fn probe_cuvs_stream_binding(
-    dev: &GpuDevice,
-) -> Result<(bool, *mut std::ffi::c_void, Option<*mut std::ffi::c_void>), GpuError> {
+struct CuvsStreamProbe {
+    /// cudarc's stream — the legacy NULL stream, i.e. `0x0`.
+    cudarc: *mut std::ffi::c_void,
+    /// cuVS's own stream, as created. `None` if `cuvsStreamGet` is unavailable.
+    before: Option<*mut std::ffi::c_void>,
+    /// cuVS's stream after `bind_cuvs_stream`.
+    after: Option<*mut std::ffi::c_void>,
+    /// Whether `cuvsStreamSet` was present and took.
+    bound: bool,
+}
+
+#[cfg(test)]
+fn probe_cuvs_stream_binding(dev: &GpuDevice) -> Result<CuvsStreamProbe, GpuError> {
     let cuvs = get_cuvs()?;
     let mut res: CuvsResources = 0;
     unsafe { check_cuvs((cuvs.resources_create)(&mut res), "cuvsResourcesCreate")? };
@@ -563,12 +574,14 @@ fn probe_cuvs_stream_binding(
         handle: res,
         destroy_fn: cuvs.resources_destroy,
     };
+    let before = cuvs_stream_ptr(cuvs, res);
     let bound = bind_cuvs_stream(cuvs, res, dev)?;
-    Ok((
+    Ok(CuvsStreamProbe {
+        cudarc: dev.stream().cu_stream() as *mut std::ffi::c_void,
+        before,
+        after: cuvs_stream_ptr(cuvs, res),
         bound,
-        dev.stream().cu_stream() as *mut std::ffi::c_void,
-        cuvs_stream_ptr(cuvs, res),
-    ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,13 +1120,17 @@ mod tests {
         let dev = require_gpu!();
         require_gpu_cap!(cuvs);
 
-        let (bound, cudarc_stream, cuvs_stream) = probe_cuvs_stream_binding(&dev).unwrap();
+        let probe = probe_cuvs_stream_binding(&dev).unwrap();
+        // Printed, not only asserted: `before` is the premise — whether this
+        // device's cuVS actually chose a stream other than cudarc's, i.e.
+        // whether §8.5 was live here or only structural.
         println!(
-            "cuvsStreamSet applied: {bound}; cudarc stream {cudarc_stream:?}; \
-             cuVS stream {cuvs_stream:?}"
+            "cuvsStreamSet applied: {}; cudarc stream {:?}; cuVS stream before {:?}, \
+             after {:?}",
+            probe.bound, probe.cudarc, probe.before, probe.after
         );
 
-        let Some(cuvs_stream) = cuvs_stream else {
+        let Some(cuvs_stream) = probe.after else {
             // No `cuvsStreamGet` to read back with. The fallback path in
             // `bind_cuvs_stream` still synchronizes both sides, so this is a
             // coverage gap on this libcuvs, not a failure.
@@ -1124,11 +1141,11 @@ mod tests {
             return;
         };
         assert!(
-            bound,
+            probe.bound,
             "cuvsStreamSet is present in this libcuvs but did not take"
         );
         assert_eq!(
-            cuvs_stream, cudarc_stream,
+            cuvs_stream, probe.cudarc,
             "cuVS is on a different stream from the one this crate allocates, \
              launches and downloads on — the hazard §8.5 describes"
         );
