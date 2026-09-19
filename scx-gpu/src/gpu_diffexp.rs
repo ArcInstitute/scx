@@ -20,7 +20,8 @@
 //! * **Multi-tile path** (`> 8192`): bottom-up iterative merge sort. Tile
 //!   sort with `tile_block_radix_sort_kernel`, then `⌈log₂(K)⌉` passes of
 //!   `merge_pass_per_gene_kernel` (block-cooperative merge-path
-//!   partitioning), ping-ponging between `scratch.slab` and `scratch.slab_aux`.
+//!   partitioning), ping-ponging between the gene-major slab being sorted
+//!   (`scratch.ref_slab` / a `per_tg_pool_slabs` entry) and `scratch.slab_aux`.
 //!
 //! No upper limit beyond available VRAM. Callers no longer need to guard
 //! pool sizes against the 8192 threshold — the dispatch handles arbitrary
@@ -52,18 +53,22 @@ pub const GPU_DE_BLOCK_SORT_CAPACITY: usize = 8192;
 /// Reusable per-chunk device buffers for a streaming MWU pipeline.
 ///
 /// One allocation per chunk_max suffices for the entire DE call: the chunk
-/// loop resizes `ref_slab` / `group_slab` only when the membership counts
-/// change. This intentionally mirrors how
+/// loop resizes `ref_slab` / `per_tg_pool_slabs` only when the membership
+/// counts change. This intentionally mirrors how
 /// `gpu_pca::GpuPcaScratch` hoists allocations out of the power-iteration
 /// inner loop.
 pub struct GpuDeChunkScratch {
-    /// `[chunk_max × n_pool_max]` gene-major slab; reused for ref then for
-    /// each test group (size large enough for whichever is bigger).
-    pub slab: CudaSlice<f32>,
     /// Ping-pong buffer used by the multi-tile path in [`gpu_de_block_sort`]
     /// when `n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY`. Allocated lazily on
     /// first multi-tile encounter via [`Self::ensure_aux_capacity`]; small-
     /// pool callers never pay for it.
+    ///
+    /// The `slab` this used to ping-pong against is gone: no v3 driver ever
+    /// read it (nothing called `ensure_slab_capacity`), while
+    /// `GpuDeChunkScratch::new` allocated `chunk_max × n_pool_max` f32 eagerly
+    /// — ~2 GB at 1 M cells and chunk 500 — *and* the budget charged for it,
+    /// so the clamp then shrank the gene chunk to pay for VRAM nothing used.
+    /// The sorts ping-pong between `ref_slab` / `per_tg_pool_slabs` and this.
     pub slab_aux: CudaSlice<f32>,
     /// `[chunk_max]` f64 tie-term scratch (ref-only or combined).
     pub tie_term: CudaSlice<f64>,
@@ -75,10 +80,6 @@ pub struct GpuDeChunkScratch {
     /// per-chunk `dev.alloc_zeros` in the pdex_ref GPU driver. Grow-only via
     /// [`Self::ensure_ref_slab_capacity`].
     pub ref_slab: CudaSlice<f32>,
-    /// `[chunk_max × n_group_max]` gene-major group slab. G2 hoisted from
-    /// the per-test-group `dev.alloc_zeros` in both pdex_ref and Wilcoxon
-    /// chunk loops. Grow-only via [`Self::ensure_group_slab_capacity`].
-    pub group_slab: CudaSlice<f32>,
     /// `[n_groups_max × chunk_max]` f64 pseudobulk sums buffer. G2 hoisted
     /// from the per-chunk pseudobulk fold. Grow-only via
     /// [`Self::ensure_sums_capacity`].
@@ -111,10 +112,8 @@ pub struct GpuDeChunkScratch {
     pub per_tg_pool_slabs: Vec<CudaSlice<f32>>,
     n_obs: usize,
     chunk_max: usize,
-    slab_capacity: usize,
     aux_capacity_elems: usize,
     ref_slab_capacity: usize,
-    group_slab_capacity: usize,
     sums_capacity: usize,
     per_group_capacity: usize,
     per_tg_pool_slabs_capacity: usize,
@@ -133,17 +132,13 @@ fn de_alloc_elems(rows: usize, cols: usize) -> Result<usize, GpuError> {
 }
 
 impl GpuDeChunkScratch {
-    /// Allocate scratch buffers sized for `n_obs` cells, up to `chunk_max`
-    /// genes per chunk, and an initial pool capacity of `n_pool_max` cells.
+    /// Allocate scratch buffers sized for `n_obs` cells and up to `chunk_max`
+    /// genes per chunk.
     ///
-    /// The slab grows on demand via [`Self::ensure_slab_capacity`].
-    pub fn new(
-        dev: &GpuDevice,
-        n_obs: usize,
-        chunk_max: usize,
-        n_pool_max: usize,
-    ) -> Result<Self, GpuError> {
-        let slab = dev.alloc_zeros::<f32>(de_alloc_elems(chunk_max, n_pool_max)?)?;
+    /// Everything except the three `[chunk_max]` f64 scalars starts at zero
+    /// length and grows through an `ensure_*_capacity` call, so a small DE
+    /// never pays for an atlas-scale buffer.
+    pub fn new(dev: &GpuDevice, n_obs: usize, chunk_max: usize) -> Result<Self, GpuError> {
         // slab_aux is allocated lazily — empty until the first call that hits
         // the multi-tile sort path. Allocating a zero-length CudaSlice is
         // cheap (a few bytes of metadata) and avoids paying VRAM for the
@@ -155,19 +150,16 @@ impl GpuDeChunkScratch {
         // G2 grow-on-demand slots — start at zero size so small DE calls
         // never pay for them; first `ensure_*_capacity` call allocates.
         let ref_slab = dev.alloc_zeros::<f32>(0)?;
-        let group_slab = dev.alloc_zeros::<f32>(0)?;
         let sums = dev.alloc_zeros::<f64>(0)?;
         let u_per_group = dev.alloc_zeros::<f64>(0)?;
         let p_per_group = dev.alloc_zeros::<f64>(0)?;
         let tie_per_group = dev.alloc_zeros::<f64>(0)?;
         Ok(Self {
-            slab,
             slab_aux,
             tie_term,
             u_or_rank,
             p_values,
             ref_slab,
-            group_slab,
             sums,
             u_per_group,
             p_per_group,
@@ -175,28 +167,13 @@ impl GpuDeChunkScratch {
             per_tg_pool_slabs: Vec::new(),
             n_obs,
             chunk_max,
-            slab_capacity: n_pool_max,
             aux_capacity_elems: 0,
             ref_slab_capacity: 0,
-            group_slab_capacity: 0,
             sums_capacity: 0,
             per_group_capacity: 0,
             per_tg_pool_slabs_capacity: 0,
             alloc_count: 0,
         })
-    }
-
-    /// Grow the slab if `n_pool > current slab capacity`. No-op otherwise.
-    pub fn ensure_slab_capacity(&mut self, dev: &GpuDevice, n_pool: usize) -> Result<(), GpuError> {
-        if n_pool <= self.slab_capacity {
-            return Ok(());
-        }
-        // Bump to a round multiple to avoid thrashing on small growths.
-        let new_cap = n_pool.next_power_of_two().max(self.slab_capacity * 2);
-        self.slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
-        self.slab_capacity = new_cap;
-        self.alloc_count += 1;
-        Ok(())
     }
 
     /// Grow the ping-pong aux buffer to hold at least `n_elements` f32 keys.
@@ -209,22 +186,34 @@ impl GpuDeChunkScratch {
     /// `ShapeMismatch`, not grown. Use [`gpu_de_aux_elems`] to compute
     /// `n_elements`, and read its doc for which sort's `n_per_gene` governs.
     ///
-    /// No-op when the aux is already large enough. Bumps to
-    /// `next_power_of_two` to amortise repeated growths across a streaming
-    /// chunk loop.
+    /// No-op when the aux is already large enough.
+    ///
+    /// Takes `chunk_size` and `span` separately, and rounds the **span** — not
+    /// their product — to `next_power_of_two`, so the allocation is exactly
+    /// `chunk_size × p2(span)` and [`gpu_de_per_gene_scratch_bytes`]'s
+    /// `p2(n_aux)` charge is the per-gene truth rather than an approximation.
+    /// Rounding the product instead (what this did before) made the real buffer
+    /// up to **2×** the budgeted one — 4.29 GB against 2.4 GB modelled at
+    /// `pool_len = 600_000, chunk = 1000` — so the clamp reported `fits = true`
+    /// and the allocator then raised a bare `OutOfMemory` instead of the
+    /// dimension-naming error the clamp exists to produce. `n_aux` was the only
+    /// f32 term in that model without a `p2()`; `n_ref` and `n_g_max` already
+    /// round their spans, and this now matches them.
     pub fn ensure_aux_capacity(
         &mut self,
         dev: &GpuDevice,
-        n_elements: usize,
+        chunk_size: usize,
+        span: usize,
     ) -> Result<(), GpuError> {
+        if span == 0 {
+            return Ok(());
+        }
+        let n_elements = gpu_de_aux_alloc_elems(chunk_size, span)?;
         if n_elements <= self.aux_capacity_elems {
             return Ok(());
         }
-        let new_cap = n_elements
-            .next_power_of_two()
-            .max(self.aux_capacity_elems * 2);
-        self.slab_aux = dev.alloc_zeros::<f32>(new_cap)?;
-        self.aux_capacity_elems = new_cap;
+        self.slab_aux = dev.alloc_zeros::<f32>(n_elements)?;
+        self.aux_capacity_elems = n_elements;
         self.alloc_count += 1;
         Ok(())
     }
@@ -243,24 +232,6 @@ impl GpuDeChunkScratch {
         let new_cap = n_ref.next_power_of_two().max(self.ref_slab_capacity * 2);
         self.ref_slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
         self.ref_slab_capacity = new_cap;
-        self.alloc_count += 1;
-        Ok(())
-    }
-
-    /// Grow `group_slab` to hold at least `chunk_max × n_g` f32 keys.
-    /// Called from the per-test-group loop before each scatter; only
-    /// allocates when the current largest group exceeds capacity.
-    pub fn ensure_group_slab_capacity(
-        &mut self,
-        dev: &GpuDevice,
-        n_g: usize,
-    ) -> Result<(), GpuError> {
-        if n_g <= self.group_slab_capacity {
-            return Ok(());
-        }
-        let new_cap = n_g.next_power_of_two().max(self.group_slab_capacity * 2);
-        self.group_slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
-        self.group_slab_capacity = new_cap;
         self.alloc_count += 1;
         Ok(())
     }
@@ -1500,15 +1471,10 @@ fn gpu_de_force_atomic_pseudobulk() -> bool {
 /// `ensure_*_capacity` grow calls). `next_power_of_two` mirrors the *span*
 /// rounding those grow calls apply.
 ///
-/// - `n_slab`     — base `slab`, as handed to [`GpuDeChunkScratch::new`] (f32)
-/// - `n_aux`      — ping-pong `aux` (f32). **Separate from `n_slab`**, and
-///   usually [`gpu_de_aux_span`] of the loop's largest sort, which is 0 on the
-///   single-tile fast path. These were one argument charged twice until the two
-///   diverged: `gpu_de_aux_elems` stopped allocating aux below
-///   [`GPU_DE_BLOCK_SORT_CAPACITY`] while the budget kept billing for it.
+/// - `n_aux`      — ping-pong `aux` (f32), [`gpu_de_aux_span`] of the loop's
+///   largest sort, which is 0 on the single-tile fast path.
 /// - `n_ref`      — `ref_slab` (f32)
-/// - `n_g_max`    — `group_slab` (f32) **and** the dominant `per_tg_pool_slabs`
-///   (f32, ×`n_test`)
+/// - `n_g_max`    — the dominant `per_tg_pool_slabs` (f32, ×`n_test`)
 /// - `n_test`     — per-test-group `per_tg_pool_slabs` count and the `u/p/tie`
 ///   f64 staging buffers (×3)
 /// - `n_slots`    — pseudobulk `sums` (f64)
@@ -1520,14 +1486,13 @@ fn gpu_de_force_atomic_pseudobulk() -> bool {
 /// `[chunk_max]` `tie_term`/`u_or_rank`/`p_values` scalars). None is a per-op constant,
 /// so multiplying this whole value by the chunk size is correct, not an over-count.
 ///
-/// **Known under-count, pre-existing (review §8.13):** `n_aux` is the only term
-/// whose allocation rounds the *product* rather than the span —
-/// `ensure_aux_capacity` takes an already-multiplied `chunk × span` and applies
-/// `next_power_of_two` to that, so the real buffer can be up to 2× what this
-/// charges. A per-gene model cannot express it; fixing it means rounding the
-/// span instead, or making the clamp iterate against the candidate chunk.
+/// Every f32 term now rounds its **span**, matching what the corresponding
+/// `ensure_*_capacity` allocates. `n_aux` was the exception until review §8.13:
+/// `ensure_aux_capacity` rounded the already-multiplied `chunk × span`, so the
+/// real buffer could be up to 2× this charge and the clamp said `fits = true`
+/// on a working set that then OOM'd. The `n_slab` and `group_slab` terms are
+/// gone with the buffers themselves — nothing read either one.
 pub fn gpu_de_per_gene_scratch_bytes(
-    n_slab: usize,
     n_aux: usize,
     n_ref: usize,
     n_g_max: usize,
@@ -1535,17 +1500,14 @@ pub fn gpu_de_per_gene_scratch_bytes(
     n_slots: usize,
 ) -> usize {
     let p2 = |x: usize| x.max(1).next_power_of_two();
-    // f32 (4 bytes): slab + aux + ref_slab + group_slab + per_tg_pool (×n_test).
+    // f32 (4 bytes): aux + ref_slab + per_tg_pool (×n_test).
     //
-    // `n_slab` and `n_aux` are separate because they diverge: the slab is
-    // whatever `GpuDeChunkScratch::new` was given, while aux is 0 unless some
-    // sort reaches the multi-tile path ([`gpu_de_aux_span`]). They were one
-    // argument charged twice, which billed every fast-path caller for an aux
-    // buffer `gpu_de_aux_elems` no longer allocates.
-    let f32_elems = n_slab
-        .saturating_add(n_aux)
+    // `n_aux` is 0 unless some sort reaches the multi-tile path
+    // ([`gpu_de_aux_span`]); `p2` of 0 would charge 1 element for a buffer that
+    // is never allocated, so it is folded in raw and rounded only when non-zero.
+    let aux_elems = if n_aux == 0 { 0 } else { p2(n_aux) };
+    let f32_elems = aux_elems
         .saturating_add(p2(n_ref))
-        .saturating_add(p2(n_g_max))
         .saturating_add(n_test.saturating_mul(p2(n_g_max)));
     // f64 (8 bytes): sums + 3×per-group (u/p/tie) + 3 per-gene scalars
     // (tie_term/u_or_rank/p_values).
@@ -1595,6 +1557,23 @@ pub fn gpu_de_aux_elems(chunk_size: usize, n_per_gene_max: usize) -> Result<usiz
         0 => Ok(0),
         span => de_alloc_elems(chunk_size, span),
     }
+}
+
+/// Element count [`GpuDeChunkScratch::ensure_aux_capacity`] actually allocates
+/// for `(chunk_size, span)`: `chunk_size × next_power_of_two(span)`, and `0`
+/// when the span is 0.
+///
+/// The twin of [`gpu_de_aux_elems`], which is the *requirement*
+/// [`gpu_de_block_sort`] checks against (`chunk × span`, unrounded). This is
+/// what gets allocated, and it is what [`gpu_de_per_gene_scratch_bytes`]'s
+/// `p2(n_aux)` charge must equal once multiplied by the chunk — a free function
+/// rather than an inline expression so a CPU-only test can hold the model and
+/// the allocation to each other without a device.
+pub fn gpu_de_aux_alloc_elems(chunk_size: usize, span: usize) -> Result<usize, GpuError> {
+    if span == 0 {
+        return Ok(0);
+    }
+    de_alloc_elems(chunk_size, span.next_power_of_two())
 }
 
 /// Pure budget clamp (no device access — unit-testable).

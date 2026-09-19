@@ -35,15 +35,25 @@ pub fn gpu_available() -> bool {
 /// `gpu` feature is disabled — in those cases `gpu_available()` returns
 /// `False`. Use `gpu_available()` for a yes/no check, this for device info.
 ///
+/// `device` selects which card to report on, in the usual
+/// `"gpu"` / `"gpu:N"` / `"auto"` spelling. It defaults to device 0, which is
+/// what this always reported: before that default was explicit, a caller
+/// running on `"gpu:3"` got device 0's free VRAM **and** a stray CUDA context
+/// created on device 0 just by asking.
+///
 /// Example:
 ///     info = pyscx.accel.gpu_info()
 ///     if info is not None:
 ///         print(f"GPU: {info['device']}, {info['free_vram_gb']:.1f} GB free")
+///     # a specific card
+///     pyscx.accel.gpu_info(device="gpu:3")
 #[pyfunction]
-pub fn gpu_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
+#[pyo3(signature = (device=None))]
+pub fn gpu_info(py: Python<'_>, device: Option<&str>) -> PyResult<Py<PyAny>> {
+    let device_id = resolve_info_device(device)?;
     #[cfg(feature = "gpu")]
     {
-        match scx_accel::gpu_info() {
+        match scx_accel::gpu_info_for(device_id) {
             Some(info) => {
                 let dict = PyDict::new(py);
                 dict.set_item("device", info.device_name)?;
@@ -62,9 +72,42 @@ pub fn gpu_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
     }
     #[cfg(not(feature = "gpu"))]
     {
+        let _ = device_id;
         Ok(py.None())
     }
 }
+
+/// Resolve the optional `device=` of the two reporting helpers to an ordinal.
+///
+/// `None` means device 0 — the historical, and still the default, behaviour, so
+/// the zero-argument `gpu_info()` presence probe keeps returning `None` rather
+/// than raising on a CPU-only build. An explicit selector goes through the
+/// shared grammar, which is what makes `"gpu:3"` report on card 3; `"cpu"` is a
+/// category error here, since there is no such thing as CPU VRAM.
+fn resolve_info_device(device: Option<&str>) -> PyResult<usize> {
+    let Some(device) = device else {
+        return Ok(0);
+    };
+    let resolved = resolve_device(device)?;
+    resolved.gpu_id().ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "device='{device}' selects the CPU; this call reports on a GPU. \
+             Pass 'gpu', 'gpu:N', or omit it for device 0."
+        ))
+    })
+}
+
+/// Margin applied to free VRAM before `estimate_gpu_memory` calls a working set
+/// a fit.
+///
+/// Matches `RESIDENT_VRAM_HEADROOM` in `scx-gpu/src/gpu_pca_resident.rs`, which
+/// is the budget the resident-PCA path actually allocates against — so the
+/// advisory answer and the real decision do not disagree by construction. The
+/// comparison was a bare `estimated < free` (review §8.13): no margin for the
+/// terms the estimate omits, and none for the VRAM that gets taken between the
+/// question and the op.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+const VRAM_ESTIMATE_HEADROOM: f64 = 1.2;
 
 /// Estimate GPU memory required for a given operation on the dataset.
 ///
@@ -79,13 +122,15 @@ pub fn gpu_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
 ///     if est["fits_in_vram"]:
 ///         pyscx.accel.pca(adata, device="gpu")
 #[pyfunction]
-#[pyo3(signature = (adata, operation, **kwargs))]
+#[pyo3(signature = (adata, operation, *, device=None, **kwargs))]
 pub fn estimate_gpu_memory<'py>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     operation: &str,
+    device: Option<&str>,
     kwargs: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
+    let device_id = resolve_info_device(device)?;
     // Helper to extract a kwarg with a default
     let get_kwarg_usize = |key: &str, default: usize| -> PyResult<usize> {
         if let Some(kw) = kwargs {
@@ -186,21 +231,29 @@ pub fn estimate_gpu_memory<'py>(
 
     let required_gb = estimated_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 
-    // Query available VRAM
+    // Query available VRAM, on the card the caller actually selected, and keep
+    // a margin. A bare `estimated < free` treats the estimate as exact and the
+    // card as otherwise empty — neither holds: every term here is a modelled
+    // lower bound (kernel workspaces, allocator rounding and fragmentation are
+    // not in it), and free VRAM moves between the answer and the call it
+    // informs. `VRAM_ESTIMATE_HEADROOM` is the same 1.2 the resident-PCA
+    // budget uses (`scx-gpu/src/gpu_pca_resident.rs`), so the two agree on what
+    // "fits" means.
     let fits_in_vram: bool;
 
     #[cfg(feature = "gpu")]
     {
-        fits_in_vram = match scx_accel::gpu_info() {
+        fits_in_vram = match scx_accel::gpu_info_for(device_id) {
             Some(info) => {
-                let free_bytes = info.free_vram_bytes;
-                estimated_bytes < free_bytes
+                let budget = info.free_vram_bytes as f64 / VRAM_ESTIMATE_HEADROOM;
+                (estimated_bytes as f64) < budget
             }
             None => false,
         };
     }
     #[cfg(not(feature = "gpu"))]
     {
+        let _ = device_id;
         fits_in_vram = false;
     }
 

@@ -34,12 +34,20 @@ fn prescan_rice_blocks(
     for _ in 0..n_blocks {
         let block_len = remaining.min(block_size);
 
-        // Read 1-byte header: k in low nibble
-        let k = reader
+        // Read 1-byte header: k in low nibble. Spec §4 reserves the high
+        // nibble; the CPU decoder rejects a non-zero one (`scx_codec::rice`)
+        // and this prescan used to mask it off, so a corrupt stream decoded to
+        // a different answer on the GPU than on the CPU — silently.
+        let block_header = reader
             .read_bits(8)
             .map_err(|e| GpuError::InvalidShard(format!("Rice prescan: truncated header: {e}")))?
-            as u8
-            & 0x0F;
+            as u8;
+        if block_header & 0xF0 != 0 {
+            return Err(GpuError::InvalidShard(format!(
+                "Rice prescan: block header has non-zero reserved high nibble: 0x{block_header:02x}"
+            )));
+        }
+        let k = block_header & 0x0F;
 
         // Record the byte offset right after the header byte.
         let bit_pos = reader.position();
@@ -51,16 +59,36 @@ fn prescan_rice_blocks(
         block_k.push(k);
 
         // Skip past this block's encoded values to find the next block boundary.
-        // We must decode all values because Rice codes are variable-length.
+        // We must decode all values because Rice codes are variable-length —
+        // which means the prescan already holds `q` and `r`, so it can apply the
+        // CPU's range check for free.
         for _ in 0..block_len {
-            let _q = reader.read_unary().map_err(|e| {
+            let q = reader.read_unary().map_err(|e| {
                 GpuError::InvalidShard(format!("Rice prescan: truncated value: {e}"))
             })?;
-            if k > 0 {
+            let r = if k > 0 {
                 reader.read_bits(k).map_err(|e| {
                     GpuError::InvalidShard(format!("Rice prescan: truncated remainder: {e}"))
+                })?
+            } else {
+                0
+            };
+            // The kernel reconstructs `(q << k) | r` in **32 bits** and adds 1
+            // (`kernels/rice_decode.cu`), with none of the CPU's `checked_shl` /
+            // `<= u32::MAX` filter. `read_unary` is bounded only by the stream
+            // length, so ~16 KiB of set bits gives `q >= 2^17`; at `k = 15` that
+            // is `q << k >= 2^32` and the kernel wraps silently in release while
+            // the CPU returns `MalformedInput`. Range-check here, where the
+            // quotient is already in hand, rather than in 32-bit device code.
+            q.checked_shl(k as u32)
+                .map(|qk| qk | r)
+                .and_then(|shifted| shifted.checked_add(1))
+                .filter(|&v| v <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    GpuError::InvalidShard(
+                        "Rice prescan: value overflows u32 (corrupt stream)".to_string(),
+                    )
                 })?;
-            }
         }
 
         // Align to byte boundary (blocks are byte-aligned)
@@ -77,14 +105,13 @@ fn prescan_rice_blocks(
 /// The bitstream is uploaded to GPU, metadata is pre-scanned on CPU,
 /// and the kernel is launched with one thread per Rice block (256 values).
 ///
-/// Bit-identical to `scx_codec::rice::rice_decode` for well-formed input. A
-/// stream that runs past the encoded data is caught by
-/// `prescan_rice_blocks`'s validation before the kernel launches (returns
-/// `Err`, matching CPU). Two CPU-side corruption checks are not mirrored
-/// here, though: a non-zero reserved high nibble in the block header is
-/// silently masked rather than rejected, and a value that would overflow
-/// `u32` is not range-checked before the kernel's 32-bit `(q << k) | r`,
-/// which wraps silently instead of erroring.
+/// Bit-identical to `scx_codec::rice::rice_decode` for well-formed input, and
+/// it now rejects the same malformed input. `prescan_rice_blocks` runs every
+/// CPU-side corruption check before the kernel launches: a stream that runs
+/// past the encoded data, a non-zero reserved high nibble in a block header,
+/// and a value that would overflow `u32` in the kernel's 32-bit
+/// `(q << k) | r`. Each returns `Err`, where the first two used to be the
+/// CPU's answer only and the third wrapped silently on the device.
 pub fn rice_decode_gpu(
     dev: &GpuDevice,
     data: &[u8],
@@ -164,7 +191,73 @@ fn rice_decode_gpu_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scx_codec::rice::{rice_decode, rice_encode, B_VAL};
+    use scx_codec::bitstream::BitWriter;
+    use scx_codec::rice::{rice_decode, rice_encode, B_VAL, MAX_RICE_K};
+
+    /// Spec §4 reserves the block header's high nibble. The CPU decoder rejects
+    /// a non-zero one; this prescan masked it off, so the same corrupt shard
+    /// produced an answer on the GPU and an error on the CPU.
+    ///
+    /// Needs no GPU — the prescan is host-side. Until this PR `rice_gpu.rs` had
+    /// no CPU-runnable test at all, so every check in it was exercised only by
+    /// the one sbatch job that runs the `#[ignore]`d suites.
+    #[test]
+    fn prescan_rice_rejects_a_reserved_high_nibble() {
+        let values = vec![1u32, 2, 3, 4];
+        let mut encoded = rice_encode(&values, B_VAL).unwrap();
+
+        // Premise: the untouched stream prescans, so the rejection below is
+        // about the nibble and not about the fixture.
+        assert!(
+            prescan_rice_blocks(&encoded, values.len(), B_VAL).is_ok(),
+            "premise: the fixture prescans before corruption"
+        );
+        assert_eq!(
+            encoded[0] & 0xF0,
+            0,
+            "premise: byte 0 is the block header and its high nibble is clear"
+        );
+
+        encoded[0] |= 0xA0;
+        let Err(err) = prescan_rice_blocks(&encoded, values.len(), B_VAL) else {
+            panic!("a non-zero reserved nibble must be rejected, not masked off");
+        };
+        // Match the guard's own words: masked off, this stream still decodes
+        // happily, so `is_err()` would not distinguish the two behaviours.
+        assert!(
+            matches!(&err, GpuError::InvalidShard(m) if m.contains("reserved high nibble")),
+            "expected the reserved-nibble guard, got {err:?}"
+        );
+    }
+
+    /// The kernel reconstructs `(q << k) | r` in 32 bits and wraps silently in
+    /// release. The CPU range-checks it (`rice_decode_rejects_u32_overflow`);
+    /// this is that fixture, driven through the GPU prescan.
+    #[test]
+    fn prescan_rice_rejects_a_value_that_overflows_u32() {
+        let mut w = BitWriter::new();
+        w.write_bits(MAX_RICE_K as u64, 8); // block header: k = 15
+                                            // q = 2^17 → q << 15 = 2^32, one past u32::MAX.
+        w.write_unary(1u64 << 17);
+        w.write_bits(0, MAX_RICE_K);
+        w.pad_to_byte();
+        let data = w.flush();
+
+        // Premise: the CPU rejects this exact stream, so the two arms are being
+        // held to one rule rather than to two different ones.
+        assert!(
+            rice_decode(&data, 1, B_VAL).is_err(),
+            "premise: the CPU decoder rejects this fixture"
+        );
+
+        let Err(err) = prescan_rice_blocks(&data, 1, B_VAL) else {
+            panic!("a value that overflows u32 must be rejected, not wrapped in the kernel");
+        };
+        assert!(
+            matches!(&err, GpuError::InvalidShard(m) if m.contains("overflows u32")),
+            "expected the u32 range check, got {err:?}"
+        );
+    }
 
     #[test]
     #[ignore = "requires a CUDA GPU"]

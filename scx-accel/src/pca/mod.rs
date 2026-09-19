@@ -16,4 +16,4 @@ pub use cpu::{
     COVARIANCE_PCA_THRESHOLD,
 };
 #[cfg(feature = "gpu")]
-pub use gpu::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
+pub use gpu::{gpu_available, gpu_info, gpu_info_for, randomized_pca_gpu, GpuInfo};

@@ -20,7 +20,7 @@ use crate::combined_csr::CombinedCsr;
 use crate::csr_placement::Placement;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::forbp_gpu::forbp_decode_gpu;
+use crate::forbp_gpu::forbp_decode_gpu_with_hint;
 use crate::profile::{self, CodecClass};
 use crate::rice_gpu::rice_decode_gpu;
 use crate::shufdelta_gpu::{decode_indices_frame_to_device, decode_values_frame_to_device};
@@ -472,11 +472,13 @@ fn decode_scx1_gpu(
     // The kernels re-derive per-row/per-block offsets via a GPU prescan.
     let t_gpu = profile::start();
     let (d_indices_u32, _row_lengths) =
-        forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?;
+        forbp_decode_gpu_with_hint(dev, indices_bytes, n_rows, nnz, index_dtype_u16)?;
     // FOR-BP sizes its output from the stream's own per-row nnz varints, so this
-    // is where it can disagree with the header (`rice_decode_gpu` below is given
-    // `nnz` and returns exactly that). Unchecked, the two device buffers of a
-    // `GpuCsr` would have different lengths.
+    // is where it can disagree with the header. `nnz` goes in as a *bound* on a
+    // zero-payload run, not as the output length (`rice_decode_gpu` below is
+    // given `nnz` and returns exactly that), so the two can still differ and the
+    // check stays load-bearing: unchecked, the two device buffers of a `GpuCsr`
+    // would have different lengths.
     check_device_len(d_indices_u32.len(), nnz, "unframed Scx1 indices")?;
     // FOR-BP indices (scalar + BitPacker4x rows, Task 4.4b) and Rice values both
     // decode on the device — the gpu_decode bucket covers the bitstream upload +
@@ -630,15 +632,16 @@ fn decode_framed_scx1_gpu(
             let ix_frame = &indices_bytes[span.indices.clone()];
             let vv_frame = &values_bytes[span.values.clone()];
             let (d_indices_u32, _row_lengths) =
-                forbp_decode_gpu(dev, ix_frame, g_rows, index_dtype_u16)?;
+                forbp_decode_gpu_with_hint(dev, ix_frame, g_rows, g_nnz, index_dtype_u16)?;
             let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
             let d_values_u32 = rice_decode_gpu(dev, vv_frame, g_nnz, B_VAL)?;
             let d_data = cast_u32_to_f32_gpu(dev, &d_values_u32)?;
             // `place` carries the length check: this is one of only two paths
-            // where it has content, because `forbp_decode_gpu` sizes its output
+            // where it has content, because the FOR-BP decode sizes its output
             // from the bitstream's own per-row nnz varints rather than from
-            // `g_nnz`. It also carries the bounds check, which was a
-            // `slice_mut` panic here before.
+            // `g_nnz` — which it takes only as a bound on a zero-payload run.
+            // It also carries the bounds check, which was a `slice_mut` panic
+            // here before.
             combined.place(
                 dev,
                 Placement {

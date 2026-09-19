@@ -177,7 +177,7 @@ pub use nb_glm::{finalize_nb_glm, gpu_nb_glm_fit_states, gpu_pseudobulk_nb_glm, 
 #[cfg(feature = "gpu")]
 pub use neighbors::cuvs_available;
 #[cfg(feature = "gpu")]
-pub use pca::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
+pub use pca::{gpu_available, gpu_info, gpu_info_for, randomized_pca_gpu, GpuInfo};
 /// CPU per-stage timing profiler (io / decode / reduction / marshalling),
 /// enabled by `SCX_CPU_PROFILE=1`. The CPU-path twin of [`scx_gpu::profile`];
 /// the ranking oracle for the Phase-2 performance tasks. See

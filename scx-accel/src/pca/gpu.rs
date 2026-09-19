@@ -96,12 +96,29 @@ pub struct GpuInfo {
 /// Query GPU device information for device 0.
 ///
 /// Returns `None` if no GPU is available or CUDA initialization fails.
+///
+/// Kept as the zero-argument probe every caller already uses for "is there a
+/// GPU at all"; [`gpu_info_for`] is the one to call when a specific ordinal was
+/// selected.
 pub fn gpu_info() -> Option<GpuInfo> {
+    gpu_info_for(0)
+}
+
+/// Query GPU device information for a specific ordinal.
+///
+/// Returns `None` if the ordinal does not exist or CUDA initialization fails.
+///
+/// This exists because [`gpu_info`] hardcoded device 0 (review §8.13): on a
+/// multi-GPU host it reported device 0's free VRAM no matter which card the
+/// caller had selected, **and** created a CUDA context on device 0 as a side
+/// effect of asking. Every other `GpuDevice::new` call site in the workspace
+/// forwards the ordinal; this was the one that could not.
+pub fn gpu_info_for(device_id: usize) -> Option<GpuInfo> {
     let count = scx_gpu::GpuDevice::count().ok()?;
-    if count == 0 {
+    if device_id >= count {
         return None;
     }
-    let dev = scx_gpu::GpuDevice::new(0).ok()?;
+    let dev = scx_gpu::GpuDevice::new(device_id).ok()?;
     let device_name = dev.name().unwrap_or_else(|_| "unknown".to_string());
     let (free, total) = dev.free_memory().ok()?;
     Some(GpuInfo {

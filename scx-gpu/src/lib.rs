@@ -163,17 +163,17 @@ pub use cusparse::{
 pub use device::{flat_launch_1d, GpuDevice};
 pub use device_resident::{DeviceEmbedding, DeviceKnnGraph};
 pub use error::{decline_on_runtime_failure, GpuError, Result};
-pub use forbp_gpu::forbp_decode_gpu;
+pub use forbp_gpu::{forbp_decode_gpu, forbp_decode_gpu_with_hint};
 // `GpuCscShardView` stays public: it appears in `GpuMatrixSource`'s signature.
 // The trait and the adapter behind it do not.
 pub use gpu_csc_shard_source::GpuCscShardView;
 pub use gpu_csr_assemble::{decode_csr_shards_to_device, decode_csr_shards_to_device_with_stats};
 pub use gpu_diffexp::{
     build_cell_to_group_dev, build_cell_to_pos_dev, default_gpu_de_gene_chunk_size,
-    gpu_de_aux_elems, gpu_de_aux_span, gpu_de_block_sort, gpu_de_budget_gene_chunk,
-    gpu_de_combined_tie_term, gpu_de_per_gene_scratch_bytes, gpu_de_pseudobulk_all_groups,
-    gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct, gpu_de_pvalues,
-    gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
+    gpu_de_aux_alloc_elems, gpu_de_aux_elems, gpu_de_aux_span, gpu_de_block_sort,
+    gpu_de_budget_gene_chunk, gpu_de_combined_tie_term, gpu_de_per_gene_scratch_bytes,
+    gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct,
+    gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
     gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, GpuDeChunkScratch,
     GPU_DE_BLOCK_SORT_CAPACITY, GPU_DE_MIN_GENE_CHUNK,
 };
