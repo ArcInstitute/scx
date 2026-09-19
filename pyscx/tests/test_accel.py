@@ -2199,16 +2199,13 @@ class TestLeiden:
         normalization would have left this test green while the Rust karate
         tests reddened. The upper bound is what makes this binding pinned.
         Found by Cursor Agent - Grok 4.6 High.
-        """
-        try:
-            import leidenalg  # noqa: F401
-        except ImportError:
-            pytest.skip("leidenalg not available")
-        try:
-            import igraph  # noqa: F401
-        except ImportError:
-            pytest.skip("igraph not available")
 
+        No `leidenalg` / `igraph` importorskip: the body calls only native
+        `pyscx.accel.pca` / `neighbors` / `leiden`, so skipping on those
+        packages meant an environment without them never exercised the Python
+        writeback this test exists to guard. Found by Cursor Agent - Grok 4.6
+        High and codex - gpt-5.6-sol.
+        """
         import pyscx
 
         adata = synthetic_adata.copy()

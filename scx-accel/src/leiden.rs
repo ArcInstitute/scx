@@ -2154,16 +2154,6 @@ mod tests {
         );
     }
 
-    /// `edges_to_csr` plus the node count, so a fixture can hand its CSR
-    /// straight to `leiden()`.
-    fn edges_to_csr_with_n(
-        edges: &[(usize, usize, f64)],
-        n: usize,
-    ) -> (Vec<i64>, Vec<i32>, Vec<f64>, usize) {
-        let (indptr, indices, data) = edges_to_csr(edges, n);
-        (indptr, indices, data, n)
-    }
-
     // ── Review §7.10 — reported modularity is normalized ──────────────
 
     /// Zachary's Karate Club (igraph `Graph.Famous("Zachary")`): 34 nodes,
@@ -2251,7 +2241,8 @@ mod tests {
         ];
         let n = 34;
         let edges: Vec<(usize, usize, f64)> = EDGES.iter().map(|&(u, v)| (u, v, 1.0)).collect();
-        edges_to_csr_with_n(&edges, n)
+        let (indptr, indices, data) = edges_to_csr(&edges, n);
+        (indptr, indices, data, n)
     }
 
     /// `2m` for the Karate Club: 78 unit-weight edges.

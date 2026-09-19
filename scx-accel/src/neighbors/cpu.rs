@@ -1212,10 +1212,74 @@ mod tests {
             "an unreachable target must be reported, not answered with σ ≈ {}",
             search.sigma
         );
-        // The σ it does return is still the right one for a cloud of identical
-        // points: `compute_connectivities` gives every neighbour full strength
-        // below 1e-10. Only the flag was wrong.
         assert!(search.sigma <= 1e-10, "got {}", search.sigma);
+    }
+
+    /// What a `converged: false` row actually produces downstream — pinned as a
+    /// **known limitation**, not as the right answer.
+    ///
+    /// An earlier version of the test above asserted that σ ≤ 1e-10 "is still
+    /// the right one for a cloud of identical points". That is true of an
+    /// **all-tied** row and false of the mixed-tie row the fixture actually
+    /// builds: `compute_connectivities`' `d <= rho || sigma <= 1e-10` shortcut
+    /// gives strength 1.0 to *every* neighbour once σ collapses, so the row
+    /// becomes a clique — the far neighbours get the same weight as the
+    /// duplicates. Caught by Cursor Agent - Grok 4.6 High.
+    ///
+    /// umap-learn does not reach this state at all: `smooth_knn_dist` floors σ
+    /// at `MIN_K_DIST_SCALE * mean(distances)`, so its far neighbours get a
+    /// small positive strength rather than either 1.0 or 0.0. Adopting that
+    /// floor is the full `smooth_knn_dist` parity that was deliberately left out
+    /// of this change, because it moves **every** dataset's connectivities and
+    /// not just the saturating ones. Dropping the `sigma <= 1e-10` arm on its own
+    /// would be half of upstream's rule, swapping one wrong answer (1.0) for
+    /// another (0.0).
+    ///
+    /// So this pins the current behaviour and names the mitigation: the
+    /// aggregated `converged: false` warning fires on exactly these rows. The
+    /// assertion is written so that adopting the σ floor later *reds* it.
+    #[test]
+    fn a_mixed_tie_row_currently_collapses_to_a_clique() {
+        // Three identical points plus one far point, k = 4. Each duplicate's
+        // neighbour list is [three 0-distance ties, one far], so its
+        // `|{d ≤ ρ}|` is 3 against a target of `log2(4) = 2` — unreachable from
+        // below, hence a collapsed σ. The far point's own row brackets normally.
+        let n_obs = 4;
+        let k = 4;
+        let knn_indices = vec![
+            0usize, 1, 2, 3, // point 0: dups then the far one
+            1, 0, 2, 3, // point 1
+            2, 0, 1, 3, // point 2
+            3, 0, 1, 2, // point 3: itself then the three far dups
+        ];
+        let knn_distances = vec![
+            0.0, 0.0, 0.0, 9.0, //
+            0.0, 0.0, 0.0, 9.0, //
+            0.0, 0.0, 0.0, 9.0, //
+            0.0, 9.0, 9.0, 9.0, //
+        ];
+        let target = (k as f64).ln() / std::f64::consts::LN_2;
+
+        // Premise: this row's target really is unreachable from below, so σ
+        // collapses and `converged` is false.
+        let search = find_sigma(&knn_distances[0..k], 0.0, target);
+        assert!(!search.converged, "premise: the row must be unbracketed");
+
+        let (_indptr, _indices, data) =
+            compute_connectivities(&knn_indices, &knn_distances, n_obs, k);
+        // Premise: the far point's own row is *not* collapsed, so any 1.0 on the
+        // (dup, far) pairs comes from the duplicates' rows dominating the fuzzy
+        // union — not from both sides agreeing the pair is close.
+        let far = find_sigma(&knn_distances[3 * k..4 * k], 0.0, target);
+        assert!(far.converged, "premise: the far point's row must bracket");
+
+        // Every stored membership is 1.0 — the far neighbours included. When the
+        // σ floor lands, the far entries become strictly less than 1 and this
+        // reds, which is the point of pinning it.
+        assert!(
+            data.iter().all(|&v| (v - 1.0).abs() < 1e-12),
+            "known limitation: a collapsed σ gives every neighbour full strength;              got {data:?}"
+        );
     }
 
     /// A non-finite distance has no bandwidth to find, and the sum will not

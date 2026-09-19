@@ -855,7 +855,8 @@ pub(super) fn fit_targets_pandas_with_design<'py>(
 /// integer coefficient index, a weight vector, or `None` (the last coefficient,
 /// DESeq2 convention). `options` is an optional dict overriding `NbGlmOptions`
 /// fields (`dispersion`, `min_disp`, `max_disp`, `max_irls_iters`, `irls_tol`,
-/// `max_outer_iters`, `fit_dispersion_trend`, `shrink_dispersion`).
+/// `max_outer_iters`, `fit_dispersion_trend`, `shrink_dispersion`,
+/// `disp_outlier_sd`).
 ///
 /// Returns a pandas DataFrame with PyDESeq2-style columns: `gene, baseMean,
 /// log2FoldChange, lfcSE, stat, pvalue, padj, dispersion, converged, n_iter`

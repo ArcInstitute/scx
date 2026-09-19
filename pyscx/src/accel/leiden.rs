@@ -228,11 +228,14 @@ fn run_rust_leiden(
     params_dict.set_item("ignored", ignored)?;
     leiden_dict.set_item("params", params_dict)?;
     leiden_dict.set_item("backend", "scx-accel")?;
-    // `modularity` is normalized (`quality / 2m`, in [-0.5, 1]) so it is
-    // comparable across graphs and with the cuGraph backend below, which writes
-    // cuGraph's own normalized value into the same key. `quality` is the raw RB
-    // objective, comparable only between partitions of the same graph; it is
-    // `None` on the cuGraph branch because cuGraph does not expose it.
+    // `modularity` is normalized (`quality / 2m`) so it is comparable across
+    // graphs and with the cuGraph backend below, which writes cuGraph's own
+    // normalized value into the same key. At the default `resolution = 1.0`
+    // that is Newman modularity and lies in [-0.5, 1]; at other resolutions the
+    // γ term does not cancel and it is *not* so bounded (Zachary's graph:
+    // -0.996 at γ = 20, -2.490 at γ = 50). `quality` is the raw RB objective,
+    // comparable only between partitions of the same graph; it is `None` on the
+    // cuGraph branch because cuGraph does not expose it.
     leiden_dict.set_item("modularity", result.modularity)?;
     leiden_dict.set_item("quality", result.quality)?;
     leiden_dict.set_item("n_communities", result.n_communities)?;

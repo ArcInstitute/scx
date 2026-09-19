@@ -2005,7 +2005,8 @@ deletion vector ∧ column-local transform chain — the same capability
 gate `"csc"` enforces) and CSR otherwise; on GPU it stays CSR so the
 planner routes `gpu_csc_v3` when a sidecar is present. The route and
 `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`
-(`cpu_csc` vs `cpu_csr`). Pass `prefer_format="csr"` explicitly to pin
+(`cpu_csc` vs `cpu_csr`; `cpu_csc_nnz` when the 1-vs-rest exact-nnz Wilcoxon
+kernel is opted into with `SCX_ACCEL_WILCOXON_NNZ=1`). Pass `prefer_format="csr"` explicitly to pin
 the pre-change behaviour. The non-DE functions keep `"csr"` — the
 runtime does not yet auto-route them. No thread-local default; no
 env-var override; each call sets the choice locally.

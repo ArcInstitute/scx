@@ -474,7 +474,7 @@ const NORM_PPF_075: f64 = 0.674_489_750_196_081_7;
 /// a prior width that is off by that much; a *classification boundary* does.
 ///
 /// Returns 0.0 on an empty slice; callers guard for that separately.
-fn median_of_sorted(values: &[f64]) -> f64 {
+pub(crate) fn median_of_sorted(values: &[f64]) -> f64 {
     let n = values.len();
     if n == 0 {
         return 0.0;
@@ -531,6 +531,10 @@ pub(crate) fn dispersion_outlier_mask(
     squared_logres: f64,
     outlier_sd: f64,
 ) -> Vec<bool> {
+    debug_assert!(
+        outlier_sd.is_finite() && outlier_sd >= 0.0,
+        "disp_outlier_sd must be validated before dispatch; got {outlier_sd}"
+    );
     let threshold = outlier_sd * squared_logres.sqrt();
     (0..alpha_mle.len())
         .map(|g| {
@@ -568,7 +572,16 @@ pub(crate) fn estimate_prior_var(
 ) -> DispersionPriorFit {
     let floor = ABOVE_MIN_DISP_FACTOR * min_disp;
     let mut resid: Vec<f64> = (0..alpha_mle.len())
-        .filter(|&g| valid[g] && alpha_mle[g].is_finite() && alpha_mle[g] >= floor)
+        // `> 0.0` as well as `>= floor`, not instead of it. The floor is
+        // pydeseq2's `above_min_disp` and is derived from a *public, unvalidated*
+        // option: `min_disp = 0.0` makes it 0, at which point `0.0 >= 0.0` admits
+        // a zero dispersion and `ln(0)` is `-inf`. The sort below treats
+        // incomparable values as equal, so that contaminates the median and the
+        // MAD silently rather than failing. This predicate was in the pre-0.20
+        // code and its removal was a regression — found by codex - gpt-5.6-sol.
+        .filter(|&g| {
+            valid[g] && alpha_mle[g].is_finite() && alpha_mle[g] > 0.0 && alpha_mle[g] >= floor
+        })
         .map(|g| alpha_mle[g].ln() - log_targets[g])
         .collect();
     if resid.len() < 3 {

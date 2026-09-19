@@ -19,9 +19,11 @@ use scx_gpu::{
     GPU_NB_GLM_METHOD_CR_SHRUNK, GPU_NB_GLM_METHOD_MOMENTS, GPU_NB_GLM_NSUB_MAX, GPU_NB_GLM_PMAX,
 };
 
-use super::dispersion::{dispersion_outlier_mask, estimate_prior_var, fit_dispersion_trend};
+use super::dispersion::{
+    dispersion_outlier_mask, estimate_prior_var, fit_dispersion_trend, median_of_sorted,
+};
 use super::size_factors::median_ratio_size_factors;
-use super::validate::{validate_contrast, validate_inputs};
+use super::validate::{validate_contrast, validate_inputs, validate_options};
 use super::{assemble_result, profile, wald, GeneState};
 use crate::error::{AccelError, Result};
 use crate::nb_glm::{DispersionMethod, DispersionTrend, NbGlmContrast, NbGlmOptions, NbGlmResult};
@@ -114,6 +116,7 @@ pub fn gpu_nb_glm_fit_states(
 ) -> Result<NbGlmFitData> {
     let start = std::time::Instant::now();
 
+    validate_options(options)?;
     validate_inputs(
         counts_gene_major,
         n_genes,
@@ -209,12 +212,25 @@ pub fn gpu_nb_glm_fit_states(
                     .filter(|&g| valid[g] && alpha_mle[g] > 0.0)
                     .map(|g| alpha_mle[g])
                     .collect();
+                // `median_of_sorted`, not `valid_alphas[len / 2]`. This is the
+                // same upper-median convention the MAD just retired for
+                // pydeseq2 parity, and leaving it here would mean a run with no
+                // trend shrinks toward a different centre than the prior width
+                // is calibrated against. `fit_dispersion_trend` defaults to
+                // true, which is what hid it. Flagged independently by
+                // Cursor Agent - Grok 4.6 High and Antigravity - Gemini 3.8 Flash.
+                //
+                // The median is taken on the alpha scale, as before — for an odd
+                // count that is identical to a median of the logs, and for an
+                // even count the two differ; nothing here calls for changing
+                // *which* quantity is summarised, only for summarising it the
+                // way numpy does.
                 let median = if valid_alphas.is_empty() {
                     options.min_disp
                 } else {
                     valid_alphas
                         .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    valid_alphas[valid_alphas.len() / 2]
+                    median_of_sorted(&valid_alphas)
                 };
                 vec![median.max(options.min_disp).ln(); n_genes]
             }

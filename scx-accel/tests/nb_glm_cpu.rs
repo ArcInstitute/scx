@@ -766,3 +766,60 @@ fn dispersion_outlier_gate_can_be_disabled() {
         );
     }
 }
+
+/// `disp_outlier_sd` is rejected when it cannot mean anything.
+///
+/// `NaN` / `+inf` make every `>` in the outlier comparison false, so the
+/// carve-out silently behaves as though it were off — while the caller
+/// explicitly asked for it to be on. A negative value moves the threshold
+/// *below* the trend and exempts ordinary, even below-trend genes from
+/// shrinkage, the exact inverse of the option's purpose. Neither failure is
+/// visible in the output. Found by codex - gpt-5.6-sol, which confirmed all
+/// three were accepted through the Python binding.
+#[test]
+fn an_out_of_domain_disp_outlier_sd_is_rejected() {
+    let (counts, n_genes, n_samples) = trend_plus_one_outlier();
+    let (design, _, nf) = design_two_condition(6, 6);
+    let sf = vec![1.0; n_samples];
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.0001] {
+        let err = pseudobulk_nb_glm(
+            &counts,
+            n_genes,
+            n_samples,
+            &design,
+            nf,
+            Some(&sf),
+            NbGlmContrast::Coefficient { index: 1 },
+            NbGlmOptions {
+                disp_outlier_sd: Some(bad),
+                ..NbGlmOptions::default()
+            },
+        )
+        .expect_err(&format!("disp_outlier_sd = {bad} should be rejected"));
+        assert!(
+            matches!(err, AccelError::InvalidInput(_)),
+            "{bad} gave {err:?}, expected InvalidInput"
+        );
+        assert!(
+            err.to_string().contains("disp_outlier_sd"),
+            "the message should name the option: {err}"
+        );
+    }
+    // And the in-domain values still work, including the 0.0 boundary.
+    for ok in [0.0, 0.5, 2.0, 100.0] {
+        pseudobulk_nb_glm(
+            &counts,
+            n_genes,
+            n_samples,
+            &design,
+            nf,
+            Some(&sf),
+            NbGlmContrast::Coefficient { index: 1 },
+            NbGlmOptions {
+                disp_outlier_sd: Some(ok),
+                ..NbGlmOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("disp_outlier_sd = {ok} should be accepted: {e}"));
+    }
+}

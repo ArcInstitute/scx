@@ -108,7 +108,8 @@ planner, **not** by `prefer_format="csc"`:
 
 Always confirm the backend that actually ran via
 `adata.uns["scx_accel"][op]["route"]` — `gpu_csc_v3` (GPU CSC-direct),
-`gpu_csr_v3` (GPU, no sidecar), or `cpu_csc` / `cpu_csr`. All accel ops stamp
+`gpu_csr_v3` (GPU, no sidecar), or `cpu_csc` / `cpu_csr` (plus `cpu_csc_nnz`,
+the 1-vs-rest exact-nnz Wilcoxon kernel, when `SCX_ACCEL_WILCOXON_NNZ=1`). All accel ops stamp
 this envelope, including `harmony_integrate` (`gpu_dense` / `cpu_dense`).
 
 **Preprocessing / QC (non-materializing on backed/lazy):**
