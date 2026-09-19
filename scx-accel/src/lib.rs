@@ -184,6 +184,8 @@ pub use pca::{gpu_available, gpu_info, gpu_info_for, randomized_pca_gpu, GpuInfo
 /// [`scx_format_io::profile`].
 pub use scx_format_io::profile as cpu_profile;
 #[cfg(feature = "gpu")]
+pub use scx_gpu::gpu_pca_resident::RESIDENT_VRAM_HEADROOM;
+#[cfg(feature = "gpu")]
 pub use scx_gpu::nvcomp::nvcomp_enabled;
 #[cfg(feature = "gpu")]
 pub use scx_gpu::profile;

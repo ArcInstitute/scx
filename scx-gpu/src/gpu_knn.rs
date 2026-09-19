@@ -250,14 +250,21 @@ struct CuvsLibrary {
     index_destroy: FnCagraIndexDestroy,
     build: FnCagraBuild,
     search: FnCagraSearch,
-    /// Optional because resolving them with `?` would make an older libcuvs
-    /// that lacks one read as "cuVS not installed" — `load_cuvs_library` fails
-    /// the whole load on any unresolved symbol, and `cuvs_available()` is what
-    /// every caller probes before choosing CAGRA over CPU HNSW. A missing
-    /// symbol must degrade the synchronization strategy, not the library.
-    stream_set: Option<FnStreamSet>,
-    stream_get: Option<FnStreamGet>,
-    stream_sync: Option<FnStreamSync>,
+    /// Required, like every other symbol here.
+    ///
+    /// These were briefly `Option`, so a libcuvs missing one would degrade the
+    /// synchronization strategy rather than the library. That invented a
+    /// version-compatibility surface this crate does not otherwise offer — the
+    /// loader pins the CAGRA FFI layouts to cuVS 26.02 and rejects anything else
+    /// outright (`check_cuvs_version`) unless `SCX_CUVS_TRUST_LAYOUT=1` — and it
+    /// bought a silent hole: with neither `cuvsStreamSet` nor `cuvsStreamSync`
+    /// available, binding was skipped *and* the post-call sync was a no-op, so
+    /// the compatibility branch reproduced the exact race this module exists to
+    /// close (found by codex). A missing symbol now fails the load, which reads
+    /// as "cuVS unavailable" and routes to CPU HNSW — slower, and correct.
+    stream_set: FnStreamSet,
+    stream_get: FnStreamGet,
+    stream_sync: FnStreamSync,
 }
 
 // SAFETY: cuVS library handles are thread-safe per NVIDIA documentation.
@@ -407,10 +414,15 @@ fn load_cuvs_library() -> Result<CuvsLibrary, String> {
         let search: FnCagraSearch = *lib
             .get(b"cuvsCagraSearch\0")
             .map_err(|e| format!("cuvsCagraSearch: {e}"))?;
-        // `.ok()`, not `?` — see the fields' doc on `CuvsLibrary`.
-        let stream_set: Option<FnStreamSet> = lib.get(b"cuvsStreamSet\0").ok().map(|f| *f);
-        let stream_get: Option<FnStreamGet> = lib.get(b"cuvsStreamGet\0").ok().map(|f| *f);
-        let stream_sync: Option<FnStreamSync> = lib.get(b"cuvsStreamSync\0").ok().map(|f| *f);
+        let stream_set: FnStreamSet = *lib
+            .get(b"cuvsStreamSet\0")
+            .map_err(|e| format!("cuvsStreamSet: {e}"))?;
+        let stream_get: FnStreamGet = *lib
+            .get(b"cuvsStreamGet\0")
+            .map_err(|e| format!("cuvsStreamGet: {e}"))?;
+        let stream_sync: FnStreamSync = *lib
+            .get(b"cuvsStreamSync\0")
+            .map_err(|e| format!("cuvsStreamSync: {e}"))?;
 
         // cuVS version check — hard-fail if FFI struct layouts may differ.
         // CagraIndexParams/CagraSearchParams are pinned to cuVS 26.02 C headers.
@@ -482,56 +494,41 @@ fn get_cuvs() -> Result<&'static CuvsLibrary, GpuError> {
     }
 }
 
-/// Bind cuVS's resources to `dev`'s stream, returning whether it took.
+/// Bind cuVS's resources to `dev`'s stream.
 ///
-/// Returns `Ok(true)` when `cuvsStreamSet` was available and succeeded, so
-/// every CAGRA launch is ordered against this crate's allocations, kernels and
-/// downloads with no explicit synchronization at all. Measured on an H100 with
-/// cuVS 26.02, this moves the resources from `cudaStreamPerThread` (`0x2`) to
-/// cudarc's legacy NULL stream (`0x0`). Returns `Ok(false)` when
-/// the loaded libcuvs has no `cuvsStreamSet`: the caller then falls back to
-/// draining both sides explicitly, which is correct but costs two extra device
-/// syncs per call. A non-zero return from the symbol is also `Ok(false)` — it
-/// means cuVS declined the stream, not that the call is unusable — and is
-/// logged once so a silent downgrade is still visible.
+/// After this every CAGRA launch is ordered against this crate's allocations,
+/// kernels and downloads by the stream itself, with no explicit synchronization
+/// needed on either side. Measured on an H100 with cuVS 26.02, it moves the
+/// resources from `cudaStreamPerThread` (`0x2`) to cudarc's legacy NULL stream
+/// (`0x0`) — two streams that, left alone, never implicitly order against each
+/// other.
+///
+/// There is no "could not bind" path. A libcuvs without `cuvsStreamSet` fails
+/// to load at all (see [`CuvsLibrary`]), and a non-zero return here is a hard
+/// error rather than a downgrade. The alternative was a branch that skipped
+/// binding and then, on a library also missing `cuvsStreamSync`, skipped the
+/// synchronization too — reinstating the race on the very path added to close
+/// it (found by codex).
 fn bind_cuvs_stream(
     cuvs: &CuvsLibrary,
     res: CuvsResources,
     dev: &GpuDevice,
-) -> Result<bool, GpuError> {
-    if let Some(stream_set) = cuvs.stream_set {
-        // Same convention as `nvcomp.rs`: cudarc hands out a driver-API
-        // `CUstream`, which is ABI-compatible with the runtime's `cudaStream_t`.
-        let stream = dev.stream().cu_stream() as *mut std::ffi::c_void;
-        let rc = unsafe { stream_set(res, stream) };
-        if rc == CUVS_SUCCESS {
-            return Ok(true);
-        }
-        log::warn!(
-            "scx-gpu: cuvsStreamSet returned {rc}; falling back to explicit \
-             stream synchronization around CAGRA (correct, but two extra device \
-             drains per call)"
-        );
-    }
-    // The input side of the hazard, for the unbound path: order everything
-    // already queued on this crate's stream — the embedding upload, the output
-    // allocations — before cuVS reads or writes any of it.
-    dev.synchronize()?;
-    Ok(false)
+) -> Result<(), GpuError> {
+    // Same convention as `nvcomp.rs`: cudarc hands out a driver-API `CUstream`,
+    // which is ABI-compatible with the runtime's `cudaStream_t`.
+    let stream = dev.stream().cu_stream() as *mut std::ffi::c_void;
+    check_cuvs(unsafe { (cuvs.stream_set)(res, stream) }, "cuvsStreamSet")
 }
 
-/// Block until cuVS's stream has drained, if the loaded libcuvs exposes
-/// `cuvsStreamSync`.
+/// Block until cuVS's resources' stream has drained.
 ///
-/// A no-op on a libcuvs without the symbol, which is the one configuration this
-/// cannot make safe; the version floor in `docs/gpu-setup.md` (cuVS >= 25.10)
-/// is well above where these three entered the C API, so it is a theoretical
-/// gap rather than a supported one.
+/// Called once, after the search. With the stream bound this is *almost*
+/// redundant — `DeviceKnnGraph::to_host` synchronizes `dev.stream()`, which is
+/// now the same stream — and it is kept for the case that reasoning does not
+/// cover: RAFT may fan work onto an internal stream pool, and this is the
+/// documented way to join it. One device drain per kNN build.
 fn sync_cuvs_stream(cuvs: &CuvsLibrary, res: CuvsResources, context: &str) -> Result<(), GpuError> {
-    let Some(stream_sync) = cuvs.stream_sync else {
-        return Ok(());
-    };
-    check_cuvs(unsafe { stream_sync(res) }, context)
+    check_cuvs(unsafe { (cuvs.stream_sync)(res) }, context)
 }
 
 /// The stream cuVS's resources are on, as a raw pointer, for diagnostics.
@@ -542,9 +539,8 @@ fn sync_cuvs_stream(cuvs: &CuvsLibrary, res: CuvsResources, context: &str) -> Re
 /// (`std::ptr::null_mut()`), so "bound" is visibly `0x0`.
 #[cfg_attr(not(test), allow(dead_code))]
 fn cuvs_stream_ptr(cuvs: &CuvsLibrary, res: CuvsResources) -> Option<*mut std::ffi::c_void> {
-    let stream_get = cuvs.stream_get?;
     let mut out: *mut std::ffi::c_void = std::ptr::null_mut();
-    (unsafe { stream_get(res, &mut out) } == CUVS_SUCCESS).then_some(out)
+    (unsafe { (cuvs.stream_get)(res, &mut out) } == CUVS_SUCCESS).then_some(out)
 }
 
 /// What a fresh `cuvsResources_t` looks like before and after this crate binds
@@ -563,8 +559,6 @@ struct CuvsStreamProbe {
     before: Option<*mut std::ffi::c_void>,
     /// cuVS's stream after `bind_cuvs_stream`.
     after: Option<*mut std::ffi::c_void>,
-    /// Whether `cuvsStreamSet` was present and took.
-    bound: bool,
 }
 
 #[cfg(test)]
@@ -577,12 +571,11 @@ fn probe_cuvs_stream_binding(dev: &GpuDevice) -> Result<CuvsStreamProbe, GpuErro
         destroy_fn: cuvs.resources_destroy,
     };
     let before = cuvs_stream_ptr(cuvs, res);
-    let bound = bind_cuvs_stream(cuvs, res, dev)?;
+    bind_cuvs_stream(cuvs, res, dev)?;
     Ok(CuvsStreamProbe {
         cudarc: dev.stream().cu_stream() as *mut std::ffi::c_void,
         before,
         after: cuvs_stream_ptr(cuvs, res),
-        bound,
     })
 }
 
@@ -781,7 +774,7 @@ pub fn gpu_knn_cagra_device(
     // `cuvsStreamSync` after the fact cannot. `sync_after` is the fallback for
     // a libcuvs without `cuvsStreamSet`: sync the cudarc stream *before* the
     // build so the input is ordered, and drain cuVS's stream after each call.
-    let bound_stream = bind_cuvs_stream(cuvs, res, dev)?;
+    bind_cuvs_stream(cuvs, res, dev)?;
 
     // Create and configure CAGRA index parameters
     let mut index_params_ptr: *mut CagraIndexParams = std::ptr::null_mut();
@@ -844,7 +837,6 @@ pub fn gpu_knn_cagra_device(
             "cuvsCagraBuild",
         )?;
     }
-    sync_cuvs_stream(cuvs, res, "after cuvsCagraBuild")?;
 
     // Create and configure search parameters
     let mut search_params_ptr: *mut CagraSearchParams = std::ptr::null_mut();
@@ -960,23 +952,14 @@ pub fn gpu_knn_cagra_device(
         }
     } // SyncOnDrop guards dropped here
 
-    // Drain cuVS's stream before the guard destroys the resources. Redundant
-    // when `bound_stream` is true (the search ran on the stream `to_host` will
-    // synchronize) and load-bearing when it is false, where it is the only
-    // edge between the search and the download. `cudaStreamDestroy` is
-    // non-blocking, so the guard is not a substitute for it either way.
+    // Join any RAFT stream pool before the guard destroys the resources.
+    // `cudaStreamDestroy` is non-blocking, so the guard is not a substitute.
     sync_cuvs_stream(cuvs, res, "after cuvsCagraSearch")?;
 
     // Return the raw CAGRA output device-resident. The self-hit filter, u32→i64
     // conversion, and sqrt (L2² → Euclidean) live in `DeviceKnnGraph::to_host`,
     // which synchronizes `dev.stream()` before downloading — the same stream
     // CAGRA ran on, once `bind_cuvs_stream` has bound it.
-    if !bound_stream {
-        log::debug!(
-            "scx-gpu: CAGRA ran on cuVS's own stream, synchronized explicitly \
-             (cuvsStreamSet unavailable on the loaded libcuvs)"
-        );
-    }
     DeviceKnnGraph::new(d_neighbors, d_distances, n_obs, search_k, n_neighbors)
 }
 
@@ -1135,25 +1118,15 @@ mod tests {
         // device's cuVS actually chose a stream other than cudarc's, i.e.
         // whether §8.5 was live here or only structural.
         println!(
-            "cuvsStreamSet applied: {}; cudarc stream {:?}; cuVS stream before {:?}, \
-             after {:?}",
-            probe.bound, probe.cudarc, probe.before, probe.after
+            "cudarc stream {:?}; cuVS stream before {:?}, after {:?}",
+            probe.cudarc, probe.before, probe.after
         );
 
-        let Some(cuvs_stream) = probe.after else {
-            // No `cuvsStreamGet` to read back with. The fallback path in
-            // `bind_cuvs_stream` still synchronizes both sides, so this is a
-            // coverage gap on this libcuvs, not a failure.
-            eprintln!(
-                "{}: cuvsStreamGet unavailable, cannot read the bound stream back",
-                crate::test_gate::SKIP_MARKER
-            );
-            return;
-        };
-        assert!(
-            probe.bound,
-            "cuvsStreamSet is present in this libcuvs but did not take"
-        );
+        // `cuvsStreamGet` is a required symbol, so a `None` here is a real
+        // failure of the call rather than an absent library feature.
+        let cuvs_stream = probe
+            .after
+            .expect("cuvsStreamGet failed after a successful bind");
         assert_eq!(
             cuvs_stream, probe.cudarc,
             "cuVS is on a different stream from the one this crate allocates, \

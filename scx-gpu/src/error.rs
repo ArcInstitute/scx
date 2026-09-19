@@ -105,12 +105,25 @@ impl GpuError {
     /// Whether producing the same result by a **different route to the same
     /// device** could succeed.
     ///
-    /// [`Self::is_runtime_failure`] minus out-of-memory. A module that will not
-    /// load, a kernel launch failure, a library problem — another route (decode
-    /// on the host, then upload) does not go near any of those. A memory
-    /// shortfall is different in kind: every route still has to land the same
-    /// bytes in the same VRAM, so an alternative can only buy a slower trip to
-    /// the same error, and with a worse message than the one already in hand.
+    /// [`Self::is_runtime_failure`] minus out-of-memory, **plus**
+    /// [`GpuError::UnsupportedLayout`]. A module that will not load, a kernel
+    /// launch failure, a library problem — another route (decode on the host,
+    /// then upload) does not go near any of those. A memory shortfall is
+    /// different in kind: every route still has to land the same bytes in the
+    /// same VRAM, so an alternative can only buy a slower trip to the same
+    /// error, and with a worse message than the one already in hand.
+    ///
+    /// `UnsupportedLayout` is on the "yes" side even though it is not a runtime
+    /// failure, and the two questions genuinely differ here. "Did something go
+    /// wrong?" is no — nothing failed, this route was never viable for this
+    /// input. "Could another route succeed?" is *yes, by construction*: the
+    /// input is well-formed and it is only this path that cannot take it. The
+    /// case that forced the distinction is a FOR-BP substream past the 32-bit
+    /// bit-offset ceiling (`forbp_gpu::check_forbp_substream_len`) — a perfectly
+    /// valid shard the device kernels cannot address and the host decoder reads
+    /// correctly. Routing it to host-assemble is the right answer; raising was
+    /// not. The other non-runtime variants stay `false` because a host decode
+    /// would only re-derive the same defect.
     ///
     /// Used by `Experiment.to_gpu_anndata` to decide whether a failed in-VRAM
     /// shard decode falls through to host-assemble. Note this is *not* the
@@ -119,7 +132,8 @@ impl GpuError {
     /// fallback: `device="auto"` resolves the device before the op starts and
     /// raises on a runtime failure rather than re-running on CPU.
     pub fn alternate_route_may_succeed(&self) -> bool {
-        self.is_runtime_failure() && !matches!(self, GpuError::OutOfMemory(_))
+        matches!(self, GpuError::UnsupportedLayout(_))
+            || (self.is_runtime_failure() && !matches!(self, GpuError::OutOfMemory(_)))
     }
 }
 
@@ -254,10 +268,38 @@ mod tests {
         }
     }
 
+    /// A *defective input* admits no alternate route — another path would only
+    /// re-derive the same defect.
     #[test]
     fn an_input_defect_admits_no_alternate_route() {
         assert!(!GpuError::InvalidShard(s()).alternate_route_may_succeed());
-        assert!(!GpuError::UnsupportedLayout(s()).alternate_route_may_succeed());
+        assert!(!GpuError::ShapeMismatch {
+            expected: s(),
+            got: s()
+        }
+        .alternate_route_may_succeed());
+    }
+
+    /// An *unsupported layout* does, and the two questions come apart here.
+    ///
+    /// `UnsupportedLayout` is not a runtime failure — nothing went wrong — but
+    /// the input is well-formed and only this route cannot take it, so a host
+    /// decode genuinely does produce the answer. The case that forced the
+    /// distinction is a FOR-BP substream past the 32-bit bit-offset ceiling: a
+    /// valid shard the device kernels cannot address. It used to be classed as
+    /// a corrupt shard, which made `to_gpu_anndata` raise on a file it can read
+    /// perfectly well by another road.
+    #[test]
+    fn an_unsupported_layout_admits_an_alternate_route() {
+        let e = GpuError::UnsupportedLayout(s());
+        assert!(
+            !e.is_runtime_failure(),
+            "nothing failed — this is a routing answer, not an error that happened"
+        );
+        assert!(
+            e.alternate_route_may_succeed(),
+            "but the host route can still produce the result"
+        );
     }
 
     #[test]

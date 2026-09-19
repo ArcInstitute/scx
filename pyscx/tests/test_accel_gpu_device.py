@@ -126,6 +126,54 @@ def test_gpu_out_of_range_raises_runtime_error():
         pyscx.accel.normalize_total(a, device="gpu:99")
 
 
+def test_device_auto_is_answered_not_raised_on_the_reporting_helpers():
+    """`device="auto"` must never raise on these two.
+
+    They exist to answer "is there a GPU, and will this fit on it", and their
+    documented answers for "no GPU" are `None` and `fits_in_vram=False`.
+    `resolve_device("auto")` deliberately resolves to the CPU when CUDA is
+    absent, and an earlier version of this PR turned that normal result into a
+    `ValueError` — so the documented `device="auto"` raised on exactly the hosts
+    the helpers describe (found by codex).
+
+    Runs everywhere: on a GPU host `"auto"` picks the GPU and both return real
+    answers; on a CPU-only host both return the no-GPU answer. Neither raises.
+    """
+    import anndata
+    import numpy as np
+
+    adata = anndata.AnnData(X=np.zeros((4, 3), dtype=np.float32))
+
+    info = pyscx.accel.gpu_info(device="auto")
+    assert info is None or "device" in info
+
+    est = pyscx.accel.estimate_gpu_memory(adata, "pca", device="auto")
+    assert set(est) == {"required_gb", "fits_in_vram"}
+    assert isinstance(est["fits_in_vram"], bool)
+    if not _gpu_available():
+        assert info is None
+        assert est["fits_in_vram"] is False
+
+    # And the zero-argument form keeps its old behaviour exactly.
+    assert (pyscx.accel.gpu_info() is None) == (not _gpu_available())
+
+
+def test_reporting_helpers_reject_an_explicit_cpu_device():
+    """`"cpu"` is a category error on both: there is no CPU VRAM to report.
+
+    Distinct from `"auto"` above — the user named the CPU rather than asking
+    what was available — and it runs on every host.
+    """
+    import anndata
+    import numpy as np
+
+    adata = anndata.AnnData(X=np.zeros((4, 3), dtype=np.float32))
+    with pytest.raises(ValueError, match="selects the CPU"):
+        pyscx.accel.gpu_info(device="cpu")
+    with pytest.raises(ValueError, match="selects the CPU"):
+        pyscx.accel.estimate_gpu_memory(adata, "pca", device="cpu")
+
+
 @pytest.mark.skipif(not _gpu_available(), reason="CUDA GPU not available")
 def test_gpu_info_reports_the_device_it_was_given():
     """`gpu_info()` used to hardcode device 0 — on a multi-GPU host it reported

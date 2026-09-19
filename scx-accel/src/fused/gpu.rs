@@ -314,7 +314,8 @@ mod tests {
             .sum();
         let recall = hits as f64 / (n_rows * n_neighbors) as f64;
         // CAGRA is approximate, so this is a floor, not an equality. This
-        // fixture (400 points, k=60) measures **1.0000** on an H100 (job
+        // fixture (400 points in 12 PCA components; `n_cols = 60` is the gene
+        // axis, not the embedding width) measures **1.0000** on an H100 (job
         // 2979644), and the floor is left at 0.90 rather than pinned to that:
         // recall is a property of the ANN index build, so another card or cuVS
         // version may land a shade under 1.0 without anything being wrong.

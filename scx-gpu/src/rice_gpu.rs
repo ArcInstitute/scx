@@ -50,6 +50,13 @@ fn prescan_rice_blocks(
         let k = block_header & 0x0F;
 
         // Record the byte offset right after the header byte.
+        //
+        // No ceiling here, unlike FOR-BP's `check_forbp_substream_len`, and the
+        // asymmetry is deliberate: FOR-BP stores a *bit* offset, so it multiplies
+        // the position by 8 and overflows `u32` at 512 MiB. This stores a *byte*
+        // offset, and `data` is a sub-stream of `header.values_length`, a `u32`
+        // field — so `bit_pos / 8 <= data.len() <= u32::MAX` and the narrowing
+        // below cannot truncate. Same reasoning covers `bitstream_len`.
         let bit_pos = reader.position();
         debug_assert!(
             bit_pos.is_multiple_of(8),

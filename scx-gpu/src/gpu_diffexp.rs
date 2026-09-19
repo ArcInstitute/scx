@@ -902,12 +902,14 @@ pub fn gpu_de_block_sort(
     }
 
     // Multi-tile path: tile sort + iterative merge.
-    let n_elements = chunk_size
-        .checked_mul(n_per_gene)
-        .ok_or_else(|| GpuError::ShapeMismatch {
-            expected: "chunk_size * n_per_gene fits in usize".into(),
-            got: format!("chunk_size={chunk_size}, n_per_gene={n_per_gene}"),
-        })?;
+    // Call `gpu_de_aux_elems` rather than restating the product: it *is* the
+    // requirement this validates, and the error message below already tells
+    // callers to size with it — but nothing in production called it any more
+    // once the drivers moved to `gpu_de_aux_span`, leaving the named contract
+    // and the enforced one as two separate expressions (Cursor Agent). The
+    // single-tile early return above means `n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY`
+    // here, so the span rule cannot zero it.
+    let n_elements = gpu_de_aux_elems(chunk_size, n_per_gene)?;
     if aux.len() < n_elements {
         return Err(GpuError::ShapeMismatch {
             expected: format!(
