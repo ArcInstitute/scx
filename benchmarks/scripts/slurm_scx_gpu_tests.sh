@@ -26,11 +26,13 @@ if [[ $# -ge 1 && -n "$1" ]]; then
     echo "Queuing behind dependency: $1"
 fi
 
-# `gpu`, not `preemptible`: this is a short job and the preemptible queue can
-# starve for a day.
+# Not `preemptible`: this is a short job and the preemptible queue can starve
+# for a day. And not the bare `gpu` partition either — it is the congested one
+# (measured: ~11 h queued against ~1 min on the other two). Slurm takes the
+# first partition in the list that can run the job.
 JOB_ID=$(sbatch --parsable \
     --job-name=scx_gpu_tests \
-    --partition=gpu \
+    --partition=gpu_high_mem,ctc_gpu_priority,gpu \
     --qos=normal \
     --gres=gpu:1 \
     --cpus-per-task=8 \

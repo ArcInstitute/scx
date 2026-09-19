@@ -279,5 +279,50 @@ mod tests {
             b.sort_unstable();
             assert_eq!(a, b, "row {i}: fused vs ref neighbor sets differ");
         }
+
+        // (3) An **independent** bar. Everything above compares CAGRA against
+        //     CAGRA through the same code path, so a defect on that path is on
+        //     both arms and the comparison passes — a zero-filled output equals
+        //     a zero-filled output (review §8.5, §8.17). Score the fused
+        //     result against an exact CPU kNN over the same embedding.
+        let mut exact: Vec<Vec<usize>> = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            let mut d: Vec<(f64, usize)> = (0..n_rows)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let s: f64 = (0..k)
+                        .map(|c| {
+                            let x = pca.embeddings[i * k + c] - pca.embeddings[j * k + c];
+                            x * x
+                        })
+                        .sum();
+                    (s, j)
+                })
+                .collect();
+            d.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+            exact.push(d.into_iter().take(n_neighbors).map(|(_, j)| j).collect());
+        }
+        let hits: usize = (0..n_rows)
+            .map(|i| {
+                let got: std::collections::HashSet<usize> = knn.indices
+                    [i * n_neighbors..(i + 1) * n_neighbors]
+                    .iter()
+                    .copied()
+                    .collect();
+                exact[i].iter().filter(|j| got.contains(j)).count()
+            })
+            .sum();
+        let recall = hits as f64 / (n_rows * n_neighbors) as f64;
+        // CAGRA is approximate, so this is a floor, not an equality. The value
+        // is reset from what this fixture (400 points, k=60) actually scores on
+        // a GPU node — it is printed so a run reports it rather than only
+        // passing or failing. What the floor has to separate is coarse: an
+        // unsynchronized read returns every neighbour as index 0 and scores
+        // about 1/n_neighbors, two orders below any real answer.
+        println!("fused CAGRA recall against exact CPU kNN: {recall:.4}");
+        assert!(
+            recall >= 0.90,
+            "fused CAGRA recall against exact CPU kNN is {recall:.4}, below the 0.90 floor"
+        );
     }
 }

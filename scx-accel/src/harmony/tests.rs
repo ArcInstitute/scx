@@ -669,6 +669,16 @@ fn test_gpu_vs_cpu_per_pc_correlation() {
     // and the divergence is 1.6e-03 at its widest. 0.999 sits between them with
     // ~1e-03 of headroom for cross-device f32 drift — an order more slack than
     // the margin by which it rejects the one-armed build.
+    //
+    // What this bar **cannot** see: Pearson r is invariant to `y = a·x + b`, so
+    // a uniform relative perturbation of every coordinate leaves it at 1.0.
+    // That is exactly the shape of the `--use_fast_math` defect (review §8.16):
+    // `__logf`'s 2⁻²¹·⁴¹ absolute error on a `logf(ratio)` of ~1e-3 is a ~0.04 %
+    // relative error injected into every penalty term. Tightening this bar
+    // further would not help — the invariance is structural. The guard for that
+    // is `gpu_harmony::tests::harmony_ptx_is_not_built_with_fast_math`, which
+    // asserts on the emitted PTX instead of on a downstream correlation, and
+    // needs no GPU.
     for pc in 0..d {
         let mut x: Vec<f64> = Vec::with_capacity(n);
         let mut y: Vec<f64> = Vec::with_capacity(n);
