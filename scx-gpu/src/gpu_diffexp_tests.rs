@@ -10,6 +10,63 @@ fn test_de_alloc_elems_rejects_overflow() {
     assert!(matches!(err, GpuError::ShapeMismatch { .. }), "got {err:?}");
 }
 
+/// Which CSC pseudobulk kernel runs is a numerically visible choice, and it is
+/// keyed on a **device property**. The selection rule is a pure function so the
+/// whole table can be pinned on a CPU host, and so the route stamp and the
+/// launch site can share one copy of it rather than each deriving it.
+#[test]
+fn the_csc_pseudobulk_selection_is_one_rule_over_groups_and_shared_memory() {
+    // sm_80 (A100) and sm_90 (H100) opt-in dynamic shared memory.
+    const A100: usize = 163 * 1024;
+    const H100: usize = 227 * 1024;
+    const F64: usize = 8;
+
+    // The largest block dim whose per-group partials fit, biggest first.
+    assert_eq!(csc_pseudobulk_block_dim(1, H100, false), Some(128));
+    assert_eq!(
+        csc_pseudobulk_block_dim(H100 / (128 * F64), H100, false),
+        Some(128),
+        "exactly filling the limit at bx=128 still takes bx=128"
+    );
+    assert_eq!(
+        csc_pseudobulk_block_dim(H100 / (128 * F64) + 1, H100, false),
+        Some(64),
+        "one group past it steps down rather than falling to atomics"
+    );
+
+    // The boundary that makes this device-dependent. At bx=32 the ceiling is
+    // `limit / 256` groups: ~888 on an H100, ~637 on an A100. A DE run with
+    // n_groups in between gets the deterministic kernel on one card and the
+    // atomic one on the other, with `route` reading `gpu_csc_v3` on both.
+    let h100_max = H100 / (32 * F64);
+    let a100_max = A100 / (32 * F64);
+    assert_eq!((a100_max, h100_max), (652, 908));
+    assert_eq!(csc_pseudobulk_block_dim(h100_max, H100, false), Some(32));
+    assert_eq!(csc_pseudobulk_block_dim(h100_max + 1, H100, false), None);
+    assert_eq!(
+        csc_pseudobulk_block_dim(h100_max, A100, false),
+        None,
+        "the same group count falls to atomics on the smaller card"
+    );
+    assert_eq!(csc_pseudobulk_block_dim(a100_max, A100, false), Some(32));
+
+    // The 48 KB floor a device without the opt-in attribute gets.
+    assert_eq!(
+        csc_pseudobulk_block_dim(
+            CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT / (32 * F64) + 1,
+            CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT,
+            false
+        ),
+        None
+    );
+
+    // The force flag short-circuits every size, which is what lets a small
+    // fixture exercise the atomic arm. Passed in explicitly so this test does
+    // not depend on the process-global `OnceLock`.
+    assert_eq!(csc_pseudobulk_block_dim(1, H100, true), None);
+    assert_eq!(csc_pseudobulk_block_dim(0, H100, true), None);
+}
+
 /// The VRAM budget must charge for exactly what gets allocated.
 ///
 /// `ensure_aux_capacity` used to take an already-multiplied `chunk × span` and

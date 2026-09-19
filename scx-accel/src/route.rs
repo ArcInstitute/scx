@@ -266,7 +266,40 @@ pub struct AccelExecutionInfo {
     /// companion counter `shards_decoded` keeps its old meaning — slab passes,
     /// which residency does not change — so it is **not** the signal for this.
     pub resident_csr: Option<bool>,
+
+    /// Which reduction a GPU kernel used to fold the op's sums:
+    /// [`REDUCTION_DETERMINISTIC`] or [`REDUCTION_ATOMIC`]. `None` on every CPU
+    /// route and on any GPU route whose result does not go through one.
+    ///
+    /// `"atomic"` means a cross-block floating-point `atomicAdd`, whose
+    /// summation order is not reproducible: the same input on the same device
+    /// can give a different answer run to run in the last bits. That is not
+    /// always harmless. GPU pseudobulk sums feed `apply_cpm_filter`'s strict
+    /// `>`, and the FDR is recomputed over the survivors — so a gene within an
+    /// ULP of `cpm_filter` flips in and out between runs and moves `pvals_adj`
+    /// for **every** surviving gene. The HVG column sum-of-squares can likewise
+    /// flip near-constant-gene membership at a cutoff.
+    ///
+    /// It is recorded rather than inferred because the choice is not a property
+    /// of the input. The CSC pseudobulk path picks its kernel from
+    /// [`csc_pseudobulk_block_dim`](scx_gpu::csc_pseudobulk_block_dim), whose
+    /// answer depends on the device's opt-in shared memory — 227 KB on sm_90
+    /// against 163 KB on sm_80, i.e. 908 groups against 652 at the smallest
+    /// block dimension — so the same file gives the deterministic kernel on an
+    /// H100 and the atomic one on an A100 while `route` reads `gpu_csc_v3` on
+    /// both. `SCX_GPU_DE_REQUIRE_DETERMINISTIC=1` turns that
+    /// fall-through into an error for a caller who needs reproducibility.
+    pub reduction: Option<&'static str>,
 }
+
+/// [`AccelExecutionInfo::reduction`] for a reduction with no atomics, whose
+/// output is bit-reproducible run to run on one device.
+pub const REDUCTION_DETERMINISTIC: &str = "deterministic";
+
+/// [`AccelExecutionInfo::reduction`] for a cross-block floating-point
+/// `atomicAdd`, whose summation order — and therefore last bits — varies run to
+/// run.
+pub const REDUCTION_ATOMIC: &str = "atomic";
 
 impl AccelExecutionInfo {
     /// Construct from a route + fallback reason, leaving the optional counters
@@ -287,7 +320,7 @@ impl AccelExecutionInfo {
     /// bindings. Unset optionals are emitted as explicit
     /// `None`/`NULL` entries, not omitted — a gate distinguishing "not
     /// tracked" from "key missing entirely" depends on that.
-    pub fn fields(&self) -> [(&'static str, RouteValue<'_>); 17] {
+    pub fn fields(&self) -> [(&'static str, RouteValue<'_>); 18] {
         [
             ("route", RouteValue::Str(self.route.as_str())),
             (
@@ -333,6 +366,7 @@ impl AccelExecutionInfo {
                 RouteValue::OptU64(self.n_shards_shufdelta_gpu.map(u64::from)),
             ),
             ("resident_csr", RouteValue::OptBool(self.resident_csr)),
+            ("reduction", RouteValue::OptStr(self.reduction)),
         ]
     }
 }
@@ -563,6 +597,21 @@ pub fn plan_hvg_route(
     };
     let mut info = AccelExecutionInfo::new(route, reason);
     info.csc_available = Some(csc_available);
+    // The two GPU HVG arms fold their column moments differently, and the
+    // difference is numerically visible: the CSC reduce is one block per column
+    // with a shared-memory tree-reduce and plain stores, while the CSR path
+    // accumulates Sigma-x / Sigma-x^2 through cross-block f64 `atomicAdd` whose
+    // order varies run to run — enough to flip a near-constant gene's HVG
+    // membership at a cutoff (`gpu_hvg.rs` says so in its own doc). The CPU
+    // arms take neither. Unlike DE's, this choice follows from the *file*
+    // (`csc_available`) rather than from a device property, so `route` already
+    // separates the two — but a reader should not have to know that mapping to
+    // learn whether the answer is reproducible (review §8.6).
+    info.reduction = match info.route {
+        AccelRoute::GpuCscV3 => Some(REDUCTION_DETERMINISTIC),
+        AccelRoute::GpuCsr => Some(REDUCTION_ATOMIC),
+        _ => None,
+    };
     info
 }
 

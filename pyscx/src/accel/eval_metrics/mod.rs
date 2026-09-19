@@ -129,12 +129,20 @@ pub(crate) fn edist_device_dispatch(
         None | Some("f32") | Some("float32")
     );
     let gpu_eligible = cfg!(feature = "gpu") && !metric_is_l1 && dtype_is_f32;
-    let info = super::route::simple_exec_info(
+    let mut info = super::route::simple_exec_info(
         device,
         gpu_eligible,
         scx_accel::route::AccelRoute::GpuDense,
         scx_accel::route::AccelRoute::CpuCsr,
     );
+    if info.route.is_gpu() {
+        // `pairwise_dist_sum_kernel` folds with a global f64 `atomicAdd` across
+        // up to 65535 blocks and has no deterministic variant, so the GPU arm
+        // is not reproducible run to run. A constant, not a choice — but it is
+        // recorded rather than left implicit, because nothing else in the
+        // result says so (review §8.6).
+        info.reduction = Some(scx_accel::route::REDUCTION_ATOMIC);
+    }
     super::route::announce_route(py, op, device, &info);
     let gpu_id = if info.route.is_gpu() {
         resolved.gpu_id()

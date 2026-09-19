@@ -116,6 +116,10 @@ fn finish_pdex(
         info.shards_decoded = info.shards_decoded.or(r.exec_info.shards_decoded);
         info.shards_uploaded = info.shards_uploaded.or(r.exec_info.shards_uploaded);
         info.resident_csr = info.resident_csr.or(r.exec_info.resident_csr);
+        // Which pseudobulk reduction actually ran. The driver sets it from the
+        // same predicate the kernel dispatch calls, so the stamp cannot claim a
+        // kernel that did not run (review §8.6).
+        info.reduction = info.reduction.or(r.exec_info.reduction);
         r.exec_info = info;
         // Apply the CPM keep mask + survivor-scoped FDR (the v3 drivers populated
         // the arithmetic-mean fields when cpm_filter was set). No-op when None,
@@ -142,9 +146,35 @@ fn finish_de(result: Result<DiffExpResult>, mut info: AccelExecutionInfo) -> Res
         info.shards_decoded = info.shards_decoded.or(r.exec_info.shards_decoded);
         info.shards_uploaded = info.shards_uploaded.or(r.exec_info.shards_uploaded);
         info.resident_csr = info.resident_csr.or(r.exec_info.resident_csr);
+        // Which pseudobulk reduction actually ran. The driver sets it from the
+        // same predicate the kernel dispatch calls, so the stamp cannot claim a
+        // kernel that did not run (review §8.6).
+        info.reduction = info.reduction.or(r.exec_info.reduction);
         r.exec_info = info;
         r
     })
+}
+
+/// Which reduction the CSC pseudobulk fold will use for `n_groups` on this
+/// device, as the [`AccelExecutionInfo::reduction`](crate::route::AccelExecutionInfo)
+/// wire value.
+///
+/// Calls the *same* predicate the kernel dispatch calls
+/// ([`scx_gpu::csc_pseudobulk_block_dim`]) rather than re-deriving the rule, so
+/// the provenance record cannot drift from the kernel that ran. `n_groups` is
+/// constant across a DE op, so one label per op is well-defined.
+fn csc_pseudobulk_reduction(dev: &GpuDevice, n_groups: usize) -> &'static str {
+    if scx_gpu::csc_pseudobulk_block_dim(
+        n_groups,
+        scx_gpu::csc_pseudobulk_smem_limit(dev),
+        scx_gpu::gpu_de_force_atomic_pseudobulk(),
+    )
+    .is_some()
+    {
+        crate::route::REDUCTION_DETERMINISTIC
+    } else {
+        crate::route::REDUCTION_ATOMIC
+    }
 }
 
 /// Pseudocount used by the CPU `compute_logfc` helper. Mirrors
@@ -1448,6 +1478,10 @@ fn pdex_ref_gpu_chunked_v3_csr(
             shards_decoded: Some(shards_decoded),
             shards_uploaded: Some(shards_decoded),
             resident_csr: Some(resident_csr),
+            // `csr_shard_pseudobulk_kernel` folds with a global f64 atomicAdd
+            // and has no deterministic twin — unlike the CSC path, this is not
+            // a choice, so the label is a constant.
+            reduction: Some(crate::route::REDUCTION_ATOMIC),
             ..Default::default()
         },
     })
@@ -1840,6 +1874,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
         exec_info: crate::route::AccelExecutionInfo {
             shards_decoded: Some(shards_decoded),
             shards_uploaded: Some(shards_decoded),
+            reduction: Some(csc_pseudobulk_reduction(dev, n_groups_for_means)),
             ..Default::default()
         },
     })
@@ -2415,6 +2450,10 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
             Ok(shards)
         },
     )
+    .map(|mut r| {
+        r.exec_info.reduction = Some(csc_pseudobulk_reduction(dev, n_slots));
+        r
+    })
 }
 
 /// CSR-direct Wilcoxon rank-sum GPU driver — the CSC-absent fallback (in-memory
@@ -2589,6 +2628,8 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         },
     )?;
     result.exec_info.resident_csr = Some(resident_csr);
+    // The CSR pseudobulk kernel is atomic-only; see `pdex_ref_gpu_chunked_v3_csr`.
+    result.exec_info.reduction = Some(crate::route::REDUCTION_ATOMIC);
     Ok(result)
 }
 

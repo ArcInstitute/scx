@@ -605,22 +605,22 @@ pub fn gpu_de_pseudobulk_csc_direct(
     // global `atomicAdd` with no per-group SMEM and scales to any `n_groups`;
     // atomic contention is naturally low in that regime. `n_groups` is constant
     // across a DE op, so every shard launch takes the same path.
-    const DEFAULT_SMEM_LIMIT: usize = 48 * 1024;
-    let opt_in_limit = dev
-        .max_dynamic_shared_mem_per_block()
-        .unwrap_or(DEFAULT_SMEM_LIMIT);
-    let elem_bytes = std::mem::size_of::<f64>();
-
-    // Test-only escape hatch to exercise the global-atomic path on a small
-    // fixture regardless of `n_groups`.
-    let force_atomic = gpu_de_force_atomic_pseudobulk();
-    let smem_bx = if force_atomic {
-        None
-    } else {
-        [128u32, 64, 32]
-            .into_iter()
-            .find(|&bx| n_groups * bx as usize * elem_bytes <= opt_in_limit)
-    };
+    let smem_bx = csc_pseudobulk_block_dim(
+        n_groups,
+        csc_pseudobulk_smem_limit(dev),
+        gpu_de_force_atomic_pseudobulk(),
+    );
+    if smem_bx.is_none() && gpu_de_require_deterministic() {
+        return Err(GpuError::UnsupportedLayout(format!(
+            "SCX_GPU_DE_REQUIRE_DETERMINISTIC=1, but {n_groups} groups do not fit the \
+             deterministic CSC pseudobulk kernel's shared memory on this device \
+             ({} B opt-in): the fallback is a global f64 atomicAdd, whose summation \
+             order is not reproducible. Use fewer/coarser groups, run on a device with \
+             more opt-in shared memory, or unset the variable and accept the atomic \
+             reduction (it is stamped as `reduction=\"atomic\"` on uns[\"scx_accel\"]).",
+            csc_pseudobulk_smem_limit(dev)
+        )));
+    }
 
     let (func, bx, shared_mem_bytes) = match smem_bx {
         Some(bx) => {
@@ -629,9 +629,9 @@ pub fn gpu_de_pseudobulk_csc_direct(
                 .map_err(|e| {
                     GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}"))
                 })?;
-            let required = n_groups * bx as usize * elem_bytes;
+            let required = n_groups * bx as usize * std::mem::size_of::<f64>();
             // Opt into >48 KB when required (per-function sticky + idempotent).
-            if required > DEFAULT_SMEM_LIMIT {
+            if required > CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT {
                 func.set_attribute(
                     cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     required as i32,
@@ -1461,9 +1461,66 @@ fn gpu_de_mem_budget_frac() -> f64 {
 /// wasteful). The override must therefore be set **before** the first DE op in
 /// the process; production never sets it, and the parity test selects the atomic
 /// path via `n_groups` rather than this flag.
-fn gpu_de_force_atomic_pseudobulk() -> bool {
+pub fn gpu_de_force_atomic_pseudobulk() -> bool {
     static FORCE: OnceLock<bool> = OnceLock::new();
     *FORCE.get_or_init(|| std::env::var_os("SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC").is_some())
+}
+
+/// Whether `SCX_GPU_DE_REQUIRE_DETERMINISTIC=1` turns a fall-through to the
+/// global-atomic CSC pseudobulk kernel into an error.
+///
+/// The inverse of [`gpu_de_force_atomic_pseudobulk`], which forces the
+/// non-reproducible arm for testing. This one is for a caller who needs the
+/// numbers to be reproducible and would rather be told than silently get the
+/// atomic kernel because the device's shared memory happened not to fit.
+/// Same `OnceLock` caching and the same "set it before the first DE op" rule.
+pub fn gpu_de_require_deterministic() -> bool {
+    static REQUIRE: OnceLock<bool> = OnceLock::new();
+    *REQUIRE.get_or_init(|| std::env::var("SCX_GPU_DE_REQUIRE_DETERMINISTIC").as_deref() == Ok("1"))
+}
+
+/// The device's opt-in dynamic shared-memory limit, or the 48 KB hardware
+/// default when it cannot be read.
+///
+/// Split out so [`csc_pseudobulk_block_dim`] takes it as a plain number and the
+/// selection rule is testable without a device.
+pub fn csc_pseudobulk_smem_limit(dev: &GpuDevice) -> usize {
+    dev.max_dynamic_shared_mem_per_block()
+        .unwrap_or(CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT)
+}
+
+/// The 48 KB per-block shared-memory floor every CUDA device provides without
+/// an opt-in, used when the device attribute cannot be read.
+pub const CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT: usize = 48 * 1024;
+
+/// Which CSC pseudobulk kernel runs: `Some(block_dim)` for the deterministic
+/// SMEM tree-reduce, `None` for the global-atomic fallback.
+///
+/// **This is the single selection rule**, called both by the launch site and by
+/// the route stamp, so the provenance record cannot drift from the kernel that
+/// actually ran. It is deliberately pure — `smem_limit` and `force_atomic` are
+/// passed in rather than read from the device and the environment — so the
+/// whole table is unit-testable on a CPU host.
+///
+/// The choice is **numerically visible and device-dependent**: the tree-reduce
+/// has no atomics and is bit-reproducible run to run, the fallback is a global
+/// f64 `atomicAdd` and is not. `max_dynamic_shared_mem_per_block` is 227 KB on
+/// sm_90 and 163 KB on sm_80, so at `bx = 32` the ceiling is 908 groups on an
+/// H100 and 652 on an A100 — the same file, the same call, different numbers
+/// on a different card. That is why the answer is stamped (review §8.6) rather
+/// than left implicit, and why `SCX_GPU_DE_REQUIRE_DETERMINISTIC=1` exists.
+pub fn csc_pseudobulk_block_dim(
+    n_groups: usize,
+    smem_limit: usize,
+    force_atomic: bool,
+) -> Option<u32> {
+    if force_atomic {
+        return None;
+    }
+    let elem_bytes = std::mem::size_of::<f64>();
+    [128u32, 64, 32]
+        .into_iter()
+        .find(|&bx| n_groups * bx as usize * elem_bytes <= smem_limit)
 }
 
 /// Device-scratch bytes consumed *per gene column* of a DE chunk, matching the
