@@ -7,7 +7,7 @@
 use faer::MatRef;
 
 use crate::error::{AccelError, Result};
-use crate::nb_glm::types::NbGlmContrast;
+use crate::nb_glm::types::{NbGlmContrast, NbGlmOptions};
 
 /// Validate the count matrix, design, and size factors before fitting.
 ///
@@ -161,6 +161,53 @@ pub fn validate_contrast(contrast: &NbGlmContrast, n_features: usize) -> Result<
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Reject numeric options whose out-of-domain values would fail silently.
+///
+/// Called on both the CPU and GPU entry points, before either touches the data.
+///
+/// `disp_outlier_sd` is the one this exists for. It multiplies
+/// `√(squared_logres)` to form the dispersion-outlier threshold, and nothing
+/// downstream can tell a bad value from a deliberate one:
+///
+/// - `NaN` / `+inf` make every `>` comparison false, so the carve-out silently
+///   behaves as if it were disabled — the quietest possible failure, since the
+///   caller asked for it to be *on*;
+/// - a negative value moves the threshold *below* the trend and exempts
+///   ordinary, even below-trend genes from shrinkage, which is the opposite of
+///   what the option is for.
+///
+/// Found by codex - gpt-5.6-sol, which confirmed all three were accepted
+/// through the Python binding.
+pub fn validate_options(options: &NbGlmOptions) -> Result<()> {
+    if let Some(sd) = options.disp_outlier_sd {
+        if !sd.is_finite() || sd < 0.0 {
+            return Err(AccelError::InvalidInput(format!(
+                "disp_outlier_sd must be finite and non-negative (DESeq2's outlierSD \
+                 default is 2.0); got {sd}. Pass None to disable the \
+                 dispersion-outlier carve-out."
+            )));
+        }
+    }
+    // `min_disp` reaches `trend.eval(mu).max(min_disp).ln()`, so a zero or
+    // negative clamp puts `-inf` / `NaN` into every log target. The residual
+    // filter in `estimate_prior_var` drops those, but a poisoned *target* also
+    // drives the shrinkage itself, which no filter downstream can repair.
+    if !options.min_disp.is_finite() || options.min_disp <= 0.0 {
+        return Err(AccelError::InvalidInput(format!(
+            "min_disp must be finite and strictly positive (DESeq2 uses 1e-8); \
+             got {}. It is log-transformed to form the shrinkage target.",
+            options.min_disp
+        )));
+    }
+    if !options.max_disp.is_finite() || options.max_disp < options.min_disp {
+        return Err(AccelError::InvalidInput(format!(
+            "max_disp must be finite and >= min_disp; got max_disp={} min_disp={}",
+            options.max_disp, options.min_disp
+        )));
     }
     Ok(())
 }

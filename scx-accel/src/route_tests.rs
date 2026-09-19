@@ -184,6 +184,16 @@ fn nb_glm_ineligible_dims_fall_back_to_cpu() {
 fn route_strings_are_stable() {
     assert_eq!(AccelRoute::GpuCscV3.as_str(), "gpu_csc_v3");
     assert_eq!(AccelRoute::CpuCsr.as_str(), "cpu_csr");
+    assert_eq!(AccelRoute::CpuCsc.as_str(), "cpu_csc");
+    // The exact-nnz Wilcoxon kernel's own id (review §7.17).
+    // `benchmarks/scripts/bench_de_csc_routes.py` reads
+    // `uns["scx_accel"]["rank_genes_groups"]["route"]` and distinguishes its
+    // `csc_dense` and `csc_nnz` arms by exactly these two values; and
+    // `bench_csc_dispatch.py`'s `csc_dispatch_correct` gate tests
+    // `"csc" in route`, which this must keep satisfying.
+    assert_eq!(AccelRoute::CpuCscNnz.as_str(), "cpu_csc_nnz");
+    assert!(AccelRoute::CpuCscNnz.as_str().contains("csc"));
+    assert!(!AccelRoute::CpuCscNnz.is_gpu());
     // The fused device-resident pipeline route string is a wire contract:
     // the accel_pipeline residency benchmark's `pipeline_route_gpu_correct`
     // gate (V3 task 2.7) matches on exactly this value.

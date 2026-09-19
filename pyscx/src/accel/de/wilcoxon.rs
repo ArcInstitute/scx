@@ -370,6 +370,35 @@ fn compute_group_nonzero_counts(
     Ok(counts)
 }
 
+/// The CPU CSC route stamp for `rank_genes_groups`.
+///
+/// `SCX_ACCEL_WILCOXON_NNZ=1` swaps in a structurally different kernel, but the
+/// stamp used to read `cpu_csc` either way, so a benchmark timing the nnz path
+/// could not tell from `uns["scx_accel"]` which kernel it had measured
+/// (review §7.17). The kernel choice comes from
+/// `scx_accel::csc_wilcoxon_uses_nnz_kernel`, the same predicate
+/// `wilcoxon_rank_sum_streaming_csc` branches on — not a second copy of the
+/// rule — so the two cannot disagree. Both CSC call sites below go through
+/// here for the same reason.
+fn csc_exec_info(
+    device: &str,
+    reference: Option<usize>,
+    rankby_abs: bool,
+    chunk_size: usize,
+) -> scx_accel::route::AccelExecutionInfo {
+    let mut info = crate::accel::route::cpu_exec_info(
+        device,
+        scx_accel::InputLayout::BackedCsc,
+        false, // no GPU CSC kernel
+        true,
+        Some(chunk_size),
+    );
+    if scx_accel::csc_wilcoxon_uses_nnz_kernel(reference, rankby_abs) {
+        info.route = scx_accel::AccelRoute::CpuCscNnz;
+    }
+    info
+}
+
 /// The kernel dispatch: pick the CPU / GPU, CSC-direct / CSR / in-memory arm
 /// for `x` and run it. Knows nothing about `groups=` or `pts`.
 #[allow(clippy::too_many_arguments)]
@@ -445,13 +474,7 @@ fn dispatch_rank_genes_kernels(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info = crate::accel::route::cpu_exec_info(
-                        device,
-                        scx_accel::InputLayout::BackedCsc,
-                        false, // no GPU CSC kernel
-                        true,
-                        Some(chunk_size),
-                    );
+                    r.exec_info = csc_exec_info(device, ref_idx, rankby_abs, chunk_size);
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
@@ -481,13 +504,7 @@ fn dispatch_rank_genes_kernels(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info = crate::accel::route::cpu_exec_info(
-                        device,
-                        scx_accel::InputLayout::BackedCsc,
-                        false, // no GPU CSC kernel
-                        true,
-                        Some(chunk_size),
-                    );
+                    r.exec_info = csc_exec_info(device, ref_idx, rankby_abs, chunk_size);
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;

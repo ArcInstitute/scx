@@ -18,6 +18,15 @@ use super::types::{DispersionTrend, NbGlmOptions};
 /// Minimum empirical-Bayes prior variance on `log(alpha)` (DESeq2 uses 0.25).
 const MIN_PRIOR_VAR: f64 = 0.25;
 
+/// Genes with `alpha_MLE < ABOVE_MIN_DISP_FACTOR * min_disp` are excluded from
+/// the log-residual MAD.
+///
+/// pydeseq2's `fit_dispersion_prior` uses `genewise_dispersions >= 100 *
+/// min_disp` — "to reproduce DESeq2's behaviour", in its own comment. Checked
+/// against pydeseq2 0.5.4, which is the reference `pydeseq2_reference_tests`
+/// is generated from.
+const ABOVE_MIN_DISP_FACTOR: f64 = 100.0;
+
 /// Log-normal shrinkage prior for one gene's dispersion (spec §7.6).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DispPrior {
@@ -442,40 +451,226 @@ pub(crate) fn fit_dispersion_trend(
     last.map(|(a0, a1)| DispersionTrend { a0, a1 })
 }
 
+/// `norm.ppf(0.75)` to full f64 precision.
+///
+/// pydeseq2's `mean_absolute_deviation` divides the median absolute deviation by
+/// `scipy.stats.norm.ppf(0.75)`; the familiar `1.4826` is its reciprocal rounded
+/// to five figures. Dividing by the exact value costs nothing and removes a
+/// 1.5e-6 relative offset from a quantity this module now uses as a *threshold*,
+/// not just as a prior width.
+const NORM_PPF_075: f64 = 0.674_489_750_196_081_7;
+
+/// Median of an **already-sorted** slice, averaging the two middle elements at
+/// even length.
+///
+/// That averaging is the whole point. `values[len / 2]` — the upper median — is
+/// what this module used at both levels of the MAD, and it is not what
+/// `numpy.median` does, which is what pydeseq2's `mean_absolute_deviation` calls.
+/// The two agree at odd length and diverge by up to a factor of two at even
+/// length: on residuals `[0.3304, 0.3456, 0.8216, 5.6631]` the upper-median rule
+/// gives a scaled MAD of 0.7283 and the averaging rule 0.3641, so the
+/// `2·√(squared_logres)` outlier threshold lands at 1.457 vs 0.728 and the
+/// residual at 0.8216 is classified differently. Shrinkage would barely notice
+/// a prior width that is off by that much; a *classification boundary* does.
+///
+/// Returns 0.0 on an empty slice; callers guard for that separately.
+pub(crate) fn median_of_sorted(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        // Midpoint form rather than `(a + b) / 2.0`: it cannot overflow and it
+        // matches numpy's own mean-of-two for the magnitudes seen here.
+        values[n / 2 - 1] + (values[n / 2] - values[n / 2 - 1]) / 2.0
+    }
+}
+
+/// The two numbers the log-residual MAD pass produces.
+///
+/// They are returned together because they must come from **one** pass: the MAP
+/// shrinkage prior uses `prior_var` and the dispersion-outlier gate uses
+/// `squared_logres`, and a gate computed from a second, differently-filtered MAD
+/// would not be the gate DESeq2 specifies.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DispersionPriorFit {
+    /// Empirical-Bayes prior variance of `log(alpha)`, after subtracting the
+    /// expected sampling variance and applying the [`MIN_PRIOR_VAR`] floor.
+    /// pydeseq2's `uns["prior_disp_var"]`.
+    pub prior_var: f64,
+    /// The squared scaled MAD of the log-residuals *before* that subtraction and
+    /// floor — pydeseq2's `uns["_squared_logres"]`, which is what the outlier
+    /// gate takes its square root of.
+    pub squared_logres: f64,
+}
+
+/// Genes whose gene-wise dispersion MLE is far enough above the trend that
+/// DESeq2 declines to shrink it (`estimateDispersionsMAP`'s `dispOutlier`).
+///
+/// The rule, verbatim from pydeseq2's `fit_MAP_dispersions`:
+///
+/// ```text
+/// outlier = log(alpha_MLE) > log(alpha_trend) + outlier_sd * sqrt(_squared_logres)
+/// ```
+///
+/// with `outlier_sd = 2`. A gene it flags keeps its MLE dispersion instead of the
+/// shrunken one. Without the carve-out a genuinely over-dispersed gene is pulled
+/// toward the trend, its standard error is understated and its Wald statistic
+/// inflated — a false-positive mechanism in exactly the low-replicate regime the
+/// shrinkage exists to serve (review §7.15).
+///
+/// Note the threshold uses `squared_logres`, **not** `prior_var`: the latter has
+/// already had `trigamma((m−p)/2)` subtracted and been floored at 0.25, and is a
+/// different quantity.
+pub(crate) fn dispersion_outlier_mask(
+    log_targets: &[f64],
+    alpha_mle: &[f64],
+    valid: &[bool],
+    squared_logres: f64,
+    outlier_sd: f64,
+) -> Vec<bool> {
+    debug_assert!(
+        outlier_sd.is_finite() && outlier_sd >= 0.0,
+        "disp_outlier_sd must be validated before dispatch; got {outlier_sd}"
+    );
+    let threshold = outlier_sd * squared_logres.sqrt();
+    (0..alpha_mle.len())
+        .map(|g| {
+            valid[g]
+                && alpha_mle[g].is_finite()
+                && alpha_mle[g] > 0.0
+                && alpha_mle[g].ln() > log_targets[g] + threshold
+        })
+        .collect()
+}
+
+/// The per-gene shrinkage target, in log space.
+///
+/// The fitted trend where there is one; otherwise a flat global median of the
+/// valid MLEs. Both arms clamp at `min_disp` before the `ln`.
+///
+/// Extracted because it was **copied** into `nb_glm/mod.rs` and `nb_glm/gpu.rs`,
+/// and the copies drifted: the MAD was moved onto numpy's averaging median for
+/// pydeseq2 parity and both fallbacks kept the old `values[len / 2]`, so a run
+/// with `fit_dispersion_trend = false` shrank toward a different centre than the
+/// prior width was calibrated against. Default-on trend fitting hid it, and no
+/// test could reach it, because the computation was inline in two places rather
+/// than being a function. One definition now. Flagged by
+/// Cursor Agent - Grok 4.6 High and Antigravity - Gemini 3.8 Flash.
+///
+/// The median is taken on the alpha scale, as it always was: for an odd count
+/// that is identical to a median of the logs, and for an even count they differ.
+/// Only *how* it is summarised changed, not which quantity.
+pub(crate) fn shrinkage_log_targets(
+    trend: Option<&DispersionTrend>,
+    base_means: &[f64],
+    alpha_mle: &[f64],
+    valid: &[bool],
+    options: &NbGlmOptions,
+) -> Vec<f64> {
+    let n_genes = alpha_mle.len();
+    match trend {
+        Some(t) => base_means
+            .iter()
+            .map(|&mu| t.eval(mu).max(options.min_disp).ln())
+            .collect(),
+        None => {
+            let mut valid_alphas: Vec<f64> = (0..n_genes)
+                .filter(|&g| valid[g] && alpha_mle[g] > 0.0)
+                .map(|g| alpha_mle[g])
+                .collect();
+            let median = if valid_alphas.is_empty() {
+                options.min_disp
+            } else {
+                valid_alphas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                median_of_sorted(&valid_alphas)
+            };
+            vec![median.max(options.min_disp).ln(); n_genes]
+        }
+    }
+}
+
 /// Robust empirical-Bayes prior variance of `log(alpha)` about a per-gene target
 /// (trend value or global median), via the MAD of log-residuals (spec §7.6).
 ///
-/// Mirrors DESeq2's `estimateDispersionsPriorVar`: from the squared scaled MAD of
-/// the log-residuals it subtracts `trigamma((m−p)/2)`, the expected sampling
-/// variance of a per-gene log-dispersion MLE, so the prior reflects only the true
-/// between-gene dispersion scatter rather than estimation noise. Floored at
-/// [`MIN_PRIOR_VAR`].
+/// Mirrors DESeq2's `estimateDispersionsPriorVar` / pydeseq2's
+/// `fit_dispersion_prior`, including its median convention — see
+/// [`median_of_sorted`], which is load-bearing for the outlier threshold rather
+/// than merely tidy. From the squared scaled MAD of the log-residuals it
+/// subtracts `trigamma((m−p)/2)`, the expected sampling variance of a per-gene
+/// log-dispersion MLE, so the prior reflects only the true between-gene
+/// dispersion scatter rather than estimation noise. Floored at [`MIN_PRIOR_VAR`].
+///
+/// Residuals are taken over genes whose MLE is above [`ABOVE_MIN_DISP_FACTOR`]
+/// × `min_disp`, matching pydeseq2's `above_min_disp` filter. Genes pinned at the
+/// lower clamp sit ~10–20 log units below any trend and would inflate the MAD
+/// enough to weaken the shrinkage and, worse, to push the outlier threshold in
+/// [`dispersion_outlier_mask`] out of reach — the gate would then never fire.
 pub(crate) fn estimate_prior_var(
     log_targets: &[f64],
     alpha_mle: &[f64],
     valid: &[bool],
     n_samples: usize,
     n_features: usize,
-) -> f64 {
+    min_disp: f64,
+) -> DispersionPriorFit {
+    let floor = ABOVE_MIN_DISP_FACTOR * min_disp;
     let mut resid: Vec<f64> = (0..alpha_mle.len())
-        .filter(|&g| valid[g] && alpha_mle[g].is_finite() && alpha_mle[g] > 0.0)
+        // `> 0.0` as well as `>= floor`, not instead of it. The floor is
+        // pydeseq2's `above_min_disp` and is derived from a *public, unvalidated*
+        // option: `min_disp = 0.0` makes it 0, at which point `0.0 >= 0.0` admits
+        // a zero dispersion and `ln(0)` is `-inf`. The sort below treats
+        // incomparable values as equal, so that contaminates the median and the
+        // MAD silently rather than failing. This predicate was in the pre-0.20
+        // code and its removal was a regression — found by codex - gpt-5.6-sol.
+        .filter(|&g| {
+            valid[g] && alpha_mle[g].is_finite() && alpha_mle[g] > 0.0 && alpha_mle[g] >= floor
+        })
         .map(|g| alpha_mle[g].ln() - log_targets[g])
+        // A non-finite residual survives the sort — `partial_cmp` returns `None`
+        // and the comparator maps that to `Equal` — and then silently corrupts
+        // the median. `log_targets` comes from `trend.eval(mu).max(min_disp).ln()`,
+        // so a caller passing `min_disp = 0` with a zero trend value puts `-inf`
+        // there and the subtraction yields `NaN`. Drop them rather than sort
+        // them. Found by codex - gpt-5.6-sol / Antigravity - Gemini 3.8 Flash.
+        .filter(|r| r.is_finite())
         .collect();
-    if resid.len() < 3 {
-        return MIN_PRIOR_VAR;
+    // Only the *empty* pool short-circuits, and it returns `squared_logres: 0.0`
+    // rather than the prior floor.
+    //
+    // This used to bail at `len < 3` and set **both** fields to `MIN_PRIOR_VAR`.
+    // They are not interchangeable: `prior_var` is floored at 0.25 by design,
+    // while `squared_logres` is the raw scaled-MAD² that the outlier threshold
+    // takes the square root of. Substituting 0.25 turns a threshold pydeseq2
+    // computes as `2·√0 = 0` into `2·√0.25 = 1`, so a gene pydeseq2 exempts
+    // from shrinkage gets shrunk — reopening the very false-positive mechanism
+    // the carve-out closes. pydeseq2 applies `mean_absolute_deviation` to one or
+    // two residuals like any other pool, and this now does too; the pool can be
+    // small after gene projection or after `above_min_disp`. Found by
+    // codex - gpt-5.6-sol.
+    if resid.is_empty() {
+        return DispersionPriorFit {
+            prior_var: MIN_PRIOR_VAR,
+            squared_logres: 0.0,
+        };
     }
     resid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let med = resid[resid.len() / 2];
+    let med = median_of_sorted(&resid);
     let mut abs_dev: Vec<f64> = resid.iter().map(|r| (r - med).abs()).collect();
     abs_dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mad = abs_dev[abs_dev.len() / 2];
-    let sigma = 1.4826 * mad;
+    let sigma = median_of_sorted(&abs_dev) / NORM_PPF_075;
+    let squared_logres = sigma * sigma;
     let expected_sampling_var = if n_samples > n_features {
         trigamma((n_samples - n_features) as f64 / 2.0)
     } else {
         0.0
     };
-    (sigma * sigma - expected_sampling_var).max(MIN_PRIOR_VAR)
+    DispersionPriorFit {
+        prior_var: (squared_logres - expected_sampling_var).max(MIN_PRIOR_VAR),
+        squared_logres,
+    }
 }
 
 #[cfg(test)]

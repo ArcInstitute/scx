@@ -32,4 +32,4 @@ pub use mean_var::{streaming_clip_square_sum_csc, streaming_mean_var_csc};
 pub use mean_var::{streaming_clip_square_sum_csc_with_device, streaming_mean_var_csc_with_device};
 pub use pdex::pdex_ref_streaming_csc;
 pub use pseudobulk::pseudobulk_aggregate_csc;
-pub use wilcoxon::wilcoxon_rank_sum_streaming_csc;
+pub use wilcoxon::{csc_wilcoxon_uses_nnz_kernel, wilcoxon_rank_sum_streaming_csc};

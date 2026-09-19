@@ -39,8 +39,19 @@ pub enum AccelRoute {
     CpuDense,
     /// CPU, CSR (row-major) input.
     CpuCsr,
-    /// CPU, CSC (column-major / gene-major) input.
+    /// CPU, CSC (column-major / gene-major) input, densify + dense per-gene
+    /// sort — the default CSC kernel.
     CpuCsc,
+    /// CPU, CSC input, **exact sparse-nnz** Wilcoxon kernel
+    /// (`SCX_ACCEL_WILCOXON_NNZ=1`, 1-vs-rest only).
+    ///
+    /// A structurally different kernel from [`CpuCsc`](AccelRoute::CpuCsc): it
+    /// ranks each gene's nonzeros plus an analytic implicit-zero tie block
+    /// instead of sorting an `n_obs`-length dense column. Numerically
+    /// equivalent, so it needs its own id not for correctness but so a
+    /// benchmark can tell which kernel it timed — both used to report
+    /// `cpu_csc` (review §7.17).
+    CpuCscNnz,
     /// CPU, native pseudobulk negative-binomial GLM (IRLS + Cox–Reid dispersion).
     /// A first-class native CPU route — never a rapids fallback (no `NoRapids`).
     CpuNbGlm,
@@ -83,6 +94,7 @@ impl AccelRoute {
             AccelRoute::CpuDense => "cpu_dense",
             AccelRoute::CpuCsr => "cpu_csr",
             AccelRoute::CpuCsc => "cpu_csc",
+            AccelRoute::CpuCscNnz => "cpu_csc_nnz",
             AccelRoute::CpuNbGlm => "cpu_nb_glm",
             AccelRoute::GpuNbGlmCsr => "gpu_nb_glm_csr",
             AccelRoute::GpuNbGlmCsc => "gpu_nb_glm_csc",

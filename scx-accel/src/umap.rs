@@ -144,7 +144,10 @@ pub fn compute_umap(
         }
         coords.to_vec()
     } else {
-        // Try spectral initialization, fall back to random
+        // Try spectral initialization, fall back to random. The fallback used
+        // to be silent, so a graph on which the power iteration never converged
+        // — or any input with fewer than 3 points — produced a random layout
+        // with nothing in the output to say so.
         spectral_init(
             conn_indptr,
             conn_indices,
@@ -153,7 +156,14 @@ pub fn compute_umap(
             n_components,
             seed,
         )
-        .unwrap_or_else(|_| random_init(n_obs, n_components, seed))
+        .unwrap_or_else(|e| {
+            log::warn!(
+                "UMAP spectral initialization failed ({e}); falling back to \
+                 random init. The layout is still valid but its global \
+                 structure is not seeded by the graph's spectrum."
+            );
+            random_init(n_obs, n_components, seed)
+        })
     };
 
     // SGD optimization
@@ -343,12 +353,28 @@ pub(crate) fn spectral_init(
         let mut converged = false;
 
         for _iter in 0..max_iters {
-            // Multiply by normalized adjacency: v_new = D^{-1/2} A D^{-1/2} v
+            // Multiply by the SHIFTED normalized adjacency:
+            //     v_new = (I + D^{-1/2} A D^{-1/2}) v
+            //
+            // Power iteration converges to the eigenvalue of largest
+            // *magnitude*. The spectrum of `M = D^{-1/2} A D^{-1/2}` is
+            // `[-1, 1]`, so after deflating the trivial `√D` mode at `λ = 1`
+            // the largest-magnitude survivor on a near-bipartite kNN graph is
+            // `λ ≈ -1`, not the Fiedler direction at `λ₂ ≲ 1` (review §7.11).
+            // The iteration would then return the bipartite mode and the
+            // initialization would be no better than random.
+            //
+            // `I + M` has spectrum `[0, 2]`, so largest-magnitude ≡ largest-λ
+            // and the deflated maximum is exactly the Fiedler direction — the
+            // smallest non-trivial eigenvector of the normalized Laplacian
+            // `L = I - M`, which is what umap-learn's `spectral_layout` asks
+            // scipy's `eigsh` for. The shift changes only which eigenvector is
+            // selected, never the eigenvectors themselves.
             let mut v_new = vec![0.0_f64; n_obs];
             for i in 0..n_obs {
                 let start = indptr[i] as usize;
                 let end = indptr[i + 1] as usize;
-                let mut sum = 0.0_f64;
+                let mut sum = v[i];
                 for idx in start..end {
                     let j = indices[idx] as usize;
                     let w = data[idx];
@@ -412,23 +438,32 @@ pub(crate) fn spectral_init(
         eigenvectors.push(v);
     }
 
-    // Assemble embedding (scale eigenvectors for reasonable spread)
+    // Assemble the embedding, then expand it to umap-learn's spread.
+    //
+    // umap-learn's `simplicial_set_embedding` does
+    //     expansion = 10.0 / |initialisation|.max()
+    //     embedding = initialisation * expansion + N(0, 1e-4)
+    // i.e. **one global** max-abs expansion over the whole matrix, giving a span
+    // of ±10 with the noise four orders below it.
+    //
+    // This used to be `1e-4 / std_dev * 10.0` **per component**, landing at a
+    // std of ~1e-3 — about 10⁴ too small (review §7.11). At that scale the
+    // 1e-4 noise added below was ~10 % of the signal, and the whole init sat far
+    // below the SGD's `clip_val = 4.0`, so the layout started from what was
+    // effectively a point cloud at the origin. A per-component rescale also
+    // destroys the relative scale *between* components, which carries the
+    // eigenvalue ordering; the global factor preserves it.
     let mut embedding = vec![0.0_f64; n_obs * n_components];
     for (comp, evec) in eigenvectors.iter().enumerate() {
-        // Scale to have std ≈ 1e-4 * initial_alpha (matching umap-learn's scaling)
-        let std_dev: f64 = {
-            let mean: f64 = evec.iter().sum::<f64>() / n_obs as f64;
-            let var: f64 =
-                evec.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n_obs as f64;
-            var.sqrt()
-        };
-        let scale = if std_dev > 1e-10 {
-            1e-4 / std_dev * 10.0 // small initial spread
-        } else {
-            1.0
-        };
         for i in 0..n_obs {
-            embedding[i * n_components + comp] = evec[i] * scale;
+            embedding[i * n_components + comp] = evec[i];
+        }
+    }
+    let max_abs = embedding.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    if max_abs > 1e-10 {
+        let expansion = 10.0 / max_abs;
+        for v in &mut embedding {
+            *v *= expansion;
         }
     }
 
@@ -484,6 +519,211 @@ mod tests {
         }
 
         (indptr, indices, data, n)
+    }
+
+    // ── Review §7.11 — spectral init scale and eigenvector selection ─────
+
+    /// A symmetric weighted CSR from an undirected edge list.
+    fn sym_csr(edges: &[(usize, usize, f64)], n: usize) -> (Vec<i64>, Vec<i32>, Vec<f64>) {
+        let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for &(u, v, w) in edges {
+            adj[u].push((v, w));
+            adj[v].push((u, w));
+        }
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for row in adj.iter_mut() {
+            row.sort_by_key(|&(j, _)| j);
+            for &(j, w) in row.iter() {
+                indices.push(j as i32);
+                data.push(w);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        (indptr, indices, data)
+    }
+
+    /// A **bipartite-leaning** two-community graph: a path/ladder whose
+    /// adjacency has a strong `λ ≈ -1` mode alongside the Fiedler mode.
+    ///
+    /// Two 12-node parts, dense *across* the parts and sparse *within* them, so
+    /// `D^{-1/2} A D^{-1/2}` has a large-magnitude **negative** eigenvalue. That
+    /// is the mode an unshifted power iteration converges to.
+    fn near_bipartite_graph() -> (Vec<i64>, Vec<i32>, Vec<f64>, usize) {
+        const HALF: usize = 12;
+        let n = 2 * HALF;
+        let mut edges = Vec::new();
+        for i in 0..HALF {
+            for j in 0..HALF {
+                // Dense across the parts — the bipartite backbone.
+                edges.push((i, HALF + j, 1.0));
+            }
+        }
+        // A whisper of within-part weight so the graph is connected but the
+        // negative mode still dominates in magnitude.
+        for i in 0..HALF - 1 {
+            edges.push((i, i + 1, 0.01));
+            edges.push((HALF + i, HALF + i + 1, 0.01));
+        }
+        let (indptr, indices, data) = sym_csr(&edges, n);
+        (indptr, indices, data, n)
+    }
+
+    /// The signed indicator of the two parts, normalized — the `λ ≈ -1`
+    /// eigenvector of `D^{-1/2} A D^{-1/2}` on a bipartite graph.
+    fn bipartite_mode(n: usize) -> Vec<f64> {
+        let half = n / 2;
+        let mut v: Vec<f64> = (0..n).map(|i| if i < half { 1.0 } else { -1.0 }).collect();
+        let norm = (n as f64).sqrt();
+        for x in &mut v {
+            *x /= norm;
+        }
+        v
+    }
+
+    fn abs_cosine(a: &[f64], b: &[f64]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if na < 1e-12 || nb < 1e-12 {
+            return 0.0;
+        }
+        (dot / (na * nb)).abs()
+    }
+
+    /// Pull component 0 out of the returned row-major embedding.
+    fn component(embedding: &[f64], n_obs: usize, n_components: usize, comp: usize) -> Vec<f64> {
+        (0..n_obs)
+            .map(|i| embedding[i * n_components + comp])
+            .collect()
+    }
+
+    /// The defect: an unshifted power iteration on `D^{-1/2} A D^{-1/2}`
+    /// converges to the largest-|λ| eigenvector, which on this graph is the
+    /// bipartite `λ ≈ -1` mode rather than the Fiedler direction.
+    ///
+    /// Premise assertion for the test below — without it, "the fix returns
+    /// something that is not the bipartite mode" could be true of any graph.
+    #[test]
+    fn the_unshifted_iteration_converges_to_the_bipartite_mode() {
+        let (indptr, indices, data, n) = near_bipartite_graph();
+        // Reproduce the pre-fix operator: no `+ v[i]`.
+        let degree: Vec<f64> = (0..n)
+            .map(|i| {
+                data[indptr[i] as usize..indptr[i + 1] as usize]
+                    .iter()
+                    .sum()
+            })
+            .collect();
+        let d_inv_sqrt: Vec<f64> = degree
+            .iter()
+            .map(|&d| if d > 1e-10 { 1.0 / d.sqrt() } else { 0.0 })
+            .collect();
+        let top: Vec<f64> = {
+            let mut t: Vec<f64> = degree.iter().map(|&d| d.sqrt()).collect();
+            let norm: f64 = t.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for x in &mut t {
+                *x /= norm;
+            }
+            t
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let normal = Normal::new(0.0_f64, 1.0).unwrap();
+        let mut v: Vec<f64> = (0..n).map(|_| rng.sample(normal)).collect();
+        for _ in 0..600 {
+            let mut vn = vec![0.0_f64; n];
+            for i in 0..n {
+                let mut s = 0.0;
+                for idx in indptr[i] as usize..indptr[i + 1] as usize {
+                    let j = indices[idx] as usize;
+                    s += data[idx] * d_inv_sqrt[i] * d_inv_sqrt[j] * v[j];
+                }
+                vn[i] = s;
+            }
+            let dt: f64 = vn.iter().zip(&top).map(|(a, b)| a * b).sum();
+            for (x, &t) in vn.iter_mut().zip(&top) {
+                *x -= dt * t;
+            }
+            let nrm: f64 = vn.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for x in &mut vn {
+                *x /= nrm;
+            }
+            v = vn;
+        }
+        let cos = abs_cosine(&v, &bipartite_mode(n));
+        assert!(
+            cos > 0.99,
+            "premise: the unshifted iteration should land on the bipartite mode, |cos| = {cos}"
+        );
+    }
+
+    #[test]
+    fn spectral_init_avoids_the_bipartite_mode() {
+        let (indptr, indices, data, n) = near_bipartite_graph();
+        let emb = spectral_init(&indptr, &indices, &data, n, 2, 7).expect("spectral init");
+        let c0 = component(&emb, n, 2, 0);
+        let cos = abs_cosine(&c0, &bipartite_mode(n));
+        assert!(
+            cos < 0.5,
+            "the shifted iteration must not return the λ ≈ -1 bipartite mode, |cos| = {cos}"
+        );
+    }
+
+    /// umap-learn expands the initialization to a ±10 span before adding
+    /// `N(0, 1e-4)` noise. The old per-component std rescale landed at ~1e-3 —
+    /// the same order as the noise.
+    #[test]
+    fn spectral_init_spans_plus_minus_ten() {
+        let (indptr, indices, data, n) = test_graph();
+        let emb = spectral_init(&indptr, &indices, &data, n, 2, 42).expect("spectral init");
+        let max_abs = emb.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            (max_abs - 10.0).abs() < 0.01,
+            "max |coordinate| should be ≈10 (umap-learn's expansion), got {max_abs}"
+        );
+        // And the tie-breaking noise must stay four orders below the signal.
+        assert!(
+            max_abs > 1e3 * 1e-4,
+            "noise is no longer negligible against the signal"
+        );
+    }
+
+    /// The fallback path gets the same span: fixing only the spectral arm would
+    /// leave every graph on which spectral fails at ~1e-3.
+    #[test]
+    fn random_init_spans_plus_minus_ten() {
+        let init = random_init(500, 2, 42);
+        let max_abs = init.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            (5.0..=10.0).contains(&max_abs),
+            "random init should fill roughly [-10, 10], got max |coord| {max_abs}"
+        );
+        let mean: f64 = init.iter().sum::<f64>() / init.len() as f64;
+        assert!(
+            mean.abs() < 0.5,
+            "random init should be centred, mean {mean}"
+        );
+    }
+
+    /// `compute_umap` falls back to random init when the spectral path fails.
+    /// The fallback is legitimate; taking it *silently* was not. Asserting on
+    /// the returned layout rather than on the log line, because this crate has
+    /// no log sink in tests — what is pinned here is that the fallback is
+    /// reached and produces a usable embedding, not the warning's text.
+    #[test]
+    fn umap_falls_back_to_random_init_on_a_tiny_graph() {
+        // `spectral_init` refuses n_obs < 3.
+        let n = 2;
+        let indptr = vec![0i64, 1, 2];
+        let indices = vec![1i32, 0];
+        let data = vec![1.0_f64, 1.0];
+        let emb = compute_umap(
+            &indptr, &indices, &data, n, 2, 5, 0.1, 1.0, 5, 1.0, 42, None,
+        )
+        .expect("umap on a 2-point graph");
+        assert_eq!(emb.embeddings.len(), n * 2);
+        assert!(emb.embeddings.iter().all(|v| v.is_finite()));
     }
 
     #[test]

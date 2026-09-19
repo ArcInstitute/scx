@@ -629,7 +629,11 @@ fn scx_umap_graph_impl(
 /// @param max_iterations Maximum outer-loop iterations.
 ///
 /// @return list(`membership` = 1-based integer cluster label per cell,
-///   `modularity`, `n_communities`).
+///   `modularity` (normalized generalized RB modularity `quality / 2m`,
+///   comparable across graphs; at `resolution = 1` it is Newman modularity and
+///   lies in [-0.5, 1], but at other resolutions the γ term does not cancel and
+///   it is not so bounded), `quality` (the raw un-normalized RB objective,
+///   comparable only between partitions of the same graph), `n_communities`).
 /// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
 fn scx_leiden_graph(
@@ -678,6 +682,7 @@ fn scx_leiden_graph_impl(
     // 0-based contiguous labels → 1-based for R.
     let membership: Vec<i32> = result.membership.iter().map(|&m| m as i32 + 1).collect();
     let modularity = result.modularity;
+    let quality = result.quality;
     let n_communities = result.n_communities as i32;
     let scx_accel = exec_info_to_rlist(&simple_exec_info(
         DeviceRequest::Cpu,
@@ -688,6 +693,7 @@ fn scx_leiden_graph_impl(
     R!("list(
         membership = {{membership}},
         modularity = {{modularity}},
+        quality = {{quality}},
         n_communities = {{n_communities}},
         scx_accel = {{scx_accel}}
     )")

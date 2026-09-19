@@ -41,6 +41,26 @@ pub struct NbGlmOptions {
     pub fit_dispersion_trend: bool,
     /// Apply empirical-Bayes dispersion shrinkage toward the trend.
     pub shrink_dispersion: bool,
+    /// Residual-SD multiplier for DESeq2's dispersion-**outlier** carve-out
+    /// (`estimateDispersionsMAP`'s `outlierSD`, default 2). A gene whose
+    /// `log(alpha_MLE)` exceeds `log(alpha_trend) + disp_outlier_sd *
+    /// sqrt(squared_logres)` keeps its MLE dispersion instead of the shrunken
+    /// one. Ignored unless shrinkage runs.
+    ///
+    /// `None` disables the carve-out, so every gene is shrunk. It is **not** an
+    /// escape hatch back to pre-0.20 numbers: 0.20 made two independent changes
+    /// to this pass, and this knob gates only the second.
+    ///
+    /// 1. The log-residual MAD now excludes genes below `100 * min_disp`
+    ///    (pydeseq2's `above_min_disp`). That runs **unconditionally** and moves
+    ///    `dispersion_prior_var`, hence every gene's shrunken dispersion, on any
+    ///    panel with a clamped tail.
+    /// 2. The carve-out, which moves only the genes it flags.
+    ///
+    /// So `None` means "shrink every gene *under the new prior*", not "reproduce
+    /// 0.19". Nothing in the crate reproduces 0.19 any more, deliberately — the
+    /// old prior was the divergence from DESeq2, not a supported mode.
+    pub disp_outlier_sd: Option<f64>,
 
     // --- Results-stage filtering (DESeq2 `results()` defaults; spec §19, v2) ---
     /// Apply Cook's-distance outlier filtering: genes whose max Cook's distance
@@ -95,6 +115,8 @@ impl Default for NbGlmOptions {
             disp_newton_iters: 25,
             fit_dispersion_trend: true,
             shrink_dispersion: true,
+            // DESeq2 estimateDispersionsMAP(outlierSD = 2).
+            disp_outlier_sd: Some(2.0),
 
             cooks_filtering: true,
             cooks_cutoff: None,
@@ -179,6 +201,10 @@ pub struct NbGlmDiagnostics {
     pub n_boundary_dispersion_low: usize,
     /// Genes whose dispersion hit the upper clamp.
     pub n_boundary_dispersion_high: usize,
+    /// Genes exempted from MAP shrinkage as dispersion outliers, keeping their
+    /// gene-wise MLE (DESeq2's `dispOutlier`). Zero when `disp_outlier_sd` is
+    /// `None` or shrinkage did not run.
+    pub n_dispersion_outliers: usize,
     /// Genes that did not converge within `max_outer_iters`.
     pub n_nonconverged: usize,
     /// Genes flagged as Cook's-distance outliers (`p_value`/`p_adj` → NaN).

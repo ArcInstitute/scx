@@ -30,10 +30,16 @@ use rayon::prelude::*;
 
 use crate::error::Result;
 use dispersion::{
-    estimate_prior_var, fit_dispersion, fit_dispersion_trend, moments_dispersion, DispPrior,
+    dispersion_outlier_mask, estimate_prior_var, fit_dispersion, fit_dispersion_trend,
+    moments_dispersion, shrinkage_log_targets, DispPrior,
 };
 use size_factors::median_ratio_size_factors;
-use validate::{validate_contrast, validate_inputs};
+use validate::{validate_contrast, validate_inputs, validate_options};
+
+/// Public alias for [`validate::validate_options`], so bindings can reject an
+/// out-of-domain option value at parse time and choose their own exception type
+/// without reclassifying every other error the fit can raise.
+pub use validate::validate_options as nb_glm_validate_options;
 
 /// Init floor for the intercept coefficient (`ln(max(base_mean, floor))`, §7.3).
 const MEAN_FLOOR: f64 = 1e-4;
@@ -93,6 +99,7 @@ pub fn pseudobulk_nb_glm(
 ) -> Result<NbGlmResult> {
     let start = std::time::Instant::now();
 
+    validate_options(&options)?;
     validate_inputs(
         counts_gene_major,
         n_genes,
@@ -220,6 +227,7 @@ pub fn pseudobulk_nb_glm(
     // --- Cross-gene dispersion trend + empirical-Bayes shrinkage (CoxReidShrunk). ---
     let mut dispersion_trend = None;
     let mut dispersion_prior_var = None;
+    let mut n_dispersion_outliers = 0usize;
     let final_states: Vec<GeneState> = if options.dispersion == DispersionMethod::CoxReidShrunk
         && options.shrink_dispersion
     {
@@ -228,36 +236,45 @@ pub fn pseudobulk_nb_glm(
         } else {
             None
         };
-        // Per-gene log target: trend value, else global median of valid MLEs.
-        let log_targets: Vec<f64> = match &trend {
-            Some(t) => base_means
-                .iter()
-                .map(|&mu| t.eval(mu).max(options.min_disp).ln())
-                .collect(),
-            None => {
-                let mut valid_alphas: Vec<f64> = (0..n_genes)
-                    .filter(|&g| valid[g] && alpha_mle[g] > 0.0)
-                    .map(|g| alpha_mle[g])
-                    .collect();
-                let median = if valid_alphas.is_empty() {
-                    options.min_disp
-                } else {
-                    valid_alphas
-                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    valid_alphas[valid_alphas.len() / 2]
-                };
-                vec![median.max(options.min_disp).ln(); n_genes]
-            }
-        };
-        let prior_var = estimate_prior_var(&log_targets, &alpha_mle, &valid, n_samples, n_features);
+        let log_targets =
+            shrinkage_log_targets(trend.as_ref(), &base_means, &alpha_mle, &valid, &options);
+        let prior = estimate_prior_var(
+            &log_targets,
+            &alpha_mle,
+            &valid,
+            n_samples,
+            n_features,
+            options.min_disp,
+        );
+        let prior_var = prior.prior_var;
         dispersion_trend = trend;
         dispersion_prior_var = Some(prior_var);
+
+        // DESeq2's dispersion-outlier carve-out: a gene whose MLE sits more than
+        // `disp_outlier_sd` residual SDs above the trend keeps that MLE rather
+        // than being shrunk toward it (review §7.15). Computed once, over all
+        // genes, from the same MAD pass that produced the prior.
+        let disp_outlier: Vec<bool> = match options.disp_outlier_sd {
+            Some(sd) => {
+                dispersion_outlier_mask(&log_targets, &alpha_mle, &valid, prior.squared_logres, sd)
+            }
+            None => vec![false; n_genes],
+        };
+        n_dispersion_outliers = disp_outlier.iter().filter(|&&o| o).count();
 
         let _shrink_timer = profile::start(profile::Phase::CpuShrinkPass);
         (0..n_genes)
             .into_par_iter()
             .map(|g| {
                 if mle[g].all_zero {
+                    return mle[g].clone();
+                }
+                // An exempted gene's MLE state already carries `beta`, `mu` and
+                // `fisher` fit at `mle[g].alpha` by the outer mean↔dispersion
+                // loop, so keeping the MLE dispersion means keeping this state
+                // whole — no refit, and SEs consistent with the dispersion
+                // actually reported.
+                if disp_outlier[g] {
                     return mle[g].clone();
                 }
                 let row = row_of(g);
@@ -319,6 +336,7 @@ pub fn pseudobulk_nb_glm(
         base_means,
         dispersion_trend,
         dispersion_prior_var,
+        n_dispersion_outliers,
         start,
     ))
 }
@@ -343,6 +361,7 @@ fn assemble_result(
     base_means: Vec<f64>,
     dispersion_trend: Option<DispersionTrend>,
     dispersion_prior_var: Option<f64>,
+    n_dispersion_outliers: usize,
     start: std::time::Instant,
 ) -> NbGlmResult {
     let row_of = |g: usize| &counts_gene_major[g * n_samples..(g + 1) * n_samples];
@@ -488,6 +507,7 @@ fn assemble_result(
         n_all_zero_genes,
         n_boundary_dispersion_low,
         n_boundary_dispersion_high,
+        n_dispersion_outliers,
         n_nonconverged,
         n_cooks_outliers,
         n_independent_filtered,

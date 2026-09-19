@@ -5,10 +5,16 @@
 //!
 //! `docs/pseudobulk_nb_glm.md` states it outright: *"The bar is ranking /
 //! effect-sign / significance parity, not numerical equality. If you need exact
-//! DESeq2 behaviour, use PyDESeq2."* SCX omits apeglm LFC shrinkage and handles
-//! dispersion outliers differently, both deliberately. So this file asserts
-//! ranking, sign and significance — and a deliberately loose gross-drift canary
-//! that is labelled as *not* a parity claim.
+//! DESeq2 behaviour, use PyDESeq2."* SCX omits apeglm LFC shrinkage,
+//! deliberately. So this file asserts ranking, sign and significance — and a
+//! deliberately loose gross-drift canary that is labelled as *not* a parity
+//! claim.
+//!
+//! Dispersion-outlier handling used to be listed here as a second deliberate
+//! divergence. It no longer is: since 0.20 SCX implements DESeq2's `dispOutlier`
+//! carve-out (review §7.15), and
+//! `no_gene_in_the_pydeseq2_fixture_is_a_dispersion_outlier` below pins SCX to
+//! pydeseq2's answer on this fixture.
 //!
 //! Asserting numerical equality here would pin behaviour the documentation
 //! promises not to have, and would go red on the next legitimate divergence
@@ -340,9 +346,9 @@ fn nb_glm_ranks_genes_the_way_pydeseq2_does() {
 ///
 /// The docs promise ranking / sign / significance and explicitly not numerical
 /// equality, so this bound is set two decimal orders above the observed
-/// max |Δlog2FC| of 0.0024 — loose enough that the divergences SCX documents
-/// (no apeglm shrinkage; different dispersion-outlier handling) stay inside it,
-/// tight enough that a fitter that had stopped fitting would not.
+/// max |Δlog2FC| of 0.0024 — loose enough that the divergence SCX documents
+/// (no apeglm shrinkage) stays inside it, tight enough that a fitter that had
+/// stopped fitting would not.
 ///
 /// It exists because the three tests above are all rank- and sign-based: a
 /// systematic scaling of every effect by, say, 1.5 preserves order, sign and
@@ -361,5 +367,35 @@ fn nb_glm_effects_have_not_drifted_grossly_from_pydeseq2() {
         "max |Δlog2FC| vs pydeseq2 is {worst:.4}, above the 0.1 gross-drift \
          bound (observed 0.0024 when pinned). This is not a parity failure by \
          itself — check whether the fitter changed or the reference did."
+    );
+}
+
+/// The dispersion-outlier carve-out (review §7.15) must not fire here.
+///
+/// Measured on pydeseq2 0.5.4 with this exact fixture: `_squared_logres`
+/// `0.5585319843747569`, so the gate's threshold is
+/// `2·√0.5585 = 1.4947` in log-dispersion space, and
+/// `dds.var["_outlier_genes"].sum()` is **0** — no gene's MLE is anywhere near
+/// that far above the trend.
+///
+/// This is the *non-over-firing* half of the carve-out's evidence. The firing
+/// half is `nb_glm_cpu.rs::dispersion_outlier_keeps_its_mle`, on a panel with an
+/// implanted outlier. A gate that flagged genes here would shrink nothing and
+/// silently turn `cox_reid_shrunk` back into `cox_reid_mle` on ordinary data.
+#[test]
+fn no_gene_in_the_pydeseq2_fixture_is_a_dispersion_outlier() {
+    let got = fit_checked();
+    assert_eq!(
+        got.diagnostics.n_dispersion_outliers, 0,
+        "pydeseq2 flags 0 of {NB_N_GENES} genes on this fixture; SCX flagged {}",
+        got.diagnostics.n_dispersion_outliers
+    );
+    // And shrinkage really did run, so the zero above is not vacuous.
+    let shrunk = (0..NB_N_GENES)
+        .filter(|&g| got.dispersion[g].to_bits() != got.dispersion_mle[g].to_bits())
+        .count();
+    assert!(
+        shrunk > NB_N_GENES / 2,
+        "premise: shrinkage should touch most genes, it touched {shrunk}"
     );
 }

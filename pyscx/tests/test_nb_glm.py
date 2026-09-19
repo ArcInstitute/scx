@@ -253,3 +253,44 @@ def test_nb_glm_cpu_gpu_agreement():
     rho_p = spearmanr(c_p[pfin], g_p[pfin])[0]
     assert rho_p >= 0.999, f"p-value Spearman {rho_p} < 0.999"
     assert np.allclose(c_p[pfin], g_p[pfin], rtol=5e-3, atol=5e-3)
+
+
+def test_nb_glm_rejects_out_of_domain_options_with_value_error():
+    """Out-of-domain numeric options raise ``ValueError``, not ``RuntimeError``.
+
+    ``NaN`` / ``inf`` ``disp_outlier_sd`` makes every comparison in the
+    dispersion-outlier test false, so the carve-out silently behaves as if it
+    were disabled while the caller asked for it to be on; a negative value moves
+    the threshold below the trend and exempts ordinary genes. A non-positive
+    ``min_disp`` is log-transformed into the shrinkage target and poisons it.
+    All were accepted before. ``ValueError`` because these are bad arguments,
+    matching the ``dispersion`` option's existing behaviour.
+
+    Found by codex - gpt-5.6-sol.
+    """
+    import numpy as np
+    import pytest
+
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(50, size=(8, 6)).astype(np.float64)
+    design = np.column_stack([np.ones(8), np.array([0, 0, 0, 0, 1, 1, 1, 1])]).astype(
+        np.float64
+    )
+
+    def fit(**opts):
+        return pyscx.accel.nb_glm(counts, design, options=opts, device="cpu")
+
+    for bad in (float("nan"), float("inf"), float("-inf"), -1.0):
+        with pytest.raises(ValueError, match="disp_outlier_sd"):
+            fit(disp_outlier_sd=bad)
+    for bad in (0.0, -1e-9, float("nan")):
+        with pytest.raises(ValueError, match="min_disp"):
+            fit(min_disp=bad)
+    with pytest.raises(ValueError, match="max_disp"):
+        fit(min_disp=1.0, max_disp=0.5)
+
+    # In-domain values still work, including the 0.0 boundary and None.
+    for ok in (0.0, 2.0, None):
+        fit(disp_outlier_sd=ok)

@@ -221,6 +221,7 @@ const NBGLM_OPTION_KEYS: &[&str] = &[
     "outer_tol",
     "fit_dispersion_trend",
     "shrink_dispersion",
+    "disp_outlier_sd",
     "cooks_filtering",
     "cooks_cutoff",
     "independent_filtering",
@@ -323,6 +324,25 @@ pub(super) fn nbglm_options_from_dict(
     if let Some(v) = d.get_item("shrink_dispersion")? {
         o.shrink_dispersion = v.extract()?;
     }
+    // `None` disables DESeq2's dispersion-outlier carve-out; a float sets the
+    // residual-SD multiplier (DESeq2's `outlierSD`, default 2).
+    if let Some(v) = d.get_item("disp_outlier_sd")? {
+        o.disp_outlier_sd = if v.is_none() {
+            None
+        } else {
+            Some(v.extract()?)
+        };
+    }
+    // Reject out-of-domain numerics **here**, at parse time, rather than mapping
+    // the core API's `AccelError::InvalidInput` to `ValueError` at dispatch.
+    // The latter is the obvious move and it silently reclassifies every *other*
+    // `InvalidInput` this entry point can raise — `too few samples` among them,
+    // which `test_nb_glm_too_few_samples_errors` pins as `RuntimeError`. A bad
+    // *option value* is a bad argument and gets `ValueError`, matching
+    // `DispersionMethod::parse` above; nothing else moves. `validate_options`
+    // still guards the Rust and GPU entry points independently.
+    // Found by codex - gpt-5.6-sol.
+    scx_accel::nb_glm_validate_options(&o).map_err(|e| PyValueError::new_err(e.to_string()))?;
     if let Some(v) = d.get_item("cooks_filtering")? {
         o.cooks_filtering = v.extract()?;
     }
@@ -845,7 +865,8 @@ pub(super) fn fit_targets_pandas_with_design<'py>(
 /// integer coefficient index, a weight vector, or `None` (the last coefficient,
 /// DESeq2 convention). `options` is an optional dict overriding `NbGlmOptions`
 /// fields (`dispersion`, `min_disp`, `max_disp`, `max_irls_iters`, `irls_tol`,
-/// `max_outer_iters`, `fit_dispersion_trend`, `shrink_dispersion`).
+/// `max_outer_iters`, `fit_dispersion_trend`, `shrink_dispersion`,
+/// `disp_outlier_sd`).
 ///
 /// Returns a pandas DataFrame with PyDESeq2-style columns: `gene, baseMean,
 /// log2FoldChange, lfcSE, stat, pvalue, padj, dispersion, converged, n_iter`

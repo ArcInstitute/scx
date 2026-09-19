@@ -31,12 +31,47 @@ use crate::error::{AccelError, Result};
 
 // ─── Public Types ─────────────────────────────────────────────────────
 
+/// Normalize an RB quality score onto the per-edge scale: `quality / 2m`.
+///
+/// The single definition of the relationship between [`LeidenResult::quality`]
+/// and [`LeidenResult::modularity`], so the production path and the tests that
+/// pin it against igraph cannot drift apart. `two_m == 0` (an edgeless graph)
+/// has no meaningful normalization and yields 0.0, matching
+/// [`RBPartition::quality`]'s own degenerate answer.
+fn rb_modularity(quality: f64, two_m: f64) -> f64 {
+    if two_m == 0.0 {
+        0.0
+    } else {
+        quality / two_m
+    }
+}
+
 /// Result of Leiden community detection.
 pub struct LeidenResult {
     /// Community label for each node (0-indexed, contiguous).
     pub membership: Vec<usize>,
-    /// Partition quality (RB modularity).
+    /// **Normalized** generalized RB modularity, `quality / 2m`.
+    ///
+    /// At `resolution = 1.0` this **is** Newman modularity — the quantity in
+    /// `[-0.5, 1]` that igraph / leidenalg / cuGraph report, and the one that is
+    /// comparable across graphs.
+    ///
+    /// At `resolution != 1.0` the γ term does not cancel, so this is the
+    /// *generalized* RB objective on a per-edge scale and **is not bounded by
+    /// `[-0.5, 1]`**: on Zachary's Karate Club it is `-0.996055` at γ = 20 and
+    /// `-2.490138` at γ = 50, where leidenalg's own `modularity` property
+    /// reports `-0.049803` for the same partitions. Normalizing is still the
+    /// right thing — it is what makes the number comparable with the cuGraph
+    /// backend, which writes into this same key — but do not read a γ ≠ 1 value
+    /// as Newman modularity.
     pub modularity: f64,
+    /// The raw, **un-normalized** RB quality
+    /// `Σ_c [2·w_in(c) − γ·k_c²/2m]` — leidenalg's internal
+    /// `RBConfigurationVertexPartition.quality()`. It scales with the graph's
+    /// total edge weight (~10⁶ on a 1M-edge graph), so it is comparable only
+    /// between partitions of the *same* graph. Retained because it is what the
+    /// optimizer's `diff_move` deltas sum to.
+    pub quality: f64,
     /// Number of communities found.
     pub n_communities: usize,
 }
@@ -1410,6 +1445,7 @@ pub fn leiden(
         return Ok(LeidenResult {
             membership: vec![],
             modularity: 0.0,
+            quality: 0.0,
             n_communities: 0,
         });
     }
@@ -1417,6 +1453,7 @@ pub fn leiden(
         return Ok(LeidenResult {
             membership: vec![0],
             modularity: 0.0,
+            quality: 0.0,
             n_communities: 1,
         });
     }
@@ -1474,12 +1511,18 @@ pub fn leiden(
     }
 
     let membership = partition.membership_vector();
-    let modularity = partition.quality();
+    // One `quality()` call, not two. It allocates the community-member structure
+    // and scans the whole adjacency, so deriving `modularity` from a second call
+    // would pay an extra O(V + E) pass on every CPU Leiden — including every
+    // resolution of a `clustering_agreement` sweep.
+    let quality = partition.quality();
+    let modularity = rb_modularity(quality, partition.two_m);
     let n_communities = partition.community_count();
 
     Ok(LeidenResult {
         membership,
         modularity,
+        quality,
         n_communities,
     })
 }
@@ -2108,6 +2151,231 @@ mod tests {
             q.abs() < 1e-10,
             "triangle in one community should have quality ~0.0, got {}",
             q
+        );
+    }
+
+    // ── Review §7.10 — reported modularity is normalized ──────────────
+
+    /// Zachary's Karate Club (igraph `Graph.Famous("Zachary")`): 34 nodes,
+    /// 78 unit-weight edges, so `two_m = 156`.
+    fn karate_club_csr() -> (Vec<i64>, Vec<i32>, Vec<f64>, usize) {
+        const EDGES: [(usize, usize); 78] = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (0, 5),
+            (0, 6),
+            (0, 7),
+            (0, 8),
+            (0, 10),
+            (0, 11),
+            (0, 12),
+            (0, 13),
+            (0, 17),
+            (0, 19),
+            (0, 21),
+            (0, 31),
+            (1, 2),
+            (1, 3),
+            (1, 7),
+            (1, 13),
+            (1, 17),
+            (1, 19),
+            (1, 21),
+            (1, 30),
+            (2, 3),
+            (2, 7),
+            (2, 27),
+            (2, 28),
+            (2, 32),
+            (2, 9),
+            (2, 8),
+            (2, 13),
+            (3, 7),
+            (3, 12),
+            (3, 13),
+            (4, 6),
+            (4, 10),
+            (5, 6),
+            (5, 10),
+            (5, 16),
+            (6, 16),
+            (8, 30),
+            (8, 32),
+            (8, 33),
+            (9, 33),
+            (13, 33),
+            (14, 32),
+            (14, 33),
+            (15, 32),
+            (15, 33),
+            (18, 32),
+            (18, 33),
+            (19, 33),
+            (20, 32),
+            (20, 33),
+            (22, 32),
+            (22, 33),
+            (23, 25),
+            (23, 27),
+            (23, 32),
+            (23, 33),
+            (23, 29),
+            (24, 25),
+            (24, 27),
+            (24, 31),
+            (25, 31),
+            (26, 29),
+            (26, 33),
+            (27, 33),
+            (28, 31),
+            (28, 33),
+            (29, 32),
+            (29, 33),
+            (30, 32),
+            (30, 33),
+            (31, 32),
+            (31, 33),
+            (32, 33),
+        ];
+        let n = 34;
+        let edges: Vec<(usize, usize, f64)> = EDGES.iter().map(|&(u, v)| (u, v, 1.0)).collect();
+        let (indptr, indices, data) = edges_to_csr(&edges, n);
+        (indptr, indices, data, n)
+    }
+
+    /// `2m` for the Karate Club: 78 unit-weight edges.
+    const KARATE_TWO_M: f64 = 156.0;
+
+    /// Zachary's observed factions — the canonical ground-truth 2-split.
+    const KARATE_FACTIONS: [usize; 34] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1,
+    ];
+
+    /// The direct oracle: `igraph.Graph.Famous("Zachary").modularity(factions)`
+    /// is `0.37146614069691`. Checked against igraph 1.0.0; leidenalg's own
+    /// `partition.modularity` equals `partition.quality() / (2 * ecount)` on the
+    /// same graph, which is the identity this normalization implements.
+    const KARATE_FACTION_MODULARITY: f64 = 0.371_466_140_696_91;
+
+    #[test]
+    fn modularity_matches_igraph_on_the_karate_factions() {
+        let (indptr, indices, data, n) = karate_club_csr();
+        let graph = LeidenGraph::from_csr(&indptr, &indices, &data, n);
+        let partition = RBPartition::new_with_membership(graph, &KARATE_FACTIONS, 1.0);
+        let m = rb_modularity(partition.quality(), partition.two_m);
+        assert!(
+            (m - KARATE_FACTION_MODULARITY).abs() < 1e-12,
+            "modularity {m} != igraph's {KARATE_FACTION_MODULARITY}"
+        );
+        // And the un-normalized value is exactly `2m` times it — the whole
+        // content of §7.10 is that the two were being confused.
+        assert!(
+            (partition.quality() - m * KARATE_TWO_M).abs() < 1e-9,
+            "quality {} != modularity {m} × two_m {KARATE_TWO_M}",
+            partition.quality()
+        );
+        assert!(
+            partition.quality() > 1.0,
+            "premise: the raw quality is out of modularity's range ({})",
+            partition.quality()
+        );
+    }
+
+    /// The `[-0.5, 1]` claim holds **at γ = 1**, which is where the reported
+    /// value is Newman modularity. `leiden_at_non_unit_resolution_is_not_newman_modularity`
+    /// pins what happens away from 1, so neither half of the contract can regress
+    /// silently into the other.
+    #[test]
+    fn leiden_reports_modularity_in_the_modularity_range_at_unit_resolution() {
+        let (indptr, indices, data, n) = karate_club_csr();
+        let result = leiden(&indptr, &indices, &data, n, 1.0, 42, 2, false).unwrap();
+
+        assert!(
+            (-0.5..=1.0).contains(&result.modularity),
+            "reported modularity {} is outside [-0.5, 1] — that is the raw RB \
+             quality, not modularity",
+            result.modularity
+        );
+        assert!(
+            result.modularity > 0.35,
+            "modularity {} is far below leidenalg's 0.41979 optimum",
+            result.modularity
+        );
+        assert!(
+            (result.quality - result.modularity * KARATE_TWO_M).abs() < 1e-9,
+            "quality {} != modularity {} × two_m {KARATE_TWO_M}",
+            result.quality,
+            result.modularity
+        );
+    }
+
+    /// Separate from the range check above on purpose: that one guards the
+    /// §7.10 normalization, this one guards the *search*.
+    ///
+    /// `leidenalg.find_partition(Zachary, RBConfigurationVertexPartition,
+    /// resolution_parameter=1.0, seed=42, n_iterations=-1)` reports
+    /// `quality() = 65.48717948717949`, `modularity = 0.41978961209730437`,
+    /// 4 communities (leidenalg 0.10.x / igraph 1.0.0). SCX reaches the same
+    /// partition, so the agreement is exact rather than approximate — measured,
+    /// not assumed. A change to the Leiden search reds this and leaves the
+    /// normalization test alone, which is the point of keeping them apart.
+    #[test]
+    fn leiden_reaches_leidenalgs_karate_optimum() {
+        const LEIDENALG_QUALITY: f64 = 65.487_179_487_179_49;
+        const LEIDENALG_MODULARITY: f64 = 0.419_789_612_097_304_37;
+        let (indptr, indices, data, n) = karate_club_csr();
+        let result = leiden(&indptr, &indices, &data, n, 1.0, 42, 2, false).unwrap();
+        assert!(
+            (result.quality - LEIDENALG_QUALITY).abs() < 1e-9,
+            "RB quality {} != leidenalg's {LEIDENALG_QUALITY}",
+            result.quality
+        );
+        assert!(
+            (result.modularity - LEIDENALG_MODULARITY).abs() < 1e-12,
+            "modularity {} != leidenalg's {LEIDENALG_MODULARITY}",
+            result.modularity
+        );
+        assert_eq!(result.n_communities, 4);
+    }
+
+    /// Away from γ = 1 the reported value is the **generalized** RB objective on
+    /// a per-edge scale, not Newman modularity, and it is not bounded by
+    /// `[-0.5, 1]`.
+    ///
+    /// Measured with leidenalg 0.11.0 / igraph 1.0.0 on this graph, over the same
+    /// partitions leidenalg itself finds:
+    ///
+    /// | γ | `quality / 2m` | `partition.modularity` (Newman) |
+    /// |---|---|---|
+    /// | 1  | `0.419790` | `0.419790` |
+    /// | 20 | `-0.996055` | `-0.049803` |
+    /// | 50 | `-2.490138` | `-0.049803` |
+    ///
+    /// Pinned here because the docs previously promised `[-0.5, 1]`
+    /// unconditionally. Asserting only that the value is out of range, not its
+    /// exact magnitude: SCX's search need not find leidenalg's partition at a
+    /// resolution that drives the graph to singletons, and pinning the magnitude
+    /// would make this a test of the search rather than of the scale.
+    #[test]
+    fn leiden_at_non_unit_resolution_is_not_newman_modularity() {
+        let (indptr, indices, data, n) = karate_club_csr();
+        let result = leiden(&indptr, &indices, &data, n, 50.0, 42, 2, false).unwrap();
+        assert!(
+            result.modularity < -0.5,
+            "at γ = 50 the generalized RB objective should fall below Newman's \
+             lower bound; got {} (n_communities {})",
+            result.modularity,
+            result.n_communities
+        );
+        // The identity itself still holds — it is only the *bound* that does not.
+        assert!(
+            (result.quality - result.modularity * KARATE_TWO_M).abs() < 1e-9,
+            "quality {} != modularity {} × two_m {KARATE_TWO_M}",
+            result.quality,
+            result.modularity
         );
     }
 

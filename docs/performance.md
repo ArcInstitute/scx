@@ -1652,11 +1652,13 @@ This is a compatibility change (DE previously defaulted to `"csr"`); pin
 kernel (opt-in `SCX_ACCEL_WILCOXON_NNZ=1`, 1-vs-rest) ranks only each gene's
 nonzeros plus an analytic implicit-zero tie-block — `O(nnz·log nnz)`/gene instead
 of an `O(n_obs·log n_obs)` dense sort — numerically equivalent to the dense kernel
-(property-tested to 1e-9).
+(property-tested to 1e-9). It records as its **own** route, `cpu_csc_nnz`; until
+0.20 both CSC kernels stamped `cpu_csc`, so a benchmark could not tell from
+`uns["scx_accel"]` which of the two it had timed (review §7.17).
 
 **Measured DE-route benchmark** (`rank_genes_groups`, 1-vs-rest, backed streaming;
 a CSC sidecar built with `scx build-csc`; median of 2 runs, CPU). Routes confirmed
-via `uns["scx_accel"]` (`cpu_csr` / `cpu_csc`):
+via `uns["scx_accel"]` (`cpu_csr` / `cpu_csc` / `cpu_csc_nnz`):
 
 | Dataset | Route | wall (s) | peak RSS (MB) | vs CSR | vs CSC-densify |
 |---|---|--:|--:|--:|--:|

@@ -2191,16 +2191,21 @@ class TestLeiden:
         assert "rank_genes_groups" in adata.uns
 
     def test_modularity_positive(self, synthetic_adata):
-        """Modularity should be positive for a reasonable partition."""
-        try:
-            import leidenalg  # noqa: F401
-        except ImportError:
-            pytest.skip("leidenalg not available")
-        try:
-            import igraph  # noqa: F401
-        except ImportError:
-            pytest.skip("igraph not available")
+        """Modularity is positive AND on the modularity scale.
 
+        ``> 0`` alone could not tell the normalized value from the raw RB
+        quality it replaced in 0.20 — the un-normalized number is ~10^6 on a
+        large graph and satisfies ``> 0`` just as well, so reverting the
+        normalization would have left this test green while the Rust karate
+        tests reddened. The upper bound is what makes this binding pinned.
+        Found by Cursor Agent - Grok 4.6 High.
+
+        No `leidenalg` / `igraph` importorskip: the body calls only native
+        `pyscx.accel.pca` / `neighbors` / `leiden`, so skipping on those
+        packages meant an environment without them never exercised the Python
+        writeback this test exists to guard. Found by Cursor Agent - Grok 4.6
+        High and codex - gpt-5.6-sol.
+        """
         import pyscx
 
         adata = synthetic_adata.copy()
@@ -2208,9 +2213,20 @@ class TestLeiden:
         pyscx.accel.neighbors(adata, n_neighbors=10)
         pyscx.accel.leiden(adata)
 
-        assert adata.uns["leiden"]["modularity"] > 0, (
+        modularity = adata.uns["leiden"]["modularity"]
+        assert modularity > 0, (
             "modularity should be positive for a meaningful partition"
         )
+        # `leiden()` runs at the default resolution=1.0, where the normalized RB
+        # objective *is* Newman modularity and so is bounded by [-0.5, 1].
+        assert modularity <= 1.0, (
+            f"modularity {modularity} is above 1 — that is the un-normalized RB "
+            "quality, not modularity"
+        )
+        # The raw objective is still available, and is the larger of the two.
+        quality = adata.uns["leiden"]["quality"]
+        assert quality is not None
+        assert quality > modularity
 
     def test_device_cpu_explicit(self, synthetic_adata):
         """Explicitly requesting device='cpu' should use Rust-native Leiden (or leidenalg fallback)."""
