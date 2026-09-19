@@ -254,7 +254,18 @@ Then, across genes:
    genuinely over-dispersed gene is pulled toward the trend, its SE understated
    and its Wald statistic inflated — a false-positive mechanism in exactly the
    low-replicate regime the shrinkage exists to serve. Set
-   `disp_outlier_sd=None` to restore the pre-0.20 shrink-everything behaviour.
+   `disp_outlier_sd=None` to shrink every gene instead.
+
+> **Two independent changes in 0.20, only one of which `disp_outlier_sd` gates.**
+> Step 6's MAD now excludes genes below `100 × min_disp` (pydeseq2's
+> `above_min_disp`), and that runs **unconditionally**. On a panel with a clamped
+> tail — genes pinned at `min_disp = 1e-8`, which used to contribute residuals of
+> −10 to −20 log units — dropping them lowers `dispersion_prior_var` and so
+> changes *every* gene's shrunken dispersion, whether or not any gene is flagged
+> as an outlier. `disp_outlier_sd=None` turns off only the carve-out, so it means
+> "shrink every gene under the new prior", **not** "reproduce 0.19". There is no
+> setting that reproduces 0.19, deliberately: the old prior was the divergence
+> from DESeq2, not a supported mode.
 
 7. **Wald inference** — the contrast effect `c·beta`, SE `√(cᵀ·cov·c)` from the
    Fisher inverse, Wald statistic, two-sided p-value, and `log2FoldChange =
@@ -394,7 +405,7 @@ dict; unspecified keys keep their defaults:
 | `dispersion` | `"cox_reid_shrunk"` | `"moments"` (fast, noisy), `"cox_reid_mle"` (per-gene MLE, no shrinkage), or `"cox_reid_shrunk"` (MLE + trend + EB shrinkage) |
 | `fit_dispersion_trend` | `True` | Fit the parametric mean→dispersion trend |
 | `shrink_dispersion` | `True` | Apply empirical-Bayes shrinkage toward the trend |
-| `disp_outlier_sd` | `2.0` | Residual-SD multiplier for DESeq2's dispersion-outlier carve-out (`outlierSD`). `None` disables it and shrinks every gene (pre-0.20 behaviour) |
+| `disp_outlier_sd` | `2.0` | Residual-SD multiplier for DESeq2's dispersion-outlier carve-out (`outlierSD`). `None` disables it and shrinks every gene — **under the new prior**, not back to pre-0.20 numbers (see the note under step 6) |
 | `min_disp` / `max_disp` | `1e-8` / `100.0` | Dispersion clamps |
 | `max_irls_iters` | `100` | IRLS iteration cap (converges in ~5–15) |
 | `irls_tol` | `1e-8` | Relative-deviance convergence tolerance |
@@ -417,6 +428,15 @@ dict; unspecified keys keep their defaults:
   (`pvalue = 1`, `dispersion = NaN`, `log2FoldChange = 0`) are counted in internal
   diagnostics, alongside the number exempted from shrinkage as dispersion
   outliers (`n_dispersion_outliers`).
+
+  > **"Internal" is literal.** `NbGlmDiagnostics` is a Rust-level struct: no
+  > counter in it — old or new — reaches Python or R. `accel.nb_glm` returns the
+  > per-gene frame, `pdex_nb_glm` / `pseudobulk_dex` stamp only the route, and
+  > `rscx::scx_nb_glm_matrix` returns the per-gene columns plus `scx_accel`. So
+  > from Python you cannot currently see whether `disp_outlier_sd` fired; compare
+  > a run against `disp_outlier_sd=None` if you need to know. Surfacing the
+  > counters is tracked separately — a many-target sweep fits once per target,
+  > so there is a real question about which one's diagnostics `uns` should carry.
 - Cook's-distance outliers, the number of independent-filtered genes, the chosen
   base-mean threshold, and the Cook's cutoff used are recorded in internal
   diagnostics; the per-gene maximum Cook's distance is surfaced in the `cooks`

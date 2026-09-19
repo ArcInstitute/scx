@@ -451,6 +451,43 @@ pub(crate) fn fit_dispersion_trend(
     last.map(|(a0, a1)| DispersionTrend { a0, a1 })
 }
 
+/// `norm.ppf(0.75)` to full f64 precision.
+///
+/// pydeseq2's `mean_absolute_deviation` divides the median absolute deviation by
+/// `scipy.stats.norm.ppf(0.75)`; the familiar `1.4826` is its reciprocal rounded
+/// to five figures. Dividing by the exact value costs nothing and removes a
+/// 1.5e-6 relative offset from a quantity this module now uses as a *threshold*,
+/// not just as a prior width.
+const NORM_PPF_075: f64 = 0.674_489_750_196_081_7;
+
+/// Median of an **already-sorted** slice, averaging the two middle elements at
+/// even length.
+///
+/// That averaging is the whole point. `values[len / 2]` — the upper median — is
+/// what this module used at both levels of the MAD, and it is not what
+/// `numpy.median` does, which is what pydeseq2's `mean_absolute_deviation` calls.
+/// The two agree at odd length and diverge by up to a factor of two at even
+/// length: on residuals `[0.3304, 0.3456, 0.8216, 5.6631]` the upper-median rule
+/// gives a scaled MAD of 0.7283 and the averaging rule 0.3641, so the
+/// `2·√(squared_logres)` outlier threshold lands at 1.457 vs 0.728 and the
+/// residual at 0.8216 is classified differently. Shrinkage would barely notice
+/// a prior width that is off by that much; a *classification boundary* does.
+///
+/// Returns 0.0 on an empty slice; callers guard for that separately.
+fn median_of_sorted(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        // Midpoint form rather than `(a + b) / 2.0`: it cannot overflow and it
+        // matches numpy's own mean-of-two for the magnitudes seen here.
+        values[n / 2 - 1] + (values[n / 2] - values[n / 2 - 1]) / 2.0
+    }
+}
+
 /// The two numbers the log-residual MAD pass produces.
 ///
 /// They are returned together because they must come from **one** pass: the MAP
@@ -509,7 +546,9 @@ pub(crate) fn dispersion_outlier_mask(
 /// (trend value or global median), via the MAD of log-residuals (spec §7.6).
 ///
 /// Mirrors DESeq2's `estimateDispersionsPriorVar` / pydeseq2's
-/// `fit_dispersion_prior`: from the squared scaled MAD of the log-residuals it
+/// `fit_dispersion_prior`, including its median convention — see
+/// [`median_of_sorted`], which is load-bearing for the outlier threshold rather
+/// than merely tidy. From the squared scaled MAD of the log-residuals it
 /// subtracts `trigamma((m−p)/2)`, the expected sampling variance of a per-gene
 /// log-dispersion MLE, so the prior reflects only the true between-gene
 /// dispersion scatter rather than estimation noise. Floored at [`MIN_PRIOR_VAR`].
@@ -539,11 +578,10 @@ pub(crate) fn estimate_prior_var(
         };
     }
     resid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let med = resid[resid.len() / 2];
+    let med = median_of_sorted(&resid);
     let mut abs_dev: Vec<f64> = resid.iter().map(|r| (r - med).abs()).collect();
     abs_dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mad = abs_dev[abs_dev.len() / 2];
-    let sigma = 1.4826 * mad;
+    let sigma = median_of_sorted(&abs_dev) / NORM_PPF_075;
     let squared_logres = sigma * sigma;
     let expected_sampling_var = if n_samples > n_features {
         trigamma((n_samples - n_features) as f64 / 2.0)

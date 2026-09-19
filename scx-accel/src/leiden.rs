@@ -31,14 +31,39 @@ use crate::error::{AccelError, Result};
 
 // ─── Public Types ─────────────────────────────────────────────────────
 
+/// Normalize an RB quality score onto the per-edge scale: `quality / 2m`.
+///
+/// The single definition of the relationship between [`LeidenResult::quality`]
+/// and [`LeidenResult::modularity`], so the production path and the tests that
+/// pin it against igraph cannot drift apart. `two_m == 0` (an edgeless graph)
+/// has no meaningful normalization and yields 0.0, matching
+/// [`RBPartition::quality`]'s own degenerate answer.
+fn rb_modularity(quality: f64, two_m: f64) -> f64 {
+    if two_m == 0.0 {
+        0.0
+    } else {
+        quality / two_m
+    }
+}
+
 /// Result of Leiden community detection.
 pub struct LeidenResult {
     /// Community label for each node (0-indexed, contiguous).
     pub membership: Vec<usize>,
-    /// **Normalized** RB modularity, `quality / 2m` — the quantity in
-    /// `[-0.5, 1]` that igraph / leidenalg / cuGraph call modularity, and that
-    /// users compare across graphs. At `resolution = 1.0` this is Newman
-    /// modularity.
+    /// **Normalized** generalized RB modularity, `quality / 2m`.
+    ///
+    /// At `resolution = 1.0` this **is** Newman modularity — the quantity in
+    /// `[-0.5, 1]` that igraph / leidenalg / cuGraph report, and the one that is
+    /// comparable across graphs.
+    ///
+    /// At `resolution != 1.0` the γ term does not cancel, so this is the
+    /// *generalized* RB objective on a per-edge scale and **is not bounded by
+    /// `[-0.5, 1]`**: on Zachary's Karate Club it is `-0.996055` at γ = 20 and
+    /// `-2.490138` at γ = 50, where leidenalg's own `modularity` property
+    /// reports `-0.049803` for the same partitions. Normalizing is still the
+    /// right thing — it is what makes the number comparable with the cuGraph
+    /// backend, which writes into this same key — but do not read a γ ≠ 1 value
+    /// as Newman modularity.
     pub modularity: f64,
     /// The raw, **un-normalized** RB quality
     /// `Σ_c [2·w_in(c) − γ·k_c²/2m]` — leidenalg's internal
@@ -606,28 +631,6 @@ impl RBPartition {
             q += 2.0 * w_in - self.resolution * k_c * k_c / self.two_m;
         }
         q
-    }
-
-    /// Normalized RB modularity: [`quality`](Self::quality) divided by `2m`.
-    ///
-    /// [`quality`](Self::quality) returns libleidenalg's internal
-    /// `RBConfigurationVertexPartition::quality()`, which is **not** normalized
-    /// — it grows with the graph's total edge weight and returns ~10⁶ on a
-    /// 1M-edge graph. That value was being surfaced to users as
-    /// `uns["leiden"]["modularity"]`, where the expected range is `[-0.5, 1]`
-    /// and where the GPU (cuGraph) backend writes a genuinely normalized number
-    /// into the same key (review §7.10). The `/2m` here is the whole difference;
-    /// at `resolution = 1.0` the result is Newman modularity.
-    ///
-    /// This is **reporting only**. Nothing in the optimizer reads it: every
-    /// acceptance and convergence decision runs off `diff_move` /
-    /// `diff_move_precomputed`, which stay on the un-normalized scale along with
-    /// the `epsilon` floors that compare against them.
-    fn modularity(&self) -> f64 {
-        if self.two_m == 0.0 {
-            return 0.0;
-        }
-        self.quality() / self.two_m
     }
 
     /// Quality change from moving `node` to `new_community` (thread-safe, &self).
@@ -1508,8 +1511,12 @@ pub fn leiden(
     }
 
     let membership = partition.membership_vector();
-    let modularity = partition.modularity();
+    // One `quality()` call, not two. It allocates the community-member structure
+    // and scans the whole adjacency, so deriving `modularity` from a second call
+    // would pay an extra O(V + E) pass on every CPU Leiden — including every
+    // resolution of a `clustering_agreement` sweep.
     let quality = partition.quality();
+    let modularity = rb_modularity(quality, partition.two_m);
     let n_communities = partition.community_count();
 
     Ok(LeidenResult {
@@ -2267,7 +2274,7 @@ mod tests {
         let (indptr, indices, data, n) = karate_club_csr();
         let graph = LeidenGraph::from_csr(&indptr, &indices, &data, n);
         let partition = RBPartition::new_with_membership(graph, &KARATE_FACTIONS, 1.0);
-        let m = partition.modularity();
+        let m = rb_modularity(partition.quality(), partition.two_m);
         assert!(
             (m - KARATE_FACTION_MODULARITY).abs() < 1e-12,
             "modularity {m} != igraph's {KARATE_FACTION_MODULARITY}"
@@ -2286,8 +2293,12 @@ mod tests {
         );
     }
 
+    /// The `[-0.5, 1]` claim holds **at γ = 1**, which is where the reported
+    /// value is Newman modularity. `leiden_at_non_unit_resolution_is_not_newman_modularity`
+    /// pins what happens away from 1, so neither half of the contract can regress
+    /// silently into the other.
     #[test]
-    fn leiden_reports_modularity_in_the_modularity_range() {
+    fn leiden_reports_modularity_in_the_modularity_range_at_unit_resolution() {
         let (indptr, indices, data, n) = karate_club_csr();
         let result = leiden(&indptr, &indices, &data, n, 1.0, 42, 2, false).unwrap();
 
@@ -2337,6 +2348,44 @@ mod tests {
             result.modularity
         );
         assert_eq!(result.n_communities, 4);
+    }
+
+    /// Away from γ = 1 the reported value is the **generalized** RB objective on
+    /// a per-edge scale, not Newman modularity, and it is not bounded by
+    /// `[-0.5, 1]`.
+    ///
+    /// Measured with leidenalg 0.11.0 / igraph 1.0.0 on this graph, over the same
+    /// partitions leidenalg itself finds:
+    ///
+    /// | γ | `quality / 2m` | `partition.modularity` (Newman) |
+    /// |---|---|---|
+    /// | 1  | `0.419790` | `0.419790` |
+    /// | 20 | `-0.996055` | `-0.049803` |
+    /// | 50 | `-2.490138` | `-0.049803` |
+    ///
+    /// Pinned here because the docs previously promised `[-0.5, 1]`
+    /// unconditionally. Asserting only that the value is out of range, not its
+    /// exact magnitude: SCX's search need not find leidenalg's partition at a
+    /// resolution that drives the graph to singletons, and pinning the magnitude
+    /// would make this a test of the search rather than of the scale.
+    #[test]
+    fn leiden_at_non_unit_resolution_is_not_newman_modularity() {
+        let (indptr, indices, data, n) = karate_club_csr();
+        let result = leiden(&indptr, &indices, &data, n, 50.0, 42, 2, false).unwrap();
+        assert!(
+            result.modularity < -0.5,
+            "at γ = 50 the generalized RB objective should fall below Newman's \
+             lower bound; got {} (n_communities {})",
+            result.modularity,
+            result.n_communities
+        );
+        // The identity itself still holds — it is only the *bound* that does not.
+        assert!(
+            (result.quality - result.modularity * KARATE_TWO_M).abs() < 1e-9,
+            "quality {} != modularity {} × two_m {KARATE_TWO_M}",
+            result.quality,
+            result.modularity
+        );
     }
 
     #[test]

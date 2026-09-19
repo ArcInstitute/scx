@@ -462,28 +462,38 @@ pub(crate) fn compute_connectivities(
     // that slice — the bracket expansion and the 50 bisections both depend only
     // on the input — so the parallel map is order-preserving and bit-identical to
     // the serial loop.
-    let searches: Vec<SigmaSearch> = (0..n_obs)
+    //
+    // The non-convergence count rides along on an atomic rather than in a
+    // second `Vec<SigmaSearch>`: a sum of increments is order-independent, so
+    // `Relaxed` is sufficient and the total is still a pure function of the
+    // input. That keeps this to one `n_obs` allocation and one pass.
+    let n_unbracketed = std::sync::atomic::AtomicUsize::new(0);
+    let sigmas: Vec<f64> = (0..n_obs)
         .into_par_iter()
         .map(|i| {
             let offset = i * n_neighbors;
             let rho = knn_distances[offset]; // nearest neighbor distance
-            find_sigma(&knn_distances[offset..offset + n_neighbors], rho, target)
+            let search = find_sigma(&knn_distances[offset..offset + n_neighbors], rho, target);
+            if !search.converged {
+                n_unbracketed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            search.sigma
         })
         .collect();
 
     // One aggregated warning, not one per point: a per-point `log::warn!` inside
     // the parallel map would emit up to `n_obs` lines in nondeterministic order.
-    let n_unbracketed = searches.iter().filter(|s| !s.converged).count();
+    let n_unbracketed = n_unbracketed.load(std::sync::atomic::Ordering::Relaxed);
     if n_unbracketed > 0 {
         log::warn!(
             "smooth-kNN bandwidth search failed to bracket the target \
              perplexity for {n_unbracketed} of {n_obs} cells; their σ is a bound, \
              not a solution, and their connectivities are correspondingly \
              unreliable. This normally means non-finite distances reached the \
-             graph builder — check `use_rep` for NaN/inf."
+             graph builder (check `use_rep` for NaN/inf), or enough exactly-tied \
+             nearest neighbours that no σ can reach log2(k)."
         );
     }
-    let sigmas: Vec<f64> = searches.iter().map(|s| s.sigma).collect();
 
     // Build the directed membership matrix A in CSR form (row i → μ(i,j)), with
     // each row's columns sorted ascending (the kNN list is distance-ordered, not
@@ -678,6 +688,26 @@ fn find_sigma(distances: &[f64], rho: f64, target: f64) -> SigmaSearch {
 
     let mut lo = 1e-10_f64;
     let mut hi = 1000.0_f64;
+
+    // The target must be reachable from **below** too. `connectivity_sum` rises
+    // from `|{d : d ≤ ρ}|` as σ → 0⁺, not from 0: every neighbour tied with the
+    // nearest contributes a full `exp(0) = 1` at any σ. So on a point with
+    // enough zero-distance ties — duplicate cells, which single-cell data has
+    // — the sum exceeds `log2(k)` for *every* σ and the root does not exist.
+    //
+    // Checking only the upper end would call that converged: the bisection
+    // collapses `hi` onto `lo`, returns ≈ 1e-10, and reports `converged: true`
+    // for a target it never reached, which is exactly the silence §7.3 is about.
+    // The returned σ is still the right answer downstream (`σ ≤ 1e-10` makes
+    // `compute_connectivities` give every neighbour full strength, which is what
+    // a cloud of identical points should get) — it is the *flag* that would be
+    // lying, and the flag is what drives the warning.
+    if connectivity_sum(distances, rho, lo) > target {
+        return SigmaSearch {
+            sigma: lo,
+            converged: false,
+        };
+    }
 
     // Expand `hi` until it brackets the root.
     //
@@ -1143,6 +1173,49 @@ mod tests {
                 want
             );
         }
+    }
+
+    /// The target must be reachable from **below**, and with enough exactly-tied
+    /// nearest neighbours it is not.
+    ///
+    /// `connectivity_sum` rises from `|{d : d ≤ ρ}|`, not from 0, because every
+    /// neighbour at the nearest distance contributes `exp(0) = 1` at any σ. Four
+    /// tied neighbours out of `k = 15` already exceed `log2(15) ≈ 3.907`, so no
+    /// σ solves the equation — and checking only the upper bracket reports that
+    /// as converged, because `sum(1000) ≥ target` is trivially true and the
+    /// bisection then collapses onto `lo`. Found by Antigravity - Gemini 3.8 Flash.
+    #[test]
+    fn find_sigma_reports_a_target_unreachable_from_below() {
+        // k = 15 with four neighbours tied at ρ = 0.
+        let mut distances = vec![0.0_f64; 4];
+        distances.extend((1..12).map(|i| i as f64));
+        assert_eq!(distances.len(), 15);
+        let target = (15.0_f64).ln() / std::f64::consts::LN_2;
+
+        // Premise: the sum really is above the target at *every* σ, so this is
+        // an unreachable target and not merely a hard one.
+        let n_tied = distances.iter().filter(|&&d| d <= 0.0).count() as f64;
+        assert!(
+            n_tied > target,
+            "premise: {n_tied} tied neighbours must exceed log2(k) = {target}"
+        );
+        for sigma in [1e-12, 1e-10, 1e-3, 1.0, 1e3, 1e9] {
+            assert!(
+                connectivity_sum(&distances, 0.0, sigma) > target,
+                "premise: no σ reaches the target; σ = {sigma} does"
+            );
+        }
+
+        let search = find_sigma(&distances, 0.0, target);
+        assert!(
+            !search.converged,
+            "an unreachable target must be reported, not answered with σ ≈ {}",
+            search.sigma
+        );
+        // The σ it does return is still the right one for a cloud of identical
+        // points: `compute_connectivities` gives every neighbour full strength
+        // below 1e-10. Only the flag was wrong.
+        assert!(search.sigma <= 1e-10, "got {}", search.sigma);
     }
 
     /// A non-finite distance has no bandwidth to find, and the sum will not
