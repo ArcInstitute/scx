@@ -629,9 +629,11 @@ fn scx_umap_graph_impl(
 /// @param max_iterations Maximum outer-loop iterations.
 ///
 /// @return list(`membership` = 1-based integer cluster label per cell,
-///   `modularity` (normalized RB modularity, in [-0.5, 1] and comparable
-///   across graphs), `quality` (the raw un-normalized RB objective, comparable
-///   only between partitions of the same graph), `n_communities`).
+///   `modularity` (normalized generalized RB modularity `quality / 2m`,
+///   comparable across graphs; at `resolution = 1` it is Newman modularity and
+///   lies in [-0.5, 1], but at other resolutions the γ term does not cancel and
+///   it is not so bounded), `quality` (the raw un-normalized RB objective,
+///   comparable only between partitions of the same graph), `n_communities`).
 /// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
 fn scx_leiden_graph(

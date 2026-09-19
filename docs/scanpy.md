@@ -2613,10 +2613,16 @@ pyscx.accel.leiden(adata, resolution=1.0)
 #                                     (cugraph), and `ignored` list of
 #                                     kwargs the chosen backend dropped
 #   adata.uns["leiden"]["backend"]   — "scx-accel" or "cugraph"
-#   adata.uns["leiden"]["modularity"] — normalized RB modularity in
-#                                     [-0.5, 1] (Newman modularity at
-#                                     resolution=1.0). Comparable across
-#                                     graphs and across the two backends.
+#   adata.uns["leiden"]["modularity"] — normalized generalized RB modularity,
+#                                     `quality / 2m`. Comparable across graphs
+#                                     and across the two backends. At the
+#                                     default resolution=1.0 this IS Newman
+#                                     modularity, bounded by [-0.5, 1]; at
+#                                     resolution != 1 the γ term does not
+#                                     cancel and it is NOT so bounded (on
+#                                     Zachary's graph, -0.996 at γ=20 and
+#                                     -2.490 at γ=50, where leidenalg's own
+#                                     `modularity` reports -0.0498).
 #   adata.uns["leiden"]["quality"]   — the raw, un-normalized RB objective
 #                                     Σ_c [2·w_in(c) − γ·k_c²/2m], i.e.
 #                                     `modularity × 2m`. Scales with total
