@@ -22,6 +22,14 @@ use crate::diffexp::{
 use crate::error::{AccelError, Result};
 use scx_format_io::ColumnShardSource;
 
+/// Parse of the `SCX_ACCEL_WILCOXON_NNZ` gate, split out from the `OnceLock`
+/// read below so the accepted spellings are unit-testable. The process-global
+/// cache makes [`nnz_wilcoxon_enabled`] itself untestable from a test binary
+/// that has already read it once.
+fn nnz_gate_from_env_str(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1" | "true" | "TRUE" | "on"))
+}
+
 /// Opt-in gate for the exact sparse-nnz Wilcoxon fast path (§5.3).
 ///
 /// Default **off**: the densify + dense-kernel path stays the measured baseline
@@ -32,11 +40,25 @@ use scx_format_io::ColumnShardSource;
 fn nnz_wilcoxon_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        matches!(
-            std::env::var("SCX_ACCEL_WILCOXON_NNZ").ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "on")
-        )
+        nnz_gate_from_env_str(std::env::var("SCX_ACCEL_WILCOXON_NNZ").ok().as_deref())
     })
+}
+
+/// Whether a CSC Wilcoxon call with these arguments takes the exact sparse-nnz
+/// kernel rather than the densify path.
+///
+/// **The** selection rule, in one place. [`wilcoxon_rank_sum_streaming_csc`]
+/// branches on it and the pyscx dispatcher stamps the route from it, so the
+/// recorded route cannot disagree with the kernel that ran (review §7.17: the
+/// env gate swapped in a structurally different kernel while the stamp said
+/// `cpu_csc` either way, which is the "benchmark one route while believing
+/// another ran" class the planner exists to close).
+///
+/// Note the gate alone is not the answer: the nnz kernel is 1-vs-rest only, so
+/// `rankby_abs` or an explicit `reference` keeps the densify path even with
+/// `SCX_ACCEL_WILCOXON_NNZ=1` set.
+pub fn csc_wilcoxon_uses_nnz_kernel(reference: Option<usize>, rankby_abs: bool) -> bool {
+    reference.is_none() && !rankby_abs && nnz_wilcoxon_enabled()
 }
 
 /// Gene-chunked Wilcoxon rank-sum DE driven by a CSC source.
@@ -80,7 +102,7 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
     // Exact sparse-nnz fast path (§5.3), opt-in and 1-vs-rest only (rankby_abs
     // and an explicit reference keep the densify path). Ranks only the nonzeros +
     // an analytic implicit-zero tie-block — no `n_obs` dense column per gene.
-    if reference.is_none() && !rankby_abs && nnz_wilcoxon_enabled() {
+    if csc_wilcoxon_uses_nnz_kernel(reference, rankby_abs) {
         return wilcoxon_rank_sum_nnz_csc(
             source,
             gene_names,
@@ -471,6 +493,52 @@ mod tests {
     /// `gene_stats_nnz` is called directly: the corruption cannot be written to
     /// a file (writers canonicalize, and the encoder `debug_assert`s it), so a
     /// unit call on the kernel is the only way to exercise it at all.
+    // ── Review §7.17 — the nnz kernel has its own recorded route ───────
+
+    #[test]
+    fn the_nnz_gate_accepts_only_the_documented_spellings() {
+        for raw in ["1", "true", "TRUE", "on"] {
+            assert!(nnz_gate_from_env_str(Some(raw)), "{raw} should enable");
+        }
+        for raw in ["0", "false", "False", "off", "", "yes", "True "] {
+            assert!(!nnz_gate_from_env_str(Some(raw)), "{raw} should not enable");
+        }
+        assert!(!nnz_gate_from_env_str(None), "unset means off");
+    }
+
+    /// The selection rule is more than the env gate: the nnz kernel is
+    /// 1-vs-rest only. A stamp that read the gate alone would claim
+    /// `cpu_csc_nnz` on a `reference=` or `rankby_abs` call that actually ran
+    /// the densify path — which is the same class of defect §7.17 reports,
+    /// pointing the other way.
+    #[test]
+    fn the_kernel_predicate_is_more_than_the_env_gate() {
+        // Pinned against the branch condition in
+        // `wilcoxon_rank_sum_streaming_csc`, with the gate supplied explicitly
+        // so the test does not depend on the process-global `OnceLock`.
+        fn selects(gate: bool, reference: Option<usize>, rankby_abs: bool) -> bool {
+            reference.is_none() && !rankby_abs && gate
+        }
+        assert!(selects(true, None, false));
+        assert!(
+            !selects(true, Some(0), false),
+            "an explicit reference opts out"
+        );
+        assert!(!selects(true, None, true), "rankby_abs opts out");
+        assert!(!selects(false, None, false), "the gate is still required");
+
+        // And the exported predicate agrees with the branch on whatever this
+        // process's gate happens to be — the property that matters, since the
+        // pyscx stamp and the kernel both call it.
+        let gate = nnz_wilcoxon_enabled();
+        assert_eq!(
+            csc_wilcoxon_uses_nnz_kernel(None, false),
+            selects(gate, None, false)
+        );
+        assert!(!csc_wilcoxon_uses_nnz_kernel(Some(0), false));
+        assert!(!csc_wilcoxon_uses_nnz_kernel(None, true));
+    }
+
     #[test]
     fn gene_stats_nnz_rejects_a_cell_stored_twice() {
         // 2 cells in one group, none unlabelled. The column stores cell 0

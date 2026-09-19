@@ -87,8 +87,9 @@ mod test_support;
 pub mod umap;
 
 pub use csc::{
-    pdex_ref_streaming_csc, pseudobulk_aggregate_csc, require_csc, streaming_clip_square_sum_csc,
-    streaming_mean_var_csc, wilcoxon_rank_sum_streaming_csc, PreferFormat,
+    csc_wilcoxon_uses_nnz_kernel, pdex_ref_streaming_csc, pseudobulk_aggregate_csc, require_csc,
+    streaming_clip_square_sum_csc, streaming_mean_var_csc, wilcoxon_rank_sum_streaming_csc,
+    PreferFormat,
 };
 #[cfg(feature = "gpu")]
 pub use csc::{streaming_clip_square_sum_csc_with_device, streaming_mean_var_csc_with_device};

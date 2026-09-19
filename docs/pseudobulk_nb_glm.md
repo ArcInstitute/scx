@@ -31,9 +31,16 @@ checked in as literals so both fitters see byte-identical input — and asserts:
 
 Two things are deliberately **not** asserted, because the paragraph above
 promises they will not hold: numerical equality of `log2FoldChange` (no apeglm
-shrinkage; different dispersion-outlier handling), and *ordered-list* equality
-of `padj` — the two do swap a few adjacent genes inside the significant block,
-which is why the ranking claim is a rank correlation rather than an exact order.
+shrinkage) and *ordered-list* equality of `padj` — the two do swap a few
+adjacent genes inside the significant block, which is why the ranking claim is a
+rank correlation rather than an exact order.
+
+> **Since 0.20**, dispersion-outlier handling is no longer one of those
+> divergences. SCX used to shrink every gene toward the trend; it now implements
+> DESeq2's `dispOutlier` carve-out, so a gene whose MLE dispersion is more than
+> `disp_outlier_sd` residual SDs above the trend keeps that MLE. On the fixture
+> above pydeseq2 flags zero genes and so does SCX, which is pinned as
+> `no_gene_in_the_pydeseq2_fixture_is_a_dispersion_outlier`.
 
 Regenerate the reference with
 `benchmarks/scripts/generate_de_parity_references.py`.
@@ -232,9 +239,22 @@ Then, across genes:
 5. **Dispersion trend fit** — a parametric `α_trend(μ̄) = a0 + a1/μ̄` is fit by a
    gamma-family GLM on the per-gene MLE dispersions vs base mean.
 6. **Empirical-Bayes shrinkage** — each gene's dispersion is shrunk toward the
-   trend with a log-normal prior whose variance is estimated (robustly, via the
-   MAD of log-residuals about the trend). `beta` is refit once at the shrunken
-   dispersion so the SEs use the final value. This stabilises low-replicate genes.
+   trend with a log-normal prior whose variance is estimated robustly: the
+   squared scaled MAD of the log-residuals about the trend (over genes above
+   `100 × min_disp`, matching pydeseq2's `above_min_disp`), minus
+   `trigamma((m−p)/2)` — the expected sampling variance of a per-gene
+   log-dispersion MLE — and floored at `0.25`. `beta` is refit once at the
+   shrunken dispersion so the SEs use the final value. This stabilises
+   low-replicate genes.
+6b. **Dispersion-outlier carve-out** (DESeq2 `estimateDispersionsMAP`'s
+   `dispOutlier`, on by default since 0.20) — a gene whose MLE satisfies
+   `log(α_MLE) > log(α_trend) + disp_outlier_sd · √(squared_logres)` keeps its
+   MLE dispersion instead of the shrunken one, where `squared_logres` is the
+   MAD² from step 6 *before* the trigamma subtraction and floor. Without it a
+   genuinely over-dispersed gene is pulled toward the trend, its SE understated
+   and its Wald statistic inflated — a false-positive mechanism in exactly the
+   low-replicate regime the shrinkage exists to serve. Set
+   `disp_outlier_sd=None` to restore the pre-0.20 shrink-everything behaviour.
 
 7. **Wald inference** — the contrast effect `c·beta`, SE `√(cᵀ·cov·c)` from the
    Fisher inverse, Wald statistic, two-sided p-value, and `log2FoldChange =
@@ -374,6 +394,7 @@ dict; unspecified keys keep their defaults:
 | `dispersion` | `"cox_reid_shrunk"` | `"moments"` (fast, noisy), `"cox_reid_mle"` (per-gene MLE, no shrinkage), or `"cox_reid_shrunk"` (MLE + trend + EB shrinkage) |
 | `fit_dispersion_trend` | `True` | Fit the parametric mean→dispersion trend |
 | `shrink_dispersion` | `True` | Apply empirical-Bayes shrinkage toward the trend |
+| `disp_outlier_sd` | `2.0` | Residual-SD multiplier for DESeq2's dispersion-outlier carve-out (`outlierSD`). `None` disables it and shrinks every gene (pre-0.20 behaviour) |
 | `min_disp` / `max_disp` | `1e-8` / `100.0` | Dispersion clamps |
 | `max_irls_iters` | `100` | IRLS iteration cap (converges in ~5–15) |
 | `irls_tol` | `1e-8` | Relative-deviance convergence tolerance |
@@ -394,7 +415,8 @@ dict; unspecified keys keep their defaults:
   [docs/api.md § Accelerator route metadata](api.md#accelerator-route-metadata).
 - Genes that hit a dispersion clamp, fail to converge, or are all-zero
   (`pvalue = 1`, `dispersion = NaN`, `log2FoldChange = 0`) are counted in internal
-  diagnostics.
+  diagnostics, alongside the number exempted from shrinkage as dispersion
+  outliers (`n_dispersion_outliers`).
 - Cook's-distance outliers, the number of independent-filtered genes, the chosen
   base-mean threshold, and the Cook's cutoff used are recorded in internal
   diagnostics; the per-gene maximum Cook's distance is surfaced in the `cooks`

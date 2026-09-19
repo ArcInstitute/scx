@@ -556,3 +556,99 @@ def test_sidecar_less_file_does_not_stamp_hint(small_adata, tmp_path):
     exp = pyscx.open(str(tmp_path / "nocsc.scx"))
     assert not exp.has_csc
     assert _F10_HINT not in exp.to_anndata().uns
+
+
+# ── Review §7.17 — the exact-nnz Wilcoxon kernel has its own recorded route ──
+
+_NNZ_ROUTE_PROBE = r"""
+import sys, numpy as np, scipy.sparse as sp, anndata as ad, pyscx
+
+rng = np.random.default_rng(7)
+mat = sp.random(40, 16, density=0.4, format="csr", dtype=np.float32, random_state=rng)
+mat.data = (mat.data * 50).astype(np.float32).round() + 1.0
+adata = ad.AnnData(X=mat)
+adata.obs["cell_id"] = [f"c{i}" for i in range(40)]
+adata.obs["group"] = ["A"] * 20 + ["B"] * 20
+adata.var["gene_id"] = [f"g{i}" for i in range(16)]
+
+path = sys.argv[1]
+pyscx.from_anndata(adata, path, csc="always", csc_cols_per_shard=4)
+backed = pyscx.open(path).to_anndata(backed=True)
+backed.obs["group"] = adata.obs["group"].to_numpy()
+pyscx.accel.rank_genes_groups(
+    backed, "group", device="cpu", prefer_format="csc", reference="rest"
+)
+print(backed.uns["scx_accel"]["rank_genes_groups"]["route"])
+print(backed.uns["rank_genes_groups"]["scx_accel_route"])
+"""
+
+
+def _nnz_route(tmp_path, env_value):
+    """Run the CSC Wilcoxon probe in a fresh process and return its two routes.
+
+    A subprocess is required, not tidiness: `SCX_ACCEL_WILCOXON_NNZ` is read
+    through a `OnceLock`, so setting it inside an already-running interpreter
+    that has taken the CSC path once has no effect.
+    """
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env.pop("SCX_ACCEL_WILCOXON_NNZ", None)
+    if env_value is not None:
+        env["SCX_ACCEL_WILCOXON_NNZ"] = env_value
+    out = subprocess.run(
+        [sys.executable, "-c", _NNZ_ROUTE_PROBE, str(tmp_path / f"n{env_value}.scx")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [ln for ln in out.stdout.strip().splitlines() if ln.strip()]
+    assert len(lines) == 2, out.stdout + out.stderr
+    return lines[0], lines[1]
+
+
+def test_wilcoxon_csc_route_names_the_kernel_that_ran(tmp_path):
+    """`SCX_ACCEL_WILCOXON_NNZ=1` swaps in a structurally different kernel.
+
+    Before review §7.17 both kernels stamped `cpu_csc`, so
+    `benchmarks/scripts/bench_de_csc_routes.py` — which reads exactly this key —
+    could not tell its `csc_dense` arm from its `csc_nnz` arm in its own output.
+    Both mirrors are checked: `uns["scx_accel"][op]["route"]` and the
+    `uns["rank_genes_groups"]["scx_accel_route"]` copy.
+    """
+    pytest.importorskip("anndata")
+    dense_route, dense_mirror = _nnz_route(tmp_path, None)
+    assert dense_route == "cpu_csc", dense_route
+    assert dense_mirror == "cpu_csc", dense_mirror
+
+    nnz_route, nnz_mirror = _nnz_route(tmp_path, "1")
+    assert nnz_route == "cpu_csc_nnz", nnz_route
+    assert nnz_mirror == "cpu_csc_nnz", nnz_mirror
+
+    # `bench_csc_dispatch.py`'s `csc_dispatch_correct` gate is `"csc" in route`.
+    assert "csc" in nnz_route
+
+
+def test_wilcoxon_nnz_route_is_not_claimed_for_a_reference_call(tmp_path):
+    """The nnz kernel is 1-vs-rest only, so an explicit `reference=` keeps the
+    densify path even with the gate set — and the stamp must say so."""
+    pytest.importorskip("anndata")
+    import os
+    import subprocess
+    import sys
+
+    probe = _NNZ_ROUTE_PROBE.replace('reference="rest"', 'reference="A"')
+    env = dict(os.environ)
+    env["SCX_ACCEL_WILCOXON_NNZ"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-c", probe, str(tmp_path / "ref.scx")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    route = out.stdout.strip().splitlines()[0]
+    assert route == "cpu_csc", f"{route} (stderr: {out.stderr})"

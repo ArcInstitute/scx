@@ -19,7 +19,7 @@ use scx_gpu::{
     GPU_NB_GLM_METHOD_CR_SHRUNK, GPU_NB_GLM_METHOD_MOMENTS, GPU_NB_GLM_NSUB_MAX, GPU_NB_GLM_PMAX,
 };
 
-use super::dispersion::{estimate_prior_var, fit_dispersion_trend};
+use super::dispersion::{dispersion_outlier_mask, estimate_prior_var, fit_dispersion_trend};
 use super::size_factors::median_ratio_size_factors;
 use super::validate::{validate_contrast, validate_inputs};
 use super::{assemble_result, profile, wald, GeneState};
@@ -92,6 +92,7 @@ pub struct NbGlmFitData {
     pub(crate) base_means: Vec<f64>,
     pub(crate) dispersion_trend: Option<DispersionTrend>,
     pub(crate) dispersion_prior_var: Option<f64>,
+    pub(crate) n_dispersion_outliers: usize,
     pub(crate) start: std::time::Instant,
 }
 
@@ -184,6 +185,7 @@ pub fn gpu_nb_glm_fit_states(
     // --- Cross-gene trend + empirical-Bayes shrinkage (host) + GPU refit. ---
     let mut dispersion_trend = None;
     let mut dispersion_prior_var = None;
+    let mut n_dispersion_outliers = 0usize;
     let final_states: Vec<GeneState> = if options.dispersion == DispersionMethod::CoxReidShrunk
         && options.shrink_dispersion
     {
@@ -217,9 +219,30 @@ pub fn gpu_nb_glm_fit_states(
                 vec![median.max(options.min_disp).ln(); n_genes]
             }
         };
-        let prior_var = estimate_prior_var(&log_targets, &alpha_mle, &valid, n_samples, n_features);
+        let prior = estimate_prior_var(
+            &log_targets,
+            &alpha_mle,
+            &valid,
+            n_samples,
+            n_features,
+            options.min_disp,
+        );
+        let prior_var = prior.prior_var;
         dispersion_trend = trend;
         dispersion_prior_var = Some(prior_var);
+        // DESeq2's dispersion-outlier carve-out, from the same shared helper the
+        // CPU arm uses (review §7.15). It is a host-side decision on both arms:
+        // the device still shrinks every gene, and the exempted ones have their
+        // MLE state restored in the assembly loop below, exactly as the CPU pass
+        // returns `mle[g]` unchanged. Applying it on one arm only would diverge
+        // the `gpu_cpu_parity_cox_reid_shrunk_*` tests.
+        let disp_outlier: Vec<bool> = match options.disp_outlier_sd {
+            Some(sd) => {
+                dispersion_outlier_mask(&log_targets, &alpha_mle, &valid, prior.squared_logres, sd)
+            }
+            None => vec![false; n_genes],
+        };
+        n_dispersion_outliers = disp_outlier.iter().filter(|&&o| o).count();
         drop(_tp_timer);
 
         // GPU pass 2: shrink dispersion against the prior + refit β.
@@ -247,7 +270,7 @@ pub fn gpu_nb_glm_fit_states(
 
         (0..n_genes)
             .map(|g| {
-                if all_zero[g] {
+                if all_zero[g] || disp_outlier[g] {
                     return mle_states[g].clone();
                 }
                 let mut st = state_from_fit(&shr, g, n_samples, n_features, base_means[g], false);
@@ -268,6 +291,7 @@ pub fn gpu_nb_glm_fit_states(
         base_means,
         dispersion_trend,
         dispersion_prior_var,
+        n_dispersion_outliers,
         start,
     })
 }
@@ -302,6 +326,7 @@ pub fn finalize_nb_glm(
         fit.base_means,
         fit.dispersion_trend,
         fit.dispersion_prior_var,
+        fit.n_dispersion_outliers,
         fit.start,
     ))
 }

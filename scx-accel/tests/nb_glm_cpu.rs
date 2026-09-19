@@ -606,3 +606,163 @@ fn extreme_count_dynamic_range() {
         res.log2_fold_change[1]
     );
 }
+
+// ── Review §7.15 — DESeq2's dispersion-outlier carve-out ────────────
+
+/// Counts for one gene at a target mean and NB dispersion.
+///
+/// For NB, `Var = μ + αμ²`, so a zero-mean multiplicative pattern `s` scaled by
+/// `δ = √(1/μ + α)` reproduces that variance. Built analytically rather than
+/// sampled so the fixture is a literal, not a dependency on an RNG's stream.
+fn gene_at(mean: f64, alpha: f64, pattern: &[f64]) -> Vec<f64> {
+    let delta = (1.0 / mean + alpha).sqrt();
+    pattern
+        .iter()
+        .map(|&s| (mean * (1.0 + delta * s)).max(0.0).round())
+        .collect()
+}
+
+/// A panel with a genuine mean→dispersion trend plus one gene far above it.
+///
+/// The background genes span two decades of base mean with dispersions on a
+/// `α(μ) = a0 + a1/μ` trend and real log-scale scatter about it, so the MAD of
+/// the log-residuals is non-degenerate and the outlier threshold
+/// `2·√(squared_logres)` is a meaningful bar rather than ≈0. The last gene sits
+/// two orders above the trend.
+///
+/// Shape matters here: an earlier version of this fixture had every background
+/// gene pinned at `min_disp`, which made the residual MAD zero and the gate fire
+/// on anything above the trend — it would have "passed" without testing the rule.
+fn trend_plus_one_outlier() -> (Vec<f64>, usize, usize) {
+    // 6 control + 6 treated. Zero-mean unit-variance-ish patterns, distinct per
+    // group so the group effect is not confounded with the dispersion.
+    const P_CTRL: [f64; 6] = [1.1, -0.9, 0.3, -0.6, 0.8, -0.7];
+    const P_TRT: [f64; 6] = [-0.8, 1.0, -0.4, 0.7, -1.0, 0.5];
+    const N_BG: usize = 120;
+
+    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(N_BG + 1);
+    for g in 0..N_BG {
+        let t = g as f64 / (N_BG - 1) as f64;
+        // Base means from 20 to 2000, log-spaced.
+        let mean = 20.0 * (100.0_f64).powf(t);
+        // Trend α(μ) = 0.05 + 4/μ, times deterministic log-scale scatter in
+        // roughly [0.6, 1.7] — enough spread for a non-degenerate MAD.
+        let trend = 0.05 + 4.0 / mean;
+        let scatter = (0.5 * ((g as f64) * 2.399_963_2).sin()).exp();
+        let alpha = trend * scatter;
+        let mut row = gene_at(mean, alpha, &P_CTRL);
+        row.extend(gene_at(mean * 1.4, alpha, &P_TRT));
+        rows.push(row);
+    }
+    // The outlier: trend at this mean is ~0.06; this gene is ~100× that.
+    let mut out = gene_at(300.0, 6.0, &P_CTRL);
+    out.extend(gene_at(420.0, 6.0, &P_TRT));
+    rows.push(out);
+
+    gene_major(&rows)
+}
+
+fn fit_outlier_panel(disp_outlier_sd: Option<f64>) -> scx_accel::NbGlmResult {
+    let (counts, n_genes, n_samples) = trend_plus_one_outlier();
+    let (design, _, nf) = design_two_condition(6, 6);
+    let sf = vec![1.0; n_samples];
+    pseudobulk_nb_glm(
+        &counts,
+        n_genes,
+        n_samples,
+        &design,
+        nf,
+        Some(&sf),
+        NbGlmContrast::Coefficient { index: 1 },
+        NbGlmOptions {
+            disp_outlier_sd,
+            ..NbGlmOptions::default()
+        },
+    )
+    .expect("fit")
+}
+
+/// Premise: the panel has a non-degenerate dispersion trend and most of its
+/// genes are genuinely shrunk. Without this the carve-out test below could pass
+/// on a panel where shrinkage does nothing at all.
+#[test]
+fn the_outlier_panel_has_a_real_dispersion_trend() {
+    let res = fit_outlier_panel(None);
+    let n_genes = res.dispersion.len();
+    let pinned = res.diagnostics.n_boundary_dispersion_low;
+    assert!(
+        pinned < n_genes / 10,
+        "{pinned} of {n_genes} genes are pinned at min_disp — the panel is degenerate"
+    );
+    let shrunk = (0..n_genes)
+        .filter(|&g| res.dispersion[g].to_bits() != res.dispersion_mle[g].to_bits())
+        .count();
+    assert!(
+        shrunk > n_genes / 2,
+        "only {shrunk} of {n_genes} genes were shrunk at all"
+    );
+    let pv = res.diagnostics.dispersion_prior_var.expect("shrinkage ran");
+    assert!(pv.is_finite() && pv > 0.0, "prior var {pv}");
+}
+
+#[test]
+fn dispersion_outlier_keeps_its_mle() {
+    let res = fit_outlier_panel(Some(2.0));
+    let n_genes = res.dispersion.len();
+    let outlier = n_genes - 1;
+
+    assert_eq!(
+        res.diagnostics.n_dispersion_outliers, 1,
+        "exactly the implanted gene should be flagged, got {} (its MLE {:.4},          reported {:.4}, prior_var {:?})",
+        res.diagnostics.n_dispersion_outliers,
+        res.dispersion_mle[outlier],
+        res.dispersion[outlier],
+        res.diagnostics.dispersion_prior_var,
+    );
+    assert_eq!(
+        res.dispersion[outlier].to_bits(),
+        res.dispersion_mle[outlier].to_bits(),
+        "an exempted gene keeps its MLE dispersion exactly: reported {} vs MLE {}",
+        res.dispersion[outlier],
+        res.dispersion_mle[outlier],
+    );
+}
+
+#[test]
+fn dispersion_outlier_gate_can_be_disabled() {
+    let off = fit_outlier_panel(None);
+    let on = fit_outlier_panel(Some(2.0));
+    let n_genes = on.dispersion.len();
+    let outlier = n_genes - 1;
+
+    assert_eq!(off.diagnostics.n_dispersion_outliers, 0);
+    assert_eq!(on.diagnostics.n_dispersion_outliers, 1);
+    assert_ne!(
+        off.dispersion[outlier].to_bits(),
+        off.dispersion_mle[outlier].to_bits(),
+        "with the gate off the outlier must be shrunk like any other gene"
+    );
+    assert!(
+        off.dispersion[outlier] < on.dispersion[outlier],
+        "shrinkage pulls the outlier's dispersion toward the trend: off={} on={}",
+        off.dispersion[outlier],
+        on.dispersion[outlier]
+    );
+    // Understating a real dispersion understates the SE and inflates the Wald
+    // statistic — the false-positive mechanism §7.15 describes. Pin the direction.
+    assert!(
+        off.standard_error[outlier] < on.standard_error[outlier],
+        "shrinking the outlier understates its SE: off={} on={}",
+        off.standard_error[outlier],
+        on.standard_error[outlier]
+    );
+
+    // And the carve-out touches nothing else.
+    for g in 0..n_genes - 1 {
+        assert_eq!(
+            off.dispersion[g].to_bits(),
+            on.dispersion[g].to_bits(),
+            "background gene {g} changed when only the outlier gate moved"
+        );
+    }
+}

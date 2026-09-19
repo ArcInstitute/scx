@@ -221,6 +221,7 @@ const NBGLM_OPTION_KEYS: &[&str] = &[
     "outer_tol",
     "fit_dispersion_trend",
     "shrink_dispersion",
+    "disp_outlier_sd",
     "cooks_filtering",
     "cooks_cutoff",
     "independent_filtering",
@@ -322,6 +323,15 @@ pub(super) fn nbglm_options_from_dict(
     }
     if let Some(v) = d.get_item("shrink_dispersion")? {
         o.shrink_dispersion = v.extract()?;
+    }
+    // `None` disables DESeq2's dispersion-outlier carve-out; a float sets the
+    // residual-SD multiplier (DESeq2's `outlierSD`, default 2).
+    if let Some(v) = d.get_item("disp_outlier_sd")? {
+        o.disp_outlier_sd = if v.is_none() {
+            None
+        } else {
+            Some(v.extract()?)
+        };
     }
     if let Some(v) = d.get_item("cooks_filtering")? {
         o.cooks_filtering = v.extract()?;

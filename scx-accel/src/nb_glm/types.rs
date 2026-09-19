@@ -41,6 +41,14 @@ pub struct NbGlmOptions {
     pub fit_dispersion_trend: bool,
     /// Apply empirical-Bayes dispersion shrinkage toward the trend.
     pub shrink_dispersion: bool,
+    /// Residual-SD multiplier for DESeq2's dispersion-**outlier** carve-out
+    /// (`estimateDispersionsMAP`'s `outlierSD`, default 2). A gene whose
+    /// `log(alpha_MLE)` exceeds `log(alpha_trend) + disp_outlier_sd *
+    /// sqrt(squared_logres)` keeps its MLE dispersion instead of the shrunken
+    /// one. `None` disables the carve-out and shrinks every gene — the
+    /// pre-0.20 behaviour, retained as an escape hatch, not a recommendation.
+    /// Ignored unless shrinkage runs.
+    pub disp_outlier_sd: Option<f64>,
 
     // --- Results-stage filtering (DESeq2 `results()` defaults; spec §19, v2) ---
     /// Apply Cook's-distance outlier filtering: genes whose max Cook's distance
@@ -95,6 +103,8 @@ impl Default for NbGlmOptions {
             disp_newton_iters: 25,
             fit_dispersion_trend: true,
             shrink_dispersion: true,
+            // DESeq2 estimateDispersionsMAP(outlierSD = 2).
+            disp_outlier_sd: Some(2.0),
 
             cooks_filtering: true,
             cooks_cutoff: None,
@@ -179,6 +189,10 @@ pub struct NbGlmDiagnostics {
     pub n_boundary_dispersion_low: usize,
     /// Genes whose dispersion hit the upper clamp.
     pub n_boundary_dispersion_high: usize,
+    /// Genes exempted from MAP shrinkage as dispersion outliers, keeping their
+    /// gene-wise MLE (DESeq2's `dispOutlier`). Zero when `disp_outlier_sd` is
+    /// `None` or shrinkage did not run.
+    pub n_dispersion_outliers: usize,
     /// Genes that did not converge within `max_outer_iters`.
     pub n_nonconverged: usize,
     /// Genes flagged as Cook's-distance outliers (`p_value`/`p_adj` → NaN).

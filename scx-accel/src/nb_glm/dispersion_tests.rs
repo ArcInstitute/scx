@@ -123,8 +123,11 @@ fn estimate_prior_var_subtracts_sampling_variance() {
     let log_targets = vec![0.0; n];
     let alpha_mle: Vec<f64> = (0..n).map(|i| ((i as f64 - 30.0) * 0.1).exp()).collect();
     let valid = vec![true; n];
-    let pv_small = estimate_prior_var(&log_targets, &alpha_mle, &valid, 6, 2); // trigamma(2)≈0.645
-    let pv_large = estimate_prior_var(&log_targets, &alpha_mle, &valid, 200, 2); // trigamma(99)≈0.005
+    let min_disp = NbGlmOptions::default().min_disp;
+    // trigamma(2)≈0.645
+    let pv_small = estimate_prior_var(&log_targets, &alpha_mle, &valid, 6, 2, min_disp).prior_var;
+    // trigamma(99)≈0.005
+    let pv_large = estimate_prior_var(&log_targets, &alpha_mle, &valid, 200, 2, min_disp).prior_var;
     assert!(
         pv_large > pv_small,
         "smaller residual df subtracts more sampling variance: small={pv_small} large={pv_large}"
@@ -143,7 +146,8 @@ fn estimate_prior_var_has_floor() {
     let valid = vec![true; 10];
     // m=6, p=2 ⇒ trigamma((m−p)/2)=trigamma(2)>0; with MAD=0 the prior var floors
     // at MIN_PRIOR_VAR rather than going negative.
-    let pv = estimate_prior_var(&log_targets, &alpha_mle, &valid, 6, 2);
+    let min_disp = NbGlmOptions::default().min_disp;
+    let pv = estimate_prior_var(&log_targets, &alpha_mle, &valid, 6, 2, min_disp).prior_var;
     assert!(pv >= MIN_PRIOR_VAR - 1e-12);
 }
 
