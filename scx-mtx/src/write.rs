@@ -152,6 +152,10 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Upper bound for a value the `integer` body arm can emit. `v as i64`
+/// saturates above this, so such a matrix is declared `real` instead.
+const MAX_EXACT_INTEGER_BODY: f32 = 9_223_372_036_854_775_807.0;
+
 const MATRIX_MTX: &str = "matrix.mtx.gz";
 const BARCODES_TSV: &str = "barcodes.tsv.gz";
 const FEATURES_TSV: &str = "features.tsv.gz";
@@ -246,8 +250,13 @@ impl Staged {
                         return Err(e);
                     }
                 };
-                // `rename` needs the target gone, and we just proved it is ours.
-                let _ = std::fs::remove_file(&backup);
+                // Deliberately *not* unlinked first. `rename(2)` replaces an
+                // existing regular file atomically, and the empty placeholder
+                // `reserve` created is exactly that. Vacating the name instead
+                // would reopen the window the exclusive creation exists to
+                // close: a second export in the same process reserves the same
+                // lowest counter, and one commit renames over the other's
+                // reservation.
                 if let Err(e) = std::fs::rename(final_path, &backup) {
                     rollback(&backups, &committed);
                     return Err(e.into());
@@ -557,7 +566,11 @@ fn kept_values_are_integral(
             continue;
         }
         for &v in &values[indptr[r] as usize..indptr[r + 1] as usize] {
-            if !(v.is_finite() && v >= 0.0 && v == v.floor()) {
+            // The integer body arm writes `v as i64`, which *saturates*: a
+            // float-encoded `1e20` is integral and non-negative but would be
+            // emitted as `i64::MAX`. Declare `real` for anything the integer
+            // formatting cannot carry.
+            if !(v.is_finite() && v >= 0.0 && v == v.floor() && v < MAX_EXACT_INTEGER_BODY) {
                 return false;
             }
         }

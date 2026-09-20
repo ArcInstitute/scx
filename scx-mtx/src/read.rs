@@ -335,13 +335,16 @@ fn parse_mtx_file(
 
     // Read COO triplets into a single vec for cache-friendly sorting
     let mut entries: Vec<(usize, usize, f32)> = Vec::with_capacity(nnz);
-    // For a declared-`integer` file, the exact parsed value of every entry, in
-    // the same order. `entries` carries the `f32` the rest of the pipeline
-    // wants; this carries the integer the duplicate-sum has to be exact in.
-    // Re-deriving it with `entries[i].2 as i64` reads a value that may already
-    // have been rounded, which is how a `16777217, -16777216` pair summed to 0
-    // instead of 1 under `allow_lossy`.
-    let mut exact: Vec<i64> = if is_integer {
+    // A declared-`integer` file keeps its values as parsed, in one vector.
+    // The rest of the pipeline wants `f32`, but the duplicate-sum has to be
+    // exact: re-deriving an addend with `entries[i].2 as i64` reads a value
+    // that may already have been rounded, which is how a
+    // `16777217, -16777216` pair summed to 0 instead of 1 under `allow_lossy`.
+    //
+    // One vector rather than a parallel `Vec<i64>` plus a sort permutation:
+    // that shape held three buffers and copied the whole triplet run twice,
+    // raising peak ingest storage to ~2.7x for ordinary count matrices.
+    let mut int_entries: Vec<(usize, usize, i64)> = if is_integer {
         Vec::with_capacity(nnz)
     } else {
         Vec::new()
@@ -375,6 +378,7 @@ fn parse_mtx_file(
         // Parsing as `i64` keeps the declared type honest *and* makes the
         // precision question answerable, because the exact value is still in
         // hand when the range check runs.
+        let mut int_value: i64 = 0;
         let val: f32 = if is_integer {
             let n: i64 = parts[2].parse().map_err(|_| {
                 MtxError::Parse(format!(
@@ -383,7 +387,7 @@ fn parse_mtx_file(
                 ))
             })?;
             check_integer_fits_f32(n, opts.allow_lossy)?;
-            exact.push(n);
+            int_value = n;
             n as f32
         } else {
             parts[2]
@@ -411,10 +415,22 @@ fn parse_mtx_file(
             )));
         }
 
-        entries.push((row, col, val));
+        if is_integer {
+            int_entries.push((row, col, int_value));
+        } else {
+            entries.push((row, col, val));
+        }
     }
 
-    if entries.len() != nnz {
+    if is_integer {
+        if int_entries.len() != nnz {
+            return Err(MtxError::Parse(format!(
+                "expected {} entries, read {}",
+                nnz,
+                int_entries.len()
+            )));
+        }
+    } else if entries.len() != nnz {
         return Err(MtxError::Parse(format!(
             "expected {} entries, read {}",
             nnz,
@@ -429,17 +445,7 @@ fn parse_mtx_file(
     // Without the dedup, downstream `ScxCsc::new` rejects the duplicate
     // row indices a later `build-csc`/`--rebuild-csc` would produce.
     if is_integer {
-        // Sort the two in lockstep by sorting an index permutation, so the
-        // exact value stays attached to its coordinate.
-        let mut order: Vec<usize> = (0..entries.len()).collect();
-        order.sort_unstable_by(|&a, &b| {
-            entries[a]
-                .0
-                .cmp(&entries[b].0)
-                .then(entries[a].1.cmp(&entries[b].1))
-        });
-        entries = order.iter().map(|&i| entries[i]).collect();
-        exact = order.iter().map(|&i| exact[i]).collect();
+        int_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     } else {
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     }
@@ -461,13 +467,13 @@ fn parse_mtx_file(
         // sum the format cannot represent (`16777216, +1, -1` passes through
         // 16777217 and lands on 16777215), and an addend already rounded at
         // parse time (`16777217, -16777216` sums to 0 instead of 1).
-        let mut write = 0usize;
+        entries.reserve(int_entries.len());
         let mut i = 0usize;
-        while i < entries.len() {
-            let (row, col, _) = entries[i];
+        while i < int_entries.len() {
+            let (row, col, _) = int_entries[i];
             let mut sum: i128 = 0;
-            while i < entries.len() && entries[i].0 == row && entries[i].1 == col {
-                sum += exact[i] as i128;
+            while i < int_entries.len() && int_entries[i].0 == row && int_entries[i].1 == col {
+                sum += int_entries[i].2 as i128;
                 i += 1;
             }
             if !opts.allow_lossy && sum.unsigned_abs() > scx_codec::F32_MAX_EXACT_INT as u128 {
@@ -476,10 +482,11 @@ fn parse_mtx_file(
                     col: col + 1,
                 });
             }
-            entries[write] = (row, col, sum as f32);
-            write += 1;
+            entries.push((row, col, sum as f32));
         }
-        entries.truncate(write);
+        // Release the integer buffer before the CSR arrays are built, so the
+        // two are never resident together.
+        drop(std::mem::take(&mut int_entries));
     } else {
         scx_sparse::coalesce_sorted_coo(&mut entries);
     }

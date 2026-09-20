@@ -100,12 +100,18 @@ pub fn run_query(
     // `source` may be a cloud URL, in which case it can never name the local
     // output and the same-path arm is inert.
     match output {
-        Some(out_path) => crate::cli_utils::guard_destination(
-            &[Path::new(source)],
-            crate::cli_utils::Destination::File(out_path),
-            crate::cli_utils::SamePath::Reject,
-            force,
-        )?,
+        Some(out_path) => {
+            // `file://` has to be resolved before the comparison; the raw
+            // string is not the path the reader will open.
+            let local_source = crate::cli_utils::local_source_path(source);
+            let inputs: Vec<&Path> = local_source.as_deref().into_iter().collect();
+            crate::cli_utils::guard_destination(
+                &inputs,
+                crate::cli_utils::Destination::File(out_path),
+                crate::cli_utils::SamePath::Reject,
+                force,
+            )?
+        }
         // `--count` and the default summary both print and write nothing.
         None => crate::cli_utils::reject_inert_force(
             force,

@@ -2806,6 +2806,13 @@ fn dispatch_scx_to_mtx(
     );
     pb.set_message(format!("Converting to MTX {}...", output.display()));
 
+    // Checked *before* the export, because the cleanup below runs after the
+    // three primary members have been replaced: an alias that cannot be
+    // removed would leave the command failing with the export already swapped.
+    if force {
+        cli_utils::preflight_mtx_aliases(output, &[input])?;
+    }
+
     scx_mtx::write_scx_to_mtx_for(input, output, modality)?;
 
     // Only now that the export has succeeded, and only because `--force`

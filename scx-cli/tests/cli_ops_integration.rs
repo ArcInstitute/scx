@@ -2922,3 +2922,37 @@ fn a_destination_inside_a_directory_input_is_refused() {
         "the source member must survive the refusal"
     );
 }
+
+/// A `.scxd` destination spelled `.` must not be read as containing the whole
+/// filesystem.
+///
+/// `normalize(".")` is the empty path and `Path::starts_with(empty)` is true
+/// for every path, so a lexical containment arm without that special case
+/// refuses `scx explode /elsewhere/x.scx .` — a source on a different
+/// filesystem entirely. This is the arm the `MtxDir` destinations do not
+/// reach, so it needs its own test.
+#[cfg(feature = "cloud")]
+#[test]
+fn a_dot_scxd_destination_does_not_contain_every_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "source.scx", 6, 10);
+
+    // An empty `.scxd` that happens to be the working directory.
+    let work = dir.path().join("out.scxd");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = scx_cli()
+        .current_dir(&work)
+        .args(["explode", input.to_str().unwrap(), "."])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`.` as the .scxd destination must work when the source is elsewhere: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_dir(&work).unwrap().next().is_some(),
+        "the explode should have populated the directory"
+    );
+}

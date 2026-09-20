@@ -733,3 +733,116 @@ fn member_snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
+
+/// A stale alias that cannot be removed must be found *before* the export,
+/// not after it has already replaced the three primary members.
+///
+/// `clear_stale_mtx_aliases` runs post-export, so without a preflight the
+/// command exits non-zero with `matrix.mtx.gz` already swapped — breaking the
+/// "a failed command changes nothing" boundary the rest of the guard keeps.
+#[test]
+fn an_unremovable_stale_alias_is_caught_before_the_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let scx_path = dir.path().join("mid.scx");
+    assert!(scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let out_dir = dir.path().join("export");
+    assert!(scx()
+        .args([
+            "convert",
+            "--to",
+            "mtx",
+            scx_path.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let before = member_snapshot(&out_dir);
+
+    // A stale v2 alias that `remove_file` cannot take.
+    std::fs::create_dir(out_dir.join("genes.tsv.gz")).unwrap();
+
+    let out = scx()
+        .args([
+            "convert",
+            "--to",
+            "mtx",
+            scx_path.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "an unremovable alias must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be cleared after the export"),
+        "the refusal must say why: {stderr}"
+    );
+    let after: Vec<(String, Vec<u8>)> = member_snapshot(&out_dir)
+        .into_iter()
+        .filter(|(n, _)| n != "genes.tsv.gz")
+        .collect();
+    assert_eq!(
+        after, before,
+        "the primary members must not have been replaced"
+    );
+}
+
+/// A destination spelled `.` is the ordinary "write the MTX files here"
+/// invocation and must not be refused.
+///
+/// `normalize(".")` is the empty path, and `Path::starts_with(empty)` is true
+/// for every path — so a lexical containment arm that does not special-case it
+/// refuses every relative destination, whatever filesystem the source is on.
+#[test]
+fn a_dot_destination_is_not_treated_as_containing_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let scx_path = dir.path().join("mid.scx");
+    assert!(scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let work = dir.path().join("cwd");
+    std::fs::create_dir_all(&work).unwrap();
+    let out = scx()
+        .current_dir(&work)
+        .args(["convert", "--to", "mtx", scx_path.to_str().unwrap(), "."])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`.` as the MTX destination must work: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(work.join("matrix.mtx.gz").exists());
+}

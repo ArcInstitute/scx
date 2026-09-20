@@ -183,6 +183,32 @@ pub enum SamePath {
     Reject,
 }
 
+/// Resolve a source string to the local path it will actually be read from,
+/// or `None` when it names a genuinely remote object.
+///
+/// `scx pull` and `scx query` take a URL *or* a path, and pass it to the guard
+/// as a `Path`. For a `file://` URL that is a lie: `Path::new("file:///tmp/x")`
+/// canonicalizes to nothing while `scx-cloud` later reads `/tmp/x`, so the
+/// containment check compared the wrong string and
+/// `scx pull file:///tmp/src.scxd /tmp/src.scxd/_catalog.bin --force` destroyed
+/// the source it was pulling.
+pub fn local_source_path(source: &str) -> Option<PathBuf> {
+    if let Some(rest) = source.strip_prefix("file://") {
+        // `file:///abs` → `/abs`; a host component (`file://host/p`) is not a
+        // local path this process can compare against.
+        // `file:///abs` → `/abs`. Anything else carries a host component
+        // (`file://host/p`), which is not a path this process can compare
+        // against.
+        return rest
+            .strip_prefix('/')
+            .map(|abs| PathBuf::from(format!("/{abs}")));
+    }
+    if source.contains("://") {
+        return None; // gs://, s3://, az://, …
+    }
+    Some(PathBuf::from(source))
+}
+
 /// Whether `path` lies strictly inside `dir`.
 ///
 /// Tested on both the resolved and the literal path. Resolving alone is not
@@ -190,15 +216,33 @@ pub enum SamePath {
 /// canonicalizes to a location outside, and would be judged safe even though
 /// the entry that gets removed is the one inside.
 fn contains(dir: &Path, path: &Path) -> bool {
-    let lexical = {
-        let (d, p) = (normalize(dir), normalize(path));
-        d != p && p.starts_with(&d)
-    };
-    let resolved = match (std::fs::canonicalize(dir), resolve_parent(path)) {
-        (Ok(d), Some(p)) => d != p && p.starts_with(&d),
-        _ => false,
-    };
-    lexical || resolved
+    // Resolved location first: this is the answer for every ordinary case.
+    if let (Ok(d), Some(p)) = (std::fs::canonicalize(dir), resolve_parent(path)) {
+        if d != p && p.starts_with(&d) {
+            return true;
+        }
+    }
+    // The lexical arm exists only for one case the resolved one cannot see: a
+    // symlink sitting *inside* `dir` but pointing outside it resolves to a
+    // location outside, while the entry that actually gets removed is the one
+    // inside.
+    //
+    // It is a string-prefix test, so it is only sound when both paths are made
+    // of plain named components. `..` defeats a prefix comparison outright —
+    // `/data/in.scxd/../out.scx` starts with `/data/in.scxd` and is not inside
+    // it — and an *empty* normalized dir (`.`, `./`, `./.`) is a prefix of
+    // literally every path, which refused every relative destination spelled
+    // `.`. Both are cases where only the resolved answer means anything.
+    let (d, p) = (normalize(dir), normalize(path));
+    if d.as_os_str().is_empty() || has_parent_component(&d) || has_parent_component(&p) {
+        return false;
+    }
+    d != p && p.starts_with(&d)
+}
+
+fn has_parent_component(p: &Path) -> bool {
+    p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 /// Canonicalize `path`, falling back to canonicalizing its parent and
@@ -298,7 +342,15 @@ pub fn guard_destination(
                 )
                 .into());
             }
-            if contains(dest.path(), input) {
+            // Only for a destination this command replaces *wholesale*.
+            // `explode --force` swaps the whole `.scxd` tree, so anything
+            // inside it is deleted. An `MtxDir` is not that: the writer
+            // replaces three member names and leaves every sibling alone, so
+            // refusing here would reject `scx convert ./sample.scx . --to mtx`
+            // — the ordinary "write the MTX files here" invocation. The case
+            // that genuinely would destroy the source there (the source *is*
+            // one of those three names) is refused by `write_scx_to_mtx_for`.
+            if matches!(dest, Destination::ScxdDir(_)) && contains(dest.path(), input) {
                 return Err(format!(
                     "{} is inside the output {}; writing there would destroy the input",
                     input.display(),
@@ -330,6 +382,38 @@ pub fn guard_destination(
 /// The destination is a *directory*, so the same-path check in
 /// [`guard_destination`] compares the input against the directory and cannot
 /// see an input that happens to live inside it under one of these names.
+/// Check, before anything is written, that every alias this command will
+/// later remove *can* be removed.
+///
+/// `clear_stale_mtx_aliases` runs after the export has replaced the three
+/// primary members, so a failure there — an alias that is a directory, say —
+/// leaves the command exiting non-zero with the members already swapped,
+/// breaking the "a failed command changes nothing" boundary the rest of this
+/// guard maintains. Finding out first costs one `symlink_metadata` per name.
+pub fn preflight_mtx_aliases(dir: &Path, protect: &[&Path]) -> CliResult<()> {
+    for name in MTX_MEMBERS {
+        if MTX_WRITTEN_MEMBERS.contains(name) {
+            continue;
+        }
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                if protect.iter().any(|p| same_file(p, &path)) {
+                    continue;
+                }
+                return Err(format!(
+                    "{} is a directory, so it cannot be cleared after the export; \
+                     remove it or choose another output directory",
+                    path.display()
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub fn clear_stale_mtx_aliases(dir: &Path, protect: &[&Path]) -> CliResult<()> {
     for name in MTX_MEMBERS {
         if MTX_WRITTEN_MEMBERS.contains(name) {
