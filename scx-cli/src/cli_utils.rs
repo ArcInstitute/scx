@@ -146,10 +146,13 @@ impl<'a> Destination<'a> {
                     Vec::new()
                 }
             }
+            // `symlink_metadata` here too: a dangling `matrix.mtx.gz`
+            // symlink is not visible to `exists()`, so an unforced export
+            // would silently replace it.
             Destination::MtxDir(dir) => MTX_MEMBERS
                 .iter()
                 .map(|name| dir.join(name))
-                .filter(|p| p.exists())
+                .filter(|p| std::fs::symlink_metadata(p).is_ok())
                 .collect(),
             Destination::ScxdDir(dir) => match std::fs::read_dir(dir) {
                 // Non-empty: the members we are about to write are not
@@ -158,8 +161,11 @@ impl<'a> Destination<'a> {
                 Ok(mut entries) => entries
                     .next()
                     .map_or(Vec::new(), |_| vec![dir.to_path_buf()]),
-                // Absent, or unreadable for a reason the write itself will
-                // report with a better message than this guard could.
+                // `read_dir` also fails when the path exists but is a file or
+                // a dangling symlink, which is a collision, not an absence.
+                Err(_) if std::fs::symlink_metadata(dir).is_ok() => {
+                    vec![dir.to_path_buf()]
+                }
                 Err(_) => Vec::new(),
             },
         }
@@ -191,7 +197,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// destination.
 ///
 /// Before this existed the rule was hand-rolled four times — `compact.rs`,
-/// `optimize.rs`, `sort.rs` and `scx_ops::run_build_csc` — in three different
+/// `optimize.rs`, `sort.rs` and `scx_ops::run_build_csc` — in two different
 /// wordings, with the same-path check present in two of them and the other six
 /// destination-writing subcommands (`convert`, `merge`, `subset`,
 /// `query --output`, `upgrade`, and the cloud ops) carrying no check at all.
@@ -202,8 +208,9 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// remote `.scxd` URL, so an existence probe is a network round-trip with its
 /// own failure modes rather than a `Path::exists`.
 ///
-/// Order matters. The same-path verdict is reached *before* anything is
-/// unlinked, because the failure it prevents is destroying the input.
+/// The same-path verdict is reached first, because the failure it prevents —
+/// writing over the command's own input — is the one no `--force` can make
+/// acceptable.
 ///
 /// **This guard never deletes anything.** It answers one question — may this
 /// command write here — and nothing else. An earlier version unlinked an

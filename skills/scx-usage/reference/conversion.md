@@ -247,9 +247,13 @@ scx convert <input> <output> [--force] [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad
 ```
 - `--force` is required to overwrite an existing destination. For `--to mtx`
   that means an existing `matrix.mtx.gz` / `barcodes.tsv.gz` / `features.tsv.gz`
-  / `genes.tsv.gz` inside the output directory, not the directory itself; with
-  `--force` those members are removed before the export so no stale file is left
-  describing a different matrix.
+  / `genes.tsv.gz` inside the output directory, not the directory itself. The
+  export never deletes anything up front: it writes its three members under
+  temp names and swaps them in together once all three have succeeded, so a
+  failure leaves the previous export intact. The alternative spellings the
+  writer does not produce (`genes.tsv[.gz]`, the uncompressed forms) are
+  cleared afterwards, under `--force`, so no stale file is left describing a
+  different matrix.
 - `--stream` bounds peak memory. It applies to h5ad ↔ SCX and h5mu ↔ SCX in both
   directions and to 10x → SCX, all of which stream by default. MTX ↔ SCX has a
   single path in each direction with nothing to select — SCX → MTX always

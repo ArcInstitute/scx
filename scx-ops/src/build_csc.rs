@@ -63,9 +63,9 @@ pub fn run_build_csc(
     }
 
     // 3. `output` must be a different file from `input`, by canonical path.
-    //    The `--force` arm below unlinks `output` before `input` is opened, so
-    //    an alias (`a.scx` vs `./a.scx`) would delete the source and then fail
-    //    to open it. The in-place form (no `<OUTPUT>`) is `rebuild_csc_inplace`,
+    //    An alias (`a.scx` vs `./a.scx`) would otherwise have the rewrite
+    //    write over its own source. The in-place form (no `<OUTPUT>`) is
+    //    `rebuild_csc_inplace`,
     //    which stages a temp file; the pyscx wrapper has refused this alias
     //    since it was written — the guard belongs here so every caller gets it.
     if same_file(input, output) {
@@ -78,7 +78,10 @@ pub fn run_build_csc(
     }
 
     // 3b. Check output doesn't exist (unless --force)
-    if output.exists() && !force {
+    // `symlink_metadata`, not `exists()`: the latter follows the link and
+    // answers `false` for a dangling symlink, which would let an unforced
+    // rewrite replace it.
+    if std::fs::symlink_metadata(output).is_ok() && !force {
         return Err(format!(
             "{} already exists (use --force to overwrite)",
             output.display()

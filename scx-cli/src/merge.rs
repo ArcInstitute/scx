@@ -65,7 +65,6 @@ pub fn run_merge(
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Build refs for the ops API
-    let input_refs: Vec<&Path> = inputs.iter().map(|p| p.as_path()).collect();
 
     // Parse the optional --uns-policy flag.
     let uns_policy = match uns_policy.as_deref() {

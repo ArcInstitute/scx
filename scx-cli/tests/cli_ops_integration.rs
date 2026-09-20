@@ -2828,3 +2828,42 @@ fn explode_force_replaces_a_non_empty_directory() {
         "the replacement explode must have populated the directory"
     );
 }
+
+/// `explode --force` replaces the destination tree wholesale, so an input
+/// living inside it would be deleted along with everything else. The guard's
+/// same-path check compares a file against a directory and cannot see this.
+#[cfg(feature = "cloud")]
+#[test]
+fn explode_force_refuses_an_input_inside_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("dest.scxd");
+    std::fs::create_dir_all(&dest).unwrap();
+    // Make it non-empty so `--force` takes the replacing path.
+    std::fs::write(dest.join("stale.bin"), b"previous explode").unwrap();
+    // …and put the source inside it.
+    let input = write_test_file(&dir, "inside.scx", 6, 10);
+    let inside = dest.join("inside.scx");
+    std::fs::rename(&input, &inside).unwrap();
+    let original = std::fs::read(&inside).unwrap();
+
+    let out = scx_cli()
+        .args([
+            "explode",
+            inside.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the containment must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("inside the output directory"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&inside).unwrap(),
+        original,
+        "the input must survive the refusal"
+    );
+}

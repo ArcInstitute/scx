@@ -433,12 +433,17 @@ fn parse_mtx_file(
         while i < entries.len() {
             let (row, col, _) = entries[i];
             let start = i;
-            let mut sum: i64 = 0;
+            // `i128`, not a saturating `i64`: saturation is not "lossy", it is
+            // a different number. Two duplicates of `i64::MAX` would clamp to
+            // one `i64::MAX` and store ~2⁶³, where the correctly rounded f32
+            // sum is ~2⁶⁴ — and under `allow_lossy`, which licenses f32
+            // rounding and nothing else, that would ship silently.
+            let mut sum: i128 = 0;
             while i < entries.len() && entries[i].0 == row && entries[i].1 == col {
-                sum = sum.saturating_add(entries[i].2 as i64);
+                sum += entries[i].2 as i128;
                 i += 1;
             }
-            if !opts.allow_lossy && sum.unsigned_abs() > scx_codec::F32_MAX_EXACT_INT as u64 {
+            if !opts.allow_lossy && sum.unsigned_abs() > scx_codec::F32_MAX_EXACT_INT as u128 {
                 return Err(MtxError::LossySummedIntegerValue {
                     row: row + 1,
                     col: col + 1,

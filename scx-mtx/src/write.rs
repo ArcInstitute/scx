@@ -80,6 +80,20 @@ pub fn write_scx_to_mtx_for(
         None => reader.n_vars() as usize,
     };
 
+    // The destination is a *directory*, so a caller's same-path check compares
+    // the source against it and cannot see a source living inside it under one
+    // of the names this export replaces. Refused here rather than in the CLI
+    // so `pyscx.to_mtx`, which calls this directly, gets the same rule.
+    for name in [MATRIX_MTX, BARCODES_TSV, FEATURES_TSV] {
+        if same_file(scx_path, &output_dir.join(name)) {
+            return Err(MtxError::Other(format!(
+                "the source {} is also the `{name}` this export would write; \
+                 choose an output directory that does not contain the input",
+                scx_path.display()
+            )));
+        }
+    }
+
     std::fs::create_dir_all(output_dir)?;
 
     // Every member is written to a temp name and renamed into place only once
@@ -128,6 +142,16 @@ pub fn write_scx_to_mtx_for(
     staged.commit()
 }
 
+/// True when both paths name the same file. Canonicalization resolves `./a`
+/// against `a` and follows symlinks; it fails on a path that does not exist,
+/// which is when a literal comparison is the right answer.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 const MATRIX_MTX: &str = "matrix.mtx.gz";
 const BARCODES_TSV: &str = "barcodes.tsv.gz";
 const FEATURES_TSV: &str = "features.tsv.gz";
@@ -162,11 +186,82 @@ impl Staged {
         &self.members.last().expect("just pushed").0
     }
 
+    /// Replace all three members, or none of them.
+    ///
+    /// Renaming onto the live names one at a time is *not* all-or-nothing: a
+    /// failure on the second rename leaves a new `matrix.mtx.gz` beside the
+    /// previous run's `barcodes.tsv.gz` — the mixed directory this staging
+    /// exists to prevent, moved from the write loop to the commit loop. So
+    /// each live member is moved aside first and put back if a later one
+    /// fails.
+    ///
+    /// `self.members` is cleared only once every rename has succeeded, so an
+    /// early return still leaves `Drop` a list to clean up. The previous
+    /// `std::mem::take` emptied it before the first rename, which silently
+    /// disabled `Drop` on exactly the paths that needed it.
     fn commit(mut self) -> Result<(), MtxError> {
-        for (temp, final_path) in std::mem::take(&mut self.members) {
-            std::fs::rename(&temp, &final_path)?;
+        // A member that is not a regular file cannot be renamed over.
+        // Discovering that half way through is what makes a commit
+        // non-atomic, so discover it before touching anything.
+        for (_, final_path) in &self.members {
+            if let Ok(meta) = std::fs::symlink_metadata(final_path) {
+                if !meta.is_file() {
+                    return Err(MtxError::Other(format!(
+                        "{} exists and is not a regular file, so the export cannot replace it",
+                        final_path.display()
+                    )));
+                }
+            }
         }
+
+        let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        let mut committed: Vec<std::path::PathBuf> = Vec::new();
+
+        for (temp, final_path) in &self.members {
+            if std::fs::symlink_metadata(final_path).is_ok() {
+                let backup = self.dir.join(format!(
+                    ".{}.scx-bak-{}",
+                    final_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_file(&backup);
+                if let Err(e) = std::fs::rename(final_path, &backup) {
+                    rollback(&backups, &committed);
+                    return Err(e.into());
+                }
+                backups.push((backup, final_path.clone()));
+            }
+            if let Err(e) = std::fs::rename(temp, final_path) {
+                rollback(&backups, &committed);
+                return Err(e.into());
+            }
+            committed.push(final_path.clone());
+        }
+
+        for (backup, _) in &backups {
+            let _ = std::fs::remove_file(backup);
+        }
+        self.members.clear();
         Ok(())
+    }
+}
+
+/// Undo a partial commit: drop whatever was put in place, then move every
+/// saved member back. Best-effort by construction — the caller is already
+/// returning the original error and there is nothing useful to report if the
+/// undo itself fails.
+fn rollback(
+    backups: &[(std::path::PathBuf, std::path::PathBuf)],
+    committed: &[std::path::PathBuf],
+) {
+    for path in committed {
+        let _ = std::fs::remove_file(path);
+    }
+    for (backup, final_path) in backups {
+        let _ = std::fs::rename(backup, final_path);
     }
 }
 
@@ -429,10 +524,23 @@ fn write_barcodes_tsv(path: &Path, obs: &arrow::array::RecordBatch) -> Result<()
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
-    // Use the first column as barcode (typically "_index" or "barcode")
-    if obs.num_columns() == 0 || obs.num_rows() == 0 {
+    if obs.num_rows() == 0 {
         return Ok(());
     }
+    // A batch can carry rows and no columns (`RecordBatchOptions::with_row_count`,
+    // which `ScxWriter::write_obs` serializes as given). Returning here emitted
+    // an empty `barcodes.tsv.gz` beside a matrix declaring `n_obs` columns — a
+    // directory Cell Ranger and Scanpy both reject. Fall back to the synthetic
+    // IDs the genuinely-absent-obs path already uses.
+    if obs.num_columns() == 0 {
+        for i in 0..obs.num_rows() {
+            writeln!(w, "cell_{}", i)?;
+        }
+        w.flush()?;
+        return Ok(());
+    }
+
+    // Use the first column as barcode (typically "_index" or "barcode")
 
     let col = obs.column(0);
     if let Some(string_arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
@@ -1104,5 +1212,121 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("single-modality"), "{err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Round-2 review: the commit must be all-or-nothing, and the source
+    // must not be one of the members being replaced.
+    // -----------------------------------------------------------------
+
+    /// A commit that fails part-way must leave the previous export exactly as
+    /// it was — not a new matrix beside the old barcodes.
+    ///
+    /// The failure is forced the way the reviewer reproduced it: make one of
+    /// the members a directory, which cannot be renamed over. Before this fix
+    /// `commit` took `self.members` before the first rename, so `Drop` was a
+    /// no-op and an early member was already replaced.
+    #[test]
+    fn a_commit_that_fails_part_way_leaves_the_previous_export_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[]);
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+
+        let before: Vec<(String, Vec<u8>)> = members(&out);
+        assert_eq!(before.len(), 3);
+
+        // `features.tsv.gz` is now a directory: the third rename cannot land.
+        std::fs::remove_file(out.join("features.tsv.gz")).unwrap();
+        std::fs::create_dir(out.join("features.tsv.gz")).unwrap();
+
+        let err = write_scx_to_mtx(&src, &out).unwrap_err().to_string();
+        assert!(
+            err.contains("not a regular file"),
+            "the precheck should name the obstruction: {err}"
+        );
+
+        // The two members that could have been replaced were not, and no
+        // staging debris survives.
+        for (name, bytes) in &before {
+            if name == "features.tsv.gz" {
+                continue;
+            }
+            assert_eq!(
+                &std::fs::read(out.join(name)).unwrap(),
+                bytes,
+                "{name} must be untouched after a failed commit"
+            );
+        }
+        let debris: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(debris.is_empty(), "staging debris left behind: {debris:?}");
+    }
+
+    /// The destination is a directory, so a caller's same-path check compares
+    /// a file against a directory and cannot see a source living inside it
+    /// under one of the names the export replaces. `pyscx.to_mtx` calls this
+    /// writer directly, so the refusal belongs here rather than in the CLI.
+    #[test]
+    fn a_source_that_is_one_of_the_members_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[]);
+        let out = dir.path().join("mtx");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // An SCX file that *is* the matrix member the export would write.
+        let disguised = out.join("matrix.mtx.gz");
+        std::fs::copy(&src, &disguised).unwrap();
+        let original = std::fs::read(&disguised).unwrap();
+
+        let err = write_scx_to_mtx(&disguised, &out).unwrap_err().to_string();
+        assert!(
+            err.contains("is also the `matrix.mtx.gz`"),
+            "the refusal must name the collision: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&disguised).unwrap(),
+            original,
+            "the source must survive the refusal"
+        );
+    }
+
+    /// An obs batch with rows but no columns must still produce one barcode
+    /// per row; an empty `barcodes.tsv.gz` beside a matrix declaring `n_obs`
+    /// columns is a directory Cell Ranger and Scanpy both reject.
+    #[test]
+    fn an_obs_batch_with_no_columns_still_emits_one_barcode_per_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("barcodes.tsv.gz");
+        let empty = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(4)),
+        )
+        .unwrap();
+        write_barcodes_tsv(&path, &empty).unwrap();
+        assert_eq!(
+            read_gz(&path).lines().collect::<Vec<_>>(),
+            vec!["cell_0", "cell_1", "cell_2", "cell_3"]
+        );
+    }
+
+    fn members(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
