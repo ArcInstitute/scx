@@ -2709,6 +2709,10 @@ fn dispatch_convert(
 }
 
 /// MTX → SCX conversion (always available, no hdf5 feature needed).
+///
+/// This direction materializes: `read_mtx_directory` holds the COO triplet
+/// buffer and then the CSR arrays. The reverse direction streams — see
+/// `dispatch_scx_to_mtx`.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_mtx_to_scx(
     input: &std::path::Path,
@@ -2732,6 +2736,13 @@ fn dispatch_mtx_to_scx(
     pb.set_message(format!("Converting MTX {}...", input.display()));
 
     let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
+    if allow_lossy {
+        eprintln!(
+            "warning: --allow-lossy is set, so any integer whose magnitude exceeds 2^24 \
+             (or whose duplicate-coordinate total does) was stored rounded to the nearest \
+             value float32 can hold."
+        );
+    }
     let orientation = mtx_pipeline::mtx_to_scx(
         input,
         output,

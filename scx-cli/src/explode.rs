@@ -27,20 +27,6 @@ pub fn run_explode(
     // old one is moved aside first and removed after the swap.
     let staged = force && dir_is_non_empty(output_dir);
 
-    // The swap below removes the whole retired tree, so an input living inside
-    // the destination would be deleted along with it. The destination is a
-    // directory, so the same-path check above compares a file against a
-    // directory and cannot see this.
-    if staged && path_contains(output_dir, input) {
-        return Err(format!(
-            "{} is inside the output directory {}; --force replaces that directory \
-             wholesale, which would delete the input",
-            input.display(),
-            output_dir.display()
-        )
-        .into());
-    }
-
     // Exclusive creation, never a guessed name: `remove_dir_all` on a
     // predictable `<dir>.<tag>-<pid>` path deletes whatever happens to be
     // there — a leftover from a killed run after PID reuse, or a directory the
@@ -113,12 +99,4 @@ fn create_exclusive_sibling(dir: &Path, tag: &str) -> Result<PathBuf, Box<dyn st
         dir.display()
     )
     .into())
-}
-
-/// Whether `path` lies inside `dir`, by canonical path.
-fn path_contains(dir: &Path, path: &Path) -> bool {
-    match (std::fs::canonicalize(dir), std::fs::canonicalize(path)) {
-        (Ok(d), Ok(p)) => p.starts_with(d),
-        _ => false,
-    }
 }

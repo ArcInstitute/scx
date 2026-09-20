@@ -335,6 +335,17 @@ fn parse_mtx_file(
 
     // Read COO triplets into a single vec for cache-friendly sorting
     let mut entries: Vec<(usize, usize, f32)> = Vec::with_capacity(nnz);
+    // For a declared-`integer` file, the exact parsed value of every entry, in
+    // the same order. `entries` carries the `f32` the rest of the pipeline
+    // wants; this carries the integer the duplicate-sum has to be exact in.
+    // Re-deriving it with `entries[i].2 as i64` reads a value that may already
+    // have been rounded, which is how a `16777217, -16777216` pair summed to 0
+    // instead of 1 under `allow_lossy`.
+    let mut exact: Vec<i64> = if is_integer {
+        Vec::with_capacity(nnz)
+    } else {
+        Vec::new()
+    };
 
     for line_result in lines {
         let line = line_result?;
@@ -372,6 +383,7 @@ fn parse_mtx_file(
                 ))
             })?;
             check_integer_fits_f32(n, opts.allow_lossy)?;
+            exact.push(n);
             n as f32
         } else {
             parts[2]
@@ -416,31 +428,46 @@ fn parse_mtx_file(
     // implementation also used by the CSC→CSR external transposer.
     // Without the dedup, downstream `ScxCsc::new` rejects the duplicate
     // row indices a later `build-csc`/`--rebuild-csc` would produce.
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    if is_integer {
+        // Sort the two in lockstep by sorting an index permutation, so the
+        // exact value stays attached to its coordinate.
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            entries[a]
+                .0
+                .cmp(&entries[b].0)
+                .then(entries[a].1.cmp(&entries[b].1))
+        });
+        entries = order.iter().map(|&i| entries[i]).collect();
+        exact = order.iter().map(|&i| exact[i]).collect();
+    } else {
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    }
 
     // The per-entry check above cannot see a *sum*: MatrixMarket adds
     // duplicate coordinates, so two entries that each fit can total past what
-    // `f32` holds exactly.
-    //
-    // The sum has to be taken in `i64`, and it has to be taken *before*
-    // coalescing. `16777216 + 1` in `f32` is `16777216`, so a check on the
-    // coalesced value would read the rounded total and wave it through — the
-    // exact failure this is here to catch. Every entry has already been proved
-    // exactly representable, so `v as i64` recovers the integer it was parsed
-    // from.
+    // `f32` holds exactly. The range check therefore belongs on the group
+    // total, before anything is cast.
     if is_integer {
+        // Coalesce the integer branch here, on the exact values.
+        //
+        // `coalesce_sorted_coo` remains the one implementation of
+        // MatrixMarket's sum-duplicates *rule*, and this applies the identical
+        // rule — adjacent entries sharing a coordinate are summed, a zero
+        // total is left for the CSR build to drop. What differs is the
+        // arithmetic: `i128` over the values as parsed, rather than a
+        // left-to-right `f32` accumulation over values already cast down.
+        // Both failures that cost are invisible to the f32 version: a partial
+        // sum the format cannot represent (`16777216, +1, -1` passes through
+        // 16777217 and lands on 16777215), and an addend already rounded at
+        // parse time (`16777217, -16777216` sums to 0 instead of 1).
+        let mut write = 0usize;
         let mut i = 0usize;
         while i < entries.len() {
             let (row, col, _) = entries[i];
-            let start = i;
-            // `i128`, not a saturating `i64`: saturation is not "lossy", it is
-            // a different number. Two duplicates of `i64::MAX` would clamp to
-            // one `i64::MAX` and store ~2⁶³, where the correctly rounded f32
-            // sum is ~2⁶⁴ — and under `allow_lossy`, which licenses f32
-            // rounding and nothing else, that would ship silently.
             let mut sum: i128 = 0;
             while i < entries.len() && entries[i].0 == row && entries[i].1 == col {
-                sum += entries[i].2 as i128;
+                sum += exact[i] as i128;
                 i += 1;
             }
             if !opts.allow_lossy && sum.unsigned_abs() > scx_codec::F32_MAX_EXACT_INT as u128 {
@@ -449,22 +476,13 @@ fn parse_mtx_file(
                     col: col + 1,
                 });
             }
-            // Fold the exact total into the group's first entry and zero the
-            // rest. `coalesce_sorted_coo` still does the coalescing — it stays
-            // the single implementation of the sum-duplicates rule — but it
-            // now adds `exact + 0.0 + 0.0 …` rather than re-deriving the total
-            // in `f32`. Its left-to-right `f32` sum can visit an intermediate
-            // the format cannot represent even when the total is fine:
-            // `16777216, +1, -1` passes through `16777217`, which rounds, and
-            // lands on 16777215 instead of 16777216.
-            entries[start].2 = sum as f32;
-            for e in entries[start + 1..i].iter_mut() {
-                e.2 = 0.0;
-            }
+            entries[write] = (row, col, sum as f32);
+            write += 1;
         }
+        entries.truncate(write);
+    } else {
+        scx_sparse::coalesce_sorted_coo(&mut entries);
     }
-
-    scx_sparse::coalesce_sorted_coo(&mut entries);
 
     // Build CSR directly from the deduplicated, sorted run, dropping
     // any coordinate whose summed value is zero.
@@ -898,6 +916,33 @@ mod tests {
             data,
             vec![16_777_216.0f32],
             "the exact total is 16777216; an f32 running sum yields 16777215"
+        );
+    }
+
+    /// The parsed integer has to survive grouping, not be re-derived from the
+    /// `f32` the entry was cast to.
+    ///
+    /// `16777217` is not representable, so it is stored as `16777216`. Summed
+    /// against `-16777216` the exact MatrixMarket total is `1`, but reading
+    /// the addend back out of the `f32` gives `0` — and `allow_lossy` licenses
+    /// f32 *rounding*, not a value that is simply wrong. Reproduced by codex
+    /// in round 3.
+    #[test]
+    fn allow_lossy_sums_duplicates_from_the_parsed_integers_not_the_rounded_ones() {
+        let (_, _, data) = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 2
+1 1 16777217
+1 1 -16777216
+",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            data,
+            vec![1.0f32],
+            "the exact total is 1; re-deriving the addends from f32 gives 0"
         );
     }
 

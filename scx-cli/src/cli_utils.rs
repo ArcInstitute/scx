@@ -183,6 +183,42 @@ pub enum SamePath {
     Reject,
 }
 
+/// Whether `path` lies strictly inside `dir`.
+///
+/// Tested on both the resolved and the literal path. Resolving alone is not
+/// enough: a symlink sitting *inside* `dir` but pointing outside it
+/// canonicalizes to a location outside, and would be judged safe even though
+/// the entry that gets removed is the one inside.
+fn contains(dir: &Path, path: &Path) -> bool {
+    let lexical = {
+        let (d, p) = (normalize(dir), normalize(path));
+        d != p && p.starts_with(&d)
+    };
+    let resolved = match (std::fs::canonicalize(dir), resolve_parent(path)) {
+        (Ok(d), Some(p)) => d != p && p.starts_with(&d),
+        _ => false,
+    };
+    lexical || resolved
+}
+
+/// Canonicalize `path`, falling back to canonicalizing its parent and
+/// re-attaching the file name — a destination usually does not exist yet.
+fn resolve_parent(path: &Path) -> Option<PathBuf> {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return Some(c);
+    }
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    std::fs::canonicalize(parent).ok().map(|c| c.join(name))
+}
+
+/// Strip `.` components so a literal comparison is not defeated by `./a`.
+fn normalize(p: &Path) -> PathBuf {
+    p.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
 /// True when `a` and `b` name the same file. Canonicalization resolves `./a.scx`
 /// against `a.scx` and follows symlinks; it fails on a path that does not exist
 /// yet, which is exactly when a literal comparison is the right answer.
@@ -247,6 +283,29 @@ pub fn guard_destination(
                 )
                 .into()),
             };
+        }
+        // Equality is not the whole invariant. A *directory* input and a file
+        // destination inside it compare unequal and destroy the source anyway
+        // — `scx convert --from mtx dir dir/matrix.mtx.gz` replaced its own
+        // matrix — and the mirror case, an input inside a directory
+        // destination, is deleted by the swap that replaces that directory.
+        if matches!(same_path, SamePath::Reject) {
+            if contains(input, dest.path()) {
+                return Err(format!(
+                    "{} is inside the input {}; writing there would destroy part of the source",
+                    dest.path().display(),
+                    input.display()
+                )
+                .into());
+            }
+            if contains(dest.path(), input) {
+                return Err(format!(
+                    "{} is inside the output {}; writing there would destroy the input",
+                    input.display(),
+                    dest.path().display()
+                )
+                .into());
+            }
         }
     }
 

@@ -822,11 +822,10 @@ mod tests {
     }
 
     /// `input` and `output` naming the same file through different spellings
-    /// is refused before the `--force` arm can unlink it: the source stays
-    /// byte-identical.
+    /// is refused outright: the source stays byte-identical.
     #[cfg(unix)]
     #[test]
-    fn test_build_csc_refuses_an_aliased_output_before_force_unlinks_it() {
+    fn test_build_csc_refuses_an_aliased_output() {
         let dir = tempfile::tempdir().unwrap();
         let input = write_test_input(&dir, 4, 3);
         let before = std::fs::read(&input).unwrap();

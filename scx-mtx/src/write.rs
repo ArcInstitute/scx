@@ -103,7 +103,7 @@ pub fn write_scx_to_mtx_for(
     let mut staged = Staged::new(output_dir);
 
     write_matrix_mtx(
-        staged.temp_for(MATRIX_MTX),
+        staged.temp_for(MATRIX_MTX)?,
         &reader,
         &shards,
         keep.as_deref(),
@@ -120,10 +120,10 @@ pub fn write_scx_to_mtx_for(
                 Some(mask) => scx_format_io::filter_batch_by_keep_mask(&obs, mask)?,
                 None => obs,
             };
-            write_barcodes_tsv(staged.temp_for(BARCODES_TSV), &obs)?
+            write_barcodes_tsv(staged.temp_for(BARCODES_TSV)?, &obs)?
         }
         Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
-            write_synthetic_barcodes(staged.temp_for(BARCODES_TSV), n_obs)?;
+            write_synthetic_barcodes(staged.temp_for(BARCODES_TSV)?, n_obs)?;
         }
         Err(e) => return Err(e.into()),
     }
@@ -132,9 +132,9 @@ pub fn write_scx_to_mtx_for(
     // `modality_id == 0` to `read_var()`, so this one call covers both the
     // multimodal per-modality section and the global one.
     match reader.read_var_for(modality_id) {
-        Ok(var) => write_features_tsv(staged.temp_for(FEATURES_TSV), &var)?,
+        Ok(var) => write_features_tsv(staged.temp_for(FEATURES_TSV)?, &var)?,
         Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
-            write_synthetic_features(staged.temp_for(FEATURES_TSV), n_vars)?;
+            write_synthetic_features(staged.temp_for(FEATURES_TSV)?, n_vars)?;
         }
         Err(e) => return Err(e.into()),
     }
@@ -178,12 +178,10 @@ impl Staged {
 
     /// Reserve `name` and hand back the temp path to write to. The temp lives
     /// in the destination directory so the commit is a rename, not a copy.
-    fn temp_for(&mut self, name: &str) -> &Path {
-        let temp = self
-            .dir
-            .join(format!(".{name}.scx-tmp-{}", std::process::id()));
+    fn temp_for(&mut self, name: &str) -> Result<&Path, MtxError> {
+        let temp = reserve(&self.dir, name, "tmp")?;
         self.members.push((temp, self.dir.join(name)));
-        &self.members.last().expect("just pushed").0
+        Ok(&self.members.last().expect("just pushed").0)
     }
 
     /// Replace all three members, or none of them.
@@ -199,15 +197,27 @@ impl Staged {
     /// early return still leaves `Drop` a list to clean up. The previous
     /// `std::mem::take` emptied it before the first rename, which silently
     /// disabled `Drop` on exactly the paths that needed it.
+    ///
+    /// The precheck is the primary guard and is what the tests exercise; the
+    /// backup/rollback path covers what it cannot see — a rename that fails
+    /// for a reason the precheck has no way to predict (permissions, ENOSPC,
+    /// a race between the check and the rename).
     fn commit(mut self) -> Result<(), MtxError> {
         // A member that is not a regular file cannot be renamed over.
         // Discovering that half way through is what makes a commit
         // non-atomic, so discover it before touching anything.
         for (_, final_path) in &self.members {
+            // `is_dir()`, not `!is_file()`. `symlink_metadata` is `lstat`, so
+            // `is_file()` is false for a symlink — including a live one to a
+            // regular file, verified on this host. `rename(2)` replaces a
+            // symlink inode perfectly well, and refusing one would mean
+            // `--force` could not finish the overwrite the guard demands. A
+            // directory is the obstruction that genuinely cannot be renamed
+            // over.
             if let Ok(meta) = std::fs::symlink_metadata(final_path) {
-                if !meta.is_file() {
+                if meta.is_dir() {
                     return Err(MtxError::Other(format!(
-                        "{} exists and is not a regular file, so the export cannot replace it",
+                        "{} exists and is a directory, so the export cannot replace it",
                         final_path.display()
                     )));
                 }
@@ -219,14 +229,24 @@ impl Staged {
 
         for (temp, final_path) in &self.members {
             if std::fs::symlink_metadata(final_path).is_ok() {
-                let backup = self.dir.join(format!(
-                    ".{}.scx-bak-{}",
-                    final_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    std::process::id()
-                ));
+                // Created exclusively, never unlinked-then-reused. A
+                // predictable `.{name}.scx-bak-{pid}` that this process
+                // removes first is the same "delete a guessed path before
+                // proving ownership" hazard just taken out of `explode` — and
+                // after a kill between the two renames, that path *is* the
+                // previous export.
+                let name = final_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "member".to_string());
+                let backup = match reserve(&self.dir, &name, "bak") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        rollback(&backups, &committed);
+                        return Err(e);
+                    }
+                };
+                // `rename` needs the target gone, and we just proved it is ours.
                 let _ = std::fs::remove_file(&backup);
                 if let Err(e) = std::fs::rename(final_path, &backup) {
                     rollback(&backups, &committed);
@@ -247,6 +267,33 @@ impl Staged {
         self.members.clear();
         Ok(())
     }
+}
+
+/// Create and return a staging path in `dir`, proving it is ours.
+///
+/// `create_new` fails on an existing path, so a collision advances the counter
+/// rather than being removed — nothing here ever unlinks a name it did not
+/// just create. That also makes two concurrent exports in one process safe.
+fn reserve(dir: &Path, stem: &str, tag: &str) -> Result<std::path::PathBuf, MtxError> {
+    for attempt in 0..1024 {
+        let candidate = dir.join(format!(
+            ".{stem}.scx-{tag}-{}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(MtxError::Other(format!(
+        "could not reserve a staging name for {stem} in {}",
+        dir.display()
+    )))
 }
 
 /// Undo a partial commit: drop whatever was put in place, then move every
@@ -1242,7 +1289,7 @@ mod tests {
 
         let err = write_scx_to_mtx(&src, &out).unwrap_err().to_string();
         assert!(
-            err.contains("not a regular file"),
+            err.contains("is a directory"),
             "the precheck should name the obstruction: {err}"
         );
 
@@ -1264,6 +1311,42 @@ mod tests {
             .filter(|n| n.starts_with('.'))
             .collect();
         assert!(debris.is_empty(), "staging debris left behind: {debris:?}");
+    }
+
+    /// A member that is a **symlink** must still be replaceable.
+    ///
+    /// `symlink_metadata` is `lstat`, so `is_file()` is false for a symlink —
+    /// including a live one to a regular file. A precheck written as
+    /// `!meta.is_file()` therefore refuses the replacement that `--force`
+    /// exists to authorise, while `rename(2)` would have handled it. Only a
+    /// directory genuinely cannot be renamed over.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_member_is_replaced_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[]);
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+
+        // Point `matrix.mtx.gz` at a file outside the export.
+        let elsewhere = dir.path().join("elsewhere.gz");
+        std::fs::write(&elsewhere, b"not the export").unwrap();
+        let member = out.join("matrix.mtx.gz");
+        std::fs::remove_file(&member).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &member).unwrap();
+
+        write_scx_to_mtx(&src, &out).expect("a symlinked member must be replaceable");
+
+        let meta = std::fs::symlink_metadata(&member).unwrap();
+        assert!(
+            meta.is_file(),
+            "the link should have been replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read(&elsewhere).unwrap(),
+            b"not the export".to_vec(),
+            "rename replaces the link, it does not write through it"
+        );
     }
 
     /// The destination is a directory, so a caller's same-path check compares

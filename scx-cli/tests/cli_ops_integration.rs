@@ -2858,12 +2858,67 @@ fn explode_force_refuses_an_input_inside_the_destination() {
     assert!(!out.status.success(), "the containment must be refused");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("inside the output directory"),
+        stderr.contains("is inside the output"),
         "the refusal must say why: {stderr}"
     );
     assert_eq!(
         std::fs::read(&inside).unwrap(),
         original,
         "the input must survive the refusal"
+    );
+}
+
+/// Equality is not the whole "never overwrite an input" invariant.
+///
+/// A *directory* input and a file destination inside it compare unequal, so
+/// the same-path check missed them entirely: `scx convert --from mtx dir
+/// dir/matrix.mtx.gz --force` exited 0 and replaced the source matrix with an
+/// SCX file. The mirror case — an input inside a directory destination — is
+/// what the explode swap would delete.
+#[test]
+fn a_destination_inside_a_directory_input_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    std::fs::create_dir_all(&mtx_dir).unwrap();
+    std::fs::write(
+        mtx_dir.join("matrix.mtx"),
+        "%%MatrixMarket matrix coordinate integer general\n2 2 1\n1 1 3\n",
+    )
+    .unwrap();
+    std::fs::write(mtx_dir.join("barcodes.tsv"), "AAAC-1\nBBBC-1\n").unwrap();
+    std::fs::write(
+        mtx_dir.join("features.tsv"),
+        "G1\tA\tGene Expression\nG2\tB\tGene Expression\n",
+    )
+    .unwrap();
+
+    let dest = mtx_dir.join("matrix.mtx.gz");
+    std::fs::write(&dest, b"a member of the source directory").unwrap();
+    let before = std::fs::read(&dest).unwrap();
+
+    let out = scx_cli()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "writing into the source directory must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is inside the input"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        before,
+        "the source member must survive the refusal"
     );
 }
