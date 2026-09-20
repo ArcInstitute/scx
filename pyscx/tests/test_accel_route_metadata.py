@@ -51,6 +51,29 @@ def _random_count_adata(n_obs: int, n_vars: int, density: float, seed: int):
     return anndata.AnnData(X=sp.csr_matrix(dense))
 
 
+def test_reduction_key_reaches_the_uns_record_and_is_none_on_cpu():
+    """`reduction` says whether a GPU kernel folded the op's sums with a
+    cross-block atomic — `"deterministic"` / `"atomic"` — and is `None` wherever
+    no reduction of that kind ran.
+
+    Both bindings serialize `AccelExecutionInfo::fields()` generically, so this
+    pins the *binding* half of the contract the Rust-side
+    `fields_pins_the_wire_keys_in_order` pins on its side: the key is present,
+    not merely defined. Present-and-`None` is the distinction the CPU arm has
+    to make — a consumer reading "not tracked" from a missing key would get the
+    same answer for an op that never reduced and an op whose stamp was dropped.
+    """
+    adata = _make_adata()
+    adata.X = sp.csr_matrix(adata.X)
+    pyscx.accel.pdex_ref(adata, GROUPBY, reference=REFERENCE, device="cpu")
+    info = _route(adata, "pdex_ref")
+    assert "reduction" in info, f"reduction missing from the record: {sorted(info)}"
+    assert info["reduction"] is None, (
+        "a CPU route folds nothing with an atomic, so it must report None rather "
+        f"than a label: {info['reduction']!r}"
+    )
+
+
 def test_pdex_ref_cpu_dense_route():
     adata = _make_adata()  # dense numpy X
     pyscx.accel.pdex_ref(adata, GROUPBY, reference=REFERENCE, device="cpu")

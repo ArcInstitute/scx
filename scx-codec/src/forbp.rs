@@ -318,7 +318,7 @@ pub fn forbp_decode_with_hint(
 /// any realistic no-hint decode — the largest such caller is the codec bench,
 /// well under a million indices — while keeping a hostile constant-run bounded
 /// to tens of MiB rather than the multi-GiB OOM the old `nnz <= 1` guard blocked.
-const FORBP_NO_HINT_MAX_NNZ: usize = 1 << 24;
+pub const FORBP_NO_HINT_MAX_NNZ: usize = 1 << 24;
 
 fn forbp_decode_inner(
     data: &[u8],

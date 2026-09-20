@@ -89,7 +89,7 @@ scx_pca <- function(object, assay = NULL, layer = "data", features = NULL,
   object[[reduction.name]] <- red
   object@misc$scx_accel[["pca"]] <- res$scx_accel
   # The solver arm the shared auto rule picked (covariance vs randomized) —
-  # a sibling of the 17-key record, not one of its keys, so Seurat users can
+  # a sibling of the 18-key record, not one of its keys, so Seurat users can
   # see which solver ran without a second matrix-form call.
   object@misc$scx_accel[["pca_method"]] <- res$method
   invisible(object)

@@ -27,7 +27,7 @@
 use scx_format_io::ShardSource;
 use scx_gpu::{
     build_cell_to_group_dev, build_cell_to_pos_dev, cuda_graphs_enabled,
-    default_gpu_de_gene_chunk_size, gpu_de_aux_elems, gpu_de_block_sort, gpu_de_combined_tie_term,
+    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
     gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct, gpu_de_pvalues,
     gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
     gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term,
@@ -116,6 +116,10 @@ fn finish_pdex(
         info.shards_decoded = info.shards_decoded.or(r.exec_info.shards_decoded);
         info.shards_uploaded = info.shards_uploaded.or(r.exec_info.shards_uploaded);
         info.resident_csr = info.resident_csr.or(r.exec_info.resident_csr);
+        // Which pseudobulk reduction actually ran. The driver sets it from the
+        // same predicate the kernel dispatch calls, so the stamp cannot claim a
+        // kernel that did not run (review §8.6).
+        info.reduction = info.reduction.or(r.exec_info.reduction);
         r.exec_info = info;
         // Apply the CPM keep mask + survivor-scoped FDR (the v3 drivers populated
         // the arithmetic-mean fields when cpm_filter was set). No-op when None,
@@ -142,9 +146,35 @@ fn finish_de(result: Result<DiffExpResult>, mut info: AccelExecutionInfo) -> Res
         info.shards_decoded = info.shards_decoded.or(r.exec_info.shards_decoded);
         info.shards_uploaded = info.shards_uploaded.or(r.exec_info.shards_uploaded);
         info.resident_csr = info.resident_csr.or(r.exec_info.resident_csr);
+        // Which pseudobulk reduction actually ran. The driver sets it from the
+        // same predicate the kernel dispatch calls, so the stamp cannot claim a
+        // kernel that did not run (review §8.6).
+        info.reduction = info.reduction.or(r.exec_info.reduction);
         r.exec_info = info;
         r
     })
+}
+
+/// Which reduction the CSC pseudobulk fold will use for `n_groups` on this
+/// device, as the [`AccelExecutionInfo::reduction`](crate::route::AccelExecutionInfo)
+/// wire value.
+///
+/// Calls the *same* predicate the kernel dispatch calls
+/// ([`scx_gpu::csc_pseudobulk_block_dim`]) rather than re-deriving the rule, so
+/// the provenance record cannot drift from the kernel that ran. `n_groups` is
+/// constant across a DE op, so one label per op is well-defined.
+fn csc_pseudobulk_reduction(dev: &GpuDevice, n_groups: usize) -> &'static str {
+    if scx_gpu::csc_pseudobulk_block_dim(
+        n_groups,
+        scx_gpu::csc_pseudobulk_smem_limit(dev),
+        scx_gpu::gpu_de_force_atomic_pseudobulk(),
+    )
+    .is_some()
+    {
+        crate::route::REDUCTION_DETERMINISTIC
+    } else {
+        crate::route::REDUCTION_ATOMIC
+    }
 }
 
 /// Pseudocount used by the CPU `compute_logfc` helper. Mirrors
@@ -1100,7 +1130,6 @@ fn pdex_ref_gpu_chunked_v3_csr(
         dev,
         chunk_size,
         n_pool_max,
-        n_pool_max,
         n_ref,
         n_g_max,
         n_test,
@@ -1118,7 +1147,6 @@ fn pdex_ref_gpu_chunked_v3_csr(
             dev,
             chunk_size,
             n_pool_max,
-            n_pool_max,
             n_ref,
             n_g_max,
             n_test,
@@ -1130,23 +1158,21 @@ fn pdex_ref_gpu_chunked_v3_csr(
         Some(r) => r,
         None => source,
     };
-    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
+    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
     scratch
         .ensure_ref_slab_capacity(dev, n_ref)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure ref_slab: {e}")))?;
     scratch
-        .ensure_group_slab_capacity(dev, n_g_max.max(1))
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure group_slab: {e}")))?;
-    scratch
         .ensure_sums_capacity(dev, n_groups_for_means)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure sums: {e}")))?;
     // `n_pool_max` is already `n_ref.max(n_g_max)`, which is what the sequence
-    // sorts: the ref slab, then each test group's slab. See `gpu_de_aux_elems`.
-    let aux_elems = gpu_de_aux_elems(chunk_size, n_pool_max)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 aux sizing: {e}")))?;
+    // sorts: the ref slab, then each test group's slab. See `gpu_de_aux_span`.
+    // The span goes in un-multiplied: `ensure_aux_capacity` rounds it and then
+    // multiplies by the chunk, which is what keeps the allocation equal to the
+    // `gpu_de_per_gene_scratch_bytes` charge rather than up to 2× it.
     scratch
-        .ensure_aux_capacity(dev, aux_elems)
+        .ensure_aux_capacity(dev, chunk_size, scx_gpu::gpu_de_aux_span(n_pool_max))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure aux: {e}")))?;
     scratch
         .ensure_per_group_capacity(dev, n_test.max(1))
@@ -1452,6 +1478,10 @@ fn pdex_ref_gpu_chunked_v3_csr(
             shards_decoded: Some(shards_decoded),
             shards_uploaded: Some(shards_decoded),
             resident_csr: Some(resident_csr),
+            // `csr_shard_pseudobulk_kernel` folds with a global f64 atomicAdd
+            // and has no deterministic twin — unlike the CSC path, this is not
+            // a choice, so the label is a constant.
+            reduction: Some(crate::route::REDUCTION_ATOMIC),
             ..Default::default()
         },
     })
@@ -1554,29 +1584,26 @@ fn pdex_ref_gpu_chunked_v3_csc(
         dev,
         chunk_size,
         n_pool_max,
-        n_pool_max,
         n_ref,
         n_g_max,
         n_test,
         n_groups_for_means,
     )?;
-    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
+    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
     scratch
         .ensure_ref_slab_capacity(dev, n_ref)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure ref_slab: {e}")))?;
     scratch
-        .ensure_group_slab_capacity(dev, n_g_max.max(1))
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure group_slab: {e}")))?;
-    scratch
         .ensure_sums_capacity(dev, n_groups_for_means)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure sums: {e}")))?;
     // `n_pool_max` is already `n_ref.max(n_g_max)`, which is what the sequence
-    // sorts: the ref slab, then each test group's slab. See `gpu_de_aux_elems`.
-    let aux_elems = gpu_de_aux_elems(chunk_size, n_pool_max)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 aux sizing: {e}")))?;
+    // sorts: the ref slab, then each test group's slab. See `gpu_de_aux_span`.
+    // The span goes in un-multiplied: `ensure_aux_capacity` rounds it and then
+    // multiplies by the chunk, which is what keeps the allocation equal to the
+    // `gpu_de_per_gene_scratch_bytes` charge rather than up to 2× it.
     scratch
-        .ensure_aux_capacity(dev, aux_elems)
+        .ensure_aux_capacity(dev, chunk_size, scx_gpu::gpu_de_aux_span(n_pool_max))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure aux: {e}")))?;
     scratch
         .ensure_per_group_capacity(dev, n_test.max(1))
@@ -1847,6 +1874,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
         exec_info: crate::route::AccelExecutionInfo {
             shards_decoded: Some(shards_decoded),
             shards_uploaded: Some(shards_decoded),
+            reduction: Some(csc_pseudobulk_reduction(dev, n_groups_for_means)),
             ..Default::default()
         },
     })
@@ -2085,23 +2113,21 @@ where
 
     // Clamp the gene chunk so the per-target-group pool slabs (the dominant
     // `n_test × chunk × n_g_max` allocation) fit a budget fraction of free VRAM
-    // (B8). `pool_len` is the `slab` (sized the same below) and `n_sorted_max`
-    // is the largest sort, from which the wrapper derives the aux charge via
-    // `gpu_de_aux_span` — 0 unless some sort actually reaches the multi-tile
-    // path, since budgeting for a buffer that is never allocated only shrinks
-    // the chunk. They are separate arguments precisely so neither has to stand
-    // in for the other. `n_slots` sizes the f64 sums.
+    // (B8). `n_sorted_max` is the largest sort, from which the wrapper derives
+    // the aux charge via `gpu_de_aux_span` — 0 unless some sort actually reaches
+    // the multi-tile path, since budgeting for a buffer that is never allocated
+    // only shrinks the chunk. `pool_len` sizes `ref_slab`, and `n_slots` the
+    // f64 sums.
     let chunk_size = clamp_chunk_to_de_budget(
         dev,
         chunk_size,
-        pool_len.max(1),
         n_sorted_max,
         pool_len.max(1),
         n_g_max,
         n_test,
         n_slots.max(1),
     )?;
-    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, pool_len.max(1))
+    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
     scratch
         .ensure_ref_slab_capacity(dev, pool_len.max(1))
@@ -2109,10 +2135,8 @@ where
     scratch
         .ensure_sums_capacity(dev, n_slots.max(1))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 ensure sums: {e}")))?;
-    let aux_elems = gpu_de_aux_elems(chunk_size, n_sorted_max)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 aux sizing: {e}")))?;
     scratch
-        .ensure_aux_capacity(dev, aux_elems)
+        .ensure_aux_capacity(dev, chunk_size, scx_gpu::gpu_de_aux_span(n_sorted_max))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 ensure aux: {e}")))?;
     scratch
         .ensure_per_group_capacity(dev, n_test.max(1))
@@ -2426,6 +2450,10 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
             Ok(shards)
         },
     )
+    .map(|mut r| {
+        r.exec_info.reduction = Some(csc_pseudobulk_reduction(dev, n_slots));
+        r
+    })
 }
 
 /// CSR-direct Wilcoxon rank-sum GPU driver — the CSC-absent fallback (in-memory
@@ -2476,7 +2504,6 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
     let probe_chunk = probe_de_gene_chunk(
         dev,
         chunk_size,
-        pool_len.max(1),
         n_sorted_max,
         pool_len.max(1),
         n_g_max,
@@ -2497,7 +2524,6 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         clamp_chunk_to_de_budget(
             dev,
             chunk_size,
-            pool_len.max(1),
             n_sorted_max,
             pool_len.max(1),
             n_g_max,
@@ -2602,6 +2628,8 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
         },
     )?;
     result.exec_info.resident_csr = Some(resident_csr);
+    // The CSR pseudobulk kernel is atomic-only; see `pdex_ref_gpu_chunked_v3_csr`.
+    result.exec_info.reduction = Some(crate::route::REDUCTION_ATOMIC);
     Ok(result)
 }
 
@@ -2622,7 +2650,6 @@ fn open_device(device_id: usize) -> Result<GpuDevice> {
 fn clamp_chunk_to_de_budget(
     dev: &GpuDevice,
     requested_chunk: usize,
-    n_slab: usize,
     n_sorted_max: usize,
     n_ref: usize,
     n_g_max: usize,
@@ -2630,10 +2657,10 @@ fn clamp_chunk_to_de_budget(
     n_slots: usize,
 ) -> Result<usize> {
     // Aux is charged only when a sort can actually reach the multi-tile path;
-    // `gpu_de_aux_elems` allocates nothing below it, so billing for it here
-    // would shrink the gene chunk to reserve a buffer that never exists.
+    // `gpu_de_aux_span` is 0 below it and `ensure_aux_capacity` then allocates
+    // nothing, so billing for it here would shrink the gene chunk to reserve a
+    // buffer that never exists.
     let per_gene = scx_gpu::gpu_de_per_gene_scratch_bytes(
-        n_slab,
         scx_gpu::gpu_de_aux_span(n_sorted_max),
         n_ref,
         n_g_max,
@@ -2769,7 +2796,6 @@ fn try_resident_csr(
 fn probe_de_gene_chunk(
     dev: &GpuDevice,
     requested_chunk: usize,
-    n_slab: usize,
     n_sorted_max: usize,
     n_ref: usize,
     n_g_max: usize,
@@ -2777,10 +2803,10 @@ fn probe_de_gene_chunk(
     n_slots: usize,
 ) -> usize {
     // Aux is charged only when a sort can actually reach the multi-tile path;
-    // `gpu_de_aux_elems` allocates nothing below it, so billing for it here
-    // would shrink the gene chunk to reserve a buffer that never exists.
+    // `gpu_de_aux_span` is 0 below it and `ensure_aux_capacity` then allocates
+    // nothing, so billing for it here would shrink the gene chunk to reserve a
+    // buffer that never exists.
     let per_gene = scx_gpu::gpu_de_per_gene_scratch_bytes(
-        n_slab,
         scx_gpu::gpu_de_aux_span(n_sorted_max),
         n_ref,
         n_g_max,

@@ -1473,4 +1473,62 @@ mod tests {
         let (z0, z1) = gpu_harmony_reduce_objective(&dev, &empty, 0, &empty, 0).unwrap();
         assert_eq!((z0, z1), (0.0, 0.0));
     }
+
+    /// `harmony.cu` must not be built with `--use_fast_math`.
+    ///
+    /// The flag remaps `logf` to the `__logf` intrinsic, whose documented
+    /// maximum *absolute* error is 2⁻²¹·⁴¹.
+    /// `harmony_block_softmax_penalty_kernel` folds `θ·logf(ratio)` into the
+    /// softmax logit with `ratio = (2E+1)/(O+E+1)`,
+    /// which sits near 1 in a well-mixed cluster — so `logf(ratio)` is often
+    /// ~1e-3 and that absolute error is ~0.04 % *relative*, injected into every
+    /// penalty term and then exponentiated. It also turns `-dist/sigma` into an
+    /// approximate division. The file is memory-bound reductions; there was
+    /// nothing to buy (review §8.16).
+    ///
+    /// Asserted on the **emitted PTX**, which is what the flag actually
+    /// changes, rather than on the build script's own list — a test that read
+    /// `FAST_MATH_EXEMPT` would only prove the constant equals itself. Needs no
+    /// GPU: it inspects a compiled artifact. It does need nvcc to have run, so
+    /// it declines on a stub build, where `build.rs` writes a comment-only PTX.
+    #[test]
+    fn harmony_ptx_is_not_built_with_fast_math() {
+        if HARMONY_PTX.contains(crate::device::PTX_STUB_MARKER) {
+            eprintln!(
+                "{}: harmony.ptx is a stub (nvcc absent at build time)",
+                crate::test_gate::SKIP_MARKER
+            );
+            return;
+        }
+
+        // Premise: this is the real kernel, so an absent instruction below
+        // means the flag is off and not that the file failed to compile.
+        assert!(
+            HARMONY_PTX.contains("harmony_block_softmax_penalty_kernel"),
+            "premise: the PTX holds the kernel whose precision this is about"
+        );
+
+        // `__logf` compiles to a bare `lg2.approx` + scale; precise `logf` is a
+        // range-reduced sequence that emits none. Measured on this file:
+        // 13 with the flag, 0 without.
+        let approx_log = HARMONY_PTX.matches("lg2.approx").count();
+        assert_eq!(
+            approx_log, 0,
+            "harmony.ptx has {approx_log} lg2.approx instructions — it was built \
+             with --use_fast_math, which remaps logf to __logf"
+        );
+
+        // `--prec-div=false` turns f32 division approximate. Measured: 19 with
+        // the flag, 0 without (15 `div.rn.f32` + 4 `rcp.rn.f32` instead).
+        let approx_div = HARMONY_PTX.matches("div.approx").count();
+        assert_eq!(
+            approx_div, 0,
+            "harmony.ptx has {approx_div} div.approx instructions — it was built \
+             with --use_fast_math, which implies --prec-div=false"
+        );
+        assert!(
+            HARMONY_PTX.contains("div.rn.f32"),
+            "expected precise f32 division in the exempt build"
+        );
+    }
 }

@@ -279,5 +279,54 @@ mod tests {
             b.sort_unstable();
             assert_eq!(a, b, "row {i}: fused vs ref neighbor sets differ");
         }
+
+        // (3) An **independent** bar. Everything above compares CAGRA against
+        //     CAGRA through the same code path, so a defect on that path is on
+        //     both arms and the comparison passes — a zero-filled output equals
+        //     a zero-filled output (review §8.5, §8.17). Score the fused
+        //     result against an exact CPU kNN over the same embedding.
+        let mut exact: Vec<Vec<usize>> = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            let mut d: Vec<(f64, usize)> = (0..n_rows)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let s: f64 = (0..k)
+                        .map(|c| {
+                            let x = pca.embeddings[i * k + c] - pca.embeddings[j * k + c];
+                            x * x
+                        })
+                        .sum();
+                    (s, j)
+                })
+                .collect();
+            d.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+            exact.push(d.into_iter().take(n_neighbors).map(|(_, j)| j).collect());
+        }
+        let hits: usize = (0..n_rows)
+            .map(|i| {
+                let got: std::collections::HashSet<usize> = knn.indices
+                    [i * n_neighbors..(i + 1) * n_neighbors]
+                    .iter()
+                    .copied()
+                    .collect();
+                exact[i].iter().filter(|j| got.contains(j)).count()
+            })
+            .sum();
+        let recall = hits as f64 / (n_rows * n_neighbors) as f64;
+        // CAGRA is approximate, so this is a floor, not an equality. This
+        // fixture (400 points in 12 PCA components; `n_cols = 60` is the gene
+        // axis, not the embedding width) measures **1.0000** on an H100 (job
+        // 2979930, on the current code), and the floor is left at 0.90 rather
+        // than pinned to that: recall is a property of the ANN index build, so
+        // another card or cuVS version may land a shade under 1.0 without
+        // anything being wrong.
+        // What the floor has to separate is coarse — an unsynchronized read
+        // returns every neighbour as index 0, which scores ~0.0025 here.
+        // Printed so a run reports the number rather than only pass/fail.
+        println!("fused CAGRA recall against exact CPU kNN: {recall:.4}");
+        assert!(
+            recall >= 0.90,
+            "fused CAGRA recall against exact CPU kNN is {recall:.4}, below the 0.90 floor"
+        );
     }
 }

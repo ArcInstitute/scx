@@ -312,16 +312,29 @@ that way, so the unscoped form additionally fails on them. Run doctests
 separately with `cargo test -p scx-gpu --doc`.
 
 `SCX_REQUIRE_GPU=1` turns "no device" from a skip into a hard failure;
-`SCX_REQUIRE_NVCOMP=1` / `SCX_REQUIRE_CUVS=1` do the same per optional library,
+`SCX_REQUIRE_NVCOMP=1` / `SCX_REQUIRE_CUVS=1` do the same per optional library
+(**`SCX_REQUIRE_CUVS` now defaults to `1` in the runner** — see below),
 and `SCX_REQUIRE_LARGE_VRAM=1` does it for the free-VRAM floor that gates the
 tests needing a multi-GiB allocation to reach a 32-bit index boundary (today:
 `colmajor_kernels_do_their_work_past_2_31_elements`, which needs ~10 GiB).
 `benchmarks/scripts/_run_scx_gpu_tests.sh` sets `SCX_REQUIRE_GPU=1`, **defaults
-`SCX_REQUIRE_LARGE_VRAM=1`** (override with `=0` on a smaller or shared GPU),
-passes `--include-ignored`, asserts the result line reports `0 ignored`, and
+`SCX_REQUIRE_LARGE_VRAM=1` and `SCX_REQUIRE_CUVS=1`** (override either with `=0`
+on a smaller/shared GPU or a node without the RAPIDS wheels), passes
+`--include-ignored`, asserts the result line reports `0 ignored`, and
 prints every `SCX_GPU_TEST_SKIPPED` line as a closing summary — so a node
 missing nvcomp shows up as listed coverage it did not provide, not as tests that
-silently stopped existing. The VRAM default is on for the same reason the device
+silently stopped existing.
+
+⚠️ **A listed skip is only useful if someone reads it.** `libcuvs_c.so` is
+`dlopen`'d at run time and lives in the repo venv's
+`site-packages/libcuvs/lib64`, which the runner did not put on
+`LD_LIBRARY_PATH` — so all three CAGRA tests (`test_gpu_knn_cagra_basic`,
+`test_gpu_knn_cagra_large_k`, `test_pca_then_knn_gpu_matches_sequential`)
+skipped on **every** GPU run since they were written, while the CAGRA path
+carried a Critical stream-synchronization defect. The runner now exports the
+RAPIDS lib directories and requires cuVS by default. The general lesson: a
+gate whose default is "allowed to skip" provides no coverage until something
+forces it. The VRAM default is on for the same reason the device
 one is: the job holds a whole GPU via `--gres=gpu:1`, and left opt-in the only
 test that can observe a 2³¹ kernel-index overflow could quietly skip while the
 suite reported green.

@@ -9,6 +9,45 @@
 // If nvcc is not available, compilation is skipped gracefully and a
 // fallback empty PTX marker is written so include_str!() doesn't fail.
 
+/// Kernels built **without** `--use_fast_math`.
+///
+/// `--use_fast_math` remaps `logf`→`__logf` and `expf`→`__expf` and implies
+/// `--prec-div=false --ftz=true`. Those are single-precision transformations,
+/// so the cost of the flag is a property of what a kernel computes in `f32`.
+///
+/// - `harmony` — `harmony_update_r_kernel` folds `theta * logf(ratio)` into the
+///   softmax logit, where `ratio = (2E+1)/(O+E+1)` sits near 1 in a well-mixed
+///   cluster and so `logf(ratio)` is often ~1e-3. `__logf`'s documented maximum
+///   *absolute* error is 2^-21.41, which at that magnitude is ~0.04 % relative
+///   — injected into every penalty term and then exponentiated. The objective
+///   and cross-entropy kernels take `logf` too, and `-dist/sigma` is an `f32`
+///   division that `--prec-div=false` degrades. The file is memory-bound
+///   reductions; there was nothing to buy (review §8.16). (`rsqrtf` at
+///   `harmony.cu`'s column normalise is approximate whatever this flag says —
+///   exempting the file does not change it.)
+/// - `nb_glm` — a precision-sensitive `f64` fitter (Cox–Reid dispersion,
+///   digamma/trigamma, IRLS divisions), and the reason its ~1.5e-4 CPU↔GPU
+///   agreement floor is what it is. Its source holds **no `float` at all**, so
+///   the obvious reading is that these flags cannot reach it — but a PTX diff
+///   says otherwise: `--ftz=false` flips `abs.ftz.f32` / `setp.lt.ftz.f32` to
+///   their non-ftz forms inside `nb_glm_fit_kernel`, which is libdevice's
+///   double `lgamma` doing its range checks in `f32`. The exemption is
+///   load-bearing through a transitive call, not through the source's own
+///   arithmetic.
+///
+/// Every other kernel is an `f32` throughput path with no transcendentals — the
+/// one borderline case is `normalize_log1p.cu`, whose `log1pf` nvcc does *not*
+/// remap but whose `f32` divisions `--prec-div=false` does touch; exempting it
+/// would move every GPU-normalized result, so it is left alone deliberately.
+///
+/// What the flag costs `harmony`, measured by PTX diff at `-arch=compute_70`:
+/// 13 `lg2.approx.ftz.f32` and 19 `div.approx.ftz.f32` become 0 and
+/// 15 `div.rn.f32` + 4 `rcp.rn.f32`. The `expf` half of the review's claim does
+/// **not** reproduce — `ex2.approx.ftz.f32` appears 10 times either way, since
+/// that is how nvcc implements precise `expf` too; only the `.ftz` qualifier
+/// moves. Likewise `rsqrtf` stays `rsqrt.approx` and merely loses `.ftz`.
+const FAST_MATH_EXEMPT: &[&str] = &["nb_glm", "harmony"];
+
 fn main() {
     let kernel_dir = std::path::Path::new("kernels");
     if !kernel_dir.exists() {
@@ -110,13 +149,7 @@ fn main() {
 
             let mut cmd = std::process::Command::new("nvcc");
             cmd.arg("--ptx").arg("-O3");
-            // `nb_glm` is a precision-sensitive `f64` fitter (Cox–Reid dispersion,
-            // digamma/trigamma, IRLS divisions). `--use_fast_math` implies
-            // `--prec-div=false --ftz=true`, which degrades exactly those f64
-            // divisions and is the mechanism behind its ~1.5e-4 CPU↔GPU agreement
-            // floor — so build it with precise division/sqrt and no flush-to-zero.
-            // The other kernels are `f32` throughput paths and keep fast-math.
-            if stem == "nb_glm" {
+            if FAST_MATH_EXEMPT.contains(&stem) {
                 cmd.arg("--prec-div=true")
                     .arg("--prec-sqrt=true")
                     .arg("--ftz=false");

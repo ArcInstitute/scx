@@ -20,7 +20,8 @@
 //! * **Multi-tile path** (`> 8192`): bottom-up iterative merge sort. Tile
 //!   sort with `tile_block_radix_sort_kernel`, then `⌈log₂(K)⌉` passes of
 //!   `merge_pass_per_gene_kernel` (block-cooperative merge-path
-//!   partitioning), ping-ponging between `scratch.slab` and `scratch.slab_aux`.
+//!   partitioning), ping-ponging between the gene-major slab being sorted
+//!   (`scratch.ref_slab` / a `per_tg_pool_slabs` entry) and `scratch.slab_aux`.
 //!
 //! No upper limit beyond available VRAM. Callers no longer need to guard
 //! pool sizes against the 8192 threshold — the dispatch handles arbitrary
@@ -52,18 +53,22 @@ pub const GPU_DE_BLOCK_SORT_CAPACITY: usize = 8192;
 /// Reusable per-chunk device buffers for a streaming MWU pipeline.
 ///
 /// One allocation per chunk_max suffices for the entire DE call: the chunk
-/// loop resizes `ref_slab` / `group_slab` only when the membership counts
-/// change. This intentionally mirrors how
+/// loop resizes `ref_slab` / `per_tg_pool_slabs` only when the membership
+/// counts change. This intentionally mirrors how
 /// `gpu_pca::GpuPcaScratch` hoists allocations out of the power-iteration
 /// inner loop.
 pub struct GpuDeChunkScratch {
-    /// `[chunk_max × n_pool_max]` gene-major slab; reused for ref then for
-    /// each test group (size large enough for whichever is bigger).
-    pub slab: CudaSlice<f32>,
     /// Ping-pong buffer used by the multi-tile path in [`gpu_de_block_sort`]
     /// when `n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY`. Allocated lazily on
     /// first multi-tile encounter via [`Self::ensure_aux_capacity`]; small-
     /// pool callers never pay for it.
+    ///
+    /// The `slab` this used to ping-pong against is gone: no v3 driver ever
+    /// read it (nothing called `ensure_slab_capacity`), while
+    /// `GpuDeChunkScratch::new` allocated `chunk_max × n_pool_max` f32 eagerly
+    /// — ~2 GB at 1 M cells and chunk 500 — *and* the budget charged for it,
+    /// so the clamp then shrank the gene chunk to pay for VRAM nothing used.
+    /// The sorts ping-pong between `ref_slab` / `per_tg_pool_slabs` and this.
     pub slab_aux: CudaSlice<f32>,
     /// `[chunk_max]` f64 tie-term scratch (ref-only or combined).
     pub tie_term: CudaSlice<f64>,
@@ -75,10 +80,6 @@ pub struct GpuDeChunkScratch {
     /// per-chunk `dev.alloc_zeros` in the pdex_ref GPU driver. Grow-only via
     /// [`Self::ensure_ref_slab_capacity`].
     pub ref_slab: CudaSlice<f32>,
-    /// `[chunk_max × n_group_max]` gene-major group slab. G2 hoisted from
-    /// the per-test-group `dev.alloc_zeros` in both pdex_ref and Wilcoxon
-    /// chunk loops. Grow-only via [`Self::ensure_group_slab_capacity`].
-    pub group_slab: CudaSlice<f32>,
     /// `[n_groups_max × chunk_max]` f64 pseudobulk sums buffer. G2 hoisted
     /// from the per-chunk pseudobulk fold. Grow-only via
     /// [`Self::ensure_sums_capacity`].
@@ -111,10 +112,8 @@ pub struct GpuDeChunkScratch {
     pub per_tg_pool_slabs: Vec<CudaSlice<f32>>,
     n_obs: usize,
     chunk_max: usize,
-    slab_capacity: usize,
     aux_capacity_elems: usize,
     ref_slab_capacity: usize,
-    group_slab_capacity: usize,
     sums_capacity: usize,
     per_group_capacity: usize,
     per_tg_pool_slabs_capacity: usize,
@@ -133,17 +132,13 @@ fn de_alloc_elems(rows: usize, cols: usize) -> Result<usize, GpuError> {
 }
 
 impl GpuDeChunkScratch {
-    /// Allocate scratch buffers sized for `n_obs` cells, up to `chunk_max`
-    /// genes per chunk, and an initial pool capacity of `n_pool_max` cells.
+    /// Allocate scratch buffers sized for `n_obs` cells and up to `chunk_max`
+    /// genes per chunk.
     ///
-    /// The slab grows on demand via [`Self::ensure_slab_capacity`].
-    pub fn new(
-        dev: &GpuDevice,
-        n_obs: usize,
-        chunk_max: usize,
-        n_pool_max: usize,
-    ) -> Result<Self, GpuError> {
-        let slab = dev.alloc_zeros::<f32>(de_alloc_elems(chunk_max, n_pool_max)?)?;
+    /// Everything except the three `[chunk_max]` f64 scalars starts at zero
+    /// length and grows through an `ensure_*_capacity` call, so a small DE
+    /// never pays for an atlas-scale buffer.
+    pub fn new(dev: &GpuDevice, n_obs: usize, chunk_max: usize) -> Result<Self, GpuError> {
         // slab_aux is allocated lazily — empty until the first call that hits
         // the multi-tile sort path. Allocating a zero-length CudaSlice is
         // cheap (a few bytes of metadata) and avoids paying VRAM for the
@@ -155,19 +150,16 @@ impl GpuDeChunkScratch {
         // G2 grow-on-demand slots — start at zero size so small DE calls
         // never pay for them; first `ensure_*_capacity` call allocates.
         let ref_slab = dev.alloc_zeros::<f32>(0)?;
-        let group_slab = dev.alloc_zeros::<f32>(0)?;
         let sums = dev.alloc_zeros::<f64>(0)?;
         let u_per_group = dev.alloc_zeros::<f64>(0)?;
         let p_per_group = dev.alloc_zeros::<f64>(0)?;
         let tie_per_group = dev.alloc_zeros::<f64>(0)?;
         Ok(Self {
-            slab,
             slab_aux,
             tie_term,
             u_or_rank,
             p_values,
             ref_slab,
-            group_slab,
             sums,
             u_per_group,
             p_per_group,
@@ -175,10 +167,8 @@ impl GpuDeChunkScratch {
             per_tg_pool_slabs: Vec::new(),
             n_obs,
             chunk_max,
-            slab_capacity: n_pool_max,
             aux_capacity_elems: 0,
             ref_slab_capacity: 0,
-            group_slab_capacity: 0,
             sums_capacity: 0,
             per_group_capacity: 0,
             per_tg_pool_slabs_capacity: 0,
@@ -186,45 +176,55 @@ impl GpuDeChunkScratch {
         })
     }
 
-    /// Grow the slab if `n_pool > current slab capacity`. No-op otherwise.
-    pub fn ensure_slab_capacity(&mut self, dev: &GpuDevice, n_pool: usize) -> Result<(), GpuError> {
-        if n_pool <= self.slab_capacity {
-            return Ok(());
-        }
-        // Bump to a round multiple to avoid thrashing on small growths.
-        let new_cap = n_pool.next_power_of_two().max(self.slab_capacity * 2);
-        self.slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
-        self.slab_capacity = new_cap;
-        self.alloc_count += 1;
-        Ok(())
-    }
-
-    /// Grow the ping-pong aux buffer to hold at least `n_elements` f32 keys.
+    /// Grow the ping-pong aux buffer for a chunk loop of `chunk_size` genes
+    /// whose largest per-gene sort has span `span`.
+    ///
+    /// ⚠️ **`span` is a per-gene span, not an element count.** Pass
+    /// [`gpu_de_aux_span`] of the **largest** `n_per_gene` in the loop — not
+    /// [`gpu_de_aux_elems`], which is already `chunk × span` and would be
+    /// multiplied by the chunk a second time here. The two were one argument
+    /// until this signature split, and the doc kept pointing at the wrong one
+    /// (found by codex); the units now differ by a factor of `chunk_size`, so
+    /// following the old advice over-allocates by exactly that much or
+    /// overflows. `gpu_de_aux_elems` is the *validation* unit — what
+    /// [`gpu_de_block_sort`] demands of the buffer — and is not interchangeable
+    /// with this one.
     ///
     /// **The caller must size this before a multi-tile sort** — despite the
     /// name, [`gpu_de_block_sort`] does NOT call it. It cannot: it takes `slab`
     /// and `aux` as two separate `&mut CudaSlice<f32>` (so a caller can thread
     /// two disjoint `GpuDeChunkScratch` fields at once) and so holds no handle
     /// to the scratch. An undersized aux is rejected there with
-    /// `ShapeMismatch`, not grown. Use [`gpu_de_aux_elems`] to compute
-    /// `n_elements`, and read its doc for which sort's `n_per_gene` governs.
+    /// `ShapeMismatch`, not grown.
     ///
-    /// No-op when the aux is already large enough. Bumps to
-    /// `next_power_of_two` to amortise repeated growths across a streaming
-    /// chunk loop.
+    /// No-op when the aux is already large enough.
+    ///
+    /// Rounds the **span** — not
+    /// their product — to `next_power_of_two`, so the allocation is exactly
+    /// `chunk_size × p2(span)` and [`gpu_de_per_gene_scratch_bytes`]'s
+    /// `p2(n_aux)` charge is the per-gene truth rather than an approximation.
+    /// Rounding the product instead (what this did before) made the real buffer
+    /// up to **2×** the budgeted one — 4.29 GB against 2.4 GB modelled at
+    /// `pool_len = 600_000, chunk = 1000` — so the clamp reported `fits = true`
+    /// and the allocator then raised a bare `OutOfMemory` instead of the
+    /// dimension-naming error the clamp exists to produce. `n_aux` was the only
+    /// f32 term in that model without a `p2()`; `n_ref` and `n_g_max` already
+    /// round their spans, and this now matches them.
     pub fn ensure_aux_capacity(
         &mut self,
         dev: &GpuDevice,
-        n_elements: usize,
+        chunk_size: usize,
+        span: usize,
     ) -> Result<(), GpuError> {
+        if span == 0 {
+            return Ok(());
+        }
+        let n_elements = gpu_de_aux_alloc_elems(chunk_size, span)?;
         if n_elements <= self.aux_capacity_elems {
             return Ok(());
         }
-        let new_cap = n_elements
-            .next_power_of_two()
-            .max(self.aux_capacity_elems * 2);
-        self.slab_aux = dev.alloc_zeros::<f32>(new_cap)?;
-        self.aux_capacity_elems = new_cap;
+        self.slab_aux = dev.alloc_zeros::<f32>(n_elements)?;
+        self.aux_capacity_elems = n_elements;
         self.alloc_count += 1;
         Ok(())
     }
@@ -243,24 +243,6 @@ impl GpuDeChunkScratch {
         let new_cap = n_ref.next_power_of_two().max(self.ref_slab_capacity * 2);
         self.ref_slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
         self.ref_slab_capacity = new_cap;
-        self.alloc_count += 1;
-        Ok(())
-    }
-
-    /// Grow `group_slab` to hold at least `chunk_max × n_g` f32 keys.
-    /// Called from the per-test-group loop before each scatter; only
-    /// allocates when the current largest group exceeds capacity.
-    pub fn ensure_group_slab_capacity(
-        &mut self,
-        dev: &GpuDevice,
-        n_g: usize,
-    ) -> Result<(), GpuError> {
-        if n_g <= self.group_slab_capacity {
-            return Ok(());
-        }
-        let new_cap = n_g.next_power_of_two().max(self.group_slab_capacity * 2);
-        self.group_slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
-        self.group_slab_capacity = new_cap;
         self.alloc_count += 1;
         Ok(())
     }
@@ -634,22 +616,22 @@ pub fn gpu_de_pseudobulk_csc_direct(
     // global `atomicAdd` with no per-group SMEM and scales to any `n_groups`;
     // atomic contention is naturally low in that regime. `n_groups` is constant
     // across a DE op, so every shard launch takes the same path.
-    const DEFAULT_SMEM_LIMIT: usize = 48 * 1024;
-    let opt_in_limit = dev
-        .max_dynamic_shared_mem_per_block()
-        .unwrap_or(DEFAULT_SMEM_LIMIT);
-    let elem_bytes = std::mem::size_of::<f64>();
-
-    // Test-only escape hatch to exercise the global-atomic path on a small
-    // fixture regardless of `n_groups`.
-    let force_atomic = gpu_de_force_atomic_pseudobulk();
-    let smem_bx = if force_atomic {
-        None
-    } else {
-        [128u32, 64, 32]
-            .into_iter()
-            .find(|&bx| n_groups * bx as usize * elem_bytes <= opt_in_limit)
-    };
+    let smem_bx = csc_pseudobulk_block_dim(
+        n_groups,
+        csc_pseudobulk_smem_limit(dev),
+        gpu_de_force_atomic_pseudobulk(),
+    );
+    if smem_bx.is_none() && gpu_de_require_deterministic() {
+        return Err(GpuError::UnsupportedLayout(format!(
+            "SCX_GPU_DE_REQUIRE_DETERMINISTIC=1, but {n_groups} groups do not fit the \
+             deterministic CSC pseudobulk kernel's shared memory on this device \
+             ({} B opt-in): the fallback is a global f64 atomicAdd, whose summation \
+             order is not reproducible. Use fewer/coarser groups, run on a device with \
+             more opt-in shared memory, or unset the variable and accept the atomic \
+             reduction (it is stamped as `reduction=\"atomic\"` on uns[\"scx_accel\"]).",
+            csc_pseudobulk_smem_limit(dev)
+        )));
+    }
 
     let (func, bx, shared_mem_bytes) = match smem_bx {
         Some(bx) => {
@@ -658,9 +640,9 @@ pub fn gpu_de_pseudobulk_csc_direct(
                 .map_err(|e| {
                     GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}"))
                 })?;
-            let required = n_groups * bx as usize * elem_bytes;
+            let required = n_groups * bx as usize * std::mem::size_of::<f64>();
             // Opt into >48 KB when required (per-function sticky + idempotent).
-            if required > DEFAULT_SMEM_LIMIT {
+            if required > CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT {
                 func.set_attribute(
                     cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     required as i32,
@@ -931,12 +913,14 @@ pub fn gpu_de_block_sort(
     }
 
     // Multi-tile path: tile sort + iterative merge.
-    let n_elements = chunk_size
-        .checked_mul(n_per_gene)
-        .ok_or_else(|| GpuError::ShapeMismatch {
-            expected: "chunk_size * n_per_gene fits in usize".into(),
-            got: format!("chunk_size={chunk_size}, n_per_gene={n_per_gene}"),
-        })?;
+    // Call `gpu_de_aux_elems` rather than restating the product: it *is* the
+    // requirement this validates, and the error message below already tells
+    // callers to size with it — but nothing in production called it any more
+    // once the drivers moved to `gpu_de_aux_span`, leaving the named contract
+    // and the enforced one as two separate expressions (Cursor Agent). The
+    // single-tile early return above means `n_per_gene > GPU_DE_BLOCK_SORT_CAPACITY`
+    // here, so the span rule cannot zero it.
+    let n_elements = gpu_de_aux_elems(chunk_size, n_per_gene)?;
     if aux.len() < n_elements {
         return Err(GpuError::ShapeMismatch {
             expected: format!(
@@ -1490,9 +1474,66 @@ fn gpu_de_mem_budget_frac() -> f64 {
 /// wasteful). The override must therefore be set **before** the first DE op in
 /// the process; production never sets it, and the parity test selects the atomic
 /// path via `n_groups` rather than this flag.
-fn gpu_de_force_atomic_pseudobulk() -> bool {
+pub fn gpu_de_force_atomic_pseudobulk() -> bool {
     static FORCE: OnceLock<bool> = OnceLock::new();
     *FORCE.get_or_init(|| std::env::var_os("SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC").is_some())
+}
+
+/// Whether `SCX_GPU_DE_REQUIRE_DETERMINISTIC=1` turns a fall-through to the
+/// global-atomic CSC pseudobulk kernel into an error.
+///
+/// The inverse of [`gpu_de_force_atomic_pseudobulk`], which forces the
+/// non-reproducible arm for testing. This one is for a caller who needs the
+/// numbers to be reproducible and would rather be told than silently get the
+/// atomic kernel because the device's shared memory happened not to fit.
+/// Same `OnceLock` caching and the same "set it before the first DE op" rule.
+pub fn gpu_de_require_deterministic() -> bool {
+    static REQUIRE: OnceLock<bool> = OnceLock::new();
+    *REQUIRE.get_or_init(|| std::env::var("SCX_GPU_DE_REQUIRE_DETERMINISTIC").as_deref() == Ok("1"))
+}
+
+/// The device's opt-in dynamic shared-memory limit, or the 48 KB hardware
+/// default when it cannot be read.
+///
+/// Split out so [`csc_pseudobulk_block_dim`] takes it as a plain number and the
+/// selection rule is testable without a device.
+pub fn csc_pseudobulk_smem_limit(dev: &GpuDevice) -> usize {
+    dev.max_dynamic_shared_mem_per_block()
+        .unwrap_or(CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT)
+}
+
+/// The 48 KB per-block shared-memory floor every CUDA device provides without
+/// an opt-in, used when the device attribute cannot be read.
+pub const CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT: usize = 48 * 1024;
+
+/// Which CSC pseudobulk kernel runs: `Some(block_dim)` for the deterministic
+/// SMEM tree-reduce, `None` for the global-atomic fallback.
+///
+/// **This is the single selection rule**, called both by the launch site and by
+/// the route stamp, so the provenance record cannot drift from the kernel that
+/// actually ran. It is deliberately pure — `smem_limit` and `force_atomic` are
+/// passed in rather than read from the device and the environment — so the
+/// whole table is unit-testable on a CPU host.
+///
+/// The choice is **numerically visible and device-dependent**: the tree-reduce
+/// has no atomics and is bit-reproducible run to run, the fallback is a global
+/// f64 `atomicAdd` and is not. `max_dynamic_shared_mem_per_block` is 227 KB on
+/// sm_90 and 163 KB on sm_80, so at `bx = 32` the ceiling is 908 groups on an
+/// H100 and 652 on an A100 — the same file, the same call, different numbers
+/// on a different card. That is why the answer is stamped (review §8.6) rather
+/// than left implicit, and why `SCX_GPU_DE_REQUIRE_DETERMINISTIC=1` exists.
+pub fn csc_pseudobulk_block_dim(
+    n_groups: usize,
+    smem_limit: usize,
+    force_atomic: bool,
+) -> Option<u32> {
+    if force_atomic {
+        return None;
+    }
+    let elem_bytes = std::mem::size_of::<f64>();
+    [128u32, 64, 32]
+        .into_iter()
+        .find(|&bx| n_groups * bx as usize * elem_bytes <= smem_limit)
 }
 
 /// Device-scratch bytes consumed *per gene column* of a DE chunk, matching the
@@ -1500,15 +1541,10 @@ fn gpu_de_force_atomic_pseudobulk() -> bool {
 /// `ensure_*_capacity` grow calls). `next_power_of_two` mirrors the *span*
 /// rounding those grow calls apply.
 ///
-/// - `n_slab`     — base `slab`, as handed to [`GpuDeChunkScratch::new`] (f32)
-/// - `n_aux`      — ping-pong `aux` (f32). **Separate from `n_slab`**, and
-///   usually [`gpu_de_aux_span`] of the loop's largest sort, which is 0 on the
-///   single-tile fast path. These were one argument charged twice until the two
-///   diverged: `gpu_de_aux_elems` stopped allocating aux below
-///   [`GPU_DE_BLOCK_SORT_CAPACITY`] while the budget kept billing for it.
+/// - `n_aux`      — ping-pong `aux` (f32), [`gpu_de_aux_span`] of the loop's
+///   largest sort, which is 0 on the single-tile fast path.
 /// - `n_ref`      — `ref_slab` (f32)
-/// - `n_g_max`    — `group_slab` (f32) **and** the dominant `per_tg_pool_slabs`
-///   (f32, ×`n_test`)
+/// - `n_g_max`    — the dominant `per_tg_pool_slabs` (f32, ×`n_test`)
 /// - `n_test`     — per-test-group `per_tg_pool_slabs` count and the `u/p/tie`
 ///   f64 staging buffers (×3)
 /// - `n_slots`    — pseudobulk `sums` (f64)
@@ -1520,14 +1556,13 @@ fn gpu_de_force_atomic_pseudobulk() -> bool {
 /// `[chunk_max]` `tie_term`/`u_or_rank`/`p_values` scalars). None is a per-op constant,
 /// so multiplying this whole value by the chunk size is correct, not an over-count.
 ///
-/// **Known under-count, pre-existing (review §8.13):** `n_aux` is the only term
-/// whose allocation rounds the *product* rather than the span —
-/// `ensure_aux_capacity` takes an already-multiplied `chunk × span` and applies
-/// `next_power_of_two` to that, so the real buffer can be up to 2× what this
-/// charges. A per-gene model cannot express it; fixing it means rounding the
-/// span instead, or making the clamp iterate against the candidate chunk.
+/// Every f32 term now rounds its **span**, matching what the corresponding
+/// `ensure_*_capacity` allocates. `n_aux` was the exception until review §8.13:
+/// `ensure_aux_capacity` rounded the already-multiplied `chunk × span`, so the
+/// real buffer could be up to 2× this charge and the clamp said `fits = true`
+/// on a working set that then OOM'd. The `n_slab` and `group_slab` terms are
+/// gone with the buffers themselves — nothing read either one.
 pub fn gpu_de_per_gene_scratch_bytes(
-    n_slab: usize,
     n_aux: usize,
     n_ref: usize,
     n_g_max: usize,
@@ -1535,17 +1570,14 @@ pub fn gpu_de_per_gene_scratch_bytes(
     n_slots: usize,
 ) -> usize {
     let p2 = |x: usize| x.max(1).next_power_of_two();
-    // f32 (4 bytes): slab + aux + ref_slab + group_slab + per_tg_pool (×n_test).
+    // f32 (4 bytes): aux + ref_slab + per_tg_pool (×n_test).
     //
-    // `n_slab` and `n_aux` are separate because they diverge: the slab is
-    // whatever `GpuDeChunkScratch::new` was given, while aux is 0 unless some
-    // sort reaches the multi-tile path ([`gpu_de_aux_span`]). They were one
-    // argument charged twice, which billed every fast-path caller for an aux
-    // buffer `gpu_de_aux_elems` no longer allocates.
-    let f32_elems = n_slab
-        .saturating_add(n_aux)
+    // `n_aux` is 0 unless some sort reaches the multi-tile path
+    // ([`gpu_de_aux_span`]); `p2` of 0 would charge 1 element for a buffer that
+    // is never allocated, so it is folded in raw and rounded only when non-zero.
+    let aux_elems = if n_aux == 0 { 0 } else { p2(n_aux) };
+    let f32_elems = aux_elems
         .saturating_add(p2(n_ref))
-        .saturating_add(p2(n_g_max))
         .saturating_add(n_test.saturating_mul(p2(n_g_max)));
     // f64 (8 bytes): sums + 3×per-group (u/p/tie) + 3 per-gene scalars
     // (tie_term/u_or_rank/p_values).
@@ -1595,6 +1627,23 @@ pub fn gpu_de_aux_elems(chunk_size: usize, n_per_gene_max: usize) -> Result<usiz
         0 => Ok(0),
         span => de_alloc_elems(chunk_size, span),
     }
+}
+
+/// Element count [`GpuDeChunkScratch::ensure_aux_capacity`] actually allocates
+/// for `(chunk_size, span)`: `chunk_size × next_power_of_two(span)`, and `0`
+/// when the span is 0.
+///
+/// The twin of [`gpu_de_aux_elems`], which is the *requirement*
+/// [`gpu_de_block_sort`] checks against (`chunk × span`, unrounded). This is
+/// what gets allocated, and it is what [`gpu_de_per_gene_scratch_bytes`]'s
+/// `p2(n_aux)` charge must equal once multiplied by the chunk — a free function
+/// rather than an inline expression so a CPU-only test can hold the model and
+/// the allocation to each other without a device.
+pub fn gpu_de_aux_alloc_elems(chunk_size: usize, span: usize) -> Result<usize, GpuError> {
+    if span == 0 {
+        return Ok(0);
+    }
+    de_alloc_elems(chunk_size, span.next_power_of_two())
 }
 
 /// Pure budget clamp (no device access — unit-testable).

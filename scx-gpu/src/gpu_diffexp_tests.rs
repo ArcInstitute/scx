@@ -10,6 +10,120 @@ fn test_de_alloc_elems_rejects_overflow() {
     assert!(matches!(err, GpuError::ShapeMismatch { .. }), "got {err:?}");
 }
 
+/// Which CSC pseudobulk kernel runs is a numerically visible choice, and it is
+/// keyed on a **device property**. The selection rule is a pure function so the
+/// whole table can be pinned on a CPU host, and so the route stamp and the
+/// launch site can share one copy of it rather than each deriving it.
+#[test]
+fn the_csc_pseudobulk_selection_is_one_rule_over_groups_and_shared_memory() {
+    // sm_80 (A100) and sm_90 (H100) opt-in dynamic shared memory.
+    const A100: usize = 163 * 1024;
+    const H100: usize = 227 * 1024;
+    const F64: usize = 8;
+
+    // The largest block dim whose per-group partials fit, biggest first.
+    assert_eq!(csc_pseudobulk_block_dim(1, H100, false), Some(128));
+    assert_eq!(
+        csc_pseudobulk_block_dim(H100 / (128 * F64), H100, false),
+        Some(128),
+        "exactly filling the limit at bx=128 still takes bx=128"
+    );
+    assert_eq!(
+        csc_pseudobulk_block_dim(H100 / (128 * F64) + 1, H100, false),
+        Some(64),
+        "one group past it steps down rather than falling to atomics"
+    );
+
+    // The boundary that makes this device-dependent. At bx=32 the ceiling is
+    // `limit / 256` groups: ~888 on an H100, ~637 on an A100. A DE run with
+    // n_groups in between gets the deterministic kernel on one card and the
+    // atomic one on the other, with `route` reading `gpu_csc_v3` on both.
+    let h100_max = H100 / (32 * F64);
+    let a100_max = A100 / (32 * F64);
+    assert_eq!((a100_max, h100_max), (652, 908));
+    assert_eq!(csc_pseudobulk_block_dim(h100_max, H100, false), Some(32));
+    assert_eq!(csc_pseudobulk_block_dim(h100_max + 1, H100, false), None);
+    assert_eq!(
+        csc_pseudobulk_block_dim(h100_max, A100, false),
+        None,
+        "the same group count falls to atomics on the smaller card"
+    );
+    assert_eq!(csc_pseudobulk_block_dim(a100_max, A100, false), Some(32));
+
+    // The 48 KB floor a device without the opt-in attribute gets.
+    assert_eq!(
+        csc_pseudobulk_block_dim(
+            CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT / (32 * F64) + 1,
+            CSC_PSEUDOBULK_DEFAULT_SMEM_LIMIT,
+            false
+        ),
+        None
+    );
+
+    // The force flag short-circuits every size, which is what lets a small
+    // fixture exercise the atomic arm. Passed in explicitly so this test does
+    // not depend on the process-global `OnceLock`.
+    assert_eq!(csc_pseudobulk_block_dim(1, H100, true), None);
+    assert_eq!(csc_pseudobulk_block_dim(0, H100, true), None);
+}
+
+/// The VRAM budget must charge for exactly what gets allocated.
+///
+/// `ensure_aux_capacity` used to take an already-multiplied `chunk × span` and
+/// round *that* to the next power of two, while `gpu_de_per_gene_scratch_bytes`
+/// charged the span un-rounded — the only f32 term without a `p2()`. The gap
+/// reaches 2×, and it lands on the one path the clamp exists to protect: the
+/// clamp reports `fits = true`, then `alloc_zeros` raises a bare `OutOfMemory`
+/// instead of the dimension-naming error.
+///
+/// Arithmetic only — no device needed, which is the point: this is the check
+/// that a CPU-only run can make.
+#[test]
+fn the_aux_budget_charges_what_the_allocator_reserves() {
+    // The review's worked example, which is also the widest gap: a 600k-cell
+    // pool sorted in 1000-gene chunks. 600_000 -> p2 = 1_048_576, so the buffer
+    // is 1000 × 1_048_576 × 4 B = 4.295 GB. Un-rounded the model charged
+    // 1000 × 600_000 × 4 B = 2.4 GB.
+    let chunk = 1_000usize;
+    let span = 600_000usize;
+    assert!(
+        span > GPU_DE_BLOCK_SORT_CAPACITY,
+        "premise: the pool must reach the multi-tile path, or aux is never allocated"
+    );
+    assert_eq!(
+        gpu_de_aux_alloc_elems(chunk, span).unwrap(),
+        1_000 * 1_048_576
+    );
+
+    // The model's aux term, isolated by differencing against a zero span. Every
+    // other argument is held fixed, so the difference is the aux charge alone.
+    let aux_bytes_per_gene = gpu_de_per_gene_scratch_bytes(gpu_de_aux_span(span), 8, 8, 1, 2)
+        - gpu_de_per_gene_scratch_bytes(0, 8, 8, 1, 2);
+    assert_eq!(
+        aux_bytes_per_gene * chunk,
+        gpu_de_aux_alloc_elems(chunk, span).unwrap() * 4,
+        "the budget charges {aux_bytes_per_gene} B/gene × {chunk} genes but the allocator \
+         reserves {} f32",
+        gpu_de_aux_alloc_elems(chunk, span).unwrap()
+    );
+
+    // And across a sweep, including exact powers of two (where the old code was
+    // accidentally right) and the boundary where the span rule turns aux off.
+    for &(chunk, span) in &[
+        (1usize, GPU_DE_BLOCK_SORT_CAPACITY + 1),
+        (7, 12_345),
+        (500, 1_000_000),
+        (1_024, 65_536),
+        (333, GPU_DE_BLOCK_SORT_CAPACITY),
+    ] {
+        let charged = (gpu_de_per_gene_scratch_bytes(gpu_de_aux_span(span), 8, 8, 1, 2)
+            - gpu_de_per_gene_scratch_bytes(0, 8, 8, 1, 2))
+            * chunk;
+        let reserved = gpu_de_aux_alloc_elems(chunk, gpu_de_aux_span(span)).unwrap() * 4;
+        assert_eq!(charged, reserved, "chunk={chunk} span={span}");
+    }
+}
+
 /// The aux buffer is governed by the **largest** per-gene sort in a chunk
 /// loop, not by the first one. A ref-mode DE call with a small reference and a
 /// large test group is the shape that separates the two, and sizing from the
@@ -89,12 +203,13 @@ fn test_gpu_de_aux_elems_is_zero_below_the_multi_tile_threshold() {
     // driver never allocates: it starts at capacity 0 and 0 <= 0 returns early.
     // (Asserted here rather than on a device, which the CPU CI lane has none of.)
 
-    // The budget must follow the allocation. `n_slab` and `n_aux` were one
-    // argument charged twice, so a fast-path driver kept paying for the aux
-    // buffer it had just stopped allocating — the chunk shrank to reserve
-    // nothing. Passing the span (0 here) is what keeps the two in step.
-    let with_aux = gpu_de_per_gene_scratch_bytes(cap, cap, cap, cap, 1, 2);
-    let without = gpu_de_per_gene_scratch_bytes(cap, gpu_de_aux_span(cap), cap, cap, 1, 2);
+    // The budget must follow the allocation: a fast-path driver once kept
+    // paying for the aux buffer it had just stopped allocating, and the chunk
+    // shrank to reserve nothing. Passing the span (0 here) keeps the two in
+    // step. `cap` is already a power of two, so the rounding `n_aux` now
+    // carries does not change the difference.
+    let with_aux = gpu_de_per_gene_scratch_bytes(cap, cap, cap, 1, 2);
+    let without = gpu_de_per_gene_scratch_bytes(gpu_de_aux_span(cap), cap, cap, 1, 2);
     assert_eq!(
         with_aux - without,
         cap * 4,
@@ -156,7 +271,6 @@ fn test_per_gene_scratch_bytes_dominated_by_per_tg_pool() {
     let n_test = 40;
     let n_g_max = 10_000;
     let bytes = gpu_de_per_gene_scratch_bytes(
-        /* n_slab */ 16_000,
         /* n_aux */ 16_000,
         /* n_ref */ 16_000,
         n_g_max,
@@ -182,7 +296,7 @@ fn test_clamp_chunk_for_budget() {
     // and a partially-occupied GPU whose free VRAM the full chunk would blow
     // past (the report OOM'd because the backed reader / shard decode / index
     // tables already held VRAM, so free ≪ 80 GB).
-    let per_gene = gpu_de_per_gene_scratch_bytes(16_000, 16_000, 16_000, 10_000, 40, 41);
+    let per_gene = gpu_de_per_gene_scratch_bytes(16_000, 16_000, 10_000, 40, 41);
     let free = 8 * 1024 * 1024 * 1024usize; // 8 GB free at DE time
 
     // 4000 × per_gene at frac=0.6 of 8 GB does not fit → clamps below 4000,
@@ -208,7 +322,7 @@ fn test_clamp_chunk_for_budget() {
 
     // Pathological: per-tg pool so large even the floor chunk can't fit on a
     // tiny device → fits=false (caller surfaces a clear error).
-    let huge_per_gene = gpu_de_per_gene_scratch_bytes(0, 0, 0, 4_000_000, 200, 201);
+    let huge_per_gene = gpu_de_per_gene_scratch_bytes(0, 0, 4_000_000, 200, 201);
     let small_free = 4 * 1024 * 1024 * 1024usize; // 4 GB
     let (chunk3, fits3) = clamp_chunk_for_budget(4000, huge_per_gene, small_free, 0.6);
     assert!(
@@ -498,7 +612,7 @@ fn test_gpu_de_primitives_match_cpu_reference() {
     let n_ref = ref_cells.len();
     let n_g = group_cells.len();
 
-    let mut scratch = GpuDeChunkScratch::new(&dev, n_obs, chunk_size, n_ref.max(n_g)).unwrap();
+    let mut scratch = GpuDeChunkScratch::new(&dev, n_obs, chunk_size).unwrap();
 
     // Gene-major slab, staged on the host: `slab[gene * n_sel + j]` is the
     // value for the j-th selected cell. This used to go through the v1 dense
@@ -518,7 +632,7 @@ fn test_gpu_de_primitives_match_cpu_reference() {
     // Sort ref.
     let mut d_ref_slab = dev.htod_copy(&host_gene_major(&ref_cells)).unwrap();
     scratch
-        .ensure_aux_capacity(&dev, chunk_size * n_ref)
+        .ensure_aux_capacity(&dev, chunk_size, n_ref)
         .unwrap();
     gpu_de_block_sort(
         &dev,
@@ -556,7 +670,7 @@ fn test_gpu_de_primitives_match_cpu_reference() {
         n_g,
     )
     .unwrap();
-    scratch.ensure_aux_capacity(&dev, chunk_size * n_g).unwrap();
+    scratch.ensure_aux_capacity(&dev, chunk_size, n_g).unwrap();
     gpu_de_block_sort(
         &dev,
         &mut d_group_slab,
@@ -638,9 +752,9 @@ fn test_gpu_de_block_sort_random_parity() {
     }
 
     let mut d_slab = dev.htod_copy(&data).unwrap();
-    let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
+    let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size).unwrap();
     scratch
-        .ensure_aux_capacity(&dev, chunk_size * n_per_gene)
+        .ensure_aux_capacity(&dev, chunk_size, n_per_gene)
         .unwrap();
     gpu_de_block_sort(
         &dev,
@@ -694,9 +808,9 @@ fn test_gpu_de_block_sort_above_capacity() {
     }
 
     let mut d_slab = dev.htod_copy(&data).unwrap();
-    let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
+    let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size).unwrap();
     scratch
-        .ensure_aux_capacity(&dev, chunk_size * n_per_gene)
+        .ensure_aux_capacity(&dev, chunk_size, n_per_gene)
         .unwrap();
     gpu_de_block_sort(
         &dev,
@@ -746,9 +860,9 @@ fn test_gpu_de_block_sort_above_capacity_uneven() {
     }
 
     let mut d_slab = dev.htod_copy(&data).unwrap();
-    let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size, 1).unwrap();
+    let mut scratch = GpuDeChunkScratch::new(&dev, 1, chunk_size).unwrap();
     scratch
-        .ensure_aux_capacity(&dev, chunk_size * n_per_gene)
+        .ensure_aux_capacity(&dev, chunk_size, n_per_gene)
         .unwrap();
     gpu_de_block_sort(
         &dev,
@@ -1081,9 +1195,8 @@ fn test_scratch_ensure_capacity_no_realloc_on_same_or_smaller() {
     let dev = require_gpu!();
     let n_obs = 100;
     let chunk_max = 8;
-    let n_pool_initial = 10;
 
-    let mut scratch = GpuDeChunkScratch::new(&dev, n_obs, chunk_max, n_pool_initial).unwrap();
+    let mut scratch = GpuDeChunkScratch::new(&dev, n_obs, chunk_max).unwrap();
     // Construction does not call `ensure_*` — alloc_count starts at zero.
     assert_eq!(scratch.alloc_count(), 0, "fresh scratch has no grow events");
 
@@ -1103,21 +1216,13 @@ fn test_scratch_ensure_capacity_no_realloc_on_same_or_smaller() {
         "smaller ref_slab size: no realloc"
     );
 
-    // First grow of group_slab.
-    scratch.ensure_group_slab_capacity(&dev, 50).unwrap();
-    assert_eq!(scratch.alloc_count(), 2, "first group_slab grow");
-
-    // Repeat — no-op.
-    scratch.ensure_group_slab_capacity(&dev, 50).unwrap();
-    assert_eq!(scratch.alloc_count(), 2, "same group_slab: no realloc");
-
     // First grow of sums.
     scratch.ensure_sums_capacity(&dev, 4).unwrap();
-    assert_eq!(scratch.alloc_count(), 3, "first sums grow");
+    assert_eq!(scratch.alloc_count(), 2, "first sums grow");
 
     // First grow of aux.
-    scratch.ensure_aux_capacity(&dev, 1024).unwrap();
-    assert_eq!(scratch.alloc_count(), 4, "first aux grow");
+    scratch.ensure_aux_capacity(&dev, 8, 128).unwrap();
+    assert_eq!(scratch.alloc_count(), 3, "first aux grow");
 
     // Another grow on ref_slab past current capacity bumps alloc count.
     // ref_slab grew to next_power_of_two(64) = 64, so 96 forces a grow.
@@ -1134,9 +1239,8 @@ fn test_scratch_ensure_capacity_no_realloc_on_same_or_smaller() {
     let frozen = scratch.alloc_count();
     for _ in 0..16 {
         scratch.ensure_ref_slab_capacity(&dev, 32).unwrap();
-        scratch.ensure_group_slab_capacity(&dev, 50).unwrap();
         scratch.ensure_sums_capacity(&dev, 4).unwrap();
-        scratch.ensure_aux_capacity(&dev, 1024).unwrap();
+        scratch.ensure_aux_capacity(&dev, 8, 128).unwrap();
     }
     assert_eq!(
         scratch.alloc_count(),

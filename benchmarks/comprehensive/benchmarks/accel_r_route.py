@@ -18,7 +18,7 @@ scheduling slot, not an input.
 Gated metrics (all deterministic, floored at 1.0):
 
 * ``r_pca_route_cpu_correct`` — ``scx_pca`` stamps ``cpu_csr`` /
-  ``user_forced_cpu`` and the record carries the exact 17 wire keys in order.
+  ``user_forced_cpu`` and the record carries the exact 18 wire keys in order.
 * ``r_pca_method_arms_correct`` — the shared covariance-vs-randomized auto
   rule flips at ``COVARIANCE_PCA_THRESHOLD`` (rscx's one real dispatch
   branch, observable via the returned ``method``).
@@ -58,7 +58,7 @@ FORMAT_DATASET_SCOPE: dict[str, frozenset[str]] = {
     FORMAT_KEY: frozenset({"pbmc3k"}),
 }
 
-# The 17-key wire contract, mirrored from `AccelExecutionInfo::fields()`
+# The 18-key wire contract, mirrored from `AccelExecutionInfo::fields()`
 # (pinned in scx-accel's route_tests.rs and rscx's testthat; re-pinned here so
 # the gate also fails on key drift).
 WIRE_KEYS = [
@@ -66,6 +66,7 @@ WIRE_KEYS = [
     "shards_decoded", "shards_uploaded", "math_mode", "spmm_policy",
     "rapids_version", "cuml_version", "cupy_version", "transfer_mode",
     "device_id", "bytes_uploaded", "n_shards_shufdelta_gpu", "resident_csr",
+    "reduction",
 ]
 
 _PROBE = Path(__file__).resolve().parents[1] / "scripts" / "r_route_probe.R"

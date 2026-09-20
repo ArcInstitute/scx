@@ -26,6 +26,37 @@ echo "=== node: $(hostname) ==="
 nvidia-smi --query-gpu=index,name,driver_version --format=csv
 export PATH=/usr/local/cuda/bin:${PATH}
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+
+# --- cuVS ------------------------------------------------------------------
+# libcuvs_c.so is dlopen'd at run time (scx-gpu/src/gpu_knn.rs), and the loader
+# looks under $VIRTUAL_ENV/lib/python*/site-packages/libcuvs/lib64 as well as
+# the normal dlopen paths. Until this was added the job exported only
+# /usr/local/cuda/lib64, so **every** CAGRA test skipped on **every** run:
+#
+#   fused::gpu::tests::test_pca_then_knn_gpu_matches_sequential  [cuVS not available]
+#   gpu_knn::tests::test_gpu_knn_cagra_basic                     [cuVS not available]
+#   gpu_knn::tests::test_gpu_knn_cagra_large_k                   [cuVS not available]
+#
+# They were listed in the closing summary each time, which is the harness
+# working as designed — but the coverage gap sat there unread while the CAGRA
+# path carried a Critical stream-synchronization defect nothing could catch.
+# The incantation is the one slurm_gpu_knn_bench.sh already uses; librmm and
+# rapids_logger are DT_NEEDED of libcuvs_c.so and must be resolvable too.
+export VIRTUAL_ENV="${SCX_DIR}/.venv"
+# Globbed, not pinned to python3.13: a venv rebuilt on a newer interpreter must
+# not silently take the tests back to skipping.
+for site in "${VIRTUAL_ENV}"/lib/python*/site-packages; do
+    for d in libcuvs libraft librmm rapids_logger; do
+        [[ -d "${site}/${d}/lib64" ]] &&
+            LD_LIBRARY_PATH="${site}/${d}/lib64:${LD_LIBRARY_PATH}"
+    done
+done
+export LD_LIBRARY_PATH
+if ! ls "${VIRTUAL_ENV}"/lib/python*/site-packages/libcuvs/lib64/libcuvs_c.so >/dev/null 2>&1; then
+    echo "WARNING: libcuvs_c.so not found under ${VIRTUAL_ENV}; the CAGRA tests" >&2
+    echo "  will fail under SCX_REQUIRE_CUVS=1. Set SCX_REQUIRE_CUVS=0 to allow" >&2
+    echo "  them to skip, or install the RAPIDS wheels into the venv." >&2
+fi
 echo
 
 # --- Preflight -------------------------------------------------------------
@@ -61,13 +92,20 @@ export SCX_GPU_REQUIRE_NVCC=1
 # silence this harness exists to remove. Override with SCX_REQUIRE_LARGE_VRAM=0
 # when running on a smaller or shared GPU.
 export SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM:-1}
+# And require cuVS, now that the job puts it on LD_LIBRARY_PATH. Same argument
+# as the two above: this is the only run where the CAGRA tests execute at all,
+# so a cuVS that fails to load here is coverage silently not provided rather
+# than an optional extra. Override with SCX_REQUIRE_CUVS=0 on a node without
+# the RAPIDS wheels.
+export SCX_REQUIRE_CUVS=${SCX_REQUIRE_CUVS:-1}
 echo "SCX_REQUIRE_GPU=1 — a GPU test that cannot open a device is a FAILURE here,"
 echo "not a skip. SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM} — likewise for the"
 echo "tests that need a multi-GiB allocation to reach a 32-bit index boundary."
-echo "Optional-library skips (nvcomp, cuVS) are still allowed and are listed in the"
-echo "summary below; set SCX_REQUIRE_NVCOMP=1 / SCX_REQUIRE_CUVS=1 to make those"
-echo "hard requirements too. All of these pass through from the submitting"
-echo "environment."
+echo "SCX_REQUIRE_CUVS=${SCX_REQUIRE_CUVS} — likewise for cuVS, which this job now"
+echo "puts on LD_LIBRARY_PATH; before that every CAGRA test skipped on every run."
+echo "nvcomp skips are still allowed and are listed in the summary below; set"
+echo "SCX_REQUIRE_NVCOMP=1 to make that a hard requirement too. All of these"
+echo "pass through from the submitting environment."
 echo
 
 LOG_DIR=$(mktemp -d)
@@ -152,12 +190,12 @@ if [[ -n "${SKIPPED}" ]]; then
     # SCX_REQUIRE_LARGE_VRAM=0 a vram_or_skip miss still prints the marker and
     # lands in this list, and asserting "these are optional-library gates" would
     # mislabel it as nvcomp/cuVS on the very override path this script documents.
-    if [[ "${SCX_REQUIRE_LARGE_VRAM}" == "1" ]]; then
-        echo "  SCX_REQUIRE_LARGE_VRAM=1, so a free-VRAM gate cannot skip either —"
-        echo "  every entry above is an optional-library gate (nvcomp, cuVS)."
+    if [[ "${SCX_REQUIRE_LARGE_VRAM}" == "1" && "${SCX_REQUIRE_CUVS}" == "1" ]]; then
+        echo "  SCX_REQUIRE_LARGE_VRAM=1 and SCX_REQUIRE_CUVS=1, so neither a free-VRAM"
+        echo "  gate nor cuVS can skip — every entry above is an nvcomp gate."
     else
-        echo "  SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM}, so an entry above may be a"
-        echo "  free-VRAM skip as well as an optional-library one (nvcomp, cuVS)."
+        echo "  SCX_REQUIRE_LARGE_VRAM=${SCX_REQUIRE_LARGE_VRAM}, SCX_REQUIRE_CUVS=${SCX_REQUIRE_CUVS} — an entry above"
+        echo "  may be a free-VRAM or cuVS skip as well as an nvcomp one."
     fi
 else
     echo "(none — every GPU test executed)"

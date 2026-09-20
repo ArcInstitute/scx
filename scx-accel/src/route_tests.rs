@@ -387,6 +387,7 @@ fn fields_pins_the_wire_keys_in_order() {
             "bytes_uploaded",
             "n_shards_shufdelta_gpu",
             "resident_csr",
+            "reduction",
         ]
     );
 }

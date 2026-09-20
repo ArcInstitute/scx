@@ -71,7 +71,13 @@ extern "C" __global__ void rice_decode_kernel(
                 word |= ((unsigned long long)bs[byte_idx + b]) << (b * 8);
             }
             word >>= bit_idx;
-            unsigned int mask = (1u << k) - 1;
+            // `1u << 32` is UB. `k` cannot reach 32 today — the host prescan
+            // masks the header byte to its low nibble, so k is in [0, 15] — but
+            // the sibling FOR-BP kernel carries the same guard
+            // (`forbp_decode.cu`, added by the #333 fuzz regression) and a
+            // divergence between two copies of one pattern is how the last one
+            // was missed. Defence in depth, not a live path.
+            unsigned int mask = (k >= 32) ? 0xFFFFFFFFu : ((1u << k) - 1);
             r = (unsigned int)(word & mask);
             bit_pos += k;
         }

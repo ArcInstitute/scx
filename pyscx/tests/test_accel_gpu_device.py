@@ -117,9 +117,85 @@ def test_gpu_out_of_range_raises_runtime_error():
     """An index past the visible CUDA-device count raises `RuntimeError`."""
     info = pyscx.accel.gpu_info()
     assert info is not None  # gated above
-    # `gpu_info()` only reports device 0 today; probe the count via cudarc/
-    # nvidia-smi semantics by trying ascending indices until one fails.
-    # We can simply request a deliberately-large index and expect failure.
+    # `gpu_info()` defaults to device 0; `gpu_info(device=...)` reports on the
+    # card named. An out-of-range ordinal has no info to report, so this is
+    # also the cheap probe for "that device does not exist".
+    assert pyscx.accel.gpu_info(device="gpu:0") is not None
     a = _small_adata()
     with pytest.raises(RuntimeError, match="CUDA device"):
         pyscx.accel.normalize_total(a, device="gpu:99")
+
+
+def test_device_auto_is_answered_not_raised_on_the_reporting_helpers():
+    """`device="auto"` must never raise on these two.
+
+    They exist to answer "is there a GPU, and will this fit on it", and their
+    documented answers for "no GPU" are `None` and `fits_in_vram=False`.
+    `resolve_device("auto")` deliberately resolves to the CPU when CUDA is
+    absent, and an earlier version of this PR turned that normal result into a
+    `ValueError` — so the documented `device="auto"` raised on exactly the hosts
+    the helpers describe (found by codex).
+
+    Runs everywhere: on a GPU host `"auto"` picks the GPU and both return real
+    answers; on a CPU-only host both return the no-GPU answer. Neither raises.
+    """
+    import anndata
+    import numpy as np
+
+    adata = anndata.AnnData(X=np.zeros((4, 3), dtype=np.float32))
+
+    info = pyscx.accel.gpu_info(device="auto")
+    assert info is None or "device" in info
+
+    est = pyscx.accel.estimate_gpu_memory(adata, "pca", device="auto")
+    assert set(est) == {"required_gb", "fits_in_vram"}
+    assert isinstance(est["fits_in_vram"], bool)
+    if not _gpu_available():
+        assert info is None
+        assert est["fits_in_vram"] is False
+
+    # And the zero-argument form keeps its old behaviour exactly.
+    assert (pyscx.accel.gpu_info() is None) == (not _gpu_available())
+
+
+def test_reporting_helpers_reject_an_explicit_cpu_device():
+    """`"cpu"` is a category error on both: there is no CPU VRAM to report.
+
+    Distinct from `"auto"` above — the user named the CPU rather than asking
+    what was available — and it runs on every host.
+    """
+    import anndata
+    import numpy as np
+
+    adata = anndata.AnnData(X=np.zeros((4, 3), dtype=np.float32))
+    with pytest.raises(ValueError, match="selects the CPU"):
+        pyscx.accel.gpu_info(device="cpu")
+    with pytest.raises(ValueError, match="selects the CPU"):
+        pyscx.accel.estimate_gpu_memory(adata, "pca", device="cpu")
+
+
+@pytest.mark.skipif(not _gpu_available(), reason="CUDA GPU not available")
+def test_gpu_info_reports_the_device_it_was_given():
+    """`gpu_info()` used to hardcode device 0 — on a multi-GPU host it reported
+    the wrong card's free VRAM and created a CUDA context on device 0 as a side
+    effect of being asked (review 8.13).
+
+    This node has whatever cards it has, so what is checked here is that the
+    default and the explicit ordinal agree and that a bad selector is refused
+    rather than silently answered from device 0. Distinguishing two *different*
+    cards needs a multi-GPU host and is not asserted.
+    """
+    default = pyscx.accel.gpu_info()
+    explicit = pyscx.accel.gpu_info(device="gpu:0")
+    assert explicit is not None
+    assert explicit["device"] == default["device"]
+
+    # An ordinal the host does not have resolves to a RuntimeError from the
+    # shared device grammar, not to a silent report on device 0.
+    with pytest.raises(RuntimeError, match="CUDA device"):
+        pyscx.accel.gpu_info(device="gpu:99")
+
+    # `cpu` is a category error: there is no CPU VRAM to report.
+    with pytest.raises(ValueError, match="selects the CPU"):
+        pyscx.accel.gpu_info(device="cpu")
+

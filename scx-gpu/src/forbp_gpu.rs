@@ -35,17 +35,98 @@ struct RowMeta {
     index_packing: u8,
 }
 
+/// The largest FOR-BP sub-stream this decoder accepts, in bytes.
+///
+/// `RowMeta::bit_offset` is `cursor.position() * 8` in a `u32`, and both kernels
+/// consume it — and every offset they derive from it (`cur_bit`, `base_byte`,
+/// `chunk_base`) — as 32-bit. At `u32::MAX / 8` bytes the product stops fitting:
+/// every row past that point would decode from a wrapped bit position while the
+/// CPU decoder reads the same file correctly. Framed shards pass one row group
+/// at a time and never approach it; the unframed `decode_scx1_gpu` path (legacy
+/// v1 files, or `--row-group-rows 0`) passes the whole sub-stream, and an
+/// ATAC-like modality reaches ~1 GB in a single shard.
+///
+/// Rejecting is deliberate rather than widening the kernels' whole bit domain to
+/// 64-bit: the host decoder reads these files correctly, and `scx optimize`
+/// re-frames the file permanently. The same ceiling makes `data.len() as u32`
+/// (the kernels' `bitstream_len` bound) lossless.
+///
+/// The rejection is a [`GpuError::UnsupportedLayout`], which is what actually
+/// routes `to_gpu_anndata` to host-assemble. It was `InvalidShard` first, and
+/// that silently did **not** degrade — `alternate_route_may_succeed()` is false
+/// for an input defect, so the call raised instead. Classifying it correctly is
+/// the whole of the graceful part; the variant is not cosmetic.
+pub(crate) const MAX_FORBP_SUBSTREAM_BYTES: usize = (u32::MAX / 8) as usize;
+
+/// Reject a FOR-BP sub-stream whose byte length makes [`RowMeta::bit_offset`]
+/// unrepresentable.
+///
+/// A free function over the *length* rather than an inline check on the slice,
+/// so the boundary is testable without materialising half a gigabyte: the
+/// guard a test exercises here is the one `preparse_forbp` actually calls.
+pub(crate) fn check_forbp_substream_len(len: usize) -> Result<(), GpuError> {
+    if len > MAX_FORBP_SUBSTREAM_BYTES {
+        // `UnsupportedLayout`, not `InvalidShard`: the shard is **valid**, and the
+        // CPU decoder reads it correctly — it is this route that cannot address
+        // it. That is the distinction `GpuError::UnsupportedLayout` documents
+        // ("a path that was never viable"), and it is what lets
+        // `alternate_route_may_succeed` send `to_gpu_anndata` to host-assemble
+        // rather than raising. Classifying a valid shard as corrupt would be both
+        // wrong and user-hostile.
+        return Err(GpuError::UnsupportedLayout(format!(
+            "FOR-BP prescan: sub-stream is {len} bytes, above the \
+             {MAX_FORBP_SUBSTREAM_BYTES}-byte GPU ceiling (the decode kernels address it \
+             with 32-bit bit offsets); re-frame the file with \
+             `scx optimize --row-group-rows 256`, or decode it on the CPU"
+        )));
+    }
+    Ok(())
+}
+
 /// Pre-parse the FOR-BP encoded stream on CPU to extract per-row metadata.
 ///
 /// Returns `(row_metas, all_row_lengths, total_nnz)` where:
 /// - `row_metas` contains metadata for non-empty rows only (sent to GPU)
 /// - `all_row_lengths` contains nnz for every row including empty ones (for CSR)
 /// - `total_nnz` is the sum of all row nnz values
+///
+/// `nnz_hint` is the declared nnz the caller expects (`0` = unknown), and it
+/// bounds the **cumulative decoded index count across every non-empty row** —
+/// not only a zero-payload run, which is all the CPU twin needs to bound. It
+/// mirrors `scx_codec::forbp::forbp_decode_with_hint`'s parameter of the same
+/// name; this prescan is the third copy of that per-row parse, and the only one
+/// that pre-allocates from the summed varints, which is why its bound is the
+/// wider one.
 fn preparse_forbp(
     data: &[u8],
     n_rows: usize,
+    nnz_hint: usize,
     index_dtype_u16: bool,
 ) -> Result<(Vec<RowMeta>, Vec<usize>, usize), GpuError> {
+    check_forbp_substream_len(data.len())?;
+    // Both bounds are `forbp_decode_inner`'s (`scx-codec/src/forbp.rs`): every
+    // row writes at least one varint byte even when empty, and an index needs at
+    // least one bit. They bound `Vec::with_capacity` there and the cumulative
+    // output here, before either can be driven by a hostile header.
+    if n_rows > data.len() {
+        return Err(GpuError::InvalidShard(format!(
+            "FOR-BP prescan: n_rows={n_rows} exceeds the {} stream bytes that could encode them",
+            data.len()
+        )));
+    }
+    if data.len().checked_mul(8).is_some_and(|cap| nnz_hint > cap) {
+        return Err(GpuError::InvalidShard(format!(
+            "FOR-BP prescan: nnz_hint={nnz_hint} exceeds the {} bits the stream carries",
+            data.len() * 8
+        )));
+    }
+    // Ceiling on total decoded indices: exact when the caller declared the nnz
+    // (both production call sites do), else the codec's absolute no-hint cap.
+    let max_output = if nnz_hint > 0 {
+        nnz_hint
+    } else {
+        scx_codec::forbp::FORBP_NO_HINT_MAX_NNZ
+    };
     let mut cursor = Cursor::new(data);
     let mut rows_remaining = n_rows;
     let mut metas = Vec::new();
@@ -113,6 +194,29 @@ fn preparse_forbp(
                 )));
             }
 
+            // Bound the *cumulative* decoded index count, on **every** non-empty
+            // row. `forbp_decode_inner` applies this only to the zero-payload
+            // (`frame_bits == 0`) case, and that is sound there because the CPU
+            // pushes into a `Vec` as it decodes: its growth is bounded by the
+            // pushes it actually makes, so a lying `nnz` on a positive-width row
+            // costs nothing until the payload runs out.
+            //
+            // This decoder cannot borrow that reasoning. It sums the stream's own
+            // per-row varints and hands the total to `alloc_zeros(total_nnz)`
+            // *before* any decoding, so a `frame_bits == 1` row carrying real
+            // payload bytes can pass the `need_bytes > remaining` check below
+            // while claiming an `nnz` the shard header never declared — up to
+            // `remaining * 8` of them. At the substream ceiling that is ~4.29e9
+            // indices, a ~17 GB VRAM request, and `check_device_len` reports the
+            // mismatch only afterwards. Gating this on `frame_bits == 0` left
+            // exactly that hole open (found by codex).
+            if (output_offset as usize).saturating_add(nnz) > max_output {
+                return Err(GpuError::InvalidShard(format!(
+                    "FOR-BP prescan: a row of {nnz} (frame_bits={frame_bits}) would take \
+                     the decoded index count past the declared bound of {max_output}"
+                )));
+            }
+
             // Record the bit offset where packed deltas start
             let bit_offset = (cursor.position() as u32) * 8;
 
@@ -146,7 +250,21 @@ fn preparse_forbp(
                 index_packing,
             });
 
-            output_offset += nnz as u32;
+            // Checked: `nnz` is an untrusted varint, and `output_offset` is the
+            // kernel's per-row *write base* into a buffer sized from this same
+            // running total. A wrap here is an out-of-bounds device write, not
+            // merely a short allocation. No cheap test reaches it — the bounds
+            // above cap the sum at `data.len() * 8`, so it takes a stream within
+            // a factor of two of `MAX_FORBP_SUBSTREAM_BYTES` to cross `u32::MAX`
+            // — but that stream is exactly the one the unframed path accepts.
+            output_offset = u32::try_from(nnz)
+                .ok()
+                .and_then(|n| output_offset.checked_add(n))
+                .ok_or_else(|| {
+                    GpuError::InvalidShard(format!(
+                        "FOR-BP prescan: decoded index count overflows u32 at a row of {nnz}"
+                    ))
+                })?;
         }
 
         if n_rows_in_block > rows_remaining {
@@ -174,8 +292,31 @@ pub fn forbp_decode_gpu(
     n_rows: usize,
     index_dtype_u16: bool,
 ) -> Result<(CudaSlice<u32>, Vec<usize>), GpuError> {
+    forbp_decode_gpu_with_hint(dev, data, n_rows, 0, index_dtype_u16)
+}
+
+/// Decode FOR-BP encoded column indices on GPU against a **declared** nnz.
+///
+/// The twin of [`forbp_decode_gpu`] that knows what the shard header says the
+/// answer should be, mirroring `scx_codec::forbp::forbp_decode_with_hint`. The
+/// hint is a bound, never an output size: the decode still derives its length
+/// from the stream's own per-row varints, and the caller still compares the two
+/// (`check_device_len` / `CombinedCsr::place`). What it buys is that a row
+/// claiming more indices than the header declares — whether it carries payload
+/// bytes or not — is rejected during the prescan rather than after a multi-GB
+/// `alloc_zeros`.
+///
+/// Output is **bit-identical** to [`forbp_decode_gpu`] for any stream both accept.
+pub fn forbp_decode_gpu_with_hint(
+    dev: &GpuDevice,
+    data: &[u8],
+    n_rows: usize,
+    nnz_hint: usize,
+    index_dtype_u16: bool,
+) -> Result<(CudaSlice<u32>, Vec<usize>), GpuError> {
     // CPU pre-parse all headers
-    let (metas, all_row_lengths, total_nnz) = preparse_forbp(data, n_rows, index_dtype_u16)?;
+    let (metas, all_row_lengths, total_nnz) =
+        preparse_forbp(data, n_rows, nnz_hint, index_dtype_u16)?;
     forbp_decode_gpu_core(dev, data, metas, all_row_lengths, total_nnz)
 }
 
@@ -198,6 +339,9 @@ fn forbp_decode_gpu_core(
         return Ok((dev.alloc_zeros::<u32>(0)?, all_row_lengths));
     }
 
+    // Lossless: `preparse_forbp` rejected anything above `MAX_FORBP_SUBSTREAM_BYTES`
+    // (< 2^29), so this narrowing cannot truncate. Before that bound it could,
+    // which would have made the kernels' only bounds check spuriously loose.
     let bitstream_len = data.len() as u32;
     let d_bitstream = dev.htod_copy(data)?;
     let mut d_output = dev.alloc_zeros::<u32>(total_nnz)?;
@@ -331,12 +475,12 @@ mod tests {
             encoded[FRAME_BITS_OFF]
         );
         assert!(
-            preparse_forbp(&encoded, 1, true).is_ok(),
+            preparse_forbp(&encoded, 1, 0, true).is_ok(),
             "premise: the fixture parses before corruption"
         );
 
         encoded[FRAME_BITS_OFF] = 47;
-        let Err(err) = preparse_forbp(&encoded, 1, true) else {
+        let Err(err) = preparse_forbp(&encoded, 1, 0, true) else {
             panic!("frame_bits=47 must be rejected, not handed to the kernel");
         };
         // Match the guard's own message, not merely `is_err()`. Without the
@@ -354,12 +498,168 @@ mod tests {
         // frame_bits=47 to the GPU as a shift width.
         let mut padded = encoded.clone();
         padded.extend(std::iter::repeat_n(0u8, 64));
-        let Err(err) = preparse_forbp(&padded, 1, true) else {
+        let Err(err) = preparse_forbp(&padded, 1, 0, true) else {
             panic!("frame_bits=47 within a padded buffer must still be rejected");
         };
         assert!(
             matches!(&err, GpuError::InvalidShard(m) if m.contains("frame_bits=47")),
             "expected the frame_bits guard, got {err:?}"
+        );
+    }
+
+    /// LEB128, the width `scx_codec::forbp::read_varint` consumes.
+    fn varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7F) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// One u16-index block holding a single row whose nnz varint claims
+    /// `claimed_nnz` and whose `frame_bits` is 0 — a zero-payload run.
+    ///
+    /// Hand-built rather than encoder-produced: `forbp_encode` will not emit a
+    /// row that lies about its own length, and the lie is the whole fixture.
+    fn zero_payload_row(claimed_nnz: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u32.to_le_bytes()); // block_nnz (unread by the prescan)
+        out.extend_from_slice(&1u16.to_le_bytes()); // n_rows_in_block
+        out.extend_from_slice(&varint(claimed_nnz)); // per-row nnz
+        out.extend_from_slice(&7u16.to_le_bytes()); // frame_min
+        out.push(0); // frame_bits == 0 -> no payload follows
+        out
+    }
+
+    /// A `frame_bits == 0` row carries no payload, so the `need_bytes > remaining`
+    /// reject cannot see it: an nnz varint of half a billion parses out of ~14
+    /// bytes and reaches `alloc_zeros(total_nnz)` as a multi-GB VRAM request.
+    ///
+    /// The CPU decoder has bounded the cumulative output since its own fuzz
+    /// regression (`forbp_decode_inner`'s `max_output`); this prescan did not.
+    /// Needs no GPU — the prescan is host-side.
+    #[test]
+    fn preparse_rejects_an_unbounded_zero_frame_bits_run() {
+        // Premise: a *modest* zero-payload run still parses, so the rejection
+        // below is about the bound and not about zero-payload rows as such.
+        let small = zero_payload_row(4);
+        let (_, row_lengths, total) =
+            preparse_forbp(&small, 1, 0, true).expect("a bounded zero-payload run still parses");
+        assert_eq!(
+            row_lengths,
+            vec![4],
+            "premise: the fixture decodes as one row"
+        );
+        assert_eq!(total, 4, "premise: its nnz is the varint's value");
+
+        let hostile = zero_payload_row(500_000_000);
+        assert!(
+            hostile.len() < 32,
+            "premise: the lie costs {} bytes, so nothing bounds it by payload",
+            hostile.len()
+        );
+
+        // No hint: the codec's absolute no-hint cap applies.
+        let Err(err) = preparse_forbp(&hostile, 1, 0, true) else {
+            panic!("an unbounded zero-payload run must be rejected before it sizes an allocation");
+        };
+        assert!(
+            matches!(&err, GpuError::InvalidShard(m)
+                if m.contains("frame_bits=0") && m.contains("bound of 16777216")),
+            "expected the cumulative-output bound, got {err:?}"
+        );
+
+        // With a declared nnz the bound is exact rather than absolute, which is
+        // what both production call sites pass.
+        let Err(err) = preparse_forbp(&hostile, 1, 4, true) else {
+            panic!("a declared nnz of 4 must reject a claimed 500_000_000");
+        };
+        assert!(
+            matches!(&err, GpuError::InvalidShard(m) if m.contains("bound of 4")),
+            "expected the declared bound in the message, got {err:?}"
+        );
+    }
+
+    /// A `frame_bits > 0` row is bounded too, not just the zero-payload case.
+    ///
+    /// The CPU decoder bounds only the zero-payload arm, and that is sound there
+    /// because it pushes into a `Vec` as it goes. This prescan sums the stream's
+    /// varints and hands the total to `alloc_zeros` *before* decoding, so a row
+    /// that carries real payload bytes while claiming a far larger `nnz` than the
+    /// shard header declared reached the allocator unchecked. Found by codex on
+    /// PR #549.
+    #[test]
+    fn preparse_bounds_a_positive_width_row_against_the_declared_nnz() {
+        // One 1-bit-wide row claiming 4000 indices, with the 500 payload bytes
+        // that claim genuinely requires — so the truncation check cannot catch
+        // it. The header, however, declares 4.
+        let claimed = 4_000usize;
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&0u32.to_le_bytes()); // block_nnz
+        hostile.extend_from_slice(&1u16.to_le_bytes()); // n_rows_in_block
+        hostile.extend_from_slice(&varint(claimed as u64)); // per-row nnz
+        hostile.extend_from_slice(&7u16.to_le_bytes()); // frame_min
+        hostile.push(1); // frame_bits = 1  -> positive width
+        hostile.resize(hostile.len() + claimed.div_ceil(8), 0); // real payload
+
+        // Premise: the payload is present, so the truncation reject cannot fire
+        // and an unbounded prescan accepts this row.
+        assert!(
+            preparse_forbp(&hostile, 1, 0, true).is_ok(),
+            "premise: with no declared nnz the row is within the no-hint cap"
+        );
+
+        let Err(err) = preparse_forbp(&hostile, 1, 4, true) else {
+            panic!("a positive-width row claiming {claimed} against a declared 4 must be rejected");
+        };
+        assert!(
+            matches!(&err, GpuError::InvalidShard(m)
+                if m.contains("frame_bits=1") && m.contains("bound of 4")),
+            "expected the cumulative bound to name the positive-width row, got {err:?}"
+        );
+    }
+
+    /// `RowMeta::bit_offset` is `cursor.position() * 8` in a `u32`. Past
+    /// `u32::MAX / 8` bytes every row decodes from a wrapped bit position while
+    /// the CPU reads the same file correctly — so the prescan refuses the
+    /// sub-stream instead.
+    ///
+    /// Exercises the guard through the function `preparse_forbp` calls, over a
+    /// length rather than a slice, so the boundary is checked without
+    /// materialising half a gigabyte.
+    #[test]
+    fn preparse_rejects_a_substream_past_the_bit_offset_ceiling() {
+        assert_eq!(
+            MAX_FORBP_SUBSTREAM_BYTES, 536_870_911,
+            "premise: the ceiling is u32::MAX / 8"
+        );
+        // The last accepted length must still multiply into a u32 bit offset.
+        assert!(
+            u32::try_from(MAX_FORBP_SUBSTREAM_BYTES as u64 * 8).is_ok(),
+            "premise: the ceiling is the largest length whose bit offset fits"
+        );
+        assert!(
+            check_forbp_substream_len(MAX_FORBP_SUBSTREAM_BYTES).is_ok(),
+            "the boundary length itself is still decodable"
+        );
+
+        let Err(err) = check_forbp_substream_len(MAX_FORBP_SUBSTREAM_BYTES + 1) else {
+            panic!("one byte past the ceiling must be rejected, not silently wrapped");
+        };
+        assert!(
+            matches!(&err, GpuError::UnsupportedLayout(m) if m.contains("32-bit bit offsets")),
+            "expected the bit-offset ceiling, got {err:?}"
+        );
+        // The variant is load-bearing, not cosmetic: it is what routes a valid
+        // oversized shard to a host decode instead of raising at the caller.
+        assert!(
+            err.alternate_route_may_succeed(),
+            "an oversized-but-valid shard must be answerable by another route"
         );
     }
 

@@ -41,9 +41,17 @@ use crate::math_policy::GpuPcaTuning;
 use crate::pca_operator::{run_power_loop, ForwardOperand, PcaBuf, PcaOperator};
 use crate::shard_decode::GpuCsr;
 
-/// VRAM headroom factor applied to the resident-CSR + scratch estimate before
-/// comparing against free device memory.
-const RESIDENT_VRAM_HEADROOM: f64 = 1.2;
+/// VRAM headroom factor applied to a device-memory estimate before comparing it
+/// against free device memory.
+///
+/// One definition, because two would drift: the resident-CSR builder here
+/// allocates against it, and `pyscx`'s `estimate_gpu_memory` answers
+/// `fits_in_vram` against it, so a caller that asks "will this fit?" and a
+/// caller that then tries it have to mean the same thing by "fit". It is a
+/// margin for what the estimates leave out — kernel workspaces, allocator
+/// rounding and fragmentation — and for the VRAM that can be taken between the
+/// question and the allocation.
+pub const RESIDENT_VRAM_HEADROOM: f64 = 1.2;
 
 /// Kill switch for GPU PCA CSR residency. `SCX_GPU_PCA_RESIDENT=0` forces the
 /// streaming power loop (the whole matrix re-decoded and re-uploaded on every

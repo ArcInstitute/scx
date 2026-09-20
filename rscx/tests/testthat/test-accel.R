@@ -536,14 +536,15 @@ test_that("scx_pca stamps the shared route record with the wire keys in order", 
   res <- scx_pca(counts, n_components = 5L, seed = 0L)
   ra <- res$scx_accel
   expect_type(ra, "list")
-  expect_length(ra, 17L)
+  expect_length(ra, 18L)
   # Key list + order = AccelExecutionInfo::fields(), the cross-binding wire
   # contract (pinned in scx-accel's route_tests.rs; re-pinned here from R).
   expect_equal(names(ra), c(
     "route", "fallback_reason", "chunk_size", "graph_replay", "csc_available",
     "shards_decoded", "shards_uploaded", "math_mode", "spmm_policy",
     "rapids_version", "cuml_version", "cupy_version", "transfer_mode",
-    "device_id", "bytes_uploaded", "n_shards_shufdelta_gpu", "resident_csr"
+    "device_id", "bytes_uploaded", "n_shards_shufdelta_gpu", "resident_csr",
+    "reduction"
   ))
   expect_equal(ra$route, "cpu_csr")
   expect_equal(ra$fallback_reason, "user_forced_cpu")
