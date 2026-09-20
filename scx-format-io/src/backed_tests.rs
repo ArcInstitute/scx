@@ -2828,9 +2828,8 @@ fn multimodal_fallback_does_not_mix_modalities() {
     );
 }
 
-/// Characterization: what `BackedCsrReader::new` — the *unscoped* constructor —
-/// does on a multimodal file. Nothing pinned this before, and the answer is
-/// surprising enough to be worth a test rather than a reading of the source.
+/// What `BackedCsrReader::new` — the *unscoped* constructor — does on a
+/// multimodal file, and where the refusal now falls.
 ///
 /// `::new` builds its index from `CatalogView::csr_shards_sorted()`, which
 /// filters on `section_type == CsrShard` with **no `modality_id` predicate**.
@@ -2842,11 +2841,17 @@ fn multimodal_fallback_does_not_mix_modalities() {
 /// `pyscx/src/backed/multimodal.rs`, `pyscx/src/convert/multimodal.rs`,
 /// `scx-convert/src/export_filter.rs`).
 ///
-/// This test asserts today's behaviour, deliberately. It is not an endorsement
-/// — it is the tripwire that makes a change to it visible, and the safety net
-/// for the `backed.rs` split in Phase 3b.
+/// **Construction still succeeds, and the index still spans both modalities**
+/// — that is what the first two assertions pin, and it is deliberate:
+/// `pyscx`'s `open_backed_matrix_reader` builds one of these before it knows
+/// whether an upstream guard will reject the file, so failing here would move
+/// a refusal out from under a better-worded one. The reads are what refuse.
+///
+/// This test used to assert that `read_all()` returned the folded 8-row matrix
+/// for a 4-cell file, describing itself as a tripwire rather than an
+/// endorsement. This is that tripwire firing.
 #[test]
-fn backed_csr_reader_new_on_a_multimodal_file_folds_every_modality() {
+fn backed_csr_reader_new_on_a_multimodal_file_refuses_whole_matrix_reads() {
     use crate::modality::ModalityType;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("multimodal_unscoped.scx");
@@ -2930,26 +2935,38 @@ fn backed_csr_reader_new_on_a_multimodal_file_folds_every_modality() {
         "n_obs from the header; n_vars is the file-wide max, not RNA's 3"
     );
 
-    // 3. `read_all` concatenates every shard, so it returns 8 rows for a
-    //    4-cell file, with both modalities' values folded together.
-    let all = unscoped.read_all().unwrap();
-    assert_eq!(
-        all.shape,
-        (8, ATAC_VARS as usize),
-        "read_all folds both modalities: 4 RNA rows + 4 ATAC rows"
+    // 3. `read_all` — which is what pyscx's `to_memory()` reaches — used to
+    //    concatenate every shard and return 8 rows for a 4-cell file, with both
+    //    modalities' values folded together and the header's file-wide width.
+    //    It now refuses.
+    let err = unscoped
+        .read_all()
+        .expect_err("a whole-matrix read over two overlapping tilings is not well defined");
+    assert!(
+        matches!(err, ScxError::MultimodalRequiresModality { .. }),
+        "expected MultimodalRequiresModality, got {err:?}"
     );
-    assert_eq!(
-        all.data,
-        vec![11.0, 12.0, 13.0, 14.0, 21.0, 22.0, 23.0, 24.0]
-    );
-    assert_eq!(all.indices, vec![0, 0, 0, 0, 4, 4, 4, 4]);
 
-    // 4. The scoped constructor is the one that answers per modality.
+    // 4. `read_rows` was already guarded, by the positional tiling check inside
+    //    it rather than at the catalog seam. Both refusals stand; they are
+    //    different checks and neither subsumes the other (the tiling check also
+    //    catches a gap, which the overlap predicate does not).
+    assert!(matches!(
+        unscoped.read_rows(0, n_obs).expect_err("already guarded"),
+        ScxError::InvalidCatalog(_)
+    ));
+
+    // 5. The scoped constructor is the one that answers per modality — and it
+    //    answers through `read_all()` too, so the refusal above is about the
+    //    flattened list, not about whole-matrix reads on multimodal files.
     let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 0);
     assert_eq!(rna.shape(), (4, RNA_VARS as usize));
     let rna_rows = rna.read_rows(0, 4).unwrap();
     assert_eq!(rna_rows.data, vec![11.0, 12.0, 13.0, 14.0]);
     assert_eq!(rna_rows.shape, (4, RNA_VARS as usize));
+    let rna_all = rna.read_all().unwrap();
+    assert_eq!(rna_all.shape, (4, RNA_VARS as usize));
+    assert_eq!(rna_all.data, vec![11.0, 12.0, 13.0, 14.0]);
 }
 
 /// Write a fixture `.scx` at an explicit path (peer of `write_test_file_and_open`

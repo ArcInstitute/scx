@@ -99,6 +99,16 @@ pub struct BackedCsrReader {
     pub(super) n_obs: usize,
     /// If set, this reader targets a specific layer rather than X.
     pub(super) layer_name: Option<String>,
+    /// `Some(id)` when built by [`Self::for_modality`]; `None` for every other
+    /// constructor.
+    ///
+    /// Deliberately **not** derived from `x_sorted_entries.first()` the way
+    /// [`Self::modality_id`] is. On an unscoped reader over a multimodal file
+    /// that first entry carries whichever modality sorted there, so deriving
+    /// the scope from it turns "nobody chose" into "modality 2", which is the
+    /// silent wrong answer this whole family exists to stop. A constructor
+    /// either was given a modality or was not, and only the constructor knows.
+    pub(super) scoped_modality: Option<u8>,
     /// Pre-sorted lightweight catalog rows for X shards. Drops the
     /// per-shard `String` name and 32-byte BLAKE3 checksum that the
     /// read path never consumes. See [`ShardEntryLite`] for the
@@ -282,6 +292,7 @@ impl BackedCsrReader {
             n_vars,
             n_obs,
             layer_name: None,
+            scoped_modality: None,
             x_sorted_entries,
             sorted_entries: Vec::new(),
             shard_cache: SharedShardCache::new(cache_shards, bytes_budget),
@@ -325,6 +336,7 @@ impl BackedCsrReader {
             n_vars,
             n_obs,
             layer_name: None,
+            scoped_modality: None,
             x_sorted_entries,
             sorted_entries: Vec::new(),
             shard_cache,
@@ -371,6 +383,7 @@ impl BackedCsrReader {
             n_vars,
             n_obs,
             layer_name: None,
+            scoped_modality: Some(modality_id),
             x_sorted_entries,
             sorted_entries: Vec::new(),
             shard_cache: SharedShardCache::new(cache_shards, bytes_budget),
@@ -433,6 +446,7 @@ impl BackedCsrReader {
             n_vars,
             n_obs,
             layer_name: Some(layer_name.to_string()),
+            scoped_modality: None,
             x_sorted_entries,
             sorted_entries,
             shard_cache: SharedShardCache::new(cache_shards, bytes_budget),
@@ -2036,29 +2050,20 @@ impl BackedCsrReader {
     /// Read all rows — materializes the full matrix.
     ///
     /// Used by `to_memory()` on the Python side.
+    ///
+    /// Honours the modality this reader was *scoped* to at construction: one
+    /// built by [`Self::for_modality`] reads that modality's shards. It used to call the
+    /// flattened `read_all_csr_shards()` whatever it was scoped to, so
+    /// `for_modality(rna).read_all()` returned **both** modalities' rows
+    /// concatenated, at the file-wide width — the scoped reader answering
+    /// unscoped. An unscoped reader over a multimodal file now gets
+    /// [`ScxError::MultimodalRequiresModality`] from the catalog seam rather
+    /// than that same folded matrix.
     pub fn read_all(&self) -> Result<ScxCsr> {
-        match &self.layer_name {
-            None => self.reader.read_all_csr_shards(),
-            Some(name) => self.reader.read_layer(name),
-        }
-    }
-
-    /// Phase 5b: modality-scoped X read for bitmap fallbacks. Mirrors
-    /// `read_all()` for the X path but honours `self.modality_id()` so
-    /// per-modality `BackedCsrReader`s on multimodal files do not fold
-    /// in rows from other modalities. Layer readers route through the
-    /// global layer path (bitmaps are X-only, so this method is never
-    /// called on layer readers in practice).
-    #[cfg(feature = "deletion-vectors")]
-    fn read_all_modality_scoped(&self) -> Result<ScxCsr> {
-        if let Some(name) = &self.layer_name {
-            return self.reader.read_layer(name);
-        }
-        let modality_id = self.modality_id();
-        if modality_id == 0 {
-            self.reader.read_all_csr_shards()
-        } else {
-            self.reader.read_all_csr_shards_for(modality_id)
+        match (&self.layer_name, self.scoped_modality) {
+            (Some(name), _) => self.reader.read_layer(name),
+            (None, Some(mid)) => self.reader.read_all_csr_shards_for(mid),
+            (None, None) => self.reader.read_all_csr_shards(),
         }
     }
 
@@ -2113,8 +2118,14 @@ impl BackedCsrReader {
     /// by [`Self::gene_detection_counts`] / [`Self::cells_expressing_gene`]
     /// to look up the matching bitmap sidecar shards.
     ///
-    /// Returns `0` for unimodal files and for the global X path on
-    /// multimodal files; `for_modality(reader, id, ...)` returns `id`.
+    /// Read off the **first** entry of this reader's shard table, so it
+    /// answers `0` on a unimodal file and `id` on a `for_modality` reader —
+    /// but on an *unscoped* reader over a multimodal file it answers whichever
+    /// modality sorted first, which is nobody's choice. It stays that way
+    /// because the bitmap sidecar lookup wants the modality of the shards this
+    /// reader actually holds; for "which modality did the caller ask for",
+    /// `scoped_modality` is the field that knows, and it is what
+    /// [`Self::read_all`] routes on.
     pub fn modality_id(&self) -> u8 {
         self.x_sorted_entries
             .first()
@@ -2163,7 +2174,7 @@ impl BackedCsrReader {
         // Fallback: scan CSR. Counts the distinct rows per column.
         // Modality-scoped so per-modality readers don't fold in rows
         // from other modalities on multimodal files.
-        let csr = self.read_all_modality_scoped()?;
+        let csr = self.read_all()?;
         for row in 0..csr.indptr.len().saturating_sub(1) {
             let lo = csr.indptr[row] as usize;
             let hi = csr.indptr[row + 1] as usize;
@@ -2207,7 +2218,7 @@ impl BackedCsrReader {
         // Fallback: scan CSR for the gene column. Modality-scoped so
         // per-modality readers don't pick up rows from other modalities
         // on multimodal files.
-        let csr = self.read_all_modality_scoped()?;
+        let csr = self.read_all()?;
         for row in 0..csr.indptr.len().saturating_sub(1) {
             let lo = csr.indptr[row] as usize;
             let hi = csr.indptr[row + 1] as usize;

@@ -961,3 +961,109 @@ fn the_in_flight_window_is_sized_from_the_widest_shard() {
     assert_eq!(batches.len(), 3);
     assert!(batches.iter().all(|b| b.len() == 1));
 }
+
+// -----------------------------------------------------------------------
+// The multimodal tripwire on the typed whole-matrix reads
+// -----------------------------------------------------------------------
+
+/// The typed twin of `read_all_csr_shards` has the same hazard and had no
+/// guard: `shards_sorted()` is the flattened, all-modality list, so a
+/// multimodal file assembled into one `TypedCsr` stacked both modalities'
+/// tilings of `[0, n_obs)` — a 6-row result for a 3-cell file, at the
+/// file-wide maximum width.
+///
+/// It is reachable from `to_anndata(data_dtype=…)`, which is why it matters
+/// that it was not on the review's list of sites.
+#[test]
+fn typed_whole_matrix_reads_refuse_an_overlapping_shard_tiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let modalities: Vec<ModalitySpec> = vec![
+        ("rna", ModalityType::Rna, 10, vec![u16_shard(3, 10, 0, 300)]),
+        (
+            "atac",
+            ModalityType::Atac,
+            6,
+            vec![u16_shard(3, 6, 0, 1000)],
+        ),
+    ];
+    let path = write_multimodal_file(&dir, "mm_typed.scx", 3, &modalities, CodecId::None, None);
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(reader.is_multimodal(), "fixture premise");
+
+    let plan = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+    let err = reader
+        .read_all_csr_shards_typed(&plan)
+        .expect_err("a typed whole-matrix read of a two-modality file is not well defined");
+    assert!(
+        matches!(err, crate::ScxError::MultimodalRequiresModality { .. }),
+        "expected MultimodalRequiresModality, got {err:?}"
+    );
+
+    // The dense twin builds on the CSR one, so it inherits the refusal rather
+    // than scattering a doubled row axis into a zeroed buffer.
+    let dense_plan = MaterializePlan {
+        container: Container::Dense,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+    let dense_err = reader
+        .read_all_csr_shards_dense_typed(&dense_plan)
+        .expect_err("the dense typed read must refuse what the CSR one refuses");
+    assert!(
+        matches!(
+            dense_err,
+            crate::ScxError::MultimodalRequiresModality { .. }
+        ),
+        "expected MultimodalRequiresModality, got {dense_err:?}"
+    );
+
+    // The scoped typed read is unaffected: it never touched the flat list.
+    let rna_id = reader.modality_id("rna").unwrap();
+    let rna = reader.read_all_csr_shards_for_typed(rna_id, &plan).unwrap();
+    assert_eq!(rna.shape, (3, 10));
+}
+
+/// The accept side: a single-modality file still reads typed, at both
+/// containers, so the guard above is not simply refusing everything.
+#[test]
+fn typed_whole_matrix_reads_accept_a_single_tiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let modalities: Vec<ModalitySpec> = vec![(
+        "rna",
+        ModalityType::Rna,
+        10,
+        vec![u16_shard(3, 10, 0, 300), u16_shard(3, 10, 3, 1000)],
+    )];
+    let path = write_multimodal_file(&dir, "uni_typed.scx", 6, &modalities, CodecId::None, None);
+    let reader = ScxReader::open(&path).unwrap();
+
+    let plan = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+    assert_eq!(
+        reader.read_all_csr_shards_typed(&plan).unwrap().shape,
+        (6, 10)
+    );
+    let dense_plan = MaterializePlan {
+        container: Container::Dense,
+        data_dtype: ValueDtype::U16,
+        index_dtype: IndexDtype::I32,
+        allow_lossy: false,
+    };
+    assert_eq!(
+        reader
+            .read_all_csr_shards_dense_typed(&dense_plan)
+            .unwrap()
+            .shape,
+        (6, 10)
+    );
+}

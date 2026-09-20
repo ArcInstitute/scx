@@ -133,6 +133,32 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
     catalog's authenticated one *before* bounding indices by it: a payload that
     can widen its own bound can put an invalid matrix into scipy's hands, where
     no Rust-side guard runs at all.
+- **Never positionally index the flattened CSR shard list.** On a multimodal
+  file every modality independently tiles the obs axis `[0, n_obs)`, so
+  `FullCatalog::csr_shards_sorted()` carries **overlapping** row ranges: a
+  shard's position in it identifies neither an obs row nor a modality.
+  `FullCatalog::single_tiling_csr_shards(op)` is the seam — it returns the same
+  list or `ScxError::MultimodalRequiresModality`, and every whole-matrix or
+  positional read goes through it (`read_all_csr_shards`, its `_typed` and
+  `_filtered` twins, `read_csr_shard`, `BackedCsrIndex::from_catalog`, and
+  `BackedCsrReader::read_all` by inheritance). Raw `csr_shards_sorted()` stays
+  for genuinely modality-agnostic work — a widest-value-encoding fold, an
+  nnz sum, a checksum walk — and for the ops already fenced upstream by a
+  table-based `is_multimodal()` refusal.
+
+  ⚠️ **Test the geometry, not the modality table.** `is_multimodal()` is `true`
+  for a file with a *one-entry* modality table, which is what
+  `from_mudata(MuData({"rna": adata}))` and a single-modality h5mu ingest write
+  — and that file stamps its only X with `modality_id = 1`, so modality 0 owns
+  no shards while the flattened cover is perfectly unambiguous. Both
+  `is_multimodal()` and "modality 0 tiles the obs axis" reject it falsely. Only
+  the shard ranges answer the question being asked.
+
+  ⚠️ **Overlap-free is not "tiles exactly once".** The predicate skips entries
+  with no row-range stats, and it says nothing about gaps. A consumer that needs
+  every row claimed once — the ML loaders do — needs the contiguity half too;
+  `scx-loader`'s `ensure_csr_ranges_are_readable` is the worked example.
+
 - **Prefer riding an existing pass to adding one.** The bound above is enforced
   by handing `scx_codec::decode_shard_scipy` an `index_bound`, so it rides the
   scan that already rejects `> i32::MAX`; only the comparand changes. The same

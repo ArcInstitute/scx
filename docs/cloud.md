@@ -321,6 +321,20 @@ the selective pull:
   downloaded shards, filter rows, rebase CSR indptr, and write only
   matching cells.
 
+**Multimodal sources are refused.** A filtered pull resolves each matching obs
+row to a *position* in the flattened CSR shard list and downloads by that
+position. On a multimodal file every row sits in one shard **per modality**, so
+that resolution kept whichever modality sorted first and wrote an output whose
+catalog still advertised every modality while its payload held one — measured on
+a two-modality fixture with two shards each: 4 shards, 1 downloaded, reported
+back as a successful 50-cell pull. Shard-granular filtering has no correct
+answer to give there, because the unit it downloads is a shard and the
+modalities do not share theirs. `scx pull` without `--filter` is unaffected (it
+copies every section verbatim); to filter one modality, pull the file and run
+`scx subset --modality NAME --filter ...` locally. The refusal happens as soon as
+`_catalog.bin` is in hand — before the header and before any obs object — so a
+rejected pull costs one small GET.
+
 **Omitted sections.** Selective pulls omit section types that cannot be
 subset at the shard level without re-indexing (e.g., `ObsmEmbedding`,
 `LayerCsrShard`, `ObspCsrShard`). The returned stats dict includes an

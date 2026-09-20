@@ -111,8 +111,24 @@ impl BackedCsrIndex {
     /// Extracts CSR shard entries, sorts by `row_start`, and records their
     /// position in the sorted order (which is the index used by
     /// `ScxReader::read_csr_shard`).
-    pub fn from_catalog(catalog: &FullCatalog) -> Self {
-        Self::from_catalog_filtered(catalog, SectionType::CsrShard, None)
+    ///
+    /// Fallible because the index it builds resolves a row with
+    /// `partition_point(|r| r.row_start <= row)` and takes `pos - 1`, which is
+    /// meaningful only over one non-overlapping tiling. On a multimodal file
+    /// every modality tiles `[0, n_obs)`, so that lookup returns whichever
+    /// modality sorted last — a choice nobody made. Rejected here rather than
+    /// answered; [`Self::from_catalog_for_modality`] is the scoped builder.
+    ///
+    /// Callers that hold a `CatalogView` rather than a `FullCatalog` go through
+    /// `from_view_sorted`, whose caller has already chosen a shard list; the
+    /// refusal for those lives at the read, in `BackedCsrReader::read_all`.
+    pub fn from_catalog(catalog: &FullCatalog) -> Result<Self> {
+        catalog.single_tiling_csr_shards("BackedCsrIndex::from_catalog")?;
+        Ok(Self::from_catalog_filtered(
+            catalog,
+            SectionType::CsrShard,
+            None,
+        ))
     }
 
     /// Build from a [`FullCatalog`] for a specific layer.

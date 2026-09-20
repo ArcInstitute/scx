@@ -193,67 +193,114 @@ pub struct ScxCsr {
 
 impl ScxCsr {
     /// Create a new ScxCsr with full validation.
+    ///
+    /// Equivalent to building the struct and calling [`Self::validate`], which
+    /// is the single formulation of these checks.
     pub fn new(
         shape: (usize, usize),
         indptr: Vec<i64>,
         indices: Vec<i32>,
         data: Vec<f32>,
     ) -> Result<Self, CsrError> {
+        let csr = Self {
+            shape,
+            indptr,
+            indices,
+            data,
+        };
+        csr.validate()?;
+        Ok(csr)
+    }
+
+    /// Check [`Self::new_unchecked`]'s invariants 1-5 against an already-built
+    /// matrix. Invariant 6 (`shape.0 > 0` or `indptr == [0]`) follows from 1
+    /// and 2 and needs no separate test.
+    ///
+    /// # Who this is for
+    ///
+    /// **Callers that build a CSR from outside a reader.** Anything arriving
+    /// through `scx-format-io` has already been validated at the decode seam
+    /// (`docs/conventions.md` § "Validate shard payload at the decode seam,
+    /// not at the consumer"), and re-checking it there is redundant work in a
+    /// hot loop — do not add a call on a decode path. What this exists for is
+    /// the other direction: an `ScxCsr` assembled from an R `dgCMatrix`, from
+    /// caller-supplied numpy arrays, or by hand in a test, where nothing has
+    /// checked anything and `new_unchecked`'s `debug_assert`s vanish in
+    /// release.
+    ///
+    /// # What it does NOT check
+    ///
+    /// **Per-row column indices strictly increasing.** That rule is not one of
+    /// `new_unchecked`'s six at all — it comes from `docs/format.md` § "v3
+    /// canonical CSR invariant", and it is the one structural rule ordinary
+    /// reads deliberately do not verify: an ordering pass at the decode seam
+    /// measured +5.1-6.4% of per-shard decode, so it lives in
+    /// `scx validate --deep`
+    /// (`scx_format_io::ScxReader::validate_canonical_csr_entry`) and, on the
+    /// write side, in [`crate::is_canonical_csr`], which also rejects a stored
+    /// `0.0`. Call one of those if you need ordering or uniqueness; do not
+    /// "complete" this function by adding the pass, which would reverse a
+    /// measured decision.
+    ///
+    /// Note the asymmetry with [`crate::ScxCsc::new`], which *does* reject a
+    /// duplicate row index within a column: a CSC sidecar is built once by
+    /// `scx build-csc` rather than decoded per read, so it can afford the
+    /// `HashSet` per column. Left as it is, deliberately.
+    pub fn validate(&self) -> Result<(), CsrError> {
+        // The step numbers below are this function's own, not
+        // `new_unchecked`'s: steps 4 and 5 are the two halves of its invariant
+        // 4, so step 6 here is its invariant 5.
+        //
         // 1. indptr length
-        let expected_len = shape.0 + 1;
-        if indptr.len() != expected_len {
+        let expected_len = self.shape.0 + 1;
+        if self.indptr.len() != expected_len {
             return Err(CsrError::IndptrLength {
-                got: indptr.len(),
+                got: self.indptr.len(),
                 expected: expected_len,
             });
         }
 
         // 2. indptr[0] == 0 (scipy convention)
-        if indptr[0] != 0 {
-            return Err(CsrError::IndptrNonZeroStart(indptr[0]));
+        if self.indptr[0] != 0 {
+            return Err(CsrError::IndptrNonZeroStart(self.indptr[0]));
         }
 
         // 3. monotonically non-decreasing
-        for i in 1..indptr.len() {
-            if indptr[i] < indptr[i - 1] {
+        for i in 1..self.indptr.len() {
+            if self.indptr[i] < self.indptr[i - 1] {
                 return Err(CsrError::IndptrNotMonotonic { index: i });
             }
         }
 
         // 4. indices.len() == data.len()
-        if indices.len() != data.len() {
+        if self.indices.len() != self.data.len() {
             return Err(CsrError::IndicesDataMismatch {
-                indices: indices.len(),
-                data: data.len(),
+                indices: self.indices.len(),
+                data: self.data.len(),
             });
         }
 
         // 5. nnz match
-        let indptr_nnz = *indptr.last().unwrap(); // safe: len >= 1
-        if indptr_nnz as usize != indices.len() {
+        let indptr_nnz = *self.indptr.last().unwrap(); // safe: len >= 1
+        if indptr_nnz as usize != self.indices.len() {
             return Err(CsrError::NnzMismatch {
                 indptr_nnz,
-                actual_nnz: indices.len(),
+                actual_nnz: self.indices.len(),
             });
         }
 
         // 6. all indices in [0, n_cols)
-        for (pos, &idx) in indices.iter().enumerate() {
-            if idx < 0 || idx as usize >= shape.1 {
+        for (pos, &idx) in self.indices.iter().enumerate() {
+            if idx < 0 || idx as usize >= self.shape.1 {
                 return Err(CsrError::IndexOutOfRange {
                     index: idx,
-                    n_cols: shape.1,
+                    n_cols: self.shape.1,
                     position: pos,
                 });
             }
         }
 
-        Ok(Self {
-            shape,
-            indptr,
-            indices,
-            data,
-        })
+        Ok(())
     }
 
     /// Create a new ScxCsr without public validation.
@@ -1557,5 +1604,135 @@ mod tests {
         // seam (`scx validate --deep`), deliberately not on the read path.
         let canonical = ScxCsr::new((1, 3), vec![0, 1], vec![0], vec![3.0]).unwrap();
         assert!((canonical.row_var().unwrap()[0] - 2.0).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    /// Build by struct literal, the way `new_unchecked` callers and the R /
+    /// numpy interop paths do — bypassing `new` entirely. That is the shape
+    /// `validate` exists for, and it is not reachable through the `new` error
+    /// tests above, which can only produce a matrix `new` already rejected.
+    fn literal(
+        shape: (usize, usize),
+        indptr: Vec<i64>,
+        indices: Vec<i32>,
+        data: Vec<f32>,
+    ) -> ScxCsr {
+        ScxCsr {
+            shape,
+            indptr,
+            indices,
+            data,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_matrix() {
+        // The accept side first: without it every assertion below would pass
+        // against a `validate` that rejected everything.
+        literal((2, 4), vec![0, 2, 3], vec![0, 3, 1], vec![1.0, 2.0, 3.0])
+            .validate()
+            .expect("a well-formed CSR must validate");
+        // Degenerate but legal: no rows, no columns, no entries.
+        literal((0, 0), vec![0], vec![], vec![])
+            .validate()
+            .expect("the empty matrix is well formed");
+    }
+
+    #[test]
+    fn validate_catches_each_structural_invariant() {
+        assert!(matches!(
+            literal((3, 5), vec![0, 2, 5], vec![], vec![])
+                .validate()
+                .unwrap_err(),
+            CsrError::IndptrLength {
+                got: 3,
+                expected: 4
+            }
+        ));
+        assert!(matches!(
+            literal((1, 5), vec![5, 7], vec![1, 3], vec![1.0, 2.0])
+                .validate()
+                .unwrap_err(),
+            CsrError::IndptrNonZeroStart(5)
+        ));
+        assert!(matches!(
+            literal((2, 5), vec![0, 3, 1], vec![0, 1, 2], vec![1.0, 2.0, 3.0])
+                .validate()
+                .unwrap_err(),
+            CsrError::IndptrNotMonotonic { index: 2 }
+        ));
+        assert!(matches!(
+            literal((1, 5), vec![0, 2], vec![0, 1], vec![1.0])
+                .validate()
+                .unwrap_err(),
+            CsrError::IndicesDataMismatch {
+                indices: 2,
+                data: 1
+            }
+        ));
+        assert!(matches!(
+            literal((1, 5), vec![0, 3], vec![0, 1], vec![1.0, 2.0])
+                .validate()
+                .unwrap_err(),
+            CsrError::NnzMismatch {
+                indptr_nnz: 3,
+                actual_nnz: 2
+            }
+        ));
+        assert!(matches!(
+            literal((1, 2), vec![0, 1], vec![7], vec![1.0])
+                .validate()
+                .unwrap_err(),
+            CsrError::IndexOutOfRange {
+                index: 7,
+                n_cols: 2,
+                position: 0
+            }
+        ));
+        // A negative index is the same invariant, and the one that becomes a
+        // huge `usize` rather than a panic when it is not caught.
+        assert!(matches!(
+            literal((1, 5), vec![0, 1], vec![-1], vec![1.0])
+                .validate()
+                .unwrap_err(),
+            CsrError::IndexOutOfRange { index: -1, .. }
+        ));
+    }
+
+    /// The documented boundary, pinned so that "completing" `validate` with an
+    /// ordering pass is a test failure rather than a silent reversal of a
+    /// measured decision.
+    ///
+    /// Both matrices below violate `docs/format.md` § "v3 canonical CSR
+    /// invariant" — one stores a column twice, the other stores its columns
+    /// out of order — and `validate` accepts both, because ordering and
+    /// uniqueness are `scx validate --deep`'s job on the read side and
+    /// `is_canonical_csr`'s on the write side.
+    #[test]
+    fn validate_deliberately_accepts_a_non_canonical_row() {
+        // `is_canonical_csr` speaks the on-disk widths, not scipy's.
+        fn canonical(csr: &ScxCsr) -> bool {
+            let indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
+            let indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
+            crate::validate::is_canonical_csr(&indptr, &indices, &csr.data)
+        }
+
+        let duplicate = literal((1, 3), vec![0, 2], vec![0, 0], vec![1.0, 2.0]);
+        duplicate.validate().expect("structurally valid");
+        assert!(
+            !canonical(&duplicate),
+            "the canonical check is the one that rejects a duplicate"
+        );
+
+        let unsorted = literal((1, 3), vec![0, 2], vec![2, 0], vec![1.0, 2.0]);
+        unsorted.validate().expect("structurally valid");
+        assert!(
+            !canonical(&unsorted),
+            "the canonical check is the one that rejects an unsorted row"
+        );
     }
 }

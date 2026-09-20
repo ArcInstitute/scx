@@ -845,6 +845,73 @@ def test_to_anndata_backed_multimodal_requires_modality(cite_seq_mudata, tmp_pat
     assert rna.shape[1] == cite_seq_mudata.mod["rna"].n_vars
 
 
+def test_to_anndata_without_a_modality_refuses_a_multimodal_file(
+    cite_seq_mudata, tmp_path
+):
+    """`to_anndata()` with no modality has no single matrix to return.
+
+    `docs/multimodal.md` has always documented this refusal; it did not exist.
+    The eager path reached the flattened whole-matrix read and returned an
+    `n_obs * n_modalities`-row AnnData over mixed column spaces — 60 rows for a
+    30-cell CITE-seq file — and the backed path built an unscoped handle whose
+    `shape` advertised one modality's width over an index spanning both.
+
+    All three entry points are covered because they take three different routes
+    into the reader: eager assembly, the backed handle constructor, and the
+    typed in-decode narrow.
+    """
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+    reader = pyscx.open(path)
+
+    for call in (
+        lambda: reader.to_anndata(),
+        lambda: reader.to_anndata(backed=True),
+        lambda: reader.to_anndata(data_dtype="uint16"),
+    ):
+        with pytest.raises(ValueError, match="to_mudata"):
+            call()
+
+    # The supported routes still answer.
+    assert set(reader.to_mudata().mod) == {"rna", "adt"}
+    assert (
+        reader.to_anndata(modality="rna", backed=True).shape[1]
+        == cite_seq_mudata.mod["rna"].n_vars
+    )
+
+
+def test_to_anndata_accepts_a_file_whose_only_modality_is_id_1(tmp_path):
+    """The accept-side case a modality-table-based guard gets wrong.
+
+    `from_mudata(MuData({"rna": adata}))` writes a one-entry modality table, so
+    `is_multimodal` is True and the only X is stamped `modality_id = 1` — yet
+    its shards form one unambiguous tiling of the obs axis and `to_anndata()`
+    is well defined. The refusal above keys on shard geometry precisely so this
+    file keeps working; keying it on `is_multimodal` would reject every h5mu
+    ingest of a single-modality file.
+    """
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    rna = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.3, size=(12, 7)).astype(np.float32))
+    )
+    rna.obs_names = [f"c{i}" for i in range(12)]
+    rna.var_names = [f"g{i}" for i in range(7)]
+    path = str(tmp_path / "one_modality.scx")
+    pyscx.from_mudata(mudata.MuData({"rna": rna}), path)
+
+    reader = pyscx.open(path)
+    assert reader.is_multimodal, "fixture premise: the one-entry table sets the flag"
+    assert reader.to_anndata().shape == (12, 7)
+
+
 def test_to_mudata_backed_single_modality_wraps(tmp_path):
     """Phase 6b: `to_mudata(backed=True)` on a single-modality v1 file
     wraps the result in a one-modality `MuData` rather than raising

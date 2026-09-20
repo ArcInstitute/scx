@@ -83,6 +83,35 @@ pub(super) fn to_anndata_impl<'py>(
         }
         return convert::to_anndata_backed_for_modality(py, &exp.path, name, cache_shards);
     }
+    // No modality named, and the file holds more than one tiling of the obs
+    // axis. `docs/multimodal.md` has always said `to_anndata()` raises here —
+    // it did not. The eager path reached `read_all_csr_shards`, which
+    // concatenated every modality's tiling and returned an
+    // `n_obs * n_modalities`-row AnnData over mixed column spaces; the backed
+    // path built an unscoped handle whose `shape` reported one modality's
+    // width while its index spanned all of them.
+    //
+    // Both now refuse, but the refusals come from `scx-format-io` and name
+    // Rust APIs. Answering here instead lets the message name what a Python
+    // caller actually types — and covers the backed path, which constructs
+    // its handle before any read and so would otherwise fail later and
+    // elsewhere.
+    //
+    // Keyed on the shard geometry, not on `is_multimodal()`: a file with a
+    // one-entry modality table — what `from_mudata(MuData({"rna": adata}))`
+    // writes — sets that flag while presenting a single unambiguous tiling,
+    // and `to_anndata()` on it is well defined and must keep working.
+    let reader = exp.reader()?;
+    if reader.catalog().has_overlapping_csr_ranges() {
+        let names = reader.modality_names();
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "this file holds {} modalities ({names:?}), which each cover the whole obs \
+             axis, so `to_anndata()` has no single matrix to return. Use `to_mudata()` \
+             for all of them, `to_anndata(modality=..., backed=True)` for one, or \
+             extract one first with `scx subset --modality NAME`.",
+            names.len()
+        )));
+    }
     // NOTE: backed reads are *not* gated for the u32→f32 decode loss.
     // A backed AnnData decodes lazily per-slice, so a whole-catalog check
     // here would spuriously error on a partial read that never touches the

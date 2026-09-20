@@ -74,7 +74,7 @@ fn bounded_registry(dir: &std::path::Path, n: usize, limit: usize) -> StdArc<Rea
         slots.push(FileSlot {
             path: path.clone(),
             n_obs: reader.n_obs(),
-            index: BackedCsrIndex::from_catalog(reader.catalog()),
+            index: BackedCsrIndex::from_catalog(reader.catalog()).unwrap(),
             identity: Some(FileIdentity::of(&reader)),
         });
         if i < limit {
@@ -184,7 +184,7 @@ fn a_reopenable_slot_without_an_identity_is_refused() {
     let slots = vec![FileSlot {
         path: path.clone(),
         n_obs: reader.n_obs(),
-        index: BackedCsrIndex::from_catalog(reader.catalog()),
+        index: BackedCsrIndex::from_catalog(reader.catalog()).unwrap(),
         identity: None,
     }];
     // Retain nothing, so the first lease must go through the reopen path.
