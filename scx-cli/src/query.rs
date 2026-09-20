@@ -86,6 +86,7 @@ pub fn run_query(
     filter: Option<&str>,
     count: bool,
     output: Option<&Path>,
+    force: bool,
     select_genes: Option<&Path>,
     normalize: Option<f64>,
     log1p: bool,
@@ -93,6 +94,25 @@ pub fn run_query(
     json: bool,
     explain: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse to clobber *before* the query runs. A guard at the write site
+    // would let a long scan finish and then throw the result away, and a
+    // refused invocation must leave the destination untouched either way.
+    // `source` may be a cloud URL, in which case it can never name the local
+    // output and the same-path arm is inert.
+    match output {
+        Some(out_path) => crate::cli_utils::guard_destination(
+            &[Path::new(source)],
+            crate::cli_utils::Destination::File(out_path),
+            crate::cli_utils::SamePath::Reject,
+            force,
+        )?,
+        // `--count` and the default summary both print and write nothing.
+        None => crate::cli_utils::reject_inert_force(
+            force,
+            "this query prints its result rather than writing one (add --output PATH)",
+        )?,
+    }
+
     // Cloud URLs require the tokio runtime to outlive the pipeline
     // (the `CloudSectionReader` stores a `Handle` into it). Hold the
     // runtime in a guard binding tied to the function's lifetime.
@@ -602,6 +622,7 @@ mod tests {
             Some("cell_type == 'T cell'"),
             true, // count
             None,
+            false,
             None,
             None,
             false,

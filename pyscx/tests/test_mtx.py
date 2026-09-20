@@ -187,3 +187,101 @@ def test_from_mtx_rejects_bad_shard_obs(tmp_path):
     mtx_dir = _mtx_dir_with(tmp_path, 8)
     with pytest.raises(ValueError, match="shard_obs"):
         pyscx.from_mtx(str(mtx_dir), str(tmp_path / "bad.scx"), shard_obs="sometimes")
+
+
+# ---------------------------------------------------------------------------
+# `integer` headers are taken at their word, and the MTX export is
+# modality-scoped and streams shard by shard.
+# ---------------------------------------------------------------------------
+
+
+def _big_count_dir(tmp_path, value):
+    """3 genes x 2 cells — deliberately non-square, so the orientation is
+    unambiguous and the only warning a test can observe is the one it is
+    asserting on."""
+    d = tmp_path / "big_mtx"
+    write_cellranger_mtx(
+        d,
+        "%%MatrixMarket matrix coordinate integer general\n"
+        "3 2 2\n"
+        "1 1 1\n"
+        f"3 2 {value}\n",
+        ["AAAC-1", "BBBC-1"],
+        [("ENSG001", "GeneA"), ("ENSG002", "GeneB"), ("ENSG003", "GeneC")],
+    )
+    return d
+
+
+def test_from_mtx_refuses_a_count_past_2_24(tmp_path):
+    """`is_integer` used to be parsed for header validation and dropped, so
+    every value went through `float32` and 16777217 silently became 16777216.
+
+    The pipeline is f32 end to end, so the honest answer is to refuse rather
+    than round quietly — the same posture the *read* side already takes."""
+    mtx_dir = _big_count_dir(tmp_path, 16777217)
+    out = tmp_path / "big.scx"
+    with pytest.raises(RuntimeError, match="16777217"):
+        pyscx.from_mtx(str(mtx_dir), str(out))
+    assert not out.exists()
+
+
+def test_from_mtx_allow_lossy_accepts_the_rounding_with_a_warning(tmp_path):
+    mtx_dir = _big_count_dir(tmp_path, 16777217)
+    out = tmp_path / "big_lossy.scx"
+    with pytest.warns(UserWarning, match="rounded"):
+        pyscx.from_mtx(str(mtx_dir), str(out), allow_lossy=True)
+    adata = pyscx.open(str(out)).to_anndata()
+    assert _to_dense(adata).max() == pytest.approx(16777216.0)
+
+
+def test_from_mtx_at_the_2_24_boundary_is_unchanged(tmp_path):
+    """Premise assertion: the guard fires *above* the limit, not at it. Without
+    this the test above could pass against a gate that refused every count."""
+    mtx_dir = _big_count_dir(tmp_path, 16777216)
+    out = tmp_path / "boundary.scx"
+    pyscx.from_mtx(str(mtx_dir), str(out))
+    adata = pyscx.open(str(out)).to_anndata()
+    assert _to_dense(adata).max() == pytest.approx(16777216.0)
+
+
+def test_to_mtx_round_trips_and_accepts_modality_none(tmp_path):
+    """The export streams shard by shard now; the observable contract is that a
+    single-modality file still round-trips through it unchanged."""
+    mtx_dir = tmp_path / "rt_in"
+    write_cellranger_mtx(
+        mtx_dir,
+        "%%MatrixMarket matrix coordinate integer general\n"
+        "4 3 5\n"
+        "1 2 3\n"
+        "2 1 1\n"
+        "2 3 4\n"
+        "3 3 5\n"
+        "4 1 2\n",
+        ["AAAC-1", "BBBC-1", "CCCC-1"],
+        [("ENSG1", "A"), ("ENSG2", "B"), ("ENSG3", "C"), ("ENSG4", "D")],
+    )
+    scx_path = tmp_path / "rt.scx"
+    pyscx.from_mtx(str(mtx_dir), str(scx_path))
+    before = _to_dense(pyscx.open(str(scx_path)).to_anndata())
+
+    out_dir = tmp_path / "rt_out"
+    pyscx.to_mtx(str(scx_path), str(out_dir), modality=None)
+    scx_again = tmp_path / "rt2.scx"
+    pyscx.from_mtx(str(out_dir), str(scx_again))
+    np.testing.assert_array_equal(
+        _to_dense(pyscx.open(str(scx_again)).to_anndata()), before
+    )
+
+
+def test_to_mtx_rejects_a_modality_on_a_single_modality_file(tmp_path):
+    mtx_dir = tmp_path / "single_in"
+    write_cellranger_mtx(
+        mtx_dir,
+        "%%MatrixMarket matrix coordinate integer general\n3 2 1\n1 1 1\n",
+        ["AAAC-1", "BBBC-1"],
+        [("ENSG1", "A"), ("ENSG2", "B"), ("ENSG3", "C")],
+    )
+    scx_path = tmp_path / "single.scx"
+    pyscx.from_mtx(str(mtx_dir), str(scx_path))
+    with pytest.raises(RuntimeError, match="single-modality"):
+        pyscx.to_mtx(str(scx_path), str(tmp_path / "out"), modality="rna")

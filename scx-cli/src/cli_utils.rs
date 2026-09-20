@@ -75,6 +75,219 @@ pub fn validate_all_same_n_vars(paths: &[PathBuf]) -> CliResult<u64> {
     Ok(expected_n_vars)
 }
 
+// ---------------------------------------------------------------------------
+// Destination overwrite protection
+// ---------------------------------------------------------------------------
+
+/// What a destination *is*, so the guard asks the right existence question.
+///
+/// "Does the path exist?" is the wrong question for two of the destinations
+/// `scx` writes. `scx convert --to mtx` writes *into* a directory that
+/// `scx_mtx::write_scx_to_mtx` opens with `create_dir_all`, so an existing —
+/// or empty — directory is the normal case, not a collision. `scx explode`
+/// writes members into a `.scxd` directory for the same reason.
+pub enum Destination<'a> {
+    /// A single output file. Collides when that file exists.
+    File(&'a Path),
+    /// A Cell Ranger MTX directory. Collides on any member an export would
+    /// replace — or, worse, leave behind: a stale `genes.tsv[.gz]` beside a
+    /// fresh `features.tsv.gz` is a directory the MTX *reader* still accepts
+    /// (it takes either spelling), so it would be read as the export's own
+    /// feature table.
+    MtxDir(&'a Path),
+    /// An exploded `.scxd` directory. Collides when it exists and is
+    /// non-empty; its member set is the catalog's, not a fixed list.
+    ///
+    /// Only `scx explode` writes one, and that subcommand is behind
+    /// `--features cloud`, so the variant is genuinely unconstructed in a
+    /// default build.
+    #[cfg_attr(not(feature = "cloud"), allow(dead_code))]
+    ScxdDir(&'a Path),
+}
+
+/// Every filename an MTX directory may carry that an export would replace or
+/// shadow. The writer emits only the three `.gz` forms; the other five are
+/// spellings [`scx_mtx::read_mtx_directory`] accepts, and leaving one next to
+/// a fresh export is how a directory comes to describe two different matrices.
+const MTX_MEMBERS: &[&str] = &[
+    "matrix.mtx.gz",
+    "matrix.mtx",
+    "barcodes.tsv.gz",
+    "barcodes.tsv",
+    "features.tsv.gz",
+    "features.tsv",
+    "genes.tsv.gz",
+    "genes.tsv",
+];
+
+impl<'a> Destination<'a> {
+    fn path(&self) -> &'a Path {
+        match *self {
+            Destination::File(p) | Destination::MtxDir(p) | Destination::ScxdDir(p) => p,
+        }
+    }
+
+    /// Paths that already exist and that writing this destination would
+    /// replace or leave behind. Empty means there is nothing to clobber.
+    fn collisions(&self) -> Vec<PathBuf> {
+        match *self {
+            Destination::File(p) => {
+                if p.exists() {
+                    vec![p.to_path_buf()]
+                } else {
+                    Vec::new()
+                }
+            }
+            Destination::MtxDir(dir) => MTX_MEMBERS
+                .iter()
+                .map(|name| dir.join(name))
+                .filter(|p| p.exists())
+                .collect(),
+            Destination::ScxdDir(dir) => match std::fs::read_dir(dir) {
+                // Non-empty: the members we are about to write are not
+                // enumerable ahead of time, so the directory itself is the
+                // unit of collision.
+                Ok(mut entries) => entries
+                    .next()
+                    .map_or(Vec::new(), |_| vec![dir.to_path_buf()]),
+                // Absent, or unreadable for a reason the write itself will
+                // report with a better message than this guard could.
+                Err(_) => Vec::new(),
+            },
+        }
+    }
+}
+
+/// Whether writing onto the command's own input is a legitimate in-place form.
+pub enum SamePath {
+    /// `optimize` / `cloud-optimize`: the writer stages a sibling tempfile and
+    /// renames over the target on `finish()`, so the input is read in full
+    /// before it is replaced.
+    InPlaceOk,
+    /// Everything else. Not a `--force` question: unlinking or renaming over
+    /// the input before the op has read it is data loss whatever the flags say.
+    Reject,
+}
+
+/// True when `a` and `b` name the same file. Canonicalization resolves `./a.scx`
+/// against `a.scx` and follows symlinks; it fails on a path that does not exist
+/// yet, which is exactly when a literal comparison is the right answer.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The one overwrite guard for every `scx` subcommand that writes a local
+/// destination.
+///
+/// Before this existed the rule was hand-rolled four times — `compact.rs`,
+/// `optimize.rs`, `sort.rs` and `scx_ops::run_build_csc` — in three different
+/// wordings, with the same-path check present in two of them and the other six
+/// destination-writing subcommands (`convert`, `merge`, `subset`,
+/// `query --output`, `upgrade`, and the cloud ops) carrying no check at all.
+/// `ScxWriter::finish` persists with `rename(2)`, which replaces
+/// unconditionally, so "no check" meant "silently destroys the file".
+///
+/// `scx push` is deliberately **not** routed through here: its destination is a
+/// remote `.scxd` URL, so an existence probe is a network round-trip with its
+/// own failure modes rather than a `Path::exists`.
+///
+/// Order matters. The same-path verdict is reached *before* anything is
+/// unlinked, because the failure it prevents is destroying the input.
+///
+/// On `force`, a `File` destination is **not** unlinked: `ScxWriter::finish`
+/// renames over it atomically (`scx-format-io/src/writer.rs`), so removing it
+/// first only widens a window in which neither the old nor the new file exists.
+/// An `MtxDir` does unlink — but only the member names above, never the
+/// directory — because its members are written by name and a stale one would
+/// survive the export.
+///
+/// `inputs` is a slice because `scx merge` has several, and writing onto *any*
+/// of them is the same data loss as writing onto the one input `compact` has.
+/// Single-input callers pass `&[input]`; a command with no input file passes
+/// `&[]`.
+pub fn guard_destination(
+    inputs: &[&Path],
+    dest: Destination<'_>,
+    same_path: SamePath,
+    force: bool,
+) -> CliResult<()> {
+    for input in inputs {
+        if same_file(input, dest.path()) {
+            return match same_path {
+                SamePath::InPlaceOk => Ok(()),
+                SamePath::Reject => Err(format!(
+                    "input and output must be different files ({} names an input)",
+                    dest.path().display()
+                )
+                .into()),
+            };
+        }
+    }
+
+    let collisions = dest.collisions();
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    if !force {
+        return Err(overwrite_refusal(&dest, &collisions));
+    }
+
+    if matches!(dest, Destination::MtxDir(_)) {
+        for path in &collisions {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `--force` on a form that writes no destination.
+///
+/// `--force` is a question about a destination, so accepting it where there is
+/// none would imply a guard that does not exist. That is the same failure as a
+/// flag that is silently inert — `scx modify-metadata --index-*` without
+/// `--obs`/`--var` used to exit 0, print "Updated metadata…", and build
+/// nothing. `scx build-csc`'s in-place arm already states this reasoning; this
+/// is the same rule for `query` without `--output`, `subset --dry-run`,
+/// `upgrade --in-place` and `cloud-optimize` without `--output`.
+///
+/// `form` completes the sentence "…; " — e.g. `"--dry-run writes nothing"`.
+pub fn reject_inert_force(force: bool, form: &str) -> CliResult<()> {
+    if force {
+        return Err(format!("--force applies only when writing to an output; {form}").into());
+    }
+    Ok(())
+}
+
+fn overwrite_refusal(dest: &Destination<'_>, collisions: &[PathBuf]) -> Box<dyn std::error::Error> {
+    match dest {
+        // The wording `scx_ops::run_build_csc` has always used. It names the
+        // path, which the three CLI copies did not.
+        Destination::File(p) => {
+            format!("{} already exists (use --force to overwrite)", p.display()).into()
+        }
+        Destination::MtxDir(dir) => {
+            let names: Vec<&str> = collisions
+                .iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+                .collect();
+            format!(
+                "{} already contains an MTX export ({}); use --force to overwrite",
+                dir.display(),
+                names.join(", ")
+            )
+            .into()
+        }
+        Destination::ScxdDir(dir) => format!(
+            "{} already exists and is not empty (use --force to overwrite)",
+            dir.display()
+        )
+        .into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,11 +3,20 @@ use std::path::Path;
 pub fn run_pull(
     source: &str,
     dest: &Path,
+    force: bool,
     parallelism: usize,
     cloud_ready: bool,
     filter: Option<&str>,
     filter_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // `source` is a URL or a local `.scxd` path; when local, writing the pull
+    // onto it would destroy the thing being pulled.
+    crate::cli_utils::guard_destination(
+        &[Path::new(source)],
+        crate::cli_utils::Destination::File(dest),
+        crate::cli_utils::SamePath::Reject,
+        force,
+    )?;
     let rt = tokio::runtime::Runtime::new()?;
 
     let mode = match filter_mode {

@@ -298,3 +298,252 @@ fn mtx_shard_obs_auto_shards_above_the_threshold() {
         0,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Destination overwrite protection on both MTX directions
+// ---------------------------------------------------------------------------
+
+/// The MTX destination is a *directory* that `write_scx_to_mtx` opens with
+/// `create_dir_all`, so "does the path exist" is the wrong question: an
+/// existing (or empty) directory is the ordinary case. The collision is a
+/// member an export would replace.
+#[test]
+fn convert_to_mtx_writes_into_an_existing_empty_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let scx_path = dir.path().join("mid.scx");
+    assert!(scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let out_dir = dir.path().join("empty_out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = scx()
+        .args([
+            "convert",
+            "--to",
+            "mtx",
+            scx_path.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "an empty destination directory is not a collision: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out_dir.join("matrix.mtx.gz").exists());
+}
+
+/// …and an existing export in that directory *is* one. `--force` then clears
+/// the members it is about to replace, including the v2 `genes.tsv.gz`
+/// spelling: left behind next to a fresh `features.tsv.gz`, the MTX *reader*
+/// accepts either, so the directory would describe two different matrices.
+#[test]
+fn convert_to_mtx_refuses_an_existing_export_and_clears_it_on_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let scx_path = dir.path().join("mid.scx");
+    assert!(scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let out_dir = dir.path().join("stale_out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join("matrix.mtx.gz"), b"stale").unwrap();
+    std::fs::write(out_dir.join("genes.tsv.gz"), b"stale v2 features").unwrap();
+
+    let args = [
+        "convert",
+        "--to",
+        "mtx",
+        scx_path.to_str().unwrap(),
+        out_dir.to_str().unwrap(),
+    ];
+    let out = scx().args(args).output().unwrap();
+    assert!(!out.status.success(), "a stale export must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already contains an MTX export")
+            && stderr.contains("matrix.mtx.gz")
+            && stderr.contains("--force"),
+        "the refusal must name the members and the flag: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("matrix.mtx.gz")).unwrap(),
+        b"stale",
+        "a refused invocation must not have touched the directory"
+    );
+
+    let mut forced = args.to_vec();
+    forced.push("--force");
+    let out = scx().args(&forced).output().unwrap();
+    assert!(
+        out.status.success(),
+        "--force: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out_dir.join("genes.tsv.gz").exists(),
+        "the stale v2 features file must not survive beside the fresh features.tsv.gz"
+    );
+    assert!(out_dir.join("features.tsv.gz").exists());
+}
+
+#[test]
+fn convert_from_mtx_refuses_to_clobber_its_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let dest = dir.path().join("out.scx");
+    std::fs::write(&dest, b"do not clobber me").unwrap();
+
+    let args = [
+        "convert",
+        "--from",
+        "mtx",
+        mtx_dir.to_str().unwrap(),
+        dest.to_str().unwrap(),
+    ];
+    let out = scx().args(args).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("--force"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"do not clobber me",
+        "a refused convert must leave the destination untouched"
+    );
+
+    let mut forced = args.to_vec();
+    forced.push("--force");
+    assert!(scx().args(&forced).output().unwrap().status.success());
+}
+
+// ---------------------------------------------------------------------------
+// `integer` headers are taken at their word
+// ---------------------------------------------------------------------------
+
+fn write_big_count_mtx(dir: &std::path::Path, value: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("matrix.mtx"),
+        format!("%%MatrixMarket matrix coordinate integer general\n2 2 2\n1 1 1\n2 2 {value}\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("barcodes.tsv"), "AAAC-1\nBBBC-1\n").unwrap();
+    std::fs::write(
+        dir.join("features.tsv"),
+        "ENSG001\tGeneA\tGene Expression\nENSG002\tGeneB\tGene Expression\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn convert_from_mtx_refuses_a_count_past_2_24_and_allow_lossy_accepts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("big_mtx");
+    write_big_count_mtx(&mtx_dir, "16777217");
+    let dest = dir.path().join("big.scx");
+
+    let out = scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the rounding must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("16777217") && stderr.contains("--allow-lossy"),
+        "{stderr}"
+    );
+    assert!(!dest.exists(), "nothing should have been written");
+
+    let out = scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "--allow-lossy",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--allow-lossy must accept it: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dest.exists());
+}
+
+/// A flag that cannot apply must fail rather than be silently inert — the
+/// lesson `scx modify-metadata --index-*` and `scx query --count --output`
+/// both taught.
+#[test]
+fn allow_lossy_is_rejected_on_a_non_mtx_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let scx_path = dir.path().join("mid.scx");
+    assert!(scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let out = scx()
+        .args([
+            "convert",
+            "--to",
+            "mtx",
+            scx_path.to_str().unwrap(),
+            dir.path().join("out_mtx").to_str().unwrap(),
+            "--allow-lossy",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--allow-lossy only applies to mtx"),
+        "{stderr}"
+    );
+}

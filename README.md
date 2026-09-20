@@ -743,8 +743,10 @@ bounded by one shard's worth of CSR per matrix (and one shard's worth
 of obs/var per column when the source carries `ObsMetadataShard` /
 `VarMetadataShard` sections) regardless of total file size. Pass
 `--stream=false` (CLI) or `stream=False` (Python) to opt into the
-legacy materialising paths. MTX ↔ SCX and 10x → SCX have a single
-materialising path; just omit `--stream` and they do the right thing.
+legacy materialising paths. 10x → SCX also streams by default. MTX ↔ SCX
+has a single path in each direction, with nothing for `--stream` to select:
+SCX → MTX always streams (one decoded shard at a time), MTX → SCX always
+materialises. Just omit `--stream` and every direction does the right thing.
 
 ```bash
 # h5ad ↔ SCX (roundtrip, streaming by default)
@@ -759,6 +761,9 @@ scx convert --to h5ad experiment.scx rna.h5ad --modality rna  # extract one moda
 # Cell Ranger MTX ↔ SCX (roundtrip)
 scx convert /path/to/filtered_feature_bc_matrix/ experiment.scx
 scx convert --to mtx experiment.scx /path/to/output_dir/
+# …and one modality of a multimodal file (required there — an MTX directory
+# holds one matrix over one feature space)
+scx convert --to mtx multiome.scx /path/to/rna_dir/ --modality rna
 
 # 10x HDF5 → SCX
 scx convert filtered_feature_bc_matrix.h5 experiment.scx
@@ -781,8 +786,9 @@ pyscx.to_h5ad("experiment.scx", "experiment.h5ad")
 pyscx.to_h5mu("experiment.scx", "experiment.h5mu")
 pyscx.to_h5ad("experiment.scx", "rna.h5ad", modality="rna")  # extract one modality
 
-# Export back to MTX
+# Export back to MTX (streams shard by shard)
 pyscx.to_mtx("experiment.scx", "/path/to/output_dir")
+pyscx.to_mtx("multiome.scx", "/path/to/rna_dir", modality="rna")
 ```
 
 ### Read into AnnData

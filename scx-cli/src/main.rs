@@ -78,6 +78,9 @@ enum Commands {
         input: PathBuf,
         /// Output file path
         output: PathBuf,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
         /// Input format: h5ad, h5mu, 10x, mtx
         #[arg(long)]
         from: Option<String>,
@@ -133,9 +136,17 @@ enum Commands {
         /// this many non-zeros. Only meaningful with `--row-group-rows`.
         #[arg(long, value_name = "NNZ")]
         row_group_target_nnz: Option<u64>,
+        /// Accept an MTX integer value that float32 cannot hold exactly
+        /// (magnitude above 2^24), rounding it, instead of failing. Applies
+        /// only to `--from mtx`; SCX ingest carries values as f32, so such a
+        /// count cannot be stored exactly whatever encoding it lands in.
+        #[arg(long)]
+        allow_lossy: bool,
         /// Extract a single modality from a multi-modality SCX file
-        /// when writing to h5ad. Required when `--to h5ad` is used on
-        /// a multimodal SCX input; ignored otherwise.
+        /// when writing to h5ad or MTX. Required on a multimodal SCX
+        /// input with `--to h5ad` or `--to mtx` — an h5ad and an MTX
+        /// directory each hold one matrix over one feature space —
+        /// and ignored otherwise.
         #[arg(long)]
         modality: Option<String>,
         /// SCX → h5ad only: drop observations whose total X UMI count is
@@ -151,8 +162,10 @@ enum Commands {
         /// matrix in memory.
         ///
         /// h5ad ↔ SCX, h5mu ↔ SCX and 10x → SCX have a streaming
-        /// implementation, and those directions stream by default;
-        /// MTX ↔ SCX has a single materializing path. Omit the flag to
+        /// implementation alongside the legacy one, and those
+        /// directions stream by default. MTX ↔ SCX has a single path
+        /// in each direction with nothing to select: SCX → MTX always
+        /// streams, MTX → SCX always materializes. Omit the flag to
         /// get the right behavior for your direction.
         ///
         /// `--stream=false` opts into the legacy materializing path on
@@ -701,6 +714,9 @@ enum Commands {
         /// would otherwise be read as another input.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
         /// Codec / intent profile for the rewritten shards. `auto` (default):
         /// cost-aware adaptive, per integer shard it adopts ShufDeltaZstd when
         /// smaller by a margin — the same selection `scx convert` runs.
@@ -809,6 +825,9 @@ enum Commands {
         /// `--count`, which prints a number and writes nothing.
         #[arg(long, conflicts_with = "count")]
         output: Option<PathBuf>,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
         /// File containing gene indices for projection (one per line)
         #[arg(long)]
         select_genes: Option<PathBuf>,
@@ -855,6 +874,9 @@ enum Commands {
         /// Output path (default: rewrite in-place via atomic rename)
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
     },
     /// Explode a packed .scx into an .scxd directory
     #[cfg(feature = "cloud")]
@@ -863,6 +885,9 @@ enum Commands {
         input: PathBuf,
         /// Output directory (must end in .scxd)
         output: PathBuf,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
     },
     /// Pack an .scxd directory into a packed .scx file
     #[cfg(feature = "cloud")]
@@ -871,6 +896,9 @@ enum Commands {
         input: PathBuf,
         /// Output .scx file
         output: PathBuf,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
     },
     /// Download from cloud/local exploded .scxd and pack into local .scx
     #[cfg(feature = "cloud")]
@@ -879,6 +907,9 @@ enum Commands {
         source: String,
         /// Output .scx file path
         dest: PathBuf,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
         /// Number of parallel download tasks
         #[arg(long, default_value = "8")]
         parallelism: usize,
@@ -943,6 +974,9 @@ enum Commands {
         input: PathBuf,
         /// Output SCX file path (optional with --dry-run)
         output: Option<PathBuf>,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
         /// Obs predicate expression to filter cells
         #[arg(long)]
         filter: Option<String>,
@@ -1018,6 +1052,9 @@ enum Commands {
         input: PathBuf,
         /// Output SCX file path (default: separate output)
         output: Option<PathBuf>,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
         /// Upgrade in-place via atomic rename
         #[arg(long)]
         in_place: bool,
@@ -1349,6 +1386,8 @@ fn main() {
         Commands::Convert {
             input,
             output,
+            force,
+            allow_lossy,
             from,
             to,
             shard_size,
@@ -1391,6 +1430,8 @@ fn main() {
             run_convert(
                 &input,
                 &output,
+                force,
+                allow_lossy,
                 from.as_deref(),
                 to.as_deref(),
                 shard_size,
@@ -1742,6 +1783,7 @@ fn main() {
         Commands::Merge {
             inputs,
             output,
+            force,
             rebuild_csc,
             csc_cols_per_shard,
             csc_memory_limit,
@@ -1759,6 +1801,7 @@ fn main() {
             Some(output) => merge::run_merge(
                 &inputs,
                 &output,
+                force,
                 rebuild_csc,
                 csc_cols_per_shard,
                 &csc_memory_limit,
@@ -1801,6 +1844,7 @@ fn main() {
             filter_flag,
             count,
             output,
+            force,
             select_genes,
             normalize,
             log1p,
@@ -1821,6 +1865,7 @@ fn main() {
                 filter.or(filter_flag).as_deref(),
                 count,
                 output.as_deref(),
+                force,
                 select_genes.as_deref(),
                 normalize,
                 log1p,
@@ -1896,6 +1941,7 @@ fn main() {
         Commands::Subset {
             input,
             output,
+            force,
             filter,
             genes,
             modality,
@@ -1912,6 +1958,7 @@ fn main() {
         } => subset::run_subset(
             &input,
             output.as_deref(),
+            force,
             filter.as_deref(),
             genes.as_deref(),
             modality.as_deref(),
@@ -1934,20 +1981,32 @@ fn main() {
         Commands::Upgrade {
             input,
             output,
+            force,
             in_place,
-        } => upgrade::run_upgrade(&input, output.as_deref(), in_place),
+        } => upgrade::run_upgrade(&input, output.as_deref(), force, in_place),
         #[cfg(feature = "cloud")]
-        Commands::CloudOptimize { input, output } => {
-            cloud_optimize::run_cloud_optimize(&input, output.as_deref())
-        }
+        Commands::CloudOptimize {
+            input,
+            output,
+            force,
+        } => cloud_optimize::run_cloud_optimize(&input, output.as_deref(), force),
         #[cfg(feature = "cloud")]
-        Commands::Explode { input, output } => explode::run_explode(&input, &output),
+        Commands::Explode {
+            input,
+            output,
+            force,
+        } => explode::run_explode(&input, &output, force),
         #[cfg(feature = "cloud")]
-        Commands::Pack { input, output } => pack::run_pack(&input, &output),
+        Commands::Pack {
+            input,
+            output,
+            force,
+        } => pack::run_pack(&input, &output, force),
         #[cfg(feature = "cloud")]
         Commands::Pull {
             source,
             dest,
+            force,
             parallelism,
             no_cloud_ready,
             filter,
@@ -1955,6 +2014,7 @@ fn main() {
         } => pull::run_pull(
             &source,
             &dest,
+            force,
             parallelism,
             !no_cloud_ready,
             filter.as_deref(),
@@ -1978,6 +2038,8 @@ fn main() {
 fn run_convert(
     input: &std::path::Path,
     output: &std::path::Path,
+    force: bool,
+    allow_lossy: bool,
     from: Option<&str>,
     to: Option<&str>,
     shard_size: u32,
@@ -2016,6 +2078,19 @@ fn run_convert(
     group_pass: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
+
+    // Refuse to clobber the destination before any conversion work starts.
+    // The destination's *shape* follows the direction: `--to mtx` writes
+    // members into a directory `scx_mtx` opens with `create_dir_all`, so
+    // `output.exists()` would be true for every ordinary invocation and false
+    // for the one that matters. Everything else writes a single file.
+    let convert_dest = if direction == "scx_to_mtx" {
+        cli_utils::Destination::MtxDir(output)
+    } else {
+        cli_utils::Destination::File(output)
+    };
+    cli_utils::guard_destination(&[input], convert_dest, cli_utils::SamePath::Reject, force)?;
+
     let sort_by_list = parse_index_columns(sort_by);
     let group_by_value = group_by
         .map(str::to_string)
@@ -2068,6 +2143,13 @@ fn run_convert(
     // this point sees the resolved `bool`.
     let stream_requested = stream;
     let stream = convert::resolve_stream(stream_requested, direction)?;
+    // A flag that cannot apply must fail rather than be silently inert.
+    if allow_lossy && direction != "mtx_to_scx" {
+        return Err(format!(
+            "--allow-lossy only applies to mtx → scx; got direction '{direction}'."
+        )
+        .into());
+    }
     if (modalities.is_some() || modality_types.is_some()) && direction != "h5mu_to_scx" {
         return Err(format!(
             "--modalities / --modality-types only apply to h5mu → scx; got direction '{direction}'."
@@ -2132,9 +2214,10 @@ fn run_convert(
                 codec,
                 csc_policy,
                 csc_cols_per_shard,
+                allow_lossy,
             );
         }
-        "scx_to_mtx" => return dispatch_scx_to_mtx(input, output),
+        "scx_to_mtx" => return dispatch_scx_to_mtx(input, output, modality),
         _ => {}
     }
 
@@ -2626,6 +2709,7 @@ fn dispatch_convert(
 }
 
 /// MTX → SCX conversion (always available, no hdf5 feature needed).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_mtx_to_scx(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -2634,6 +2718,7 @@ fn dispatch_mtx_to_scx(
     codec: &str,
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
+    allow_lossy: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::mtx_pipeline;
     use indicatif::{ProgressBar, ProgressStyle};
@@ -2647,7 +2732,14 @@ fn dispatch_mtx_to_scx(
     pb.set_message(format!("Converting MTX {}...", input.display()));
 
     let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
-    let orientation = mtx_pipeline::mtx_to_scx(input, output, shard_size, codec, obs_shard_policy)?;
+    let orientation = mtx_pipeline::mtx_to_scx(
+        input,
+        output,
+        shard_size,
+        codec,
+        obs_shard_policy,
+        allow_lossy,
+    )?;
     pb.finish_and_clear();
 
     if orientation == convert::MtxOrientation::Ambiguous {
@@ -2690,6 +2782,7 @@ fn dispatch_mtx_to_scx(
 fn dispatch_scx_to_mtx(
     input: &std::path::Path,
     output: &std::path::Path,
+    modality: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use indicatif::{ProgressBar, ProgressStyle};
 
@@ -2701,7 +2794,7 @@ fn dispatch_scx_to_mtx(
     );
     pb.set_message(format!("Converting to MTX {}...", output.display()));
 
-    scx_mtx::write_scx_to_mtx(input, output)?;
+    scx_mtx::write_scx_to_mtx_for(input, output, modality)?;
 
     pb.finish_and_clear();
     println!("Converted {} -> {}", input.display(), output.display());

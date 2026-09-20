@@ -985,10 +985,17 @@ fn from_mudata(
 /// as row-sharded `ObsMetadataShard` sections above `n_obs > shard_size` — the
 /// same knob and threshold as `pyscx.from_h5ad`. Var stays a single section.
 ///
+/// A `%%MatrixMarket ... integer ...` header is taken at its word: values are
+/// parsed as integers, and one whose magnitude exceeds 2**24 — the largest
+/// integer `float32` holds exactly — raises, because SCX ingest carries values
+/// as f32 and could only store it rounded. `allow_lossy=True` accepts the
+/// rounding, with a warning, and is named after the read path's `allow_lossy`
+/// for the same reason.
+///
 /// Example:
 ///     pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
 #[pyfunction]
-#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto"))]
+#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto", allow_lossy=false))]
 fn from_mtx(
     py: Python<'_>,
     mtx_dir: &str,
@@ -996,6 +1003,7 @@ fn from_mtx(
     codec: Option<&str>,
     shard_size: Option<u32>,
     shard_obs: &str,
+    allow_lossy: bool,
 ) -> PyResult<()> {
     let obs_shard_policy =
         scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
@@ -1006,8 +1014,19 @@ fn from_mtx(
         codec.unwrap_or("auto"),
         "pyscx",
         obs_shard_policy,
+        allow_lossy,
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    if allow_lossy {
+        crate::pyimport::import_module(py, "warnings")?.call_method1(
+            "warn",
+            (
+                "allow_lossy=True: any MTX integer above 2**24 was rounded to the \
+                 nearest float32-representable value on ingest.",
+            ),
+        )?;
+    }
 
     // A square matrix can't be disambiguated by dimension, so the reader
     // assumed the Cell Ranger default (features × barcodes) and transposed.
@@ -1031,13 +1050,26 @@ fn from_mtx(
 ///
 /// Output directory will contain: matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz
 ///
+/// Streams shard by shard: peak memory is one decoded shard, not the whole
+/// matrix. Logically deleted cells are excluded from both the matrix and
+/// `barcodes.tsv.gz`.
+///
+/// `modality` names one modality of a multimodal file and is **required**
+/// there: a MatrixMarket directory describes one matrix over one feature
+/// space, so exporting a multimodal file unscoped would stack the modalities
+/// into one matrix over mixed column spaces. Pass `None` (the default) for a
+/// single-modality file.
+///
 /// Example:
 ///     pyscx.to_mtx("data.scx", "/path/to/output_dir")
+///     pyscx.to_mtx("multiome.scx", "/path/to/rna_dir", modality="rna")
 #[pyfunction]
-fn to_mtx(scx_path: &str, output_dir: &str) -> PyResult<()> {
-    scx_mtx::write_scx_to_mtx(
+#[pyo3(signature = (scx_path, output_dir, modality=None))]
+fn to_mtx(scx_path: &str, output_dir: &str, modality: Option<&str>) -> PyResult<()> {
+    scx_mtx::write_scx_to_mtx_for(
         std::path::Path::new(scx_path),
         std::path::Path::new(output_dir),
+        modality,
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
