@@ -2090,7 +2090,7 @@ impl BackedCsrReader {
     /// `open_backed_matrix_reader` builds a reader before it knows whether an
     /// upstream guard will reject the file, and failing there would move a
     /// refusal out from under a better-worded one.
-    fn ensure_row_addressable(&self, op: &str) -> Result<()> {
+    pub(super) fn ensure_row_addressable(&self, op: &str) -> Result<()> {
         if self.row_addressing_ambiguous {
             return Err(ScxError::MultimodalRequiresModality { op: op.to_string() });
         }
@@ -2623,13 +2623,23 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
     /// Refuses on an unscoped reader over overlapping ranges, along with
     /// [`Self::read_shard_arc`].
     ///
-    /// Every streaming consumer — the row and column reductions in
+    /// Nearly every streaming consumer — the reductions in
     /// `backed/aggregate.rs`, streaming PCA / HVG, the GPU staging adapters —
-    /// reaches shards through this trait, and each of them reads the
-    /// concatenation as **one obs axis**: `row_sums` returns a vector it sizes
-    /// `n_obs` and then extends per shard, so on two overlapping tilings it
-    /// answered with `n_obs * n_modalities` entries. Guarding the trait method
-    /// closes that whole family at one site instead of at twenty call sites.
+    /// reaches shards through this trait, and each reads the concatenation as
+    /// **one obs axis**: `row_sums` sizes a vector `n_obs` and then extends per
+    /// shard, so on two overlapping tilings it answered with
+    /// `n_obs * n_modalities` entries. Guarding the trait method closes that
+    /// family at one site rather than twenty.
+    ///
+    /// ⚠️ **"Every" is not true, and assuming it was left a hole.**
+    /// `col_means_and_sum_sq` is an *inherent* method that loops
+    /// `read_shard_cached_arc` directly, and Rust resolves a concrete-typed
+    /// call to the inherent method rather than to this trait — so it went on
+    /// folding both modalities into one `n_vars`-wide vector after this guard
+    /// landed (measured: means carrying `12.5` at one modality's column 0 and
+    /// `22.5` at another's column 4). It calls
+    /// [`Self::ensure_row_addressable`] itself. A new inherent method that
+    /// walks shards owes the same call; the trait does not cover it.
     ///
     /// The index-named low-level reads ([`Self::read_shard_uncached`],
     /// [`Self::read_shard_cached`]) stay open: a caller naming a shard index is

@@ -2988,10 +2988,18 @@ fn benchmark_refuses_a_multimodal_file_and_names_a_remedy() {
         "message must name the remedy: {err}"
     );
 
-    // Commands that read no matrix are untouched.
-    for cmd in ["info", "validate"] {
-        let out = scx_cli().arg(cmd).arg(&mm).output().unwrap();
-        assert!(out.status.success(), "`scx {cmd}` must still work: {out:?}");
+    // Commands that read no matrix are untouched. `validate --deep` decodes
+    // every shard and checks the canonical CSR invariant per shard — so it is
+    // the one that would break if the refusal had landed at the decode seam
+    // instead of at the whole-matrix assembly, which is why it is run with the
+    // flag rather than without.
+    for args in [vec!["info"], vec!["validate"], vec!["validate", "--deep"]] {
+        let out = scx_cli().args(&args).arg(&mm).output().unwrap();
+        assert!(
+            out.status.success(),
+            "`scx {}` must still work: {out:?}",
+            args.join(" ")
+        );
     }
 
     // The remedy the message names, end to end.

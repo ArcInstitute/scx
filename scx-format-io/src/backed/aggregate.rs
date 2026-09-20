@@ -653,6 +653,17 @@ impl BackedCsrReader {
     /// - `means`: `Some(Vec<f64>)` of length `n_vars` if `zero_center`, else `None`
     /// - `col_sum_sq`: `Vec<f64>` of length `n_vars` — per-column Σ x²
     pub fn col_means_and_sum_sq(&self, zero_center: bool) -> Result<(Option<Vec<f64>>, Vec<f64>)> {
+        // Guarded here rather than by `ShardSource`: this is an *inherent*
+        // method, and a concrete-typed call resolves to it rather than to the
+        // trait, so it walked every shard of an unscoped multimodal reader and
+        // accumulated both modalities into one `n_vars`-wide vector, dividing
+        // by one modality's `n_obs`. Measured on a two-modality fixture with
+        // equal declared widths: means of `[12.5, 0, 0, 0, 22.5]`, a matrix
+        // neither modality has, returned as `Ok`. (With *differing* declared
+        // widths an unrelated shard-header check happens to fire first, which
+        // is why the fixture that pins this declares them equal.)
+        self.ensure_row_addressable("BackedCsrReader::col_means_and_sum_sq")?;
+
         let n_vars = self.n_vars;
         let n_shards = self.index.n_shards();
         let mut col_sums = vec![0.0f64; n_vars];

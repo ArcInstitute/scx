@@ -1949,7 +1949,8 @@ fn write_multimodal_file_with_cell_type(
 /// so the `break` silently kept whichever modality sorted first and the pull
 /// wrote an output whose catalog still advertises both modalities while its
 /// payload holds one. Refused instead — before any obs object is fetched, so a
-/// rejected pull costs the catalog and header and nothing else.
+/// rejected pull costs one small GET — the guard runs as soon as `_catalog.bin`
+/// is parsed, before the header and before any obs object.
 #[tokio::test]
 async fn selective_pull_refuses_an_overlapping_shard_tiling() {
     let dir = tempfile::tempdir().unwrap();

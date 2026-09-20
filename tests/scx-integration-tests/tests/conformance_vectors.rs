@@ -710,7 +710,13 @@ fn extract_expected_csr(path: &Path) -> Option<ExpectedCsr> {
 /// tiling of the obs axis (where `extract_expected_csr` is the description).
 fn extract_expected_csr_per_modality(path: &Path) -> Option<Vec<ExpectedModalityCsr>> {
     let reader = ScxReader::open(path).unwrap();
-    if !reader.is_multimodal() || reader.header().n_csr_shards == 0 {
+    // Geometry, not the modality table — the same rule the readers use, and for
+    // the same reason. A one-entry-table fixture (`from_mudata(MuData({"rna":
+    // adata}))`) has `is_multimodal() == true` and one unambiguous tiling: its
+    // whole matrix IS `expected_csr`, and keying on the flag would make a
+    // future refresh publish both fields for it, contradicting the schema's own
+    // "None on every single-tiling fixture".
+    if !reader.catalog().has_overlapping_csr_ranges() || reader.header().n_csr_shards == 0 {
         return None;
     }
     let mut out = Vec::new();

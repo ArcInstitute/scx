@@ -349,9 +349,6 @@ impl BackedCsrIndex {
             .collect()
     }
 
-    /// Find the shard index containing a single row, or `None` if the row
-    /// falls outside every shard's range.
-    ///
     /// Whether this index's row ranges overlap, i.e. whether resolving a row
     /// to a shard is ambiguous.
     ///
@@ -362,21 +359,20 @@ impl BackedCsrIndex {
     /// and the running **maximum** end is what makes a fully-contained range
     /// count.
     ///
+    /// The scan itself is `scx_format::csr_ranges_overlap`, the same one the
+    /// catalog's predicate and seam use — this asks it about a different set of
+    /// ranges, not with a different rule. A second copy of the loop is how two
+    /// overlap predicates come to disagree on a fully-contained range.
+    ///
     /// O(n_shards), no I/O. Cached by [`BackedCsrReader`] at construction
     /// rather than recomputed per gather.
     pub fn ranges_overlap(&self) -> bool {
-        let mut max_end: Option<u64> = None;
-        for r in &self.shard_ranges {
-            if let Some(prev_end) = max_end {
-                if r.row_start < prev_end {
-                    return true;
-                }
-            }
-            max_end = Some(max_end.map_or(r.row_end, |m: u64| m.max(r.row_end)));
-        }
-        false
+        scx_format::csr_ranges_overlap(self.shard_ranges.iter().map(|r| (r.row_start, r.row_end)))
     }
 
+    /// Find the shard index containing a single row, or `None` if the row
+    /// falls outside every shard's range.
+    ///
     /// O(log n) over `shard_ranges` via `partition_point`. Equivalent to a
     /// `shards_for_indices(&[row])` call without the sort/dedup overhead —
     /// useful when sorting plans by shard locality on a per-row basis.

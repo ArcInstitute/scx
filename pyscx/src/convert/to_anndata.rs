@@ -1469,9 +1469,10 @@ pub fn to_anndata_filtered<'py>(
         // one-word change for the caller and an explicit one.
         if reader.is_multimodal() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "obs_filter on this file goes through the query engine, which is \
-                 modality-scoped: pass modality=... (one of {:?}) to query(), or \
-                 filter after `to_anndata(modality=..., backed=True)`.",
+                "eager obs_filter on this file goes through the query engine, which \
+                 is modality-scoped: pass modality=... (one of {:?}) to query(), or \
+                 use backed=True, whose obs_filter is evaluated on obs with pandas \
+                 and does not need a modality on a file with one tiling.",
                 reader.modality_names()
             )));
         }

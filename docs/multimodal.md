@@ -127,12 +127,14 @@ reader.to_anndata()                 # ValueError — use to_mudata() or modality
 > stamped `modality_id = 1` — while presenting one unambiguous tiling.
 > `to_anndata()` on such a file is well defined and keeps working.
 >
-> **Only the unfiltered read, though.** `to_anndata(obs_filter=…)` and
-> `query()` go through the query engine, which is modality-scoped: on that file
-> modality 0 owns no shards and no `var`, so both ask you to name the modality
-> (`query(modality="rna")`) even though there is only one. That asymmetry is
-> the query engine's, not the tripwire's — it is called out here because the
-> two reads look interchangeable and are not.
+> **The *eager* filtered read is the exception.** `to_anndata(obs_filter=…)`
+> (the default, `backed=False`) and `query()` go through the query engine, which
+> is modality-scoped: on that file modality 0 owns no shards and no `var`, so
+> both ask you to name the modality (`query(modality="rna")`) even though there
+> is only one. `to_anndata(backed=True, obs_filter=…)` evaluates the predicate
+> on `obs` with pandas instead and needs no modality, so it works. That
+> asymmetry is the query engine's, not the tripwire's — it is called out here
+> because the three reads look interchangeable and are not.
 
 `Experiment.modality_info(modality_id)` returns the per-modality
 record (`{name, modality_type, default_codec_id, n_vars, nnz, …}`)

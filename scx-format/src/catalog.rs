@@ -17,15 +17,19 @@ pub const ROOT_CATALOG_ENTRY_SIZE: usize = 53;
 /// Whether a sequence of `[start, end)` spans, already sorted ascending by
 /// `start`, contains an overlap.
 ///
-/// Shared by [`FullCatalog::has_overlapping_csr_ranges`] and
-/// [`FullCatalog::single_tiling_csr_shards`] — the predicate and the seam built
-/// on it must agree by construction, since the first is what documentation and
-/// `debug_assert!`s cite while the second is what actually refuses.
+/// Shared by [`FullCatalog::has_overlapping_csr_ranges`],
+/// [`FullCatalog::single_tiling_csr_shards`] and — across the crate boundary —
+/// `scx_format_io::BackedCsrIndex::ranges_overlap`, which asks the same
+/// question of the ranges *it* holds rather than of the catalog's. All three
+/// must agree by construction: the first is what documentation cites, the
+/// second is what refuses a whole-matrix read, and the third is what refuses a
+/// row lookup. A second copy of this loop is how they would come to disagree
+/// on, say, a fully-contained range.
 ///
 /// Tracks the running **maximum** end rather than the previous one: sorting by
 /// `start` does not make the ends monotone, so a shard fully contained in an
 /// earlier one would otherwise slip past.
-fn csr_ranges_overlap(spans: impl IntoIterator<Item = (u64, u64)>) -> bool {
+pub fn csr_ranges_overlap(spans: impl IntoIterator<Item = (u64, u64)>) -> bool {
     let mut max_end: Option<u64> = None;
     for (start, end) in spans {
         if let Some(prev_end) = max_end {
@@ -1084,9 +1088,16 @@ impl FullCatalog {
     }
 
     /// Whether the flattened [`Self::csr_shards_sorted`] list contains
-    /// overlapping `[row_start, row_end)` ranges. This is `true` for **any**
-    /// multimodal file (each modality independently tiles `[0, n_obs)`), and
-    /// `false` for a single clean tiling.
+    /// overlapping `[row_start, row_end)` ranges — `true` when more than one
+    /// modality owns shards (each independently tiles `[0, n_obs)`), `false`
+    /// for a single clean tiling.
+    ///
+    /// ⚠️ Not the same as "is multimodal". A file with a **one-entry** modality
+    /// table — what `from_mudata(MuData({"rna": adata}))` and a single-modality
+    /// h5mu ingest write — sets the multimodal flag while presenting one
+    /// unambiguous tiling, and answers `false` here. That difference is the
+    /// whole reason the read guards key on this rather than on
+    /// `ScxReader::is_multimodal`.
     ///
     /// It is the cross-cutting tripwire against the class of bug this guards:
     /// code that positionally indexes `csr_shards_sorted()` as if it were one
@@ -1101,12 +1112,18 @@ impl FullCatalog {
     /// ranges overlap.
     ///
     /// This is [`Self::csr_shards_sorted`] with the hazard made unrepresentable
-    /// instead of assertable. Every read that treats the flat list as one
-    /// non-overlapping tiling — a whole-matrix assembly, a positional
-    /// `shards[idx]`, a `partition_point` row lookup — goes through here, so a
-    /// new such caller inherits the refusal rather than having to remember a
-    /// `debug_assert!` that is compiled out in exactly the release builds where
-    /// this bites.
+    /// instead of assertable. Every read that takes the flat list *as a list* —
+    /// a whole-matrix assembly, a positional `shards[idx]` — goes through here,
+    /// so a new such caller inherits the refusal rather than having to remember
+    /// a `debug_assert!` that is compiled out in exactly the release builds
+    /// where this bites.
+    ///
+    /// ⚠️ **The row lookups are not covered by this**, and assuming they were
+    /// left a live hole. `BackedCsrIndex` is built from a shard list the caller
+    /// already has, and its `partition_point` row resolution *answers* on an
+    /// overlap rather than erroring. `BackedCsrReader` guards those separately,
+    /// at `ensure_row_addressable`. See `docs/conventions.md` § "Never
+    /// positionally index the flattened CSR shard list".
     ///
     /// `op` names the calling API in the error message, so the caller is told
     /// which of *their* calls to replace with its `_for(modality_id)` sibling.

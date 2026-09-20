@@ -2836,10 +2836,12 @@ fn multimodal_fallback_does_not_mix_modalities() {
 /// On a two-modality file that means one index over *both* modalities' shards,
 /// whose row ranges overlap (each modality independently tiles `[0, n_obs)`),
 /// while `n_vars` comes from the file header — the max across modalities, not
-/// any one modality's. `for_modality` is the scoped constructor and is what
-/// every production caller uses (`pyscx/src/experiment.rs`,
+/// any one modality's. `for_modality` is the scoped constructor, and is what
+/// most production callers use (`pyscx/src/experiment.rs`,
 /// `pyscx/src/backed/multimodal.rs`, `pyscx/src/convert/multimodal.rs`,
-/// `scx-convert/src/export_filter.rs`).
+/// `scx-convert/src/export_filter.rs`) — but not all: `pyscx`'s
+/// `open_backed_matrix_reader` and rscx's `x_backed()` / `x_lazy()` build the
+/// unscoped one, which is why the refusals below have to exist.
 ///
 /// **Construction still succeeds, and the index still spans both modalities**
 /// — that is what the first two assertions pin, and it is deliberate:
@@ -2972,6 +2974,12 @@ fn backed_csr_reader_new_on_a_multimodal_file_refuses_whole_matrix_reads() {
 /// A two-modality file, each modality one shard over the whole obs axis. RNA
 /// values are 11..=14 at column 0, ATAC 21..=24 at column 4, so "whose row came
 /// back?" has an answer. Returns `(path, rna_id, atac_id)`.
+///
+/// Both modalities declare the **same** width, deliberately. With differing
+/// widths `check_decoded_shard_minor` fires first on any read that decodes a
+/// shard — an unrelated guard, catching the fold by accident — and a test built
+/// on that fixture passes whether or not the multimodal guard exists. It is how
+/// `col_means_and_sum_sq`'s bypass hid from the first version of this test.
 fn write_two_modality_fixture(dir: &TempDir, name: &str) -> (std::path::PathBuf, u8, u8) {
     use crate::modality::ModalityType;
     let path = dir.path().join(name);
@@ -2980,7 +2988,7 @@ fn write_two_modality_fixture(dir: &TempDir, name: &str) -> (std::path::PathBuf,
     writer.write_obs(&sample_obs(4)).unwrap();
     let mut ids = Vec::new();
     for (mname, mtype, n_vars, col, base) in [
-        ("rna", ModalityType::Rna, 3u64, 0u32, 11u8),
+        ("rna", ModalityType::Rna, 5u64, 0u32, 11u8),
         ("atac", ModalityType::Atac, 5u64, 4u32, 21u8),
     ] {
         let mid = writer
@@ -3079,13 +3087,24 @@ fn row_addressed_reads_reject_an_unscoped_multimodal_reader() {
     // The streaming reductions read the concatenation as one obs axis, so they
     // are the same hazard in a different shape: `row_sums` sizes its vector
     // `n_obs` and extends per shard, which over two tilings returned eight
-    // entries for a four-cell file. They reach shards through `ShardSource`,
-    // which is where that family is guarded.
+    // entries for a four-cell file. Most reach shards through `ShardSource`,
+    // which is where that family is guarded — but `col_means_and_sum_sq` is an
+    // *inherent* method looping `read_shard_cached_arc` directly, so Rust
+    // resolves a concrete-typed call to it and it never touches the trait. It
+    // accumulated RNA and ATAC into one `n_vars`-wide vector and divided by one
+    // modality's `n_obs`: means carrying 12.5 at RNA's column 0 *and* 22.5 at
+    // ATAC's column 4, a matrix no modality has.
     for (what, err) in [
         ("row_sums", unscoped.row_sums().expect_err("row reduction")),
         (
             "col_sums",
             unscoped.col_sums().expect_err("column reduction"),
+        ),
+        (
+            "col_means_and_sum_sq",
+            unscoped
+                .col_means_and_sum_sq(true)
+                .expect_err("the PCA statistic surface"),
         ),
     ] {
         assert!(
@@ -3097,6 +3116,13 @@ fn row_addressed_reads_reject_an_unscoped_multimodal_reader() {
     // The scoped reader answers all of them, with that modality's values.
     let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 4);
     assert_eq!(rna.row_sums().unwrap(), vec![11.0, 12.0, 13.0, 14.0]);
+    let (means, _) = rna.col_means_and_sum_sq(true).unwrap();
+    let means = means.unwrap();
+    assert_eq!(means[0], 12.5, "RNA's column 0 mean, unmixed");
+    assert!(
+        means[1..].iter().all(|&m| m == 0.0),
+        "no other column has a mean: {means:?}"
+    );
     assert_eq!(
         rna.read_row_indices(&[0, 2]).unwrap().data,
         vec![11.0, 13.0]

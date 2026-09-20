@@ -945,9 +945,15 @@ def test_to_anndata_accepts_a_file_whose_only_modality_is_id_1(tmp_path):
     # shards and no `var` section. It used to raise a bare
     # `section not found: var`; it now says the same thing `query()` does.
     with pytest.raises(ValueError, match="modality="):
-        reader.to_anndata(obs_filter="ct == 'a'")
+        reader.to_anndata(obs_filter="`rna:ct` == 'a'")
     with pytest.raises(ValueError, match="modality="):
         reader.query()
+
+    # The *backed* filtered read is the exception, and pinning it is what keeps
+    # the refusal above from being read as "no filtered read works here": it
+    # evaluates the predicate on obs with pandas rather than through the query
+    # engine, so it needs no modality and answers correctly.
+    assert reader.to_anndata(backed=True, obs_filter="`rna:ct` == 'a'").shape == (6, 7)
 
     # Naming the sole modality works, and the scoped query answers over the
     # whole obs axis. (MuData namespaces the per-modality obs column as
