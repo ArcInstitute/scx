@@ -267,6 +267,38 @@ mod tests {
 /// So this fails loud instead, with the two ways forward. It is a narrow case:
 /// the file must actually have cells marked deleted, and every non-backed rscx
 /// read path applies the mask.
+/// Refuse a backed / lazy handle over a file whose CSR shard row ranges
+/// overlap, i.e. one that holds more than one tiling of the obs axis.
+///
+/// `RBackedSparse` and `RLazyTransformed` both build the **unscoped**
+/// `BackedCsrReader`, and every row they address goes through a
+/// `partition_point` lookup that answers over overlapping ranges by taking
+/// whichever modality sorted last. The core reader now refuses such a read —
+/// this makes the refusal happen at `x_backed()` / `x_lazy()` instead of part
+/// way into an R session, and says it in R's vocabulary rather than naming a
+/// Rust method.
+///
+/// Keyed on shard geometry, not on `is_multimodal()`: a single-modality h5mu
+/// ingest carries a one-entry modality table while presenting one unambiguous
+/// tiling, and those handles must keep working.
+pub fn reject_backed_on_overlapping_modalities(
+    reader: &scx_format_io::ScxReader,
+    path: &str,
+) -> Result<()> {
+    if !reader.catalog().has_overlapping_csr_ranges() {
+        return Ok(());
+    }
+    let names = reader.modality_names();
+    Err(Error::Other(format!(
+        "'{path}' holds {} modalities ({names:?}), which each cover the whole cell \
+         axis, so a backed or lazy handle cannot resolve a cell to one of them. Use \
+         scx_open(path)$to_seurat() / $to_mae() for all of them, \
+         scx_query(exp, modality = \"...\") for one, or extract one first with \
+         `scx subset --modality NAME`.",
+        names.len()
+    )))
+}
+
 pub fn reject_backed_on_deletions(reader: &scx_format_io::ScxReader, path: &str) -> Result<()> {
     let n_deleted = reader
         .read_deletion_vectors()

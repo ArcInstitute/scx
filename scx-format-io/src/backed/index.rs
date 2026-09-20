@@ -352,9 +352,42 @@ impl BackedCsrIndex {
     /// Find the shard index containing a single row, or `None` if the row
     /// falls outside every shard's range.
     ///
+    /// Whether this index's row ranges overlap, i.e. whether resolving a row
+    /// to a shard is ambiguous.
+    ///
+    /// Computed from the ranges the index holds rather than from the catalog,
+    /// so it is `false` on a `for_modality` index over a multimodal file — that
+    /// index holds one modality's tiling — and `true` only where a row genuinely
+    /// belongs to more than one shard. `shard_ranges` is sorted by `row_start`,
+    /// and the running **maximum** end is what makes a fully-contained range
+    /// count.
+    ///
+    /// O(n_shards), no I/O. Cached by [`BackedCsrReader`] at construction
+    /// rather than recomputed per gather.
+    pub fn ranges_overlap(&self) -> bool {
+        let mut max_end: Option<u64> = None;
+        for r in &self.shard_ranges {
+            if let Some(prev_end) = max_end {
+                if r.row_start < prev_end {
+                    return true;
+                }
+            }
+            max_end = Some(max_end.map_or(r.row_end, |m: u64| m.max(r.row_end)));
+        }
+        false
+    }
+
     /// O(log n) over `shard_ranges` via `partition_point`. Equivalent to a
     /// `shards_for_indices(&[row])` call without the sort/dedup overhead —
     /// useful when sorting plans by shard locality on a per-row basis.
+    ///
+    /// ⚠️ **Meaningful only over one non-overlapping tiling.** The
+    /// `partition_point(|r| r.row_start <= row)` / `pos - 1` idiom *answers*
+    /// over overlapping ranges by taking whichever shard sorted last, so on an
+    /// unscoped multimodal index it returns an arbitrary modality's shard with
+    /// no error. Callers that address rows go through
+    /// `BackedCsrReader::ensure_row_addressable` first; see
+    /// [`Self::ranges_overlap`].
     pub fn shard_for_row(&self, row: u64) -> Option<usize> {
         let pos = self.shard_ranges.partition_point(|r| r.row_start <= row);
         if pos == 0 {

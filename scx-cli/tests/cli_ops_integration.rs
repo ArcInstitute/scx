@@ -2956,3 +2956,56 @@ fn a_dot_scxd_destination_does_not_contain_every_source() {
         "the explode should have populated the directory"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The multimodal tripwire, at the CLI
+// ---------------------------------------------------------------------------
+
+/// `scx benchmark` reads the whole matrix, which a multimodal file does not
+/// have — it timed the folded `n_obs × n_modalities` read instead. It now
+/// fails, and the remedy its message names has to actually work, which is the
+/// half a message-only assertion would miss.
+///
+/// `info` and `validate --deep` read no matrix and must be unaffected: without
+/// those arms this would pass against a change that broke every command.
+#[test]
+fn benchmark_refuses_a_multimodal_file_and_names_a_remedy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mm = write_multimodal_test_file(&dir, "mm.scx", 12, 8, 4);
+
+    let out = scx_cli().arg("benchmark").arg(&mm).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "benchmark must fail on a multimodal file"
+    );
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        err.contains("subset --modality"),
+        "message must name the remedy: {err}"
+    );
+
+    // Commands that read no matrix are untouched.
+    for cmd in ["info", "validate"] {
+        let out = scx_cli().arg(cmd).arg(&mm).output().unwrap();
+        assert!(out.status.success(), "`scx {cmd}` must still work: {out:?}");
+    }
+
+    // The remedy the message names, end to end.
+    let rna = dir.path().join("rna.scx");
+    let out = scx_cli()
+        .args(["subset", "--modality", "rna"])
+        .arg(&mm)
+        .arg(&rna)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "subset --modality failed: {out:?}");
+    let out = scx_cli().arg("benchmark").arg(&rna).output().unwrap();
+    assert!(
+        out.status.success(),
+        "benchmark on the extracted modality must succeed: {out:?}"
+    );
+}

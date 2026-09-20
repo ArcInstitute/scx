@@ -54,6 +54,7 @@ impl RBackedSparse {
         let reader = ScxReader::open(&path_buf)
             .map_err(|e| Error::Other(format!("failed to open SCX file '{}': {}", path, e)))?;
         crate::util::reject_backed_on_deletions(&reader, path)?;
+        crate::util::reject_backed_on_overlapping_modalities(&reader, path)?;
         // Clamp on both ends. Zero would defeat the LRU; the upper bound is
         // load-bearing because `cache_shards` flows into `LruCache::new`, which
         // pre-allocates a `HashMap` of that capacity — `cache_shards = 1e9`

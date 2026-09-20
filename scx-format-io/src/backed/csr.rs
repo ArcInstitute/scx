@@ -99,6 +99,15 @@ pub struct BackedCsrReader {
     pub(super) n_obs: usize,
     /// If set, this reader targets a specific layer rather than X.
     pub(super) layer_name: Option<String>,
+    /// Whether this reader's row ranges overlap, so resolving a row to a shard
+    /// is ambiguous. Computed once at construction from
+    /// [`BackedCsrIndex::ranges_overlap`] — `false` on every single-modality
+    /// file and on every `for_modality` reader, `true` only for an unscoped
+    /// reader over a file that holds more than one tiling of the obs axis.
+    ///
+    /// Cached rather than recomputed because the row-addressed reads consult it
+    /// per gather, on the training loader's hot path.
+    pub(super) row_addressing_ambiguous: bool,
     /// `Some(id)` when built by [`Self::for_modality`]; `None` for every other
     /// constructor.
     ///
@@ -207,11 +216,22 @@ impl BackedCsrReader {
     /// This indexes **every** `CsrShard` in the catalog regardless of
     /// `modality_id`, and takes `n_vars` from the file header (the max across
     /// modalities). On a multimodal file that means one index over overlapping
-    /// row ranges — each modality independently tiles `[0, n_obs)` — so
-    /// `read_all` returns `Σ modalities` rows for an `n_obs`-cell file. Use
-    /// [`Self::for_modality`] for per-modality access; every production caller
-    /// does. Pinned by
-    /// `backed_csr_reader_new_on_a_multimodal_file_folds_every_modality`.
+    /// row ranges — each modality independently tiles `[0, n_obs)`.
+    ///
+    /// Construction still succeeds there, deliberately: `pyscx`'s
+    /// `open_backed_matrix_reader` builds a reader before it knows whether an
+    /// upstream guard will reject the file, and failing here would move a
+    /// refusal out from under a better-worded one. **The reads refuse**
+    /// instead — `read_all` at the catalog seam, `read_rows` at its own
+    /// positional tiling check, and every row-addressed or streaming path via
+    /// [`Self::ensure_row_addressable`]. `read_all` used to return
+    /// `Σ modalities` rows for an `n_obs`-cell file; it no longer does.
+    ///
+    /// Use [`Self::for_modality`] for per-modality access. Note that not every
+    /// caller does: rscx's `x_backed()` / `x_lazy()` build an unscoped reader
+    /// and refuse an overlapping file at open. Pinned by
+    /// `backed_csr_reader_new_on_a_multimodal_file_refuses_whole_matrix_reads`
+    /// and `row_addressed_reads_reject_an_unscoped_multimodal_reader`.
     pub fn new(reader: ScxReader, cache_shards: usize) -> Self {
         Self::new_with_byte_budget(reader, cache_shards, usize::MAX)
     }
@@ -288,6 +308,7 @@ impl BackedCsrReader {
         let bytes_budget = Self::count_only_byte_budget(cache_shards, bytes_budget, &sorted);
         BackedCsrReader {
             reader,
+            row_addressing_ambiguous: index.ranges_overlap(),
             index,
             n_vars,
             n_obs,
@@ -332,6 +353,7 @@ impl BackedCsrReader {
         let prefetch_count = cache_shards.max(2);
         BackedCsrReader {
             reader,
+            row_addressing_ambiguous: index.ranges_overlap(),
             index,
             n_vars,
             n_obs,
@@ -379,6 +401,7 @@ impl BackedCsrReader {
         let bytes_budget = Self::count_only_byte_budget(cache_shards, usize::MAX, &sorted);
         BackedCsrReader {
             reader,
+            row_addressing_ambiguous: index.ranges_overlap(),
             index,
             n_vars,
             n_obs,
@@ -442,6 +465,7 @@ impl BackedCsrReader {
         let bytes_budget = Self::count_only_byte_budget(cache_shards, bytes_budget, &sorted_layer);
         BackedCsrReader {
             reader,
+            row_addressing_ambiguous: index.ranges_overlap(),
             index,
             n_vars,
             n_obs,
@@ -1659,6 +1683,7 @@ impl BackedCsrReader {
     /// then warms ONLY the full-path shards, so block-index-group shards stay
     /// undecoded and the row-group path is taken.
     fn plan_row_groups(&self, sorted_pairs: &[(u64, usize)]) -> Result<Vec<RowGroup>> {
+        self.ensure_row_addressable("BackedCsrReader row gather")?;
         let mut groups: Vec<RowGroup> = Vec::new();
         let mut start = 0;
         while start < sorted_pairs.len() {
@@ -2047,6 +2072,31 @@ impl BackedCsrReader {
         1
     }
 
+    /// Refuse a read that resolves an obs row to a shard when this reader's
+    /// ranges overlap, so no such read can answer arbitrarily.
+    ///
+    /// The row-addressed paths — `read_row_indices`, `read_rows_with` and the
+    /// streaming row reductions — plan through
+    /// [`BackedCsrIndex::shard_for_row`] / `shards_with_kept_rows`, which do
+    /// not error on an overlap: `partition_point(|r| r.row_start <= row)` and
+    /// `pos - 1` simply take whichever shard sorted last. Measured on a
+    /// two-modality fixture, `read_row_indices(&[0, 2])` on an unscoped reader
+    /// returned ATAC's values at the file-wide width, as `Ok`.
+    ///
+    /// One guard rather than a check inside each lookup, for the reason
+    /// `docs/conventions.md` gives for the decode seam: the lookups are used by
+    /// several callers at several widths, and guarding some of them is how the
+    /// list of unguarded ones grows. Construction stays infallible — `pyscx`'s
+    /// `open_backed_matrix_reader` builds a reader before it knows whether an
+    /// upstream guard will reject the file, and failing there would move a
+    /// refusal out from under a better-worded one.
+    fn ensure_row_addressable(&self, op: &str) -> Result<()> {
+        if self.row_addressing_ambiguous {
+            return Err(ScxError::MultimodalRequiresModality { op: op.to_string() });
+        }
+        Ok(())
+    }
+
     /// Read all rows — materializes the full matrix.
     ///
     /// Used by `to_memory()` on the Python side.
@@ -2118,18 +2168,22 @@ impl BackedCsrReader {
     /// by [`Self::gene_detection_counts`] / [`Self::cells_expressing_gene`]
     /// to look up the matching bitmap sidecar shards.
     ///
-    /// Read off the **first** entry of this reader's shard table, so it
-    /// answers `0` on a unimodal file and `id` on a `for_modality` reader —
-    /// but on an *unscoped* reader over a multimodal file it answers whichever
-    /// modality sorted first, which is nobody's choice. It stays that way
-    /// because the bitmap sidecar lookup wants the modality of the shards this
-    /// reader actually holds; for "which modality did the caller ask for",
-    /// `scoped_modality` is the field that knows, and it is what
-    /// [`Self::read_all`] routes on.
+    /// The modality this reader was **scoped** to when it was given one, and
+    /// otherwise the first entry of its shard table.
+    ///
+    /// The scope comes first because the table can be empty: a modality that
+    /// owns no CSR shards (or a zero-row file) left a `for_modality(reader,
+    /// mid, …)` handle reporting `0` rather than `mid`, so an external caller
+    /// inspecting it — the bitmap sidecar lookup, or R — was told the wrong
+    /// modality for a handle that had been scoped explicitly.
+    ///
+    /// On an *unscoped* reader over a multimodal file this still answers
+    /// whichever modality sorted first, which is nobody's choice. That is the
+    /// honest answer for "whose shards does this handle hold": the reads on
+    /// such a handle refuse rather than use it.
     pub fn modality_id(&self) -> u8 {
-        self.x_sorted_entries
-            .first()
-            .map(|e| e.modality_id)
+        self.scoped_modality
+            .or_else(|| self.x_sorted_entries.first().map(|e| e.modality_id))
             .unwrap_or(0)
     }
 
@@ -2566,15 +2620,32 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
         self.n_vars
     }
 
+    /// Refuses on an unscoped reader over overlapping ranges, along with
+    /// [`Self::read_shard_arc`].
+    ///
+    /// Every streaming consumer — the row and column reductions in
+    /// `backed/aggregate.rs`, streaming PCA / HVG, the GPU staging adapters —
+    /// reaches shards through this trait, and each of them reads the
+    /// concatenation as **one obs axis**: `row_sums` returns a vector it sizes
+    /// `n_obs` and then extends per shard, so on two overlapping tilings it
+    /// answered with `n_obs * n_modalities` entries. Guarding the trait method
+    /// closes that whole family at one site instead of at twenty call sites.
+    ///
+    /// The index-named low-level reads ([`Self::read_shard_uncached`],
+    /// [`Self::read_shard_cached`]) stay open: a caller naming a shard index is
+    /// making an explicit choice, and `scx-loader` uses them under its own
+    /// `ensure_csr_ranges_are_readable` fence.
     fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr> {
+        self.ensure_row_addressable("BackedCsrReader shard stream")?;
         self.read_shard_uncached(shard_idx)
     }
 
     /// Cached override: serve from the decoded-shard LRU so multi-pass
     /// kernels (out-of-core PCA) decode each shard once instead of
     /// re-decoding from disk on every pass. Mirrors the DE streaming path,
-    /// which already goes through this cache.
+    /// which already goes through this cache. Guarded as [`Self::read_shard`].
     fn read_shard_arc(&self, shard_idx: usize) -> Result<Arc<ScxCsr>> {
+        self.ensure_row_addressable("BackedCsrReader shard stream")?;
         self.read_shard_cached_arc(shard_idx)
     }
 

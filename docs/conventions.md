@@ -141,7 +141,19 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   list or `ScxError::MultimodalRequiresModality`, and every whole-matrix or
   positional read goes through it (`read_all_csr_shards`, its `_typed` and
   `_filtered` twins, `read_csr_shard`, `BackedCsrIndex::from_catalog`, and
-  `BackedCsrReader::read_all` by inheritance). Raw `csr_shards_sorted()` stays
+  `BackedCsrReader::read_all` by inheritance).
+
+  ⚠️ **A whole-matrix guard does not cover the row-addressed reads.**
+  `BackedCsrIndex::shard_for_row` / `shards_for_indices` /
+  `shards_with_kept_rows` resolve a row by `partition_point` over the shard
+  ranges, which *answers* on an overlap instead of erroring — it takes
+  whichever shard sorted last. `read_row_indices`, `read_rows_with` and every
+  streaming reduction went on returning an arbitrary modality's values after
+  `read_all` had been closed. `BackedCsrReader` caches the predicate at
+  construction (`row_addressing_ambiguous`) and one `ensure_row_addressable`
+  guards the gather planner and the `ShardSource` methods the reductions reach
+  shards through. Construction stays infallible, so a binding can build a
+  reader under a better-worded upstream guard. Raw `csr_shards_sorted()` stays
   for genuinely modality-agnostic work — a widest-value-encoding fold, an
   nnz sum, a checksum walk — and for the ops already fenced upstream by a
   table-based `is_multimodal()` refusal.

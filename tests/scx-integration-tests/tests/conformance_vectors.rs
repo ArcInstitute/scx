@@ -105,13 +105,31 @@ struct ExpectedCsr {
 struct ExpectedModalityCsr {
     modality_id: u8,
     modality_name: String,
-    /// The modality table's declared width. **`0` means undeclared, not "zero
-    /// columns"** — the same convention a shard header's `n_minor` uses
-    /// (`scx_codec::clamp_index_bound`). Both multimodal reference files read
-    /// `0` here because their generators never call `set_modality_n_vars`, and
-    /// that is worth publishing: a conforming reader must not treat the value
-    /// as a column bound.
-    n_vars: u64,
+    /// The modality's **declared** column count, present only when the file
+    /// declares one — and neither multimodal reference file does, because
+    /// their generators never call `set_modality_n_vars`.
+    ///
+    /// Omitted rather than published as `0`. The point of replacing the stacked
+    /// 60-row `expected_csr` was to stop a third-party reader treating a
+    /// published number as the spec when it is not, and `"n_vars": 0` sitting
+    /// beside a triplet whose indices run to 24 invites exactly that, however
+    /// carefully the prose explains that `0` means "undeclared" (the same
+    /// convention a shard header's `n_minor` uses — see
+    /// `scx_codec::clamp_index_bound`). Omitted is unambiguous; `0` is not.
+    ///
+    /// There is deliberately **no** derived width here either. The modality
+    /// table says 0, the file header's `n_vars` is 0 (a multimodal file's width
+    /// is per-modality), and `read_all_csr_shards_for` therefore assembles at
+    /// `shape.1 == 0`. `max_column_index + 1` would be a lower bound, not the
+    /// width, and publishing it as one would be the same class of fabrication
+    /// this field exists to avoid. What the file declares is nothing, and that
+    /// is what this records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declared_n_vars: Option<u64>,
+    /// The largest column index present, which a conforming reader *can* check
+    /// itself against. Derived from the triplet, and named as a maximum rather
+    /// than as a width for the reason above.
+    max_column_index: Option<i32>,
     #[serde(flatten)]
     csr: ExpectedCsr,
 }
@@ -709,7 +727,11 @@ fn extract_expected_csr_per_modality(path: &Path) -> Option<Vec<ExpectedModality
         out.push(ExpectedModalityCsr {
             modality_id: mid,
             modality_name: name.to_string(),
-            n_vars: reader.modality_info(mid).map(|i| i.n_vars).unwrap_or(0),
+            declared_n_vars: reader
+                .modality_info(mid)
+                .map(|i| i.n_vars)
+                .filter(|&n| n != 0),
+            max_column_index: csr.indices.iter().copied().max(),
             csr: ExpectedCsr {
                 indptr: csr.indptr,
                 indices: csr.indices,

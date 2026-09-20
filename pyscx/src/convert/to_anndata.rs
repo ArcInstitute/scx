@@ -1454,6 +1454,28 @@ pub fn to_anndata_filtered<'py>(
     if let Some(expr) = obs_filter {
         use scx_engine::QueryPipeline;
 
+        // `QueryPipeline::open` scopes to modality 0, which is the global axis
+        // on a v1 or single-modality-v2 file — but *not* on a file whose only
+        // modality is stamped `modality_id = 1`, which is what
+        // `from_mudata(MuData({"rna": adata}))` and a single-modality h5mu
+        // ingest write. There modality 0 owns no shards and no `var` section,
+        // so this path raised a bare `section not found: var` on a file whose
+        // unfiltered `to_anndata()` works. Refuse with the message `query()`
+        // uses instead, so the two agree on what a caller has to say.
+        //
+        // Not auto-resolving the sole modality here: `query()` demands the name
+        // on any file with a modality table, and silently disagreeing with it
+        // on one file shape is how the two surfaces drift apart. Naming it is a
+        // one-word change for the caller and an explicit one.
+        if reader.is_multimodal() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "obs_filter on this file goes through the query engine, which is \
+                 modality-scoped: pass modality=... (one of {:?}) to query(), or \
+                 filter after `to_anndata(modality=..., backed=True)`.",
+                reader.modality_names()
+            )));
+        }
+
         // Through the shared engine converter, like the collects below: a bad
         // predicate is a `ValueError` on `query()` and was a `RuntimeError`
         // here.

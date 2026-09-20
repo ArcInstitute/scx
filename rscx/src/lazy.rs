@@ -106,6 +106,7 @@ impl RLazyTransformed {
         let reader = ScxReader::open(path)
             .map_err(|e| Error::Other(format!("failed to open SCX file '{}': {}", path, e)))?;
         crate::util::reject_backed_on_deletions(&reader, path)?;
+        crate::util::reject_backed_on_overlapping_modalities(&reader, path)?;
         // Clamped on both ends — see `crate::util::clamp_cache_shards`; the
         // upper bound stops an enormous request from pre-allocating a HashMap
         // of that capacity inside `LruCache::new`.

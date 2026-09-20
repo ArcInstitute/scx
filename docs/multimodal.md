@@ -126,6 +126,13 @@ reader.to_anndata()                 # ValueError — use to_mudata() or modality
 > a one-entry modality table — `is_multimodal` is `True` and the only X is
 > stamped `modality_id = 1` — while presenting one unambiguous tiling.
 > `to_anndata()` on such a file is well defined and keeps working.
+>
+> **Only the unfiltered read, though.** `to_anndata(obs_filter=…)` and
+> `query()` go through the query engine, which is modality-scoped: on that file
+> modality 0 owns no shards and no `var`, so both ask you to name the modality
+> (`query(modality="rna")`) even though there is only one. That asymmetry is
+> the query engine's, not the tripwire's — it is called out here because the
+> two reads look interchangeable and are not.
 
 `Experiment.modality_info(modality_id)` returns the per-modality
 record (`{name, modality_type, default_codec_id, n_vars, nnz, …}`)
@@ -365,6 +372,12 @@ not** — it reads the file's one global matrix, and a multimodal file has none,
 so it raises rather than returning the modalities stacked into one dgCMatrix
 (which is what it used to do). Use `scx_query(modality = ...)` for one
 modality's values.
+
+`$x_backed()` and `$x_lazy()` build an **unscoped** backed reader, whose row
+lookup resolves a cell by binary-searching the shard row ranges — meaningless
+where two modalities both cover `[0, n_obs)`, and previously answered from
+whichever sorted last. Both now refuse a multimodal file at open rather than at
+some later row read.
 
 ### 4.2 MultiAssayExperiment
 

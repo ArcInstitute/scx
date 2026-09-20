@@ -883,6 +883,33 @@ def test_to_anndata_without_a_modality_refuses_a_multimodal_file(
     )
 
 
+def test_every_python_door_names_a_python_remedy(cite_seq_mudata, tmp_path):
+    """The doors that reach the core refusal without passing `to_anndata()`.
+
+    `to_anndata()` answers the multimodal case itself, before the read, so it
+    can name `to_mudata()`. Several other surfaces reach the same
+    `ScxError::MultimodalRequiresModality` from deeper in — eager
+    `to_h5ad(stream=False)` assembles the whole matrix, and `to_gpu_anndata`'s
+    host arm goes through the same assembler — and used to surface a message
+    naming `_for(modality_id)` and `scx subset --modality`, neither of which a
+    Python caller types. `to_pyerr` maps the variant once so every door says
+    what to do in Python.
+    """
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+
+    with pytest.raises(ValueError, match="to_mudata"):
+        pyscx.to_h5ad(path, str(tmp_path / "out.h5ad"), stream=False)
+
+    # The streaming exporter has always had its own refusal; it must keep it
+    # rather than fall through to the generic one.
+    with pytest.raises((ValueError, RuntimeError), match="multimodal"):
+        pyscx.to_h5ad(path, str(tmp_path / "out2.h5ad"), stream=True)
+
+
 def test_to_anndata_accepts_a_file_whose_only_modality_is_id_1(tmp_path):
     """The accept-side case a modality-table-based guard gets wrong.
 
@@ -904,12 +931,29 @@ def test_to_anndata_accepts_a_file_whose_only_modality_is_id_1(tmp_path):
     )
     rna.obs_names = [f"c{i}" for i in range(12)]
     rna.var_names = [f"g{i}" for i in range(7)]
+    rna.obs["ct"] = ["a"] * 6 + ["b"] * 6
     path = str(tmp_path / "one_modality.scx")
     pyscx.from_mudata(mudata.MuData({"rna": rna}), path)
 
     reader = pyscx.open(path)
     assert reader.is_multimodal, "fixture premise: the one-entry table sets the flag"
     assert reader.to_anndata().shape == (12, 7)
+
+    # But only the **unfiltered** whole-matrix read is well defined here, and
+    # saying so is the point: the filtered route goes through the query engine,
+    # which is modality-scoped and on this file finds modality 0 owning no
+    # shards and no `var` section. It used to raise a bare
+    # `section not found: var`; it now says the same thing `query()` does.
+    with pytest.raises(ValueError, match="modality="):
+        reader.to_anndata(obs_filter="ct == 'a'")
+    with pytest.raises(ValueError, match="modality="):
+        reader.query()
+
+    # Naming the sole modality works, and the scoped query answers over the
+    # whole obs axis. (MuData namespaces the per-modality obs column as
+    # `rna:ct`, which this predicate grammar has no quoting for — so assert on
+    # the collect rather than on a filter.)
+    assert reader.query(modality="rna").collect().n_obs == 12
 
 
 def test_to_mudata_backed_single_modality_wraps(tmp_path):

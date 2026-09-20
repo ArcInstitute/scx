@@ -58,7 +58,7 @@
     {
       "modality_id": 2,
       "modality_name": "adt",
-      "n_vars": 0,
+      "max_column_index": 7,
       "indptr": [
         0,
         3,
@@ -278,7 +278,7 @@
     {
       "modality_id": 1,
       "modality_name": "rna",
-      "n_vars": 0,
+      "max_column_index": 24,
       "indptr": [
         0,
         6,
