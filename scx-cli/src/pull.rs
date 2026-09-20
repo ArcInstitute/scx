@@ -3,11 +3,24 @@ use std::path::Path;
 pub fn run_pull(
     source: &str,
     dest: &Path,
+    force: bool,
     parallelism: usize,
     cloud_ready: bool,
     filter: Option<&str>,
     filter_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // `source` is a URL or a local `.scxd` path; when it resolves to a local
+    // path, writing the pull onto it would destroy the thing being pulled.
+    // Resolve `file://` first — comparing the raw string treats the URL as a
+    // relative path named `file:` and the containment check never fires.
+    let local_source = crate::cli_utils::local_source_path(source);
+    let inputs: Vec<&Path> = local_source.as_deref().into_iter().collect();
+    crate::cli_utils::guard_destination(
+        &inputs,
+        crate::cli_utils::Destination::File(dest),
+        crate::cli_utils::SamePath::Reject,
+        force,
+    )?;
     let rt = tokio::runtime::Runtime::new()?;
 
     let mode = match filter_mode {

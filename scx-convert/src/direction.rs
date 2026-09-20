@@ -52,9 +52,12 @@ pub fn determine_convert_direction(
 /// `true` = h5ad → scx (Phase 0/1/2), h5mu → scx (Phase 3), 10x → scx
 /// (OPT-CONVERT-9) and scx → h5ad / h5mu (Phase 8), which each have a
 /// shard-at-a-time path alongside the legacy materializing one, selected by the
-/// resolved `--stream`. `false` = a single materializing path with nothing to
-/// select: `scx-mtx` reads the whole MTX directory into memory
-/// (`read_mtx_directory`) and `write_scx_to_mtx` assembles the whole CSR.
+/// resolved `--stream`. `false` = **a single path, with nothing to select**,
+/// which is not the same as "materializing": `mtx_to_scx` does materialize
+/// (`read_mtx_directory` holds the COO triplet buffer and then the CSR arrays),
+/// while `scx_to_mtx` streams unconditionally — `write_scx_to_mtx` walks one
+/// CSR shard at a time — and so has no second path for `--stream` to pick
+/// either.
 ///
 /// **Limitation, stated precisely.** Rust cannot reflect over the match arms
 /// of [`determine_convert_direction`], so a new arm there that is never
@@ -105,10 +108,11 @@ pub fn resolve_stream(requested: Option<bool>, direction: &str) -> Result<bool, 
         Some(false) => Ok(false),
         Some(true) if supported => Ok(true),
         Some(true) => Err(format!(
-            "--stream is not supported for direction '{direction}'. Streaming is implemented \
-             only for h5ad → scx, h5mu → scx, 10x → scx, scx → h5ad and scx → h5mu; mtx ↔ scx \
-             has a single materializing path. Re-run without --stream — the flag is not needed \
-             for this direction."
+            "--stream is not supported for direction '{direction}'. Streaming is selectable \
+             only for h5ad → scx, h5mu → scx, 10x → scx, scx → h5ad and scx → h5mu, which each \
+             have both paths; mtx ↔ scx has a single path in each direction (scx → mtx always \
+             streams, mtx → scx always materializes). Re-run without --stream — the flag is not \
+             needed for this direction."
         )),
     }
 }

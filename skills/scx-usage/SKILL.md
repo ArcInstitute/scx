@@ -167,7 +167,7 @@ Most-used kwargs (shared across ingest entry points):
   **free function**, not a method. Source can be a path or a `pyscx.Experiment`.
   Deletion vectors are honored (only kept rows written). Multimodal files need
   `modality="rna"` to extract one modality.
-- `pyscx.to_h5mu(path, out)` (multimodal), `pyscx.to_mtx(scx, out_dir)`.
+- `pyscx.to_h5mu(path, out)` (multimodal), `pyscx.to_mtx(scx, out_dir, modality=None)` (`modality=` required on a multimodal file).
 
 > `to_h5ad(exp, ...)` re-exports the **unmodified on-disk** file. To persist an
 > in-memory analysis, use `adata.write_h5ad(...)` or

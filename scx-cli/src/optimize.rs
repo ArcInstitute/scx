@@ -46,17 +46,16 @@ pub fn run_optimize(
         trial: codec_trial,
         decode_target,
     });
-    // Allow an explicit in-place upgrade (`--output` == input): `ScxWriter`
-    // writes a sibling tempfile and atomically renames over the target on
-    // `finish()`, so the input is read in full before it is replaced. Only
-    // guard against clobbering a *different* pre-existing file.
-    let same_file = match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
-        (Ok(p1), Ok(p2)) => p1 == p2,
-        _ => false,
-    };
-    if output.exists() && !force && !same_file {
-        return Err("output file already exists, use --force to overwrite".into());
-    }
+    // An explicit in-place upgrade (`--output` == input) is supported:
+    // `ScxWriter` writes a sibling tempfile and atomically renames over the
+    // target on `finish()`, so the input is read in full before it is
+    // replaced. Only a *different* pre-existing file needs `--force`.
+    crate::cli_utils::guard_destination(
+        &[input],
+        crate::cli_utils::Destination::File(output),
+        crate::cli_utils::SamePath::InPlaceOk,
+        force,
+    )?;
 
     let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
     // Parsed before the rewrite starts, so a malformed size fails without

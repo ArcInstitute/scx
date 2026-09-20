@@ -112,6 +112,7 @@ fn round_trip_v3_features() {
         "auto",
         "round-trip-test",
         Default::default(),
+        false,
     )
     .unwrap();
 
@@ -178,6 +179,7 @@ fn round_trip_v2_genes() {
         "auto",
         "round-trip-test",
         Default::default(),
+        false,
     )
     .unwrap();
 
@@ -236,6 +238,7 @@ fn round_trip_all_codecs() {
             codec,
             "codec-test",
             Default::default(),
+            false,
         )
         .unwrap();
 
@@ -278,6 +281,7 @@ fn round_trip_multi_shard() {
         "auto",
         "shard-test",
         Default::default(),
+        false,
     )
     .unwrap();
 
@@ -327,6 +331,7 @@ fn round_trip_real_values() {
         "auto",
         "real-test",
         Default::default(),
+        false,
     )
     .unwrap();
 
@@ -539,6 +544,7 @@ fn round_trip_empty_matrix() {
         "auto",
         "empty-test",
         Default::default(),
+        false,
     )
     .unwrap();
 
@@ -576,6 +582,7 @@ fn export_is_features_by_barcodes() {
         "auto",
         "orient-test",
         Default::default(),
+        false,
     )
     .unwrap();
 

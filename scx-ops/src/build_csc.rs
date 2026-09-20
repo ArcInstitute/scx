@@ -63,9 +63,9 @@ pub fn run_build_csc(
     }
 
     // 3. `output` must be a different file from `input`, by canonical path.
-    //    The `--force` arm below unlinks `output` before `input` is opened, so
-    //    an alias (`a.scx` vs `./a.scx`) would delete the source and then fail
-    //    to open it. The in-place form (no `<OUTPUT>`) is `rebuild_csc_inplace`,
+    //    An alias (`a.scx` vs `./a.scx`) would otherwise have the rewrite
+    //    write over its own source. The in-place form (no `<OUTPUT>`) is
+    //    `rebuild_csc_inplace`,
     //    which stages a temp file; the pyscx wrapper has refused this alias
     //    since it was written — the guard belongs here so every caller gets it.
     if same_file(input, output) {
@@ -78,16 +78,20 @@ pub fn run_build_csc(
     }
 
     // 3b. Check output doesn't exist (unless --force)
-    if output.exists() && !force {
+    // `symlink_metadata`, not `exists()`: the latter follows the link and
+    // answers `false` for a dangling symlink, which would let an unforced
+    // rewrite replace it.
+    if std::fs::symlink_metadata(output).is_ok() && !force {
         return Err(format!(
             "{} already exists (use --force to overwrite)",
             output.display()
         )
         .into());
     }
-    if output.exists() && force {
-        std::fs::remove_file(output)?;
-    }
+    // Deliberately no `remove_file`: `ScxWriter::finish` persists with
+    // `rename(2)`, which replaces the output atomically, so unlinking first
+    // would only widen a window in which neither the old nor the new file
+    // exists. Same-path is already refused above.
 
     // 4. Open input file
     let reader = ScxReader::open(input)?;
@@ -818,11 +822,10 @@ mod tests {
     }
 
     /// `input` and `output` naming the same file through different spellings
-    /// is refused before the `--force` arm can unlink it: the source stays
-    /// byte-identical.
+    /// is refused outright: the source stays byte-identical.
     #[cfg(unix)]
     #[test]
-    fn test_build_csc_refuses_an_aliased_output_before_force_unlinks_it() {
+    fn test_build_csc_refuses_an_aliased_output() {
         let dir = tempfile::tempdir().unwrap();
         let input = write_test_input(&dir, 4, 3);
         let before = std::fs::read(&input).unwrap();

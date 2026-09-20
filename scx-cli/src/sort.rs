@@ -46,21 +46,14 @@ pub fn run_sort(
         );
     }
 
-    if output.exists() {
-        // Guard against `scx sort in.scx in.scx --force`: removing the output
-        // would delete the input before the engine reads it (data loss). sort
-        // always writes a fresh file, so same-path is never valid.
-        if let (Ok(in_p), Ok(out_p)) = (std::fs::canonicalize(input), std::fs::canonicalize(output))
-        {
-            if in_p == out_p {
-                return Err("input and output must be different files".into());
-            }
-        }
-        if !force {
-            return Err("output file already exists, use --force to overwrite".into());
-        }
-        std::fs::remove_file(output)?;
-    }
+    // sort always writes a fresh file, so same-path is never valid — writing
+    // onto the input would destroy it before the engine reads it.
+    crate::cli_utils::guard_destination(
+        &[input],
+        crate::cli_utils::Destination::File(output),
+        crate::cli_utils::SamePath::Reject,
+        force,
+    )?;
 
     // Full intent axis (`auto`/`fast`/`compact`/`compact-trial` + explicit
     // codecs), not just `CodecId::parse_cli`'s explicit set. `auto` here now

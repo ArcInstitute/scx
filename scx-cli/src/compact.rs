@@ -30,15 +30,18 @@ pub fn run_compact(
     // after the rewrite has started.
     let resolved_codec = scx_format_io::resolve_codec(Some(codec))?;
 
-    // Check output
-    if output.exists() && !force {
-        return Err("output file already exists, use --force to overwrite".into());
-    }
-
-    // If force and output exists, remove it first
-    if output.exists() && force {
-        std::fs::remove_file(output)?;
-    }
+    // Destination guard, shared with every other subcommand that writes a
+    // local destination (see `cli_utils::guard_destination`). `Reject` rather
+    // than `InPlaceOk` is a fix, not a translation: `scx compact f.scx f.scx
+    // --force` used to unlink the output and *then* read `metadata(input)`,
+    // destroying the input and failing. `sort` and `build-csc` already guarded
+    // that; compact was the third instance.
+    crate::cli_utils::guard_destination(
+        &[input],
+        crate::cli_utils::Destination::File(output),
+        crate::cli_utils::SamePath::Reject,
+        force,
+    )?;
 
     let before_size = std::fs::metadata(input)?.len();
 

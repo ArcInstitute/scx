@@ -16,11 +16,39 @@ use scx_format_io::writer::ScxWriter;
 pub fn run_upgrade(
     input: &Path,
     output: Option<&Path>,
+    force: bool,
     in_place: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Validate: either output or --in-place required
     if output.is_none() && !in_place {
         return Err("Specify an output path or use --in-place".into());
+    }
+    // …and not both: `--in-place` writes a temp beside <INPUT> and renames
+    // over it, so a positional <OUTPUT> given alongside it was silently
+    // ignored — the file the user named was never written.
+    if output.is_some() && in_place {
+        return Err(
+            "--in-place rewrites <INPUT>; it cannot be combined with an <OUTPUT> path. \
+             Drop one of the two."
+                .into(),
+        );
+    }
+
+    // 1b. Refuse to clobber a *different* pre-existing file. `--output <input>`
+    // is the explicit spelling of what `--in-place` does, and `ScxWriter`
+    // stages a sibling tempfile and renames, so the input is read in full
+    // before it is replaced.
+    match output {
+        Some(output) => crate::cli_utils::guard_destination(
+            &[input],
+            crate::cli_utils::Destination::File(output),
+            crate::cli_utils::SamePath::InPlaceOk,
+            force,
+        )?,
+        None => crate::cli_utils::reject_inert_force(
+            force,
+            "the --in-place form always rewrites <INPUT>",
+        )?,
     }
 
     // 2. Open and read existing file
@@ -599,7 +627,7 @@ mod tests {
         let output = dir.path().join("upgraded.scx");
 
         // File is at version 1 (current), should no-op
-        let result = run_upgrade(&input, Some(output.as_path()), false);
+        let result = run_upgrade(&input, Some(output.as_path()), false, false);
         assert!(result.is_ok());
         // Output should NOT have been created (no-op)
         assert!(!output.exists(), "no-op upgrade should not create output");
@@ -644,7 +672,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = write_test_file(&dir, 4, 3);
 
-        let err = run_upgrade(&input, None, false);
+        let err = run_upgrade(&input, None, false, false);
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("--in-place"));
@@ -815,7 +843,7 @@ mod tests {
         let input = write_framed_v4_file(&dir, 8, 5);
         let output = dir.path().join("upgraded.scx");
 
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
 
         assert!(
             !output.exists(),
@@ -850,7 +878,7 @@ mod tests {
         assert_eq!(framed_before, 2, "fixture's shards must actually be framed");
         drop(before);
 
-        run_upgrade(&input, None, true).unwrap();
+        run_upgrade(&input, None, false, true).unwrap();
 
         let after = ScxReader::open(&input).unwrap();
         assert_eq!(after.header().format_version, version, "version changed");
@@ -926,7 +954,7 @@ mod tests {
         drop(src);
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert!(
@@ -1020,7 +1048,7 @@ mod tests {
         drop(src);
 
         let output = dir.path().join("upgraded.scx");
-        let err = run_upgrade(&input, Some(output.as_path()), false)
+        let err = run_upgrade(&input, Some(output.as_path()), false, false)
             .expect_err("a multimodal file must be refused, not flattened");
         assert!(
             err.to_string().contains("multimodal"),
@@ -1070,7 +1098,7 @@ mod tests {
         w.finish().unwrap();
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false)
+        run_upgrade(&input, Some(output.as_path()), false, false)
             .expect("a duplicate summing past the source width must not fail the upgrade");
 
         let out = ScxReader::open(&output).unwrap();
@@ -1120,7 +1148,7 @@ mod tests {
         w.finish().unwrap();
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).expect(
+        run_upgrade(&input, Some(output.as_path()), false, false).expect(
             "a Uint32 sum past 2³² must widen to Float32 AND drop Scx1, not fail FloatWithScx1",
         );
 
@@ -1179,7 +1207,7 @@ mod tests {
         w.finish().unwrap();
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false)
+        run_upgrade(&input, Some(output.as_path()), false, false)
             .expect("a layer shard widened to Float32 must drop Scx1, not fail FloatWithScx1");
 
         let out = ScxReader::open(&output).unwrap();
@@ -1241,7 +1269,7 @@ mod tests {
         w.finish().unwrap();
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         let entry = out.catalog().shards_sorted()[0];
@@ -1355,7 +1383,7 @@ mod tests {
         drop(src);
 
         let output = dir.path().join("upgraded.scx");
-        let err = run_upgrade(&input, Some(output.as_path()), false)
+        let err = run_upgrade(&input, Some(output.as_path()), false, false)
             .expect_err("a gapped obs cover must not upgrade to a well-formed file");
         let msg = err.to_string();
         assert!(
@@ -1385,7 +1413,7 @@ mod tests {
         drop(src);
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false)
+        run_upgrade(&input, Some(output.as_path()), false, false)
             .expect("an already-at-target multimodal file must be a no-op, not an error");
         assert!(!output.exists(), "a no-op writes nothing");
     }
@@ -1431,7 +1459,7 @@ mod tests {
         w.finish().unwrap();
 
         let output = dir.path().join("upgraded.scx");
-        let err = run_upgrade(&input, Some(output.as_path()), false)
+        let err = run_upgrade(&input, Some(output.as_path()), false, false)
             .expect_err("a shard whose stamp overstates its payload must be refused");
         let msg = err.to_string();
         assert!(
@@ -1497,7 +1525,7 @@ mod tests {
         drop(src);
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert_eq!(
@@ -1603,7 +1631,7 @@ mod tests {
         drop(src);
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert_eq!(
@@ -1740,7 +1768,7 @@ mod tests {
         w.finish().unwrap();
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
 
         let src = ScxReader::open(&input).unwrap();
         let out = ScxReader::open(&output).unwrap();
@@ -1826,7 +1854,7 @@ mod tests {
         w.finish().unwrap();
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert!(
@@ -1936,7 +1964,7 @@ mod tests {
         drop(src);
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         let still_bad: Vec<String> = out
@@ -2099,7 +2127,7 @@ mod tests {
         drop(src);
 
         let output = dir.path().join("upgraded.scx");
-        run_upgrade(&input, Some(output.as_path()), false).unwrap();
+        run_upgrade(&input, Some(output.as_path()), false, false).unwrap();
         let out = ScxReader::open(&output).unwrap();
 
         // (1) The graph still declares the obs axis it is indexed on, so it

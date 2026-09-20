@@ -12,7 +12,9 @@ use arrow::array::{Array, AsArray};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use scx_codec::{ShardValuesNative, ValueEncoding};
 use scx_format_io::reader::ScxReader;
+use scx_format_io::{FullCatalogEntry, ShardStats};
 
 use crate::error::MtxError;
 
@@ -23,92 +25,369 @@ use crate::error::MtxError;
 /// - `barcodes.tsv.gz` — cell barcodes
 /// - `features.tsv.gz` — gene/feature metadata
 ///
+/// Exports the file's only modality; a multimodal file is refused. Use
+/// [`write_scx_to_mtx_for`] to name one.
+///
 /// Logically deleted cells are **excluded**. MatrixMarket has no notion of a
 /// deletion vector, so unlike an SCX→SCX rewrite there is nothing to carry the
 /// deletion in — the only faithful export is one that leaves the rows out. X and
 /// obs are filtered by the same mask and must stay that way: `barcodes.tsv.gz`
 /// with more lines than the matrix has columns is a directory Cell Ranger and
 /// Scanpy both reject.
+///
+/// Peak memory is one decoded shard, not the whole matrix.
 pub fn write_scx_to_mtx(scx_path: &Path, output_dir: &Path) -> Result<(), MtxError> {
-    std::fs::create_dir_all(output_dir)?;
-
-    let reader = ScxReader::open(scx_path)?;
-    let csr = reader.read_all_csr_shards_filtered()?;
-    let n_obs = csr.shape.0;
-    let n_vars = csr.shape.1;
-    let nnz = csr.nnz();
-
-    // Write matrix.mtx.gz
-    write_matrix_mtx(
-        output_dir,
-        &csr.indptr,
-        &csr.indices,
-        &csr.data,
-        n_obs,
-        n_vars,
-        nnz,
-    )?;
-
-    // Write barcodes.tsv.gz. Synthetic barcodes are a fallback for *genuinely
-    // absent* obs only; a decode/checksum failure is corruption and must abort
-    // rather than silently emit fabricated `cell_i` IDs (SCX-009).
-    match reader.read_obs_filtered() {
-        Ok(obs) => write_barcodes_tsv(output_dir, &obs)?,
-        Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
-            write_synthetic_barcodes(output_dir, n_obs)?;
-        }
-        Err(e) => return Err(e.into()),
-    }
-
-    // Write features.tsv.gz (same absence-vs-corruption rule as obs).
-    match reader.read_var() {
-        Ok(var) => write_features_tsv(output_dir, &var)?,
-        Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
-            write_synthetic_features(output_dir, n_vars)?;
-        }
-        Err(e) => return Err(e.into()),
-    }
-
-    Ok(())
+    write_scx_to_mtx_for(scx_path, output_dir, None)
 }
 
-/// Write `matrix.mtx.gz` in COO format.
-fn write_matrix_mtx(
-    dir: &Path,
-    indptr: &[i64],
-    indices: &[i32],
-    data: &[f32],
-    n_rows: usize,
-    n_cols: usize,
-    nnz: usize,
+/// Modality-scoped [`write_scx_to_mtx`]. `modality` names one modality of a
+/// multimodal file, and must be `None` for a single-modality one.
+///
+/// A MatrixMarket directory describes exactly one matrix over one feature
+/// space, and a multimodal SCX file is not that. Each modality independently
+/// tiles the shared obs axis, so the flattened CSR shard list carries
+/// overlapping row ranges: exporting it unscoped stacks the modalities into an
+/// `n_obs × n_modalities` matrix over mixed column spaces. It also mislabels
+/// the result — a multimodal file has no global `var` section (each modality
+/// owns `var/<name>`), so the features table falls back to synthetic `gene_i`
+/// names. Both are refused here rather than written.
+pub fn write_scx_to_mtx_for(
+    scx_path: &Path,
+    output_dir: &Path,
+    modality: Option<&str>,
 ) -> Result<(), MtxError> {
-    let path = dir.join("matrix.mtx.gz");
-    let file = std::fs::File::create(&path)?;
+    // Everything fallible that does not touch the destination happens first.
+    // A refused export — an unreadable source, a multimodal file with no
+    // `modality`, an unknown name — must leave the filesystem exactly as it
+    // found it, including not creating `output_dir`.
+    let reader = ScxReader::open(scx_path)?;
+    let modality_id = resolve_modality(&reader, modality)?;
+
+    // One mask for X and obs. They must move together (see above), so both
+    // halves take it from the same call rather than from the global-only
+    // `read_obs_filtered` / `read_all_csr_shards_filtered` pair.
+    let keep = reader.deletion_keep_mask_for(modality_id)?;
+    let shards = reader.catalog().csr_shards_for_modality(modality_id);
+
+    let n_obs = match keep.as_deref() {
+        Some(mask) => mask.iter().filter(|&&k| k).count(),
+        None => reader.n_obs() as usize,
+    };
+    // Prefer the modality table's `n_vars`: a multimodal file's header carries
+    // the file-wide maximum, not this modality's width.
+    let n_vars = match reader.modality_info(modality_id) {
+        Some(info) => info.n_vars as usize,
+        None => reader.n_vars() as usize,
+    };
+
+    // The destination is a *directory*, so a caller's same-path check compares
+    // the source against it and cannot see a source living inside it under one
+    // of the names this export replaces. Refused here rather than in the CLI
+    // so `pyscx.to_mtx`, which calls this directly, gets the same rule.
+    for name in [MATRIX_MTX, BARCODES_TSV, FEATURES_TSV] {
+        if same_file(scx_path, &output_dir.join(name)) {
+            return Err(MtxError::Other(format!(
+                "the source {} is also the `{name}` this export would write; \
+                 choose an output directory that does not contain the input",
+                scx_path.display()
+            )));
+        }
+    }
+
+    std::fs::create_dir_all(output_dir)?;
+
+    // Every member is written to a temp name and renamed into place only once
+    // all three have succeeded, so a failure part-way through leaves a
+    // previous export byte-identical rather than half-replaced. `Staged`
+    // removes anything left over on drop, including on the error paths below.
+    let mut staged = Staged::new(output_dir);
+
+    write_matrix_mtx(
+        staged.temp_for(MATRIX_MTX)?,
+        &reader,
+        &shards,
+        keep.as_deref(),
+        n_obs,
+        n_vars,
+    )?;
+
+    // Synthetic barcodes are a fallback for *genuinely absent* obs only; a
+    // decode/checksum failure is corruption and must abort rather than
+    // silently emit fabricated `cell_i` IDs (SCX-009).
+    match reader.read_obs() {
+        Ok(obs) => {
+            let obs = match keep.as_deref() {
+                Some(mask) => scx_format_io::filter_batch_by_keep_mask(&obs, mask)?,
+                None => obs,
+            };
+            write_barcodes_tsv(staged.temp_for(BARCODES_TSV)?, &obs)?
+        }
+        Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
+            write_synthetic_barcodes(staged.temp_for(BARCODES_TSV)?, n_obs)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Same absence-vs-corruption rule as obs. `read_var_for` routes
+    // `modality_id == 0` to `read_var()`, so this one call covers both the
+    // multimodal per-modality section and the global one.
+    match reader.read_var_for(modality_id) {
+        Ok(var) => write_features_tsv(staged.temp_for(FEATURES_TSV)?, &var)?,
+        Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
+            write_synthetic_features(staged.temp_for(FEATURES_TSV)?, n_vars)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    staged.commit()
+}
+
+/// True when both paths name the same file. Canonicalization resolves `./a`
+/// against `a` and follows symlinks; it fails on a path that does not exist,
+/// which is when a literal comparison is the right answer.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Upper bound for a value the `integer` body arm can emit. `v as i64`
+/// saturates above this, so such a matrix is declared `real` instead.
+const MAX_EXACT_INTEGER_BODY: f32 = 9_223_372_036_854_775_807.0;
+
+const MATRIX_MTX: &str = "matrix.mtx.gz";
+const BARCODES_TSV: &str = "barcodes.tsv.gz";
+const FEATURES_TSV: &str = "features.tsv.gz";
+
+/// Members written under a temp name and renamed into place together.
+///
+/// The point is the failure path, not the happy one: before this existed a
+/// half-finished export left the destination with a fresh `matrix.mtx.gz`
+/// beside a previous run's `barcodes.tsv.gz`, describing two different
+/// matrices. Anything still staged when this drops is removed, so an early
+/// `?` cannot leave debris either.
+struct Staged {
+    dir: std::path::PathBuf,
+    members: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+impl Staged {
+    fn new(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            members: Vec::new(),
+        }
+    }
+
+    /// Reserve `name` and hand back the temp path to write to. The temp lives
+    /// in the destination directory so the commit is a rename, not a copy.
+    fn temp_for(&mut self, name: &str) -> Result<&Path, MtxError> {
+        let temp = reserve(&self.dir, name, "tmp")?;
+        self.members.push((temp, self.dir.join(name)));
+        Ok(&self.members.last().expect("just pushed").0)
+    }
+
+    /// Replace all three members, or none of them.
+    ///
+    /// Renaming onto the live names one at a time is *not* all-or-nothing: a
+    /// failure on the second rename leaves a new `matrix.mtx.gz` beside the
+    /// previous run's `barcodes.tsv.gz` — the mixed directory this staging
+    /// exists to prevent, moved from the write loop to the commit loop. So
+    /// each live member is moved aside first and put back if a later one
+    /// fails.
+    ///
+    /// `self.members` is cleared only once every rename has succeeded, so an
+    /// early return still leaves `Drop` a list to clean up. The previous
+    /// `std::mem::take` emptied it before the first rename, which silently
+    /// disabled `Drop` on exactly the paths that needed it.
+    ///
+    /// The precheck is the primary guard and is what the tests exercise; the
+    /// backup/rollback path covers what it cannot see — a rename that fails
+    /// for a reason the precheck has no way to predict (permissions, ENOSPC,
+    /// a race between the check and the rename).
+    fn commit(mut self) -> Result<(), MtxError> {
+        // A member that is not a regular file cannot be renamed over.
+        // Discovering that half way through is what makes a commit
+        // non-atomic, so discover it before touching anything.
+        for (_, final_path) in &self.members {
+            // `is_dir()`, not `!is_file()`. `symlink_metadata` is `lstat`, so
+            // `is_file()` is false for a symlink — including a live one to a
+            // regular file, verified on this host. `rename(2)` replaces a
+            // symlink inode perfectly well, and refusing one would mean
+            // `--force` could not finish the overwrite the guard demands. A
+            // directory is the obstruction that genuinely cannot be renamed
+            // over.
+            if let Ok(meta) = std::fs::symlink_metadata(final_path) {
+                if meta.is_dir() {
+                    return Err(MtxError::Other(format!(
+                        "{} exists and is a directory, so the export cannot replace it",
+                        final_path.display()
+                    )));
+                }
+            }
+        }
+
+        let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        let mut committed: Vec<std::path::PathBuf> = Vec::new();
+
+        for (temp, final_path) in &self.members {
+            if std::fs::symlink_metadata(final_path).is_ok() {
+                // Created exclusively, never unlinked-then-reused. A
+                // predictable `.{name}.scx-bak-{pid}` that this process
+                // removes first is the same "delete a guessed path before
+                // proving ownership" hazard just taken out of `explode` — and
+                // after a kill between the two renames, that path *is* the
+                // previous export.
+                let name = final_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "member".to_string());
+                let backup = match reserve(&self.dir, &name, "bak") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        rollback(&backups, &committed);
+                        return Err(e);
+                    }
+                };
+                // Deliberately *not* unlinked first. `rename(2)` replaces an
+                // existing regular file atomically, and the empty placeholder
+                // `reserve` created is exactly that. Vacating the name instead
+                // would reopen the window the exclusive creation exists to
+                // close: a second export in the same process reserves the same
+                // lowest counter, and one commit renames over the other's
+                // reservation.
+                if let Err(e) = std::fs::rename(final_path, &backup) {
+                    rollback(&backups, &committed);
+                    return Err(e.into());
+                }
+                backups.push((backup, final_path.clone()));
+            }
+            if let Err(e) = std::fs::rename(temp, final_path) {
+                rollback(&backups, &committed);
+                return Err(e.into());
+            }
+            committed.push(final_path.clone());
+        }
+
+        for (backup, _) in &backups {
+            let _ = std::fs::remove_file(backup);
+        }
+        self.members.clear();
+        Ok(())
+    }
+}
+
+/// Create and return a staging path in `dir`, proving it is ours.
+///
+/// `create_new` fails on an existing path, so a collision advances the counter
+/// rather than being removed — nothing here ever unlinks a name it did not
+/// just create. That also makes two concurrent exports in one process safe.
+fn reserve(dir: &Path, stem: &str, tag: &str) -> Result<std::path::PathBuf, MtxError> {
+    for attempt in 0..1024 {
+        let candidate = dir.join(format!(
+            ".{stem}.scx-{tag}-{}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(MtxError::Other(format!(
+        "could not reserve a staging name for {stem} in {}",
+        dir.display()
+    )))
+}
+
+/// Undo a partial commit: drop whatever was put in place, then move every
+/// saved member back. Best-effort by construction — the caller is already
+/// returning the original error and there is nothing useful to report if the
+/// undo itself fails.
+fn rollback(
+    backups: &[(std::path::PathBuf, std::path::PathBuf)],
+    committed: &[std::path::PathBuf],
+) {
+    for path in committed {
+        let _ = std::fs::remove_file(path);
+    }
+    for (backup, final_path) in backups {
+        let _ = std::fs::rename(backup, final_path);
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        for (temp, _) in &self.members {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+}
+
+/// Resolve `--modality` against the file. Mirrors the refusal the streaming
+/// h5ad export makes and the `is_multimodal()` / `modality_id()` idiom every
+/// other modality-aware entry point uses.
+fn resolve_modality(reader: &ScxReader, modality: Option<&str>) -> Result<u8, MtxError> {
+    let available = || {
+        reader
+            .modality_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    };
+    match (reader.is_multimodal(), modality) {
+        (true, None) => Err(MtxError::ModalityRequired {
+            available: available(),
+        }),
+        (true, Some(name)) => reader
+            .modality_id(name)
+            .ok_or_else(|| MtxError::UnknownModality {
+                requested: name.to_string(),
+                available: available(),
+            }),
+        (false, Some(name)) => Err(MtxError::ModalityNotApplicable {
+            requested: name.to_string(),
+        }),
+        (false, None) => Ok(0),
+    }
+}
+
+/// Everything the MatrixMarket banner and size line must state before the
+/// first body line can be written.
+struct MatrixHeaderFacts {
+    /// Non-zeros the body will emit, after the keep mask.
+    nnz: u64,
+    /// Whether every kept value is a finite non-negative integer, which
+    /// selects both the declared type and the body's per-value format.
+    all_integer: bool,
+}
+
+/// Write `matrix.mtx.gz` in COO format, one shard at a time.
+///
+/// Peak memory is one decoded shard plus flate2's window, not the whole CSR.
+/// The two passes are forced by the format, not chosen: MatrixMarket's size
+/// line is the first data line, and the declared type also formats every
+/// value below it, so neither can be deferred until the body is known.
+fn write_matrix_mtx(
+    path: &Path,
+    reader: &ScxReader,
+    shards: &[&FullCatalogEntry],
+    keep: Option<&[bool]>,
+    n_obs: usize,
+    n_vars: usize,
+) -> Result<(), MtxError> {
+    let facts = scan_header_facts(reader, shards, keep)?;
+
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
-    // Header
-    // Detect if all values are integers for the header type field
-    let all_integer = data
-        .iter()
-        .all(|&v| v == v.floor() && v.is_finite() && v >= 0.0);
-    let type_str = if all_integer { "integer" } else { "real" };
-
-    // CLI8: derive the declared nnz from the CSR indptr so the header always
-    // matches the body, which emits exactly `indptr[r+1]-indptr[r]` lines per
-    // row. Trusting the caller's `nnz` produces a file whose declared count
-    // diverges from the body if `nnz` is stale or the CSR carries explicit
-    // zeros/dups (rejected by strict readers).
-    let body_nnz = if indptr.len() > n_rows {
-        indptr[n_rows].saturating_sub(indptr[0]).max(0) as usize
-    } else {
-        nnz
-    };
-    debug_assert_eq!(
-        body_nnz, nnz,
-        "MTX writer: caller-supplied nnz disagrees with indptr-derived nnz"
-    );
-
+    let type_str = if facts.all_integer { "integer" } else { "real" };
     writeln!(w, "%%MatrixMarket matrix coordinate {} general", type_str)?;
     writeln!(w, "% Generated by scx-mtx from SCX format")?;
     // SCX stores cells × genes (obs × var), but 10x/Cell Ranger Matrix Market
@@ -116,40 +395,212 @@ fn write_matrix_mtx(
     // the size line is `n_vars n_obs nnz` and each triplet is emitted as
     // `col(gene) row(cell) value`. Iterating the CSR in cell (obs) order means
     // entries come out grouped by column (barcode) and ascending within a
-    // column by row (feature) — exactly Cell Ranger's column-major layout.
-    writeln!(w, "{} {} {}", n_cols, n_rows, body_nnz)?;
+    // column by row (feature) — exactly Cell Ranger's column-major layout, and
+    // a shard-at-a-time walk in `row_start` order preserves it.
+    writeln!(w, "{} {} {}", n_vars, n_obs, facts.nnz)?;
 
-    // Write COO triplets (1-indexed), transposed to features × barcodes.
-    for row in 0..n_rows {
-        let start = indptr[row] as usize;
-        let end = indptr[row + 1] as usize;
-        for idx in start..end {
-            let col = indices[idx];
-            let val = data[idx];
-            if all_integer {
-                // Write as integer to avoid unnecessary decimal points
-                writeln!(w, "{} {} {}", col + 1, row + 1, val as i64)?;
-            } else {
-                writeln!(w, "{} {} {}", col + 1, row + 1, val)?;
+    // Ordinal among *kept* rows, so a triplet's barcode index and the line it
+    // names in `barcodes.tsv.gz` stay the same number.
+    let mut out_row: usize = 0;
+    let mut emitted: u64 = 0;
+
+    for entry in shards {
+        let row_start = require_stats(entry)?.row_start as usize;
+        let (indptr, indices, values) = reader.read_shard_from_entry_native(entry)?;
+        let n_rows = indptr.len().saturating_sub(1);
+        for r in 0..n_rows {
+            if !row_is_kept(keep, row_start + r) {
+                continue;
             }
+            for idx in indptr[r] as usize..indptr[r + 1] as usize {
+                let col = indices[idx] + 1;
+                let row = out_row + 1;
+                match &values {
+                    // Integer-encoded values stay `u32` the whole way out. The
+                    // assembled export decoded them to `f32` first and wrote
+                    // `val as i64`, which silently rounds any count above 2²⁴ —
+                    // the same defect MTX *ingest* had, in the other direction.
+                    ShardValuesNative::U32(v) => writeln!(w, "{} {} {}", col, row, v[idx])?,
+                    ShardValuesNative::F32(v) if facts.all_integer => {
+                        // Write as integer to avoid unnecessary decimal points.
+                        writeln!(w, "{} {} {}", col, row, v[idx] as i64)?
+                    }
+                    ShardValuesNative::F32(v) => writeln!(w, "{} {} {}", col, row, v[idx])?,
+                }
+                emitted += 1;
+            }
+            out_row += 1;
         }
     }
 
     w.flush()?;
+
+    // CLI8: the declared counts must equal what the body emitted. This used to
+    // be a `debug_assert_eq!`, which in a release build lets a disagreement
+    // ship as a file strict readers reject part-way through.
+    if emitted != facts.nnz {
+        return Err(MtxError::Other(format!(
+            "MTX writer: declared {} non-zeros but emitted {emitted}",
+            facts.nnz
+        )));
+    }
+    if out_row != n_obs {
+        return Err(MtxError::Other(format!(
+            "MTX writer: declared {n_obs} columns (barcodes) but the CSR shards \
+             covered {out_row} kept rows"
+        )));
+    }
     Ok(())
 }
 
+/// Compute the header facts, taking each from the cheapest source that can
+/// answer it.
+///
+/// `nnz` mirrors the streaming SCX → h5ad export's `precompute_total_nnz`:
+/// catalog `stats.nnz` with zero decode when nothing is deleted, and an
+/// indptr-only decode when a keep mask is active.
+///
+/// `all_integer` is derived from the **values**, never from the shard's
+/// `ValueEncoding`, and that is load-bearing rather than fussy: an h5ad-sourced
+/// file routinely holds integral counts in a `Float32`-encoded shard, so
+/// reading the flag off the encoding would flip the declared type of every such
+/// export from `integer` to `real`. (`benchmarks/comprehensive/thresholds.yaml`
+/// floors `mtx_header_integer` and `mtx_values_all_integral` on exactly that
+/// file shape.) An integer-encoded shard *is* provably finite, non-negative and
+/// integral, so it answers from its 76-byte shard header with no decode; only
+/// float-encoded shards are decoded, and the scan stops as soon as one value
+/// settles the question for the whole matrix. Cost: nothing on an
+/// integer-encoded file, one early-exiting decode on a genuinely real one, and
+/// one extra value pass on a float-encoded all-integral one.
+///
+/// The scan is restricted to **kept** rows, because the flag describes the
+/// matrix that gets written: a value in a deleted row can no more make the
+/// export `real` than it can contribute to `nnz`.
+fn scan_header_facts(
+    reader: &ScxReader,
+    shards: &[&FullCatalogEntry],
+    keep: Option<&[bool]>,
+) -> Result<MatrixHeaderFacts, MtxError> {
+    let mut nnz: u64 = 0;
+    let mut all_integer = true;
+
+    for entry in shards {
+        let stats = require_stats(entry)?;
+        let row_start = stats.row_start as usize;
+        let encoding = ValueEncoding::from_u8(reader.read_shard_header(entry)?.value_encoding)
+            .ok_or_else(|| {
+                MtxError::Other(format!(
+                    "CSR shard '{}' declares an unknown value encoding",
+                    entry.name
+                ))
+            })?;
+        // Once one value has proved the matrix is not all-integral, no later
+        // shard can change that back, so the decode is skipped from there on.
+        let needs_values = all_integer && !encoding.is_integer();
+
+        match (keep, needs_values) {
+            (None, false) => nnz = nnz.saturating_add(stats.nnz),
+            (Some(mask), false) => {
+                let indptr = reader.read_shard_indptr_from_entry(entry)?;
+                nnz = nnz.saturating_add(kept_nnz(&indptr, row_start, mask));
+            }
+            // The values are needed anyway, so nnz comes out of the same
+            // decode rather than reading the shard a second time.
+            (_, true) => {
+                let (indptr, _indices, values) = reader.read_shard_from_entry_native(entry)?;
+                nnz = nnz.saturating_add(match keep {
+                    Some(mask) => kept_nnz(&indptr, row_start, mask),
+                    None => stats.nnz,
+                });
+                if let ShardValuesNative::F32(v) = &values {
+                    all_integer = kept_values_are_integral(&indptr, row_start, keep, v);
+                }
+            }
+        }
+    }
+
+    Ok(MatrixHeaderFacts { nnz, all_integer })
+}
+
+fn require_stats(entry: &FullCatalogEntry) -> Result<&ShardStats, MtxError> {
+    entry.stats.as_ref().ok_or_else(|| {
+        MtxError::Other(format!(
+            "CSR shard '{}' carries no catalog stats, so its row range is unknown",
+            entry.name
+        ))
+    })
+}
+
+/// Whether the global obs row survives the deletion vector. A row past the end
+/// of the mask reads as kept on purpose: the mask is obs-indexed and covers the
+/// whole axis, so a shard running past it is a shape error, and
+/// `write_matrix_mtx`'s closing row-count check reports it rather than this
+/// dropping the rows quietly.
+fn row_is_kept(keep: Option<&[bool]>, global_row: usize) -> bool {
+    match keep {
+        None => true,
+        Some(mask) => mask.get(global_row).copied().unwrap_or(true),
+    }
+}
+
+fn kept_nnz(indptr: &[i64], row_start: usize, mask: &[bool]) -> u64 {
+    let n_rows = indptr.len().saturating_sub(1);
+    let mut nnz: u64 = 0;
+    for r in 0..n_rows {
+        if row_is_kept(Some(mask), row_start + r) {
+            nnz = nnz.saturating_add((indptr[r + 1] - indptr[r]).max(0) as u64);
+        }
+    }
+    nnz
+}
+
+fn kept_values_are_integral(
+    indptr: &[i64],
+    row_start: usize,
+    keep: Option<&[bool]>,
+    values: &[f32],
+) -> bool {
+    let n_rows = indptr.len().saturating_sub(1);
+    for r in 0..n_rows {
+        if !row_is_kept(keep, row_start + r) {
+            continue;
+        }
+        for &v in &values[indptr[r] as usize..indptr[r + 1] as usize] {
+            // The integer body arm writes `v as i64`, which *saturates*: a
+            // float-encoded `1e20` is integral and non-negative but would be
+            // emitted as `i64::MAX`. Declare `real` for anything the integer
+            // formatting cannot carry.
+            if !(v.is_finite() && v >= 0.0 && v == v.floor() && v < MAX_EXACT_INTEGER_BODY) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Write `barcodes.tsv.gz` from obs RecordBatch.
-fn write_barcodes_tsv(dir: &Path, obs: &arrow::array::RecordBatch) -> Result<(), MtxError> {
-    let path = dir.join("barcodes.tsv.gz");
-    let file = std::fs::File::create(&path)?;
+fn write_barcodes_tsv(path: &Path, obs: &arrow::array::RecordBatch) -> Result<(), MtxError> {
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
-    // Use the first column as barcode (typically "_index" or "barcode")
-    if obs.num_columns() == 0 || obs.num_rows() == 0 {
+    if obs.num_rows() == 0 {
         return Ok(());
     }
+    // A batch can carry rows and no columns (`RecordBatchOptions::with_row_count`,
+    // which `ScxWriter::write_obs` serializes as given). Returning here emitted
+    // an empty `barcodes.tsv.gz` beside a matrix declaring `n_obs` columns — a
+    // directory Cell Ranger and Scanpy both reject. Fall back to the synthetic
+    // IDs the genuinely-absent-obs path already uses.
+    if obs.num_columns() == 0 {
+        for i in 0..obs.num_rows() {
+            writeln!(w, "cell_{}", i)?;
+        }
+        w.flush()?;
+        return Ok(());
+    }
+
+    // Use the first column as barcode (typically "_index" or "barcode")
 
     let col = obs.column(0);
     if let Some(string_arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
@@ -182,9 +633,8 @@ fn write_barcodes_tsv(dir: &Path, obs: &arrow::array::RecordBatch) -> Result<(),
 }
 
 /// Write `features.tsv.gz` from var RecordBatch.
-fn write_features_tsv(dir: &Path, var: &arrow::array::RecordBatch) -> Result<(), MtxError> {
-    let path = dir.join("features.tsv.gz");
-    let file = std::fs::File::create(&path)?;
+fn write_features_tsv(path: &Path, var: &arrow::array::RecordBatch) -> Result<(), MtxError> {
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
@@ -268,9 +718,8 @@ fn string_value(arr: &arrow::array::StringArray, idx: usize) -> &str {
 }
 
 /// Write synthetic barcodes when obs is not available.
-fn write_synthetic_barcodes(dir: &Path, n_obs: usize) -> Result<(), MtxError> {
-    let path = dir.join("barcodes.tsv.gz");
-    let file = std::fs::File::create(&path)?;
+fn write_synthetic_barcodes(path: &Path, n_obs: usize) -> Result<(), MtxError> {
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
@@ -283,9 +732,8 @@ fn write_synthetic_barcodes(dir: &Path, n_obs: usize) -> Result<(), MtxError> {
 }
 
 /// Write synthetic features when var is not available.
-fn write_synthetic_features(dir: &Path, n_vars: usize) -> Result<(), MtxError> {
-    let path = dir.join("features.tsv.gz");
-    let file = std::fs::File::create(&path)?;
+fn write_synthetic_features(path: &Path, n_vars: usize) -> Result<(), MtxError> {
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
@@ -443,5 +891,538 @@ mod tests {
             6,
             "no deletion vector: every cell is exported"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Streaming export
+    // -----------------------------------------------------------------
+
+    /// A single-modality file whose one CSR shard carries `values` under
+    /// `encoding`, one entry per row at column `row % n_vars`.
+    ///
+    /// The encoding is chosen by the caller rather than detected, which is the
+    /// whole point: the two shapes that matter here — integral counts stored
+    /// as `Float32`, and a `Uint32` count above 2²⁴ — are exactly the ones a
+    /// value-detecting writer would not produce on demand.
+    fn write_encoded_fixture(
+        dir: &tempfile::TempDir,
+        file_name: &str,
+        encoding: ValueEncoding,
+        values: &[f64],
+        n_vars: usize,
+    ) -> std::path::PathBuf {
+        let n_obs = values.len();
+        let path = dir.path().join(file_name);
+        let mut w = ScxWriter::new(
+            &path,
+            FileHeader {
+                n_obs: n_obs as u64,
+                n_vars: n_vars as u64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let obs = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cell_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_obs).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        w.write_obs(&obs).unwrap();
+        let var = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("gene_id", DataType::Utf8, false),
+                Field::new("gene_name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    (0..n_vars).map(|i| format!("ENSG{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    (0..n_vars).map(|i| format!("Gene{i}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        w.write_var(&var).unwrap();
+
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut raw: Vec<u8> = Vec::new();
+        for (row, &v) in values.iter().enumerate() {
+            indices.push((row % n_vars) as u32);
+            match encoding {
+                ValueEncoding::Uint32 => raw.extend_from_slice(&(v as u32).to_le_bytes()),
+                ValueEncoding::Float32 => raw.extend_from_slice(&(v as f32).to_le_bytes()),
+                other => panic!("fixture does not encode {other:?}"),
+            }
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        w.write_csr_shard(&indptr, &indices, &raw, CodecId::None, encoding, 0)
+            .unwrap();
+        w.finish().unwrap();
+        path
+    }
+
+    fn body_lines(mtx: &str) -> Vec<String> {
+        mtx.lines()
+            .filter(|l| !l.starts_with('%'))
+            .skip(1) // size line
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    fn banner(mtx: &str) -> String {
+        mtx.lines().next().unwrap().to_string()
+    }
+
+    /// The shard-at-a-time walk must emit exactly the COO the assembled matrix
+    /// implies — same triplets, same order, same declared counts.
+    ///
+    /// The oracle is built here from `read_all_csr_shards_filtered`, the
+    /// materialising read the export used to be written on top of, so this
+    /// compares the streaming implementation against an independent
+    /// construction rather than against a frozen blob that would have to be
+    /// regenerated with the code it is supposed to check.
+    #[test]
+    fn the_streamed_body_matches_the_assembled_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[1, 4]);
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+        let mtx = read_gz(&out.join("matrix.mtx.gz"));
+
+        let reader = ScxReader::open(&src).unwrap();
+        let csr = reader.read_all_csr_shards_filtered().unwrap();
+        let mut expected = Vec::new();
+        for row in 0..csr.shape.0 {
+            for idx in csr.indptr[row] as usize..csr.indptr[row + 1] as usize {
+                expected.push(format!(
+                    "{} {} {}",
+                    csr.indices[idx] + 1,
+                    row + 1,
+                    csr.data[idx] as i64
+                ));
+            }
+        }
+
+        assert_eq!(body_lines(&mtx), expected, "streamed body");
+        let size_line = mtx.lines().find(|l| !l.starts_with('%')).unwrap();
+        assert_eq!(
+            size_line,
+            format!("{} {} {}", csr.shape.1, csr.shape.0, csr.nnz()),
+            "size line"
+        );
+    }
+
+    /// The declared type must come from the **values**, not from the shard's
+    /// `ValueEncoding`.
+    ///
+    /// An h5ad-sourced count matrix routinely lands as integral values in a
+    /// `Float32`-encoded shard, so reading the flag off the encoding would flip
+    /// every such export from `integer` to `real`. That is the obvious
+    /// shortcut when making the export streaming — the values are exactly what
+    /// a streaming writer no longer holds all of at once — and
+    /// `benchmarks/comprehensive/thresholds.yaml` floors `mtx_header_integer`
+    /// on a file of this shape for the same reason. This is the CI-side twin,
+    /// so the regression does not have to wait for a benchmark capture.
+    #[test]
+    fn a_float_encoded_all_integral_shard_still_declares_integer() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_encoded_fixture(
+            &dir,
+            "float_integral.scx",
+            ValueEncoding::Float32,
+            &[1.0, 2.0, 3.0, 419.0],
+            4,
+        );
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+        let mtx = read_gz(&out.join("matrix.mtx.gz"));
+
+        assert_eq!(
+            banner(&mtx),
+            "%%MatrixMarket matrix coordinate integer general",
+            "integral values in a Float32-encoded shard still declare `integer`"
+        );
+        assert_eq!(
+            body_lines(&mtx).last().unwrap(),
+            "4 4 419",
+            "and the body is formatted as integers, not `419.0`"
+        );
+    }
+
+    /// The accept-side twin: one fractional value and the same file declares
+    /// `real`. Without this the test above would pass against a writer that
+    /// hard-coded `integer`.
+    #[test]
+    fn one_fractional_value_makes_the_export_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_encoded_fixture(
+            &dir,
+            "float_fraction.scx",
+            ValueEncoding::Float32,
+            &[1.0, 2.0, 3.0, 2.5],
+            4,
+        );
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+        let mtx = read_gz(&out.join("matrix.mtx.gz"));
+
+        assert_eq!(
+            banner(&mtx),
+            "%%MatrixMarket matrix coordinate real general"
+        );
+        assert_eq!(body_lines(&mtx).last().unwrap(), "4 4 2.5");
+    }
+
+    /// An integer-encoded count above 2²⁴ must export exactly.
+    ///
+    /// The assembled export decoded every shard to `f32` first and wrote
+    /// `val as i64`, so `16_777_217` came out as `16_777_216` — the same
+    /// rounding MTX *ingest* did, in the other direction. Streaming through
+    /// `read_shard_from_entry_native` keeps integer-encoded values as `u32`.
+    #[test]
+    fn an_integer_shard_above_2_24_exports_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_encoded_fixture(
+            &dir,
+            "big_counts.scx",
+            ValueEncoding::Uint32,
+            &[1.0, 16_777_217.0],
+            2,
+        );
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+        let mtx = read_gz(&out.join("matrix.mtx.gz"));
+
+        assert_eq!(
+            body_lines(&mtx),
+            vec!["1 1 1".to_string(), "2 2 16777217".to_string()],
+            "the count must survive the export, not round to 16777216"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Multimodal
+    // -----------------------------------------------------------------
+
+    /// A 3-cell file with two modalities: `rna` over 2 genes and `adt` over 3.
+    /// Each modality independently tiles the shared obs axis, which is what
+    /// makes the flattened shard list overlap.
+    fn write_multimodal_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        use scx_format_io::modality::ModalityType;
+        use scx_format_io::writer::ShardBuffers;
+
+        let n_obs = 3usize;
+        let path = dir.path().join("multi.scx");
+        let mut w = ScxWriter::new(
+            &path,
+            FileHeader {
+                n_obs: n_obs as u64,
+                n_vars: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let obs = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cell_id",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(
+                (0..n_obs).map(|i| format!("cell_{i}")).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        w.write_obs(&obs).unwrap();
+
+        for (name, mtype, genes) in [
+            ("rna", ModalityType::Rna, vec!["RNA0", "RNA1"]),
+            ("adt", ModalityType::Protein, vec!["ADT0", "ADT1", "ADT2"]),
+        ] {
+            let mid = w
+                .add_modality(name, mtype, CodecId::None, ValueEncoding::Uint8, false)
+                .unwrap();
+            w.set_modality_n_vars(mid, genes.len() as u64).unwrap();
+
+            let var = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("gene_id", DataType::Utf8, false),
+                    Field::new("gene_name", DataType::Utf8, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(genes.clone())),
+                    Arc::new(StringArray::from(genes.clone())),
+                ],
+            )
+            .unwrap();
+            w.write_var_for(mid, &var).unwrap();
+
+            // One entry per cell, so every modality covers every obs row.
+            let mut indptr = vec![0u64];
+            let mut indices = Vec::new();
+            let mut values = Vec::new();
+            for row in 0..n_obs {
+                indices.push((row % genes.len()) as u32);
+                values.push((row + 1) as u8);
+                indptr.push(indptr.last().unwrap() + 1);
+            }
+            w.write_csr_shard_for(
+                mid,
+                0,
+                ShardBuffers::new(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                ),
+            )
+            .unwrap();
+        }
+        w.finish().unwrap();
+        path
+    }
+
+    /// A MatrixMarket directory describes one matrix over one feature space.
+    ///
+    /// Unscoped, the export used to stack both modalities into a 6-row matrix
+    /// over mixed column spaces — and label it with synthetic `gene_i` names,
+    /// because a multimodal file has no global `var` section. The assertion is
+    /// on the message rather than on `is_err()` so the test cannot pass via
+    /// some unrelated failure.
+    #[test]
+    fn mtx_export_refuses_a_multimodal_file_without_a_modality() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_multimodal_fixture(&dir);
+        let out = dir.path().join("mtx");
+        let err = write_scx_to_mtx(&src, &out).unwrap_err().to_string();
+        assert!(
+            err.contains("--modality") && err.contains("rna") && err.contains("adt"),
+            "the refusal must name the flag and the available modalities: {err}"
+        );
+    }
+
+    /// Naming a modality scopes the matrix **and** the feature table to it.
+    ///
+    /// The features half is the one a shape-only assertion would miss: an
+    /// export that scoped X but kept reaching for the global `var` would fall
+    /// through to synthetic `gene_0` names and still produce a
+    /// correctly-shaped directory.
+    #[test]
+    fn mtx_export_of_one_modality_uses_that_modalitys_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_multimodal_fixture(&dir);
+
+        let out = dir.path().join("rna_mtx");
+        write_scx_to_mtx_for(&src, &out, Some("rna")).unwrap();
+        let features: Vec<String> = read_gz(&out.join("features.tsv.gz"))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect();
+        assert_eq!(features, vec!["RNA0", "RNA1"], "rna's own var, not gene_i");
+
+        let mtx = read_gz(&out.join("matrix.mtx.gz"));
+        let size_line = mtx.lines().find(|l| !l.starts_with('%')).unwrap();
+        assert_eq!(size_line, "2 3 3", "2 rna genes x 3 cells, 3 non-zeros");
+
+        // And the sibling modality is a different matrix over a different
+        // feature space, not a slice of the same one.
+        let out_adt = dir.path().join("adt_mtx");
+        write_scx_to_mtx_for(&src, &out_adt, Some("adt")).unwrap();
+        let adt_features: Vec<String> = read_gz(&out_adt.join("features.tsv.gz"))
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect();
+        assert_eq!(adt_features, vec!["ADT0", "ADT1", "ADT2"]);
+    }
+
+    #[test]
+    fn mtx_export_rejects_an_unknown_modality() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_multimodal_fixture(&dir);
+        let out = dir.path().join("mtx");
+        let err = write_scx_to_mtx_for(&src, &out, Some("atac"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown modality 'atac'") && err.contains("rna"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mtx_export_rejects_a_modality_on_a_single_modality_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[]);
+        let out = dir.path().join("mtx");
+        let err = write_scx_to_mtx_for(&src, &out, Some("rna"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("single-modality"), "{err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Round-2 review: the commit must be all-or-nothing, and the source
+    // must not be one of the members being replaced.
+    // -----------------------------------------------------------------
+
+    /// A commit that fails part-way must leave the previous export exactly as
+    /// it was — not a new matrix beside the old barcodes.
+    ///
+    /// The failure is forced the way the reviewer reproduced it: make one of
+    /// the members a directory, which cannot be renamed over. Before this fix
+    /// `commit` took `self.members` before the first rename, so `Drop` was a
+    /// no-op and an early member was already replaced.
+    #[test]
+    fn a_commit_that_fails_part_way_leaves_the_previous_export_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[]);
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+
+        let before: Vec<(String, Vec<u8>)> = members(&out);
+        assert_eq!(before.len(), 3);
+
+        // `features.tsv.gz` is now a directory: the third rename cannot land.
+        std::fs::remove_file(out.join("features.tsv.gz")).unwrap();
+        std::fs::create_dir(out.join("features.tsv.gz")).unwrap();
+
+        let err = write_scx_to_mtx(&src, &out).unwrap_err().to_string();
+        assert!(
+            err.contains("is a directory"),
+            "the precheck should name the obstruction: {err}"
+        );
+
+        // The two members that could have been replaced were not, and no
+        // staging debris survives.
+        for (name, bytes) in &before {
+            if name == "features.tsv.gz" {
+                continue;
+            }
+            assert_eq!(
+                &std::fs::read(out.join(name)).unwrap(),
+                bytes,
+                "{name} must be untouched after a failed commit"
+            );
+        }
+        let debris: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(debris.is_empty(), "staging debris left behind: {debris:?}");
+    }
+
+    /// A member that is a **symlink** must still be replaceable.
+    ///
+    /// `symlink_metadata` is `lstat`, so `is_file()` is false for a symlink —
+    /// including a live one to a regular file. A precheck written as
+    /// `!meta.is_file()` therefore refuses the replacement that `--force`
+    /// exists to authorise, while `rename(2)` would have handled it. Only a
+    /// directory genuinely cannot be renamed over.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_member_is_replaced_rather_than_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[]);
+        let out = dir.path().join("mtx");
+        write_scx_to_mtx(&src, &out).unwrap();
+
+        // Point `matrix.mtx.gz` at a file outside the export.
+        let elsewhere = dir.path().join("elsewhere.gz");
+        std::fs::write(&elsewhere, b"not the export").unwrap();
+        let member = out.join("matrix.mtx.gz");
+        std::fs::remove_file(&member).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &member).unwrap();
+
+        write_scx_to_mtx(&src, &out).expect("a symlinked member must be replaceable");
+
+        let meta = std::fs::symlink_metadata(&member).unwrap();
+        assert!(
+            meta.is_file(),
+            "the link should have been replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read(&elsewhere).unwrap(),
+            b"not the export".to_vec(),
+            "rename replaces the link, it does not write through it"
+        );
+    }
+
+    /// The destination is a directory, so a caller's same-path check compares
+    /// a file against a directory and cannot see a source living inside it
+    /// under one of the names the export replaces. `pyscx.to_mtx` calls this
+    /// writer directly, so the refusal belongs here rather than in the CLI.
+    #[test]
+    fn a_source_that_is_one_of_the_members_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_fixture(&dir, &[]);
+        let out = dir.path().join("mtx");
+        std::fs::create_dir_all(&out).unwrap();
+
+        // An SCX file that *is* the matrix member the export would write.
+        let disguised = out.join("matrix.mtx.gz");
+        std::fs::copy(&src, &disguised).unwrap();
+        let original = std::fs::read(&disguised).unwrap();
+
+        let err = write_scx_to_mtx(&disguised, &out).unwrap_err().to_string();
+        assert!(
+            err.contains("is also the `matrix.mtx.gz`"),
+            "the refusal must name the collision: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&disguised).unwrap(),
+            original,
+            "the source must survive the refusal"
+        );
+    }
+
+    /// An obs batch with rows but no columns must still produce one barcode
+    /// per row; an empty `barcodes.tsv.gz` beside a matrix declaring `n_obs`
+    /// columns is a directory Cell Ranger and Scanpy both reject.
+    #[test]
+    fn an_obs_batch_with_no_columns_still_emits_one_barcode_per_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("barcodes.tsv.gz");
+        let empty = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(4)),
+        )
+        .unwrap();
+        write_barcodes_tsv(&path, &empty).unwrap();
+        assert_eq!(
+            read_gz(&path).lines().collect::<Vec<_>>(),
+            vec!["cell_0", "cell_1", "cell_2", "cell_3"]
+        );
+    }
+
+    fn members(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }

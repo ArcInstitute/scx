@@ -62,11 +62,30 @@ pub struct MtxData {
     pub orientation: MtxOrientation,
 }
 
+/// Knobs for [`read_mtx_directory_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MtxReadOptions {
+    /// Accept an integer value that `f32` cannot hold exactly, rounding it,
+    /// instead of failing loud.
+    ///
+    /// Named after — and meaning exactly what it means on — the read path's
+    /// `allow_lossy`: the caller has looked at the precision loss and accepted
+    /// it. See [`MtxError::LossyIntegerValue`].
+    pub allow_lossy: bool,
+}
+
 /// Read a Cell Ranger–style MTX directory.
 ///
 /// Locates `matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, and
 /// `features.tsv[.gz]`/`genes.tsv[.gz]` inside `dir`. All three are required.
+///
+/// Equivalent to [`read_mtx_directory_with`] at default options.
 pub fn read_mtx_directory(dir: &Path) -> Result<MtxData, MtxError> {
+    read_mtx_directory_with(dir, MtxReadOptions::default())
+}
+
+/// [`read_mtx_directory`] with explicit options.
+pub fn read_mtx_directory_with(dir: &Path, opts: MtxReadOptions) -> Result<MtxData, MtxError> {
     // Locate matrix file
     let mtx_path = find_file(dir, &["matrix.mtx.gz", "matrix.mtx"])?;
 
@@ -94,7 +113,7 @@ pub fn read_mtx_directory(dir: &Path) -> Result<MtxData, MtxError> {
     let gz_factor: usize = if is_gz { 20 } else { 1 };
     let max_nnz_bound = mtx_file_size.saturating_mul(gz_factor) / 6;
     let mtx_reader = open_maybe_gzipped(&mtx_path)?;
-    let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(mtx_reader, max_nnz_bound)?;
+    let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(mtx_reader, max_nnz_bound, opts)?;
 
     // Parse barcodes (obs)
     let barcodes_reader = open_maybe_gzipped(&barcodes_path)?;
@@ -217,6 +236,7 @@ fn open_maybe_gzipped(path: &Path) -> Result<Box<dyn BufRead>, MtxError> {
 fn parse_mtx_file(
     reader: Box<dyn BufRead>,
     max_nnz_bound: usize,
+    opts: MtxReadOptions,
 ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>, usize, usize), MtxError> {
     let mut lines = reader.lines();
 
@@ -315,6 +335,20 @@ fn parse_mtx_file(
 
     // Read COO triplets into a single vec for cache-friendly sorting
     let mut entries: Vec<(usize, usize, f32)> = Vec::with_capacity(nnz);
+    // A declared-`integer` file keeps its values as parsed, in one vector.
+    // The rest of the pipeline wants `f32`, but the duplicate-sum has to be
+    // exact: re-deriving an addend with `entries[i].2 as i64` reads a value
+    // that may already have been rounded, which is how a
+    // `16777217, -16777216` pair summed to 0 instead of 1 under `allow_lossy`.
+    //
+    // One vector rather than a parallel `Vec<i64>` plus a sort permutation:
+    // that shape held three buffers and copied the whole triplet run twice,
+    // raising peak ingest storage to ~2.7x for ordinary count matrices.
+    let mut int_entries: Vec<(usize, usize, i64)> = if is_integer {
+        Vec::with_capacity(nnz)
+    } else {
+        Vec::new()
+    };
 
     for line_result in lines {
         let line = line_result?;
@@ -337,9 +371,29 @@ fn parse_mtx_file(
             .map_err(|_| MtxError::Parse(format!("invalid col index: {}", parts[1])))?
             .checked_sub(1)
             .ok_or_else(|| MtxError::Parse("col index 0 in 1-indexed format".into()))?;
-        let val: f32 = parts[2]
-            .parse()
-            .map_err(|_| MtxError::Parse(format!("invalid value: {}", parts[2])))?;
+        // A header that declares `integer` is a promise about the values, and
+        // until now it was only ever used to validate the header: every value
+        // was parsed as `f32` regardless, so `16777217` silently became
+        // `16777216` and `1.5`, `nan` and `inf` were all accepted as integers.
+        // Parsing as `i64` keeps the declared type honest *and* makes the
+        // precision question answerable, because the exact value is still in
+        // hand when the range check runs.
+        let mut int_value: i64 = 0;
+        let val: f32 = if is_integer {
+            let n: i64 = parts[2].parse().map_err(|_| {
+                MtxError::Parse(format!(
+                    "invalid integer value '{}' (the header declares 'integer')",
+                    parts[2]
+                ))
+            })?;
+            check_integer_fits_f32(n, opts.allow_lossy)?;
+            int_value = n;
+            n as f32
+        } else {
+            parts[2]
+                .parse()
+                .map_err(|_| MtxError::Parse(format!("invalid value: {}", parts[2])))?
+        };
 
         // Reject out-of-range coordinates before they reach the CSR build
         // (`indptr[row + 1]`) or the orientation transpose
@@ -361,10 +415,22 @@ fn parse_mtx_file(
             )));
         }
 
-        entries.push((row, col, val));
+        if is_integer {
+            int_entries.push((row, col, int_value));
+        } else {
+            entries.push((row, col, val));
+        }
     }
 
-    if entries.len() != nnz {
+    if is_integer {
+        if int_entries.len() != nnz {
+            return Err(MtxError::Parse(format!(
+                "expected {} entries, read {}",
+                nnz,
+                int_entries.len()
+            )));
+        }
+    } else if entries.len() != nnz {
         return Err(MtxError::Parse(format!(
             "expected {} entries, read {}",
             nnz,
@@ -378,8 +444,52 @@ fn parse_mtx_file(
     // implementation also used by the CSC→CSR external transposer.
     // Without the dedup, downstream `ScxCsc::new` rejects the duplicate
     // row indices a later `build-csc`/`--rebuild-csc` would produce.
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    scx_sparse::coalesce_sorted_coo(&mut entries);
+    if is_integer {
+        int_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    } else {
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    }
+
+    // The per-entry check above cannot see a *sum*: MatrixMarket adds
+    // duplicate coordinates, so two entries that each fit can total past what
+    // `f32` holds exactly. The range check therefore belongs on the group
+    // total, before anything is cast.
+    if is_integer {
+        // Coalesce the integer branch here, on the exact values.
+        //
+        // `coalesce_sorted_coo` remains the one implementation of
+        // MatrixMarket's sum-duplicates *rule*, and this applies the identical
+        // rule — adjacent entries sharing a coordinate are summed, a zero
+        // total is left for the CSR build to drop. What differs is the
+        // arithmetic: `i128` over the values as parsed, rather than a
+        // left-to-right `f32` accumulation over values already cast down.
+        // Both failures that cost are invisible to the f32 version: a partial
+        // sum the format cannot represent (`16777216, +1, -1` passes through
+        // 16777217 and lands on 16777215), and an addend already rounded at
+        // parse time (`16777217, -16777216` sums to 0 instead of 1).
+        entries.reserve(int_entries.len());
+        let mut i = 0usize;
+        while i < int_entries.len() {
+            let (row, col, _) = int_entries[i];
+            let mut sum: i128 = 0;
+            while i < int_entries.len() && int_entries[i].0 == row && int_entries[i].1 == col {
+                sum += int_entries[i].2 as i128;
+                i += 1;
+            }
+            if !opts.allow_lossy && sum.unsigned_abs() > scx_codec::F32_MAX_EXACT_INT as u128 {
+                return Err(MtxError::LossySummedIntegerValue {
+                    row: row + 1,
+                    col: col + 1,
+                });
+            }
+            entries.push((row, col, sum as f32));
+        }
+        // Release the integer buffer before the CSR arrays are built, so the
+        // two are never resident together.
+        drop(std::mem::take(&mut int_entries));
+    } else {
+        scx_sparse::coalesce_sorted_coo(&mut entries);
+    }
 
     // Build CSR directly from the deduplicated, sorted run, dropping
     // any coordinate whose summed value is zero.
@@ -484,6 +594,20 @@ fn parse_features_tsv(reader: Box<dyn BufRead>) -> Result<RecordBatch, MtxError>
     Ok(scx_format_io::ensure_pandas_index_metadata(&batch))
 }
 
+/// Refuse an integer the `f32` value pipeline cannot hold exactly.
+///
+/// Worded from, and thresholded on, the read path's own guard
+/// (`scx_codec::guard_f32_decode_loss` / `F32_MAX_EXACT_INT`), because this is
+/// the same question asked on the way in: SCX ingest carries values as `f32`
+/// from the parser to the encoder, so an integer past 2²⁴ cannot survive the
+/// trip whatever encoding it eventually lands in.
+fn check_integer_fits_f32(value: i64, allow_lossy: bool) -> Result<(), MtxError> {
+    if allow_lossy || value.unsigned_abs() <= scx_codec::F32_MAX_EXACT_INT as u64 {
+        return Ok(());
+    }
+    Err(MtxError::LossyIntegerValue { value })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,7 +627,8 @@ mod tests {
 ";
         let bound = mtx_content.len();
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
-        let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(reader, bound).unwrap();
+        let (indptr, indices, data, n_rows, n_cols) =
+            parse_mtx_file(reader, bound, MtxReadOptions::default()).unwrap();
 
         assert_eq!(n_rows, 3);
         assert_eq!(n_cols, 4);
@@ -528,7 +653,8 @@ mod tests {
 ";
         let bound = mtx_content.len();
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
-        let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(reader, bound).unwrap();
+        let (indptr, indices, data, n_rows, n_cols) =
+            parse_mtx_file(reader, bound, MtxReadOptions::default()).unwrap();
 
         assert_eq!(n_rows, 2);
         assert_eq!(n_cols, 2);
@@ -549,7 +675,7 @@ mod tests {
 ";
         let bound = mtx_content.len();
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
-        let err = parse_mtx_file(reader, bound).unwrap_err();
+        let err = parse_mtx_file(reader, bound, MtxReadOptions::default()).unwrap_err();
         assert!(
             matches!(err, MtxError::Parse(ref m) if m.contains("symmetric")),
             "expected symmetry rejection, got: {err:?}"
@@ -566,7 +692,8 @@ mod tests {
 ";
         let bound = mtx_content.len();
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
-        let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(reader, bound).unwrap();
+        let (indptr, indices, data, n_rows, n_cols) =
+            parse_mtx_file(reader, bound, MtxReadOptions::default()).unwrap();
 
         assert_eq!(n_rows, 2);
         assert_eq!(n_cols, 2);
@@ -609,7 +736,7 @@ mod tests {
     fn test_invalid_mtx_header() {
         let content = "not a valid header\n";
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(content)));
-        let result = parse_mtx_file(reader, content.len());
+        let result = parse_mtx_file(reader, content.len(), MtxReadOptions::default());
         assert!(result.is_err());
     }
 
@@ -629,12 +756,218 @@ mod tests {
 ";
         let bound = mtx_content.len() / 6;
         let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
-        let result = parse_mtx_file(reader, bound);
+        let result = parse_mtx_file(reader, bound, MtxReadOptions::default());
         assert!(result.is_err(), "should reject oversized nnz");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
             err_msg.contains("exceeds upper bound"),
             "error should mention exceeds upper bound: {err_msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `integer` headers are taken at their word
+    // -----------------------------------------------------------------------
+
+    type ParsedCsr = (Vec<i64>, Vec<i32>, Vec<f32>);
+
+    fn parse(content: &str, allow_lossy: bool) -> Result<ParsedCsr, MtxError> {
+        let bound = content.len();
+        let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(content.to_string())));
+        let (indptr, indices, data, _, _) =
+            parse_mtx_file(reader, bound, MtxReadOptions { allow_lossy })?;
+        Ok((indptr, indices, data))
+    }
+
+    /// `is_integer` used to be computed for header validation and then
+    /// dropped: every value was parsed as `f32`, so this file silently became
+    /// `16777216`. The ingest pipeline carries `f32` end to end, so the honest
+    /// answer is to refuse rather than to round quietly.
+    #[test]
+    fn integer_value_above_2_24_is_refused() {
+        let err = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 1
+1 1 16777217
+",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("16777217") && err.contains("16777216") && err.contains("--allow-lossy"),
+            "the refusal must name the value, the limit and the escape hatch: {err}"
+        );
+    }
+
+    /// The boundary itself is representable and must still load.
+    #[test]
+    fn integer_value_at_2_24_is_accepted() {
+        let (_, _, data) = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 1
+1 1 16777216
+",
+            false,
+        )
+        .unwrap();
+        assert_eq!(data, vec![16_777_216.0f32]);
+    }
+
+    /// The escape hatch is pinned, not assumed: `allow_lossy` accepts the
+    /// value and stores the rounded one.
+    #[test]
+    fn integer_value_above_2_24_is_accepted_under_allow_lossy() {
+        let (_, _, data) = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 1
+1 1 16777217
+",
+            true,
+        )
+        .unwrap();
+        assert_eq!(data, vec![16_777_216.0f32], "rounded, as advertised");
+    }
+
+    /// Parsing as `i64` also makes the declared type mean something: an
+    /// `integer` file carrying `1.5` (or `nan` / `inf`) used to parse as `f32`
+    /// and be stored as-is.
+    #[test]
+    fn a_non_integral_value_in_an_integer_file_is_refused() {
+        for token in ["1.5", "nan", "inf"] {
+            let content = format!(
+                "\
+%%MatrixMarket matrix coordinate integer general
+1 1 1
+1 1 {token}
+"
+            );
+            let err = parse(&content, false).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid integer value") && err.contains(token),
+                "'{token}' must be refused by an integer-declared file: {err}"
+            );
+        }
+    }
+
+    /// MatrixMarket sums duplicate coordinates, so a total can cross the limit
+    /// when no single entry does. The per-entry check cannot see that.
+    #[test]
+    fn duplicate_integers_summing_past_2_24_are_refused() {
+        let err = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 2
+1 1 16777216
+1 1 16777216
+",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("duplicate coordinates at (1, 1)") && err.contains("--allow-lossy"),
+            "the summed-overflow refusal must name the coordinate: {err}"
+        );
+    }
+
+    /// The case that forces the group sum to be taken in `i64`, before
+    /// coalescing: `16777216 + 1` *is* `16777216` in `f32`, so a check run on
+    /// the coalesced value reads the rounded total and passes.
+    #[test]
+    fn duplicate_integers_whose_sum_rounds_back_under_the_limit_are_refused() {
+        let err = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 2
+1 1 16777216
+1 1 1
+",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("duplicate coordinates at (1, 1)"),
+            "a sum of 16777217 must be refused even though its f32 image is not: {err}"
+        );
+    }
+
+    /// Duplicate coordinates are summed by MatrixMarket's rule, and the sum
+    /// has to be exact even when a left-to-right `f32` accumulation would not
+    /// be.
+    ///
+    /// `16777216, +1, -1` totals 16777216 — comfortably representable. But
+    /// `coalesce_sorted_coo` adds in order, so it passes through 16777217,
+    /// which `f32` rounds down, and lands on 16777215. Folding the exact `i64`
+    /// group total into the first entry and zeroing the rest keeps
+    /// `coalesce_sorted_coo` as the one implementation of the summing rule
+    /// while giving it nothing left to round.
+    #[test]
+    fn a_duplicate_group_sums_exactly_even_when_a_partial_would_round() {
+        let (_, _, data) = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 3
+1 1 16777216
+1 1 1
+1 1 -1
+",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            data,
+            vec![16_777_216.0f32],
+            "the exact total is 16777216; an f32 running sum yields 16777215"
+        );
+    }
+
+    /// The parsed integer has to survive grouping, not be re-derived from the
+    /// `f32` the entry was cast to.
+    ///
+    /// `16777217` is not representable, so it is stored as `16777216`. Summed
+    /// against `-16777216` the exact MatrixMarket total is `1`, but reading
+    /// the addend back out of the `f32` gives `0` — and `allow_lossy` licenses
+    /// f32 *rounding*, not a value that is simply wrong. Reproduced by codex
+    /// in round 3.
+    #[test]
+    fn allow_lossy_sums_duplicates_from_the_parsed_integers_not_the_rounded_ones() {
+        let (_, _, data) = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 2
+1 1 16777217
+1 1 -16777216
+",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            data,
+            vec![1.0f32],
+            "the exact total is 1; re-deriving the addends from f32 gives 0"
+        );
+    }
+
+    /// Premise assertion: the `real` branch is untouched. A `real` file may
+    /// carry whatever `f32` carries, including values past 2²⁴ — it never
+    /// promised integer exactness, so refusing it would be a different
+    /// (and wrong) change.
+    #[test]
+    fn real_values_past_2_24_are_unaffected() {
+        let (_, _, data) = parse(
+            "\
+%%MatrixMarket matrix coordinate real general
+1 1 1
+1 1 16777217.0
+",
+            false,
+        )
+        .unwrap();
+        assert_eq!(data, vec![16_777_216.0f32]);
     }
 }

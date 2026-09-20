@@ -50,6 +50,7 @@ fn report_index_outcome(index_result: Option<ConversionPredicateIndexResult>) {
 pub fn run_subset(
     input: &Path,
     output: Option<&Path>,
+    force: bool,
     filter: Option<&str>,
     gene_file: Option<&Path>,
     modality: Option<&str>,
@@ -61,6 +62,21 @@ pub fn run_subset(
     csc_memory_limit: &str,
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse to clobber before any work, on every arm below. `--dry-run`
+    // writes nothing, so an existing output is not a collision there.
+    match (dry_run, output) {
+        (false, Some(output)) => crate::cli_utils::guard_destination(
+            &[input],
+            crate::cli_utils::Destination::File(output),
+            crate::cli_utils::SamePath::Reject,
+            force,
+        )?,
+        (true, _) => crate::cli_utils::reject_inert_force(force, "--dry-run writes nothing")?,
+        // The missing-output case is reported below, with the guidance the
+        // caller actually needs.
+        (false, None) => {}
+    }
+
     // Pure modality extraction (no filter / no genes). The output is a
     // single-modality v2 file containing just the chosen modality's
     // CSR + var, with the file's global obs.
@@ -1087,6 +1103,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -1127,6 +1144,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -1158,6 +1176,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -1188,6 +1207,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             None,
             Some(gene_file.as_path()),
             None,
@@ -1218,6 +1238,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             Some(gene_file.as_path()),
             None,
@@ -1246,6 +1267,7 @@ mod tests {
         run_subset(
             &input,
             None,
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -1270,6 +1292,7 @@ mod tests {
         let err = run_subset(
             &input,
             Some(output.as_path()),
+            false,
             None,
             None,
             None,
@@ -1295,6 +1318,7 @@ mod tests {
         let err = run_subset(
             &input,
             None,
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -1328,6 +1352,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             None,
             Some(gene_file.as_path()),
             None,
@@ -1356,6 +1381,7 @@ mod tests {
         let err = run_subset(
             &input,
             Some(dir.path().join("out.scx").as_path()),
+            false,
             None,
             Some(gene_file.as_path()),
             None,
@@ -1423,6 +1449,7 @@ mod tests {
         run_subset(
             &input_path,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -1621,6 +1648,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             Some("rna"),
@@ -1672,6 +1700,7 @@ mod tests {
             run_subset(
                 &input,
                 Some(output.as_path()),
+                false,
                 filter,
                 None,
                 Some("rna"),
@@ -1716,6 +1745,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             None,
             Some(gene_file.as_path()),
             Some("rna"),
@@ -1752,6 +1782,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             None,
             Some(gene_path.as_path()),
             None,
@@ -1880,6 +1911,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'KEEP'"),
             None,
             None,
@@ -1927,6 +1959,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'NONE'"),
             None,
             None,
@@ -1964,6 +1997,7 @@ mod tests {
         run_subset(
             &input,
             Some(without.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -1986,6 +2020,7 @@ mod tests {
         run_subset(
             &input,
             Some(with.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -2017,6 +2052,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             None,
             Some(gene_file.as_path()),
             None,
@@ -2066,6 +2102,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -2125,6 +2162,7 @@ mod tests {
         let err = run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -2158,6 +2196,7 @@ mod tests {
         let err = run_subset(
             &input,
             None,
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -2180,6 +2219,7 @@ mod tests {
         run_subset(
             &input,
             None,
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -2206,6 +2246,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             None,
             None,
             Some("rna"),
@@ -2245,6 +2286,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,
@@ -2286,6 +2328,7 @@ mod tests {
         run_subset(
             &input,
             Some(output.as_path()),
+            false,
             Some("cell_type == 'T cell'"),
             None,
             None,

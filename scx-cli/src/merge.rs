@@ -13,6 +13,7 @@ use crate::index_warnings::emit_index_summary;
 pub fn run_merge(
     inputs: &[PathBuf],
     output: &Path,
+    force: bool,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
     csc_memory_limit: &str,
@@ -43,6 +44,16 @@ pub fn run_merge(
     // Validate n_vars consistency across all inputs
     crate::cli_utils::validate_all_same_n_vars(inputs)?;
 
+    // Refuse to clobber an existing destination, and to write onto any of the
+    // inputs — `merge` reads every one of them while it writes.
+    let input_refs: Vec<&Path> = inputs.iter().map(|p| p.as_path()).collect();
+    crate::cli_utils::guard_destination(
+        &input_refs,
+        crate::cli_utils::Destination::File(output),
+        crate::cli_utils::SamePath::Reject,
+        force,
+    )?;
+
     // Show progress spinner
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -54,7 +65,6 @@ pub fn run_merge(
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Build refs for the ops API
-    let input_refs: Vec<&Path> = inputs.iter().map(|p| p.as_path()).collect();
 
     // Parse the optional --uns-policy flag.
     let uns_policy = match uns_policy.as_deref() {

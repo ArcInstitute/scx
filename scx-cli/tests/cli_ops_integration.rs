@@ -2476,3 +2476,483 @@ fn query_output_without_count_still_writes() {
     );
     assert!(out.exists(), "--output alone must still write the file");
 }
+
+// ---------------------------------------------------------------------------
+// Destination overwrite protection
+//
+// `ScxWriter::finish` persists with `rename(2)`, which replaces
+// unconditionally, so a subcommand with no existence check does not "overwrite
+// on request" — it destroys the file silently. `optimize` / `compact` / `sort`
+// / `build-csc` demanded `--force`; `convert`, `merge`, `subset`,
+// `query --output`, `upgrade` and the cloud ops did not.
+// ---------------------------------------------------------------------------
+
+const SENTINEL: &[u8] = b"do not clobber me";
+
+/// Assert that `args` refuses to write over `dest` without `--force`, leaves it
+/// byte-identical, and succeeds once `--force` is added.
+///
+/// The byte-identity half is the point. An exit-code-only assertion passes just
+/// as happily against a guard that fires *after* truncating the destination,
+/// which is the worse failure of the two.
+fn assert_force_protects(args: &[&str], dest: &std::path::Path) {
+    let before = std::fs::read(dest).expect("destination must exist before the refusal");
+
+    let out = scx_cli().args(args).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a refusal for {args:?}, got success"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("--force"),
+        "the refusal must name the collision and the flag: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dest).unwrap(),
+        before,
+        "a refused invocation must leave {} untouched",
+        dest.display()
+    );
+
+    let mut forced: Vec<&str> = args.to_vec();
+    forced.push("--force");
+    let out = scx_cli().args(&forced).output().unwrap();
+    assert!(
+        out.status.success(),
+        "--force should have been accepted for {forced:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn merge_refuses_to_clobber_its_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_test_file(&dir, "merge_a.scx", 6, 10);
+    let b = write_test_file(&dir, "merge_b.scx", 5, 10);
+    let dest = dir.path().join("merged.scx");
+    std::fs::write(&dest, SENTINEL).unwrap();
+
+    assert_force_protects(
+        &[
+            "merge",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--output",
+            dest.to_str().unwrap(),
+        ],
+        &dest,
+    );
+    ScxReader::open(&dest).expect("the forced merge must have written a readable file");
+}
+
+/// `merge` is the one command with several inputs, and writing onto *any* of
+/// them is the same data loss as writing onto the single input `compact` has.
+#[test]
+fn merge_refuses_to_write_onto_one_of_its_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write_test_file(&dir, "merge_in_a.scx", 6, 10);
+    let b = write_test_file(&dir, "merge_in_b.scx", 5, 10);
+    let before = std::fs::read(&b).unwrap();
+
+    let out = scx_cli()
+        .args([
+            "merge",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--output",
+            b.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "writing onto an input must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("must be different files"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(std::fs::read(&b).unwrap(), before, "input b must survive");
+}
+
+#[test]
+fn subset_refuses_to_clobber_its_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "subset_src.scx", 9, 10);
+    let dest = dir.path().join("subset_out.scx");
+    std::fs::write(&dest, SENTINEL).unwrap();
+
+    assert_force_protects(
+        &[
+            "subset",
+            input.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'T cell'",
+        ],
+        &dest,
+    );
+    ScxReader::open(&dest).expect("the forced subset must have written a readable file");
+}
+
+/// `--dry-run` writes nothing, so an existing output is not a collision there
+/// and must not be turned into one.
+#[test]
+fn subset_dry_run_ignores_an_existing_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "subset_dry_src.scx", 9, 10);
+    let dest = dir.path().join("subset_dry_out.scx");
+    std::fs::write(&dest, SENTINEL).unwrap();
+
+    let out = scx_cli()
+        .args([
+            "subset",
+            input.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'T cell'",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--dry-run must not trip the overwrite guard: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), SENTINEL);
+}
+
+#[test]
+fn query_output_refuses_to_clobber() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "query_src.scx", 9, 10);
+    let dest = dir.path().join("query_out.scx");
+    std::fs::write(&dest, SENTINEL).unwrap();
+
+    assert_force_protects(
+        &[
+            "query",
+            input.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'T cell'",
+            "--output",
+            dest.to_str().unwrap(),
+        ],
+        &dest,
+    );
+    ScxReader::open(&dest).expect("the forced query must have written a readable file");
+}
+
+#[test]
+fn upgrade_refuses_to_clobber_its_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "upgrade_src.scx", 6, 10);
+    let dest = dir.path().join("upgrade_out.scx");
+    std::fs::write(&dest, SENTINEL).unwrap();
+
+    assert_force_protects(
+        &["upgrade", input.to_str().unwrap(), dest.to_str().unwrap()],
+        &dest,
+    );
+}
+
+/// The unlisted data-loss defect this PR closes.
+///
+/// `compact` unlinked the output when `--force` was set and *then* read
+/// `metadata(input)`. With `input == output` that deleted the input and failed
+/// — the file was gone, and the command reported an error about it being
+/// missing. `sort` and `build-csc` already carried an explicit same-path guard
+/// with a comment naming exactly this hazard; `compact` was the third instance.
+#[test]
+fn compact_refuses_to_write_onto_its_own_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "compact_self.scx", 8, 10);
+    let before = std::fs::read(&input).unwrap();
+
+    let out = scx_cli()
+        .args([
+            "compact",
+            input.to_str().unwrap(),
+            input.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "compacting a file onto itself must be refused, not attempted"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("must be different files"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        before,
+        "the input must survive the refusal — the defect was that it did not"
+    );
+    ScxReader::open(&input).expect("and must still be readable");
+}
+
+/// `--force` is a question about a destination, so a form that writes none
+/// must refuse it rather than accept it as a no-op.
+///
+/// A silently inert flag is the reason this is worth a test: `scx
+/// modify-metadata --index-*` without `--obs`/`--var` used to exit 0, print
+/// "Updated metadata…", and build nothing. `scx build-csc`'s in-place arm
+/// already stated the rule; these are the other forms it applies to.
+#[test]
+fn force_is_refused_where_nothing_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "inert_force.scx", 6, 10);
+    let i = input.to_str().unwrap();
+    let out = dir.path().join("never_written.scx");
+
+    let cases: Vec<Vec<&str>> = vec![
+        // A query that prints rather than writes.
+        vec!["query", i, "--filter", "cell_type == 'T cell'", "--force"],
+        vec!["query", i, "--count", "--force"],
+        // A dry run.
+        vec![
+            "subset",
+            i,
+            out.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'T cell'",
+            "--dry-run",
+            "--force",
+        ],
+        // An in-place upgrade.
+        vec!["upgrade", i, "--in-place", "--force"],
+    ];
+
+    for args in cases {
+        let res = scx_cli().args(&args).output().unwrap();
+        assert!(
+            !res.status.success(),
+            "expected a refusal for {args:?}, got success"
+        );
+        let stderr = String::from_utf8_lossy(&res.stderr);
+        assert!(
+            stderr.contains("--force applies only when writing to an output"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(!out.exists(), "no refused invocation may create a file");
+}
+
+/// `--in-place` writes a temp beside `<INPUT>` and renames over it, so a
+/// positional `<OUTPUT>` passed alongside was silently ignored — the file the
+/// user named was never written. Worse once `--force` existed: the guard would
+/// demand `--force` for an output the command was never going to touch.
+#[test]
+fn upgrade_refuses_in_place_together_with_an_output_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "upgrade_both.scx", 6, 10);
+    let out = dir.path().join("ignored.scx");
+
+    let res = scx_cli()
+        .args([
+            "upgrade",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--in-place",
+        ])
+        .output()
+        .unwrap();
+    assert!(!res.status.success(), "the combination must be refused");
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("--in-place") && stderr.contains("<OUTPUT>"),
+        "the refusal must name both: {stderr}"
+    );
+    assert!(!out.exists(), "nothing should have been written");
+}
+
+/// `scx explode --force` must *replace* a non-empty `.scxd`, not overlay it.
+///
+/// `scx_cloud::explode` writes the sections the current catalog names and
+/// leaves every other file alone, so a previous explode's extra shards would
+/// ride along. That is invisible to `pack` / `info` / `query`, which read the
+/// catalog, but not to a directory sync of the `.scxd`.
+#[cfg(feature = "cloud")]
+#[test]
+fn explode_force_replaces_a_non_empty_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = write_test_file(&dir, "explode_big.scx", 12, 10);
+    let out = dir.path().join("out.scxd");
+
+    assert!(scx_cli()
+        .args(["explode", big.to_str().unwrap(), out.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    // A file from a previous explode that the next one will not name.
+    let orphan = out.join("X_shard_999.bin");
+    std::fs::write(&orphan, b"left over from a previous explode").unwrap();
+
+    // Without --force the non-empty directory is refused outright.
+    let refused = scx_cli()
+        .args(["explode", big.to_str().unwrap(), out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(orphan.exists(), "a refused explode must change nothing");
+
+    let forced = scx_cli()
+        .args([
+            "explode",
+            big.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        forced.status.success(),
+        "explode --force: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(
+        !orphan.exists(),
+        "--force must replace the directory, not overlay it"
+    );
+    assert!(
+        out.join("header.bin").exists() || std::fs::read_dir(&out).unwrap().count() > 0,
+        "the replacement explode must have populated the directory"
+    );
+}
+
+/// `explode --force` replaces the destination tree wholesale, so an input
+/// living inside it would be deleted along with everything else. The guard's
+/// same-path check compares a file against a directory and cannot see this.
+#[cfg(feature = "cloud")]
+#[test]
+fn explode_force_refuses_an_input_inside_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("dest.scxd");
+    std::fs::create_dir_all(&dest).unwrap();
+    // Make it non-empty so `--force` takes the replacing path.
+    std::fs::write(dest.join("stale.bin"), b"previous explode").unwrap();
+    // …and put the source inside it.
+    let input = write_test_file(&dir, "inside.scx", 6, 10);
+    let inside = dest.join("inside.scx");
+    std::fs::rename(&input, &inside).unwrap();
+    let original = std::fs::read(&inside).unwrap();
+
+    let out = scx_cli()
+        .args([
+            "explode",
+            inside.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the containment must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is inside the output"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&inside).unwrap(),
+        original,
+        "the input must survive the refusal"
+    );
+}
+
+/// Equality is not the whole "never overwrite an input" invariant.
+///
+/// A *directory* input and a file destination inside it compare unequal, so
+/// the same-path check missed them entirely: `scx convert --from mtx dir
+/// dir/matrix.mtx.gz --force` exited 0 and replaced the source matrix with an
+/// SCX file. The mirror case — an input inside a directory destination — is
+/// what the explode swap would delete.
+#[test]
+fn a_destination_inside_a_directory_input_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    std::fs::create_dir_all(&mtx_dir).unwrap();
+    std::fs::write(
+        mtx_dir.join("matrix.mtx"),
+        "%%MatrixMarket matrix coordinate integer general\n2 2 1\n1 1 3\n",
+    )
+    .unwrap();
+    std::fs::write(mtx_dir.join("barcodes.tsv"), "AAAC-1\nBBBC-1\n").unwrap();
+    std::fs::write(
+        mtx_dir.join("features.tsv"),
+        "G1\tA\tGene Expression\nG2\tB\tGene Expression\n",
+    )
+    .unwrap();
+
+    let dest = mtx_dir.join("matrix.mtx.gz");
+    std::fs::write(&dest, b"a member of the source directory").unwrap();
+    let before = std::fs::read(&dest).unwrap();
+
+    let out = scx_cli()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "writing into the source directory must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is inside the input"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        before,
+        "the source member must survive the refusal"
+    );
+}
+
+/// A `.scxd` destination spelled `.` must not be read as containing the whole
+/// filesystem.
+///
+/// `normalize(".")` is the empty path and `Path::starts_with(empty)` is true
+/// for every path, so a lexical containment arm without that special case
+/// refuses `scx explode /elsewhere/x.scx .` — a source on a different
+/// filesystem entirely. This is the arm the `MtxDir` destinations do not
+/// reach, so it needs its own test.
+#[cfg(feature = "cloud")]
+#[test]
+fn a_dot_scxd_destination_does_not_contain_every_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "source.scx", 6, 10);
+
+    // An empty `.scxd` that happens to be the working directory.
+    let work = dir.path().join("out.scxd");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = scx_cli()
+        .current_dir(&work)
+        .args(["explode", input.to_str().unwrap(), "."])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "`.` as the .scxd destination must work when the source is elsewhere: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_dir(&work).unwrap().next().is_some(),
+        "the explode should have populated the directory"
+    );
+}
