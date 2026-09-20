@@ -23,6 +23,16 @@ pub fn run_upgrade(
     if output.is_none() && !in_place {
         return Err("Specify an output path or use --in-place".into());
     }
+    // …and not both: `--in-place` writes a temp beside <INPUT> and renames
+    // over it, so a positional <OUTPUT> given alongside it was silently
+    // ignored — the file the user named was never written.
+    if output.is_some() && in_place {
+        return Err(
+            "--in-place rewrites <INPUT>; it cannot be combined with an <OUTPUT> path. \
+             Drop one of the two."
+                .into(),
+        );
+    }
 
     // 1b. Refuse to clobber a *different* pre-existing file. `--output <input>`
     // is the explicit spelling of what `--in-place` does, and `ScxWriter`

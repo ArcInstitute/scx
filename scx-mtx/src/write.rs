@@ -56,8 +56,10 @@ pub fn write_scx_to_mtx_for(
     output_dir: &Path,
     modality: Option<&str>,
 ) -> Result<(), MtxError> {
-    std::fs::create_dir_all(output_dir)?;
-
+    // Everything fallible that does not touch the destination happens first.
+    // A refused export — an unreadable source, a multimodal file with no
+    // `modality`, an unknown name — must leave the filesystem exactly as it
+    // found it, including not creating `output_dir`.
     let reader = ScxReader::open(scx_path)?;
     let modality_id = resolve_modality(&reader, modality)?;
 
@@ -78,42 +80,102 @@ pub fn write_scx_to_mtx_for(
         None => reader.n_vars() as usize,
     };
 
-    write_matrix_mtx(output_dir, &reader, &shards, keep.as_deref(), n_obs, n_vars)?;
+    std::fs::create_dir_all(output_dir)?;
 
-    // Write barcodes.tsv.gz. Synthetic barcodes are a fallback for *genuinely
-    // absent* obs only; a decode/checksum failure is corruption and must abort
-    // rather than silently emit fabricated `cell_i` IDs (SCX-009).
+    // Every member is written to a temp name and renamed into place only once
+    // all three have succeeded, so a failure part-way through leaves a
+    // previous export byte-identical rather than half-replaced. `Staged`
+    // removes anything left over on drop, including on the error paths below.
+    let mut staged = Staged::new(output_dir);
+
+    write_matrix_mtx(
+        staged.temp_for(MATRIX_MTX),
+        &reader,
+        &shards,
+        keep.as_deref(),
+        n_obs,
+        n_vars,
+    )?;
+
+    // Synthetic barcodes are a fallback for *genuinely absent* obs only; a
+    // decode/checksum failure is corruption and must abort rather than
+    // silently emit fabricated `cell_i` IDs (SCX-009).
     match reader.read_obs() {
         Ok(obs) => {
             let obs = match keep.as_deref() {
                 Some(mask) => scx_format_io::filter_batch_by_keep_mask(&obs, mask)?,
                 None => obs,
             };
-            write_barcodes_tsv(output_dir, &obs)?
+            write_barcodes_tsv(staged.temp_for(BARCODES_TSV), &obs)?
         }
         Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
-            write_synthetic_barcodes(output_dir, n_obs)?;
+            write_synthetic_barcodes(staged.temp_for(BARCODES_TSV), n_obs)?;
         }
         Err(e) => return Err(e.into()),
     }
 
-    // Write features.tsv.gz (same absence-vs-corruption rule as obs). A
-    // multimodal file has no global `var`, so the per-modality section is the
-    // only one that exists there.
-    let var = if reader.is_multimodal() {
-        reader.read_var_for(modality_id)
-    } else {
-        reader.read_var()
-    };
-    match var {
-        Ok(var) => write_features_tsv(output_dir, &var)?,
+    // Same absence-vs-corruption rule as obs. `read_var_for` routes
+    // `modality_id == 0` to `read_var()`, so this one call covers both the
+    // multimodal per-modality section and the global one.
+    match reader.read_var_for(modality_id) {
+        Ok(var) => write_features_tsv(staged.temp_for(FEATURES_TSV), &var)?,
         Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {
-            write_synthetic_features(output_dir, n_vars)?;
+            write_synthetic_features(staged.temp_for(FEATURES_TSV), n_vars)?;
         }
         Err(e) => return Err(e.into()),
     }
 
-    Ok(())
+    staged.commit()
+}
+
+const MATRIX_MTX: &str = "matrix.mtx.gz";
+const BARCODES_TSV: &str = "barcodes.tsv.gz";
+const FEATURES_TSV: &str = "features.tsv.gz";
+
+/// Members written under a temp name and renamed into place together.
+///
+/// The point is the failure path, not the happy one: before this existed a
+/// half-finished export left the destination with a fresh `matrix.mtx.gz`
+/// beside a previous run's `barcodes.tsv.gz`, describing two different
+/// matrices. Anything still staged when this drops is removed, so an early
+/// `?` cannot leave debris either.
+struct Staged {
+    dir: std::path::PathBuf,
+    members: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+impl Staged {
+    fn new(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            members: Vec::new(),
+        }
+    }
+
+    /// Reserve `name` and hand back the temp path to write to. The temp lives
+    /// in the destination directory so the commit is a rename, not a copy.
+    fn temp_for(&mut self, name: &str) -> &Path {
+        let temp = self
+            .dir
+            .join(format!(".{name}.scx-tmp-{}", std::process::id()));
+        self.members.push((temp, self.dir.join(name)));
+        &self.members.last().expect("just pushed").0
+    }
+
+    fn commit(mut self) -> Result<(), MtxError> {
+        for (temp, final_path) in std::mem::take(&mut self.members) {
+            std::fs::rename(&temp, &final_path)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        for (temp, _) in &self.members {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
 }
 
 /// Resolve `--modality` against the file. Mirrors the refusal the streaming
@@ -161,7 +223,7 @@ struct MatrixHeaderFacts {
 /// line is the first data line, and the declared type also formats every
 /// value below it, so neither can be deferred until the body is known.
 fn write_matrix_mtx(
-    dir: &Path,
+    path: &Path,
     reader: &ScxReader,
     shards: &[&FullCatalogEntry],
     keep: Option<&[bool]>,
@@ -170,8 +232,7 @@ fn write_matrix_mtx(
 ) -> Result<(), MtxError> {
     let facts = scan_header_facts(reader, shards, keep)?;
 
-    let path = dir.join("matrix.mtx.gz");
-    let file = std::fs::File::create(&path)?;
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
@@ -363,9 +424,8 @@ fn kept_values_are_integral(
 }
 
 /// Write `barcodes.tsv.gz` from obs RecordBatch.
-fn write_barcodes_tsv(dir: &Path, obs: &arrow::array::RecordBatch) -> Result<(), MtxError> {
-    let path = dir.join("barcodes.tsv.gz");
-    let file = std::fs::File::create(&path)?;
+fn write_barcodes_tsv(path: &Path, obs: &arrow::array::RecordBatch) -> Result<(), MtxError> {
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
@@ -405,9 +465,8 @@ fn write_barcodes_tsv(dir: &Path, obs: &arrow::array::RecordBatch) -> Result<(),
 }
 
 /// Write `features.tsv.gz` from var RecordBatch.
-fn write_features_tsv(dir: &Path, var: &arrow::array::RecordBatch) -> Result<(), MtxError> {
-    let path = dir.join("features.tsv.gz");
-    let file = std::fs::File::create(&path)?;
+fn write_features_tsv(path: &Path, var: &arrow::array::RecordBatch) -> Result<(), MtxError> {
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
@@ -491,9 +550,8 @@ fn string_value(arr: &arrow::array::StringArray, idx: usize) -> &str {
 }
 
 /// Write synthetic barcodes when obs is not available.
-fn write_synthetic_barcodes(dir: &Path, n_obs: usize) -> Result<(), MtxError> {
-    let path = dir.join("barcodes.tsv.gz");
-    let file = std::fs::File::create(&path)?;
+fn write_synthetic_barcodes(path: &Path, n_obs: usize) -> Result<(), MtxError> {
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 
@@ -506,9 +564,8 @@ fn write_synthetic_barcodes(dir: &Path, n_obs: usize) -> Result<(), MtxError> {
 }
 
 /// Write synthetic features when var is not available.
-fn write_synthetic_features(dir: &Path, n_vars: usize) -> Result<(), MtxError> {
-    let path = dir.join("features.tsv.gz");
-    let file = std::fs::File::create(&path)?;
+fn write_synthetic_features(path: &Path, n_vars: usize) -> Result<(), MtxError> {
+    let file = std::fs::File::create(path)?;
     let gz = GzEncoder::new(file, Compression::default());
     let mut w = BufWriter::new(gz);
 

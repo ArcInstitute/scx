@@ -109,6 +109,10 @@ pub enum Destination<'a> {
 /// shadow. The writer emits only the three `.gz` forms; the other five are
 /// spellings [`scx_mtx::read_mtx_directory`] accepts, and leaving one next to
 /// a fresh export is how a directory comes to describe two different matrices.
+/// The three members `scx_mtx::write_scx_to_mtx_for` writes. Its own rename
+/// replaces these, so they are never separately removed.
+const MTX_WRITTEN_MEMBERS: &[&str] = &["matrix.mtx.gz", "barcodes.tsv.gz", "features.tsv.gz"];
+
 const MTX_MEMBERS: &[&str] = &[
     "matrix.mtx.gz",
     "matrix.mtx",
@@ -131,8 +135,12 @@ impl<'a> Destination<'a> {
     /// replace or leave behind. Empty means there is nothing to clobber.
     fn collisions(&self) -> Vec<PathBuf> {
         match *self {
+            // `symlink_metadata`, not `exists()`: `Path::exists` follows the
+            // link and answers `false` for a dangling symlink, so the guard
+            // would wave one through and `persist`'s rename would replace it
+            // without `--force`. Any existing entry is a collision.
             Destination::File(p) => {
-                if p.exists() {
+                if std::fs::symlink_metadata(p).is_ok() {
                     vec![p.to_path_buf()]
                 } else {
                     Vec::new()
@@ -197,12 +205,20 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// Order matters. The same-path verdict is reached *before* anything is
 /// unlinked, because the failure it prevents is destroying the input.
 ///
-/// On `force`, a `File` destination is **not** unlinked: `ScxWriter::finish`
-/// renames over it atomically (`scx-format-io/src/writer.rs`), so removing it
-/// first only widens a window in which neither the old nor the new file exists.
-/// An `MtxDir` does unlink — but only the member names above, never the
-/// directory — because its members are written by name and a stale one would
-/// survive the export.
+/// **This guard never deletes anything.** It answers one question — may this
+/// command write here — and nothing else. An earlier version unlinked an
+/// `MtxDir`'s members as soon as `--force` was seen, which ran *before* the
+/// remaining flag validation and before the source file was even opened: a
+/// forced invocation that then failed had already destroyed the previous
+/// export. That is the data-loss class this helper exists to close, so the
+/// rule is now structural rather than a matter of call ordering. Removal of
+/// anything belongs after a successful write, at the call site that knows the
+/// write succeeded.
+///
+/// Nothing is unlinked on `force` for a `File` destination either:
+/// `ScxWriter::finish` renames over it atomically
+/// (`scx-format-io/src/writer.rs`), so removing it first would only widen a
+/// window in which neither the old nor the new file exists.
 ///
 /// `inputs` is a slice because `scx merge` has several, and writing onto *any*
 /// of them is the same data loss as writing onto the one input `compact` has.
@@ -228,17 +244,39 @@ pub fn guard_destination(
     }
 
     let collisions = dest.collisions();
-    if collisions.is_empty() {
+    if collisions.is_empty() || force {
         return Ok(());
     }
-    if !force {
-        return Err(overwrite_refusal(&dest, &collisions));
-    }
+    Err(overwrite_refusal(&dest, &collisions))
+}
 
-    if matches!(dest, Destination::MtxDir(_)) {
-        for path in &collisions {
-            std::fs::remove_file(path)?;
+/// Remove the MTX member spellings an export does **not** write, so a stale one
+/// cannot survive beside the fresh files and describe a different matrix.
+///
+/// Call this only after `write_scx_to_mtx_for` has returned `Ok` and only when
+/// `--force` authorised the overwrite. The three members the writer does
+/// produce are replaced by its own rename, so they are not listed here; these
+/// are the alternative spellings [`scx_mtx::read_mtx_directory`] also accepts
+/// (`matrix.mtx`, the uncompressed `.tsv` forms, and the v2 `genes.tsv[.gz]`
+/// that would otherwise be read as the export's own feature table).
+///
+/// `protect` names paths that must never be removed whatever their spelling.
+/// The destination is a *directory*, so the same-path check in
+/// [`guard_destination`] compares the input against the directory and cannot
+/// see an input that happens to live inside it under one of these names.
+pub fn clear_stale_mtx_aliases(dir: &Path, protect: &[&Path]) -> CliResult<()> {
+    for name in MTX_MEMBERS {
+        if MTX_WRITTEN_MEMBERS.contains(name) {
+            continue;
         }
+        let path = dir.join(name);
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        if protect.iter().any(|p| same_file(p, &path)) {
+            continue;
+        }
+        std::fs::remove_file(&path)?;
     }
     Ok(())
 }

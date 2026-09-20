@@ -428,20 +428,33 @@ fn parse_mtx_file(
     // exact failure this is here to catch. Every entry has already been proved
     // exactly representable, so `v as i64` recovers the integer it was parsed
     // from.
-    if is_integer && !opts.allow_lossy {
+    if is_integer {
         let mut i = 0usize;
         while i < entries.len() {
             let (row, col, _) = entries[i];
+            let start = i;
             let mut sum: i64 = 0;
             while i < entries.len() && entries[i].0 == row && entries[i].1 == col {
                 sum = sum.saturating_add(entries[i].2 as i64);
                 i += 1;
             }
-            if sum.unsigned_abs() > scx_codec::F32_MAX_EXACT_INT as u64 {
+            if !opts.allow_lossy && sum.unsigned_abs() > scx_codec::F32_MAX_EXACT_INT as u64 {
                 return Err(MtxError::LossySummedIntegerValue {
                     row: row + 1,
                     col: col + 1,
                 });
+            }
+            // Fold the exact total into the group's first entry and zero the
+            // rest. `coalesce_sorted_coo` still does the coalescing — it stays
+            // the single implementation of the sum-duplicates rule — but it
+            // now adds `exact + 0.0 + 0.0 …` rather than re-deriving the total
+            // in `f32`. Its left-to-right `f32` sum can visit an intermediate
+            // the format cannot represent even when the total is fine:
+            // `16777216, +1, -1` passes through `16777217`, which rounds, and
+            // lands on 16777215 instead of 16777216.
+            entries[start].2 = sum as f32;
+            for e in entries[start + 1..i].iter_mut() {
+                e.2 = 0.0;
             }
         }
     }
@@ -850,6 +863,36 @@ mod tests {
         assert!(
             err.contains("duplicate coordinates at (1, 1)"),
             "a sum of 16777217 must be refused even though its f32 image is not: {err}"
+        );
+    }
+
+    /// Duplicate coordinates are summed by MatrixMarket's rule, and the sum
+    /// has to be exact even when a left-to-right `f32` accumulation would not
+    /// be.
+    ///
+    /// `16777216, +1, -1` totals 16777216 — comfortably representable. But
+    /// `coalesce_sorted_coo` adds in order, so it passes through 16777217,
+    /// which `f32` rounds down, and lands on 16777215. Folding the exact `i64`
+    /// group total into the first entry and zeroing the rest keeps
+    /// `coalesce_sorted_coo` as the one implementation of the summing rule
+    /// while giving it nothing left to round.
+    #[test]
+    fn a_duplicate_group_sums_exactly_even_when_a_partial_would_round() {
+        let (_, _, data) = parse(
+            "\
+%%MatrixMarket matrix coordinate integer general
+1 1 3
+1 1 16777216
+1 1 1
+1 1 -1
+",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            data,
+            vec![16_777_216.0f32],
+            "the exact total is 16777216; an f32 running sum yields 16777215"
         );
     }
 

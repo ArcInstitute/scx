@@ -2745,3 +2745,86 @@ fn force_is_refused_where_nothing_is_written() {
     }
     assert!(!out.exists(), "no refused invocation may create a file");
 }
+
+/// `--in-place` writes a temp beside `<INPUT>` and renames over it, so a
+/// positional `<OUTPUT>` passed alongside was silently ignored — the file the
+/// user named was never written. Worse once `--force` existed: the guard would
+/// demand `--force` for an output the command was never going to touch.
+#[test]
+fn upgrade_refuses_in_place_together_with_an_output_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "upgrade_both.scx", 6, 10);
+    let out = dir.path().join("ignored.scx");
+
+    let res = scx_cli()
+        .args([
+            "upgrade",
+            input.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--in-place",
+        ])
+        .output()
+        .unwrap();
+    assert!(!res.status.success(), "the combination must be refused");
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("--in-place") && stderr.contains("<OUTPUT>"),
+        "the refusal must name both: {stderr}"
+    );
+    assert!(!out.exists(), "nothing should have been written");
+}
+
+/// `scx explode --force` must *replace* a non-empty `.scxd`, not overlay it.
+///
+/// `scx_cloud::explode` writes the sections the current catalog names and
+/// leaves every other file alone, so a previous explode's extra shards would
+/// ride along. That is invisible to `pack` / `info` / `query`, which read the
+/// catalog, but not to a directory sync of the `.scxd`.
+#[cfg(feature = "cloud")]
+#[test]
+fn explode_force_replaces_a_non_empty_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = write_test_file(&dir, "explode_big.scx", 12, 10);
+    let out = dir.path().join("out.scxd");
+
+    assert!(scx_cli()
+        .args(["explode", big.to_str().unwrap(), out.to_str().unwrap()])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    // A file from a previous explode that the next one will not name.
+    let orphan = out.join("X_shard_999.bin");
+    std::fs::write(&orphan, b"left over from a previous explode").unwrap();
+
+    // Without --force the non-empty directory is refused outright.
+    let refused = scx_cli()
+        .args(["explode", big.to_str().unwrap(), out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(orphan.exists(), "a refused explode must change nothing");
+
+    let forced = scx_cli()
+        .args([
+            "explode",
+            big.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        forced.status.success(),
+        "explode --force: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(
+        !orphan.exists(),
+        "--force must replace the directory, not overlay it"
+    );
+    assert!(
+        out.join("header.bin").exists() || std::fs::read_dir(&out).unwrap().count() > 0,
+        "the replacement explode must have populated the directory"
+    );
+}

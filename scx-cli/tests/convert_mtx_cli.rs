@@ -547,3 +547,189 @@ fn allow_lossy_is_rejected_on_a_non_mtx_direction() {
         "{stderr}"
     );
 }
+
+/// The defect all three round-1 reviewers found, and the invariant the
+/// round-1 tests stated for `File` destinations but never checked here.
+///
+/// `--force` used to unlink the MTX members inside the destination guard,
+/// which runs straight after direction detection — before the remaining flag
+/// validation and before the source is even opened. So a forced invocation
+/// that then failed for *any* reason had already destroyed the previous
+/// export. Reproduced on the pre-fix build: the directory came back empty.
+#[test]
+fn a_forced_export_that_fails_after_the_guard_leaves_the_old_one_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let scx_path = dir.path().join("mid.scx");
+    assert!(scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    // Seed a real export, then record every member byte for byte.
+    let out_dir = dir.path().join("export");
+    assert!(scx()
+        .args([
+            "convert",
+            "--to",
+            "mtx",
+            scx_path.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let before: Vec<(String, Vec<u8>)> = member_snapshot(&out_dir);
+    assert_eq!(before.len(), 3, "the seeded export should have 3 members");
+
+    // Each of these is forced, collides with that export, and fails *after*
+    // the guard: a flag the direction rejects, and a source that cannot be
+    // opened. Neither may touch the directory.
+    let missing = dir.path().join("does_not_exist.scx");
+    for args in [
+        vec![
+            "convert",
+            "--to",
+            "mtx",
+            scx_path.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+            "--force",
+            "--allow-lossy",
+        ],
+        vec![
+            "convert",
+            "--to",
+            "mtx",
+            missing.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+            "--force",
+        ],
+    ] {
+        let out = scx().args(&args).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "expected a failure for {args:?}, got success"
+        );
+        assert_eq!(
+            member_snapshot(&out_dir),
+            before,
+            "a forced invocation that failed must leave every member byte-identical: {args:?}"
+        );
+    }
+}
+
+/// …and the accept side: a forced export that *succeeds* still replaces the
+/// members and clears the stale v2 spelling. Without this the test above
+/// would pass against a `--force` that had simply stopped working.
+#[test]
+fn a_forced_export_that_succeeds_replaces_members_and_clears_stale_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    create_mtx_dir(&mtx_dir);
+    let scx_path = dir.path().join("mid.scx");
+    assert!(scx()
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            mtx_dir.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let out_dir = dir.path().join("export");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join("matrix.mtx.gz"), b"stale").unwrap();
+    std::fs::write(out_dir.join("genes.tsv.gz"), b"stale v2 features").unwrap();
+
+    let out = scx()
+        .args([
+            "convert",
+            "--to",
+            "mtx",
+            scx_path.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--force: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(
+        std::fs::read(out_dir.join("matrix.mtx.gz")).unwrap(),
+        b"stale".to_vec(),
+        "the stale matrix must have been replaced"
+    );
+    assert!(
+        !out_dir.join("genes.tsv.gz").exists(),
+        "the stale v2 features file must not survive beside features.tsv.gz"
+    );
+    assert!(out_dir.join("features.tsv.gz").exists());
+    // No staging debris left behind.
+    let leftovers: Vec<String> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(leftovers.is_empty(), "staging debris: {leftovers:?}");
+}
+
+/// A refused export must not even create the destination directory — a
+/// command that errors should not have made anything.
+#[test]
+fn a_refused_export_does_not_create_the_output_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does_not_exist.scx");
+    let out_dir = dir.path().join("never_made");
+
+    let out = scx()
+        .args([
+            "convert",
+            "--to",
+            "mtx",
+            missing.to_str().unwrap(),
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        !out_dir.exists(),
+        "a refused export created its output directory"
+    );
+}
+
+/// Every member of an MTX directory, sorted, for byte-for-byte comparison.
+fn member_snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(e.path()).unwrap_or_default(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}

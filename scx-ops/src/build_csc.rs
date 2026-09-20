@@ -85,9 +85,10 @@ pub fn run_build_csc(
         )
         .into());
     }
-    if output.exists() && force {
-        std::fs::remove_file(output)?;
-    }
+    // Deliberately no `remove_file`: `ScxWriter::finish` persists with
+    // `rename(2)`, which replaces the output atomically, so unlinking first
+    // would only widen a window in which neither the old nor the new file
+    // exists. Same-path is already refused above.
 
     // 4. Open input file
     let reader = ScxReader::open(input)?;

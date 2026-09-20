@@ -2217,7 +2217,7 @@ fn run_convert(
                 allow_lossy,
             );
         }
-        "scx_to_mtx" => return dispatch_scx_to_mtx(input, output, modality),
+        "scx_to_mtx" => return dispatch_scx_to_mtx(input, output, modality, force),
         _ => {}
     }
 
@@ -2783,6 +2783,7 @@ fn dispatch_scx_to_mtx(
     input: &std::path::Path,
     output: &std::path::Path,
     modality: Option<&str>,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use indicatif::{ProgressBar, ProgressStyle};
 
@@ -2795,6 +2796,16 @@ fn dispatch_scx_to_mtx(
     pb.set_message(format!("Converting to MTX {}...", output.display()));
 
     scx_mtx::write_scx_to_mtx_for(input, output, modality)?;
+
+    // Only now that the export has succeeded, and only because `--force`
+    // authorised the overwrite, drop the member spellings this writer does not
+    // produce — a stale `genes.tsv.gz` beside a fresh `features.tsv.gz` is a
+    // directory that describes two different matrices. Doing this before the
+    // write is what made a failed forced invocation destroy the previous
+    // export.
+    if force {
+        cli_utils::clear_stale_mtx_aliases(output, &[input])?;
+    }
 
     pb.finish_and_clear();
     println!("Converted {} -> {}", input.display(), output.display());
