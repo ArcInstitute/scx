@@ -939,21 +939,25 @@ def test_to_anndata_accepts_a_file_whose_only_modality_is_id_1(tmp_path):
     assert reader.is_multimodal, "fixture premise: the one-entry table sets the flag"
     assert reader.to_anndata().shape == (12, 7)
 
-    # But only the **unfiltered** whole-matrix read is well defined here, and
-    # saying so is the point: the filtered route goes through the query engine,
-    # which is modality-scoped and on this file finds modality 0 owning no
-    # shards and no `var` section. It used to raise a bare
-    # `section not found: var`; it now says the same thing `query()` does.
+    # The **default eager** filtered read is the one that needs a modality: it
+    # goes through the query engine, which is modality-scoped and on this file
+    # finds modality 0 owning no shards and no `var` section. It used to raise a
+    # bare `section not found: var`; it now says what `query()` says. The other
+    # two filtered routes do not touch the query engine and are pinned below.
     with pytest.raises(ValueError, match="modality="):
         reader.to_anndata(obs_filter="`rna:ct` == 'a'")
     with pytest.raises(ValueError, match="modality="):
         reader.query()
 
-    # The *backed* filtered read is the exception, and pinning it is what keeps
-    # the refusal above from being read as "no filtered read works here": it
-    # evaluates the predicate on obs with pandas rather than through the query
-    # engine, so it needs no modality and answers correctly.
+    # Two filtered routes are the exception, and pinning them is what keeps the
+    # refusal above from being read as "no filtered read works here". Neither
+    # touches the query engine: the backed one evaluates the predicate on obs
+    # with pandas, and `preserve_slots=True` evaluates it with `pandas.eval` on
+    # an assembled AnnData. Both need no modality and answer correctly.
     assert reader.to_anndata(backed=True, obs_filter="`rna:ct` == 'a'").shape == (6, 7)
+    assert reader.to_anndata(
+        obs_filter="`rna:ct` == 'a'", preserve_slots=True
+    ).shape == (6, 7)
 
     # Naming the sole modality works, and the scoped query answers over the
     # whole obs axis. (MuData namespaces the per-modality obs column as

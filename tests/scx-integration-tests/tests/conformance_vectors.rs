@@ -1449,3 +1449,70 @@ fn test_unknown_future_section_type_skipped() {
     assert_eq!(reader.n_obs(), n_obs_expected);
     assert_eq!(reader.n_vars(), n_vars_expected);
 }
+
+/// The accept side of `extract_expected_csr_per_modality`'s geometry gate.
+///
+/// The gate was `!reader.is_multimodal()`, which is `true` for a file with a
+/// **one-entry** modality table — what `from_mudata(MuData({"rna": adata}))`
+/// and a single-modality h5mu ingest write. Such a file presents one
+/// unambiguous tiling, so its whole matrix *is* `expected_csr`; keying on the
+/// flag would have made a future sidecar refresh publish both fields for it,
+/// contradicting the schema's own "None on every single-tiling fixture".
+///
+/// No such fixture is in the reference set today, which is exactly why this
+/// builds one: the gate is right, and nothing in-tree pinned it.
+#[test]
+fn per_modality_extraction_is_keyed_on_geometry_not_the_modality_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("one_entry_table.scx");
+
+    // A one-entry modality table: `is_multimodal()` is true, the only X is
+    // stamped `modality_id = 1`, and the flattened cover is a single tiling.
+    let header = FileHeader::new_single_modality(4, 3, 4, 16384, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&make_obs(4)).unwrap();
+    let mid = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.set_modality_n_vars(mid, 3).unwrap();
+    writer.write_var_for(mid, &make_var(3)).unwrap();
+    writer
+        .write_csr_shard_for(
+            mid,
+            0,
+            scx_format_io::writer::ShardBuffers::new(
+                &[0u64, 1, 2, 3, 4],
+                &[0u32, 1, 2, 0],
+                &[1u8, 2, 3, 4],
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.is_multimodal(),
+        "fixture premise: the one-entry table sets the flag"
+    );
+    assert!(
+        !reader.catalog().has_overlapping_csr_ranges(),
+        "fixture premise: one unambiguous tiling"
+    );
+
+    assert!(
+        extract_expected_csr_per_modality(&path).is_none(),
+        "a single tiling is described by expected_csr, not per-modality vectors"
+    );
+    assert!(
+        extract_expected_csr(&path).is_some(),
+        "and expected_csr must be the one that describes it"
+    );
+}

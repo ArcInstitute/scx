@@ -196,6 +196,16 @@ impl BackedCsrReader {
     /// Covers X shards when this reader targets X, layer shards otherwise —
     /// the same entry set as [`Self::total_nnz`].
     pub fn catalog_int_value_max(&self) -> Option<u32> {
+        // An unscoped reader over overlapping ranges has no one maximum to
+        // report. This narrows the catalog by `self.modality_id()`, which there
+        // is whichever modality sorted first — so it answered that modality's
+        // maximum as the file's, and a *falsely small* one whenever another
+        // modality holds the larger value. `None` is already this method's
+        // documented "unknown", so the refusal needs no new shape: a caller
+        // that needs a real number streams `col_max`.
+        if self.row_addressing_ambiguous {
+            return None;
+        }
         let want_layer = self.layer_name.is_some();
         let modality = self.modality_id();
         // Hoisted out of the filter: otherwise every catalog entry pays a

@@ -3015,6 +3015,44 @@ fn write_two_modality_fixture(dir: &TempDir, name: &str) -> (std::path::PathBuf,
     (path, ids[0], ids[1])
 }
 
+/// `catalog_int_value_max` on an unscoped multimodal reader.
+///
+/// It narrows the catalog with `e.modality_id == self.modality_id()`, and on an
+/// unscoped reader `modality_id()` is whichever modality sorted first — so it
+/// reported that modality's maximum as the file's. The fixture puts the
+/// **larger** value in the second-sorted modality (RNA maxes at 14, ATAC at
+/// 24), so the wrong answer is a falsely *small* `Some(14)` and the test cannot
+/// pass by picking the first.
+///
+/// `None` is the honest answer here, and it is already this method's documented
+/// "unknown": a caller that needs a real number streams `col_max` instead.
+#[test]
+fn catalog_int_value_max_is_unknown_on_an_unscoped_multimodal_reader() {
+    let dir = TempDir::new().unwrap();
+    let (path, rna_id, atac_id) = write_two_modality_fixture(&dir, "mm_max.scx");
+
+    let unscoped = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+    assert_eq!(
+        unscoped.catalog_int_value_max(),
+        None,
+        "an unscoped reader over two tilings has no one maximum to report"
+    );
+
+    // Each scoped reader reports its own, and they differ — without which the
+    // assertion above would hold for a method that always answered `None`.
+    let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 0);
+    let atac = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), atac_id, 0);
+    assert_eq!(rna.catalog_int_value_max(), Some(14));
+    assert_eq!(atac.catalog_int_value_max(), Some(24));
+
+    // And a single-modality file still answers.
+    let uni = dir.path().join("uni.scx");
+    write_fixture_at(&uni, 8, 4, 2);
+    assert!(BackedCsrReader::new(ScxReader::open(&uni).unwrap(), 0)
+        .catalog_int_value_max()
+        .is_some());
+}
+
 /// `modality_id()` on a scoped reader whose modality owns no CSR shards.
 ///
 /// It read the first entry of the shard table, which is empty there, so a

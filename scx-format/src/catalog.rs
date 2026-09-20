@@ -1088,9 +1088,15 @@ impl FullCatalog {
     }
 
     /// Whether the flattened [`Self::csr_shards_sorted`] list contains
-    /// overlapping `[row_start, row_end)` ranges — `true` when more than one
-    /// modality owns shards (each independently tiles `[0, n_obs)`), `false`
-    /// for a single clean tiling.
+    /// overlapping `[row_start, row_end)` ranges. That is the whole predicate —
+    /// it is `csr_ranges_overlap` over those shards' row ranges and nothing
+    /// else, and it is stated that way deliberately, because every shorthand
+    /// for it has been wrong. Two modalities that *partitioned* `[0, n_obs)`
+    /// between them would answer `false`; one modality whose own shards
+    /// overlapped would answer `true`.
+    ///
+    /// The usual multimodal layout — each modality independently tiling
+    /// `[0, n_obs)` — is how it becomes `true` in practice.
     ///
     /// ⚠️ Not the same as "is multimodal". A file with a **one-entry** modality
     /// table — what `from_mudata(MuData({"rna": adata}))` and a single-modality

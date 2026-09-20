@@ -151,9 +151,25 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   streaming reduction went on returning an arbitrary modality's values after
   `read_all` had been closed. `BackedCsrReader` caches the predicate at
   construction (`row_addressing_ambiguous`) and one `ensure_row_addressable`
-  guards the gather planner and the `ShardSource` methods the reductions reach
-  shards through. Construction stays infallible, so a binding can build a
-  reader under a better-worded upstream guard. Raw `csr_shards_sorted()` stays
+  guards the gather planner and the `ShardSource` methods. Construction stays
+  infallible, so a binding can build a reader under a better-worded upstream
+  guard.
+
+  ⚠️ **The `ShardSource` guard does not cover an inherent method.** Rust
+  resolves a concrete-typed call to the inherent method, not to the trait, so
+  `col_means_and_sum_sq` — which loops `read_shard_cached_arc` directly — went
+  on folding every modality after the trait was guarded, returning means
+  carrying one modality's column 0 *and* another's column 4. It calls
+  `ensure_row_addressable` itself. **A new method that walks shards owes that
+  call, or must go through the trait**; `pyscx`'s `LazyShardSource::decode_shard`
+  is the example of the second.
+
+  ⚠️ **Anything that narrows by `modality_id()` owes it too.**
+  `catalog_int_value_max` filtered catalog entries by
+  `e.modality_id == self.modality_id()`, which on an unscoped reader is
+  whichever modality sorted first — a *falsely small* maximum whenever another
+  modality holds the larger value, on a method whose `None` already means
+  "unknown". Raw `csr_shards_sorted()` stays
   for genuinely modality-agnostic work — a widest-value-encoding fold, an
   nnz sum, a checksum walk — and for the ops already fenced upstream by a
   table-based `is_multimodal()` refusal.

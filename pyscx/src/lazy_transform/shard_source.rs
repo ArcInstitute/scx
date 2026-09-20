@@ -79,11 +79,23 @@ impl LazyShardSource {
     }
 
     /// Decode one shard, honouring [`Self::with_cached_reads`].
+    /// Through the `ShardSource` trait rather than the inherent
+    /// `read_shard_cached_arc` / `read_shard_uncached` it used to call.
+    ///
+    /// Behaviour-identical — the trait methods *are* those two — but they carry
+    /// `ensure_row_addressable`, so this wrapper cannot walk the shards of an
+    /// unscoped reader over overlapping row ranges and hand back one arbitrary
+    /// modality. Not reachable from Python today (`to_anndata` refuses on
+    /// geometry first, and `open_backed_csr` requires `modality=` when the file
+    /// names more than one), but this is exactly the shape that hid
+    /// `col_means_and_sum_sq`: an inherent call that the trait's guard never
+    /// sees.
     fn decode_shard(&self, shard_idx: usize) -> scx_format_io::Result<Arc<ScxCsr>> {
+        use scx_format_io::shard_source::ShardSource;
         if self.cached_reads {
-            self.backed.read_shard_cached_arc(shard_idx)
+            ShardSource::read_shard_arc(&*self.backed, shard_idx)
         } else {
-            Ok(Arc::new(self.backed.read_shard_uncached(shard_idx)?))
+            Ok(Arc::new(ShardSource::read_shard(&*self.backed, shard_idx)?))
         }
     }
 

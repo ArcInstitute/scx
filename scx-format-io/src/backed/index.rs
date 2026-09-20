@@ -367,7 +367,9 @@ impl BackedCsrIndex {
     /// O(n_shards), no I/O. Cached by [`BackedCsrReader`] at construction
     /// rather than recomputed per gather.
     pub fn ranges_overlap(&self) -> bool {
-        scx_format::csr_ranges_overlap(self.shard_ranges.iter().map(|r| (r.row_start, r.row_end)))
+        scx_format::catalog::csr_ranges_overlap(
+            self.shard_ranges.iter().map(|r| (r.row_start, r.row_end)),
+        )
     }
 
     /// Find the shard index containing a single row, or `None` if the row

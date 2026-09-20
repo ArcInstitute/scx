@@ -191,7 +191,6 @@ pub fn parse_uns_json(bytes: &[u8]) -> Result<serde_json::Value> {
     })
 }
 
-pub use catalog::csr_ranges_overlap;
 #[allow(deprecated)]
 pub use catalog::SHARD_STATS_BASE_SIZE;
 pub use catalog::{
