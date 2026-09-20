@@ -584,7 +584,15 @@ impl ManifestScan {
             // chose. See `absolute_manifest_path`.
             path: reader.path().to_path_buf(),
             n_obs: reader.n_obs(),
-            index: BackedCsrIndex::from_catalog(reader.catalog()),
+            // `ensure_csr_ranges_are_readable` above has already refused an
+            // overlapping tiling with the loader's own, more specific message,
+            // so this `?` is unreachable in practice — it is the type system
+            // holding the two checks in agreement rather than a second guard.
+            index: BackedCsrIndex::from_catalog(reader.catalog()).map_err(|e| {
+                LoaderError::ConfigError {
+                    reason: format!("SparseCellSetLoader (file {file_id}): {e}"),
+                }
+            })?,
             // Stamped whenever the registry could reopen at all — which is
             // every path-built loader, not only a limited one. `open(paths, …,
             // None)` never evicts and so never reopens today, but it holds the

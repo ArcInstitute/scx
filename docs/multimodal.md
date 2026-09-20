@@ -107,8 +107,37 @@ rna = mu.mod["rna"]                 # AnnData
 adt = mu.mod["adt"]
 
 # Single-modality extract (when you only want one):
-rna_only = reader.to_anndata()      # raises on multimodal — use to_mudata
+rna_only = reader.to_anndata(modality="rna", backed=True)
+
+# With no modality, there is no single matrix to return:
+reader.to_anndata()                 # ValueError — use to_mudata() or modality=
 ```
+
+> That refusal is newer than this paragraph. `to_anndata()` with no modality
+> used to read the **flattened** CSR shard list and concatenate every
+> modality's tiling of `[0, n_obs)`, returning a `n_obs x n_modalities`-row
+> AnnData over mixed column spaces — 60 rows for a 30-cell CITE-seq file — and
+> `to_anndata(backed=True)` built an unscoped handle whose `shape` advertised
+> one modality's width over an index spanning both. All three eager / backed /
+> typed routes now raise.
+>
+> The check is on **shard geometry**, not on `is_multimodal`. A file written by
+> `from_mudata(MuData({"rna": adata}))` or a single-modality h5mu ingest carries
+> a one-entry modality table — `is_multimodal` is `True` and the only X is
+> stamped `modality_id = 1` — while presenting one unambiguous tiling.
+> `to_anndata()` on such a file is well defined and keeps working.
+>
+> **The read that needs a modality is the one that uses the query engine.**
+> `query()` and the *default* `to_anndata(obs_filter=…)` (`backed=False`,
+> `preserve_slots=False`) go through `QueryPipeline`, which is modality-scoped:
+> on that file modality 0 owns no shards and no `var`, so both ask you to name
+> the modality (`query(modality="rna")`) even though there is only one. The two
+> other filtered routes never touch it and work unchanged —
+> `to_anndata(backed=True, obs_filter=…)` evaluates the predicate on `obs` with
+> pandas, and `to_anndata(obs_filter=…, preserve_slots=True)` evaluates it with
+> `pandas.eval` on an assembled AnnData. That asymmetry is the query engine's,
+> not the tripwire's; it is called out here because the four reads look
+> interchangeable and are not.
 
 `Experiment.modality_info(modality_id)` returns the per-modality
 record (`{name, modality_type, default_codec_id, n_vars, nnz, …}`)
@@ -342,6 +371,18 @@ Assays(seu_back)                    # "rna" "adt"
 Cells must align across assays (Seurat v5's invariant); mismatched
 `n_obs` raises explicitly. Per-assay modality types are inferred from
 the assay name (`rna`/`adt`/`atac`/`spatial`/...).
+
+`$to_seurat()` and `$to_mae()` are the multimodal routes. **`$x_matrix()` is
+not** — it reads the file's one global matrix, and a multimodal file has none,
+so it raises rather than returning the modalities stacked into one dgCMatrix
+(which is what it used to do). Use `scx_query(modality = ...)` for one
+modality's values.
+
+`$x_backed()` and `$x_lazy()` build an **unscoped** backed reader, whose row
+lookup resolves a cell by binary-searching the shard row ranges — meaningless
+where two modalities both cover `[0, n_obs)`, and previously answered from
+whichever sorted last. Both now refuse a multimodal file at open rather than at
+some later row read.
 
 ### 4.2 MultiAssayExperiment
 

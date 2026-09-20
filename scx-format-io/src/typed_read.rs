@@ -46,8 +46,17 @@ impl ScxReader {
     /// Read the whole `X` matrix as a [`TypedCsr`] materialized directly at
     /// `plan`'s value/index dtypes (deletion-vector filtered, mirroring
     /// [`read_all_csr_shards_filtered`](ScxReader::read_all_csr_shards_filtered)).
+    ///
+    /// Refuses a file whose CSR shard row ranges overlap, exactly as its f32
+    /// sibling does — see [`scx_format::FullCatalog::single_tiling_csr_shards`]. The
+    /// dense twin [`read_all_csr_shards_dense_typed`](Self::read_all_csr_shards_dense_typed)
+    /// builds on this one and so inherits the refusal.
+    /// [`read_all_csr_shards_for_typed`](Self::read_all_csr_shards_for_typed)
+    /// is the scoped read.
     pub fn read_all_csr_shards_typed(&self, plan: &MaterializePlan) -> Result<TypedCsr> {
-        let shards = self.catalog().shards_sorted();
+        let shards = self
+            .catalog()
+            .single_tiling_csr_shards("ScxReader::read_all_csr_shards_typed")?;
         let csr = self.assemble_shards_typed(&shards, self.n_vars() as usize, plan)?;
         #[cfg(feature = "deletion-vectors")]
         {

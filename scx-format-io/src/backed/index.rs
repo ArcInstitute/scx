@@ -111,8 +111,24 @@ impl BackedCsrIndex {
     /// Extracts CSR shard entries, sorts by `row_start`, and records their
     /// position in the sorted order (which is the index used by
     /// `ScxReader::read_csr_shard`).
-    pub fn from_catalog(catalog: &FullCatalog) -> Self {
-        Self::from_catalog_filtered(catalog, SectionType::CsrShard, None)
+    ///
+    /// Fallible because the index it builds resolves a row with
+    /// `partition_point(|r| r.row_start <= row)` and takes `pos - 1`, which is
+    /// meaningful only over one non-overlapping tiling. On a multimodal file
+    /// every modality tiles `[0, n_obs)`, so that lookup returns whichever
+    /// modality sorted last — a choice nobody made. Rejected here rather than
+    /// answered; [`Self::from_catalog_for_modality`] is the scoped builder.
+    ///
+    /// Callers that hold a `CatalogView` rather than a `FullCatalog` go through
+    /// `from_view_sorted`, whose caller has already chosen a shard list; the
+    /// refusal for those lives at the read, in `BackedCsrReader::read_all`.
+    pub fn from_catalog(catalog: &FullCatalog) -> Result<Self> {
+        catalog.single_tiling_csr_shards("BackedCsrIndex::from_catalog")?;
+        Ok(Self::from_catalog_filtered(
+            catalog,
+            SectionType::CsrShard,
+            None,
+        ))
     }
 
     /// Build from a [`FullCatalog`] for a specific layer.
@@ -333,12 +349,43 @@ impl BackedCsrIndex {
             .collect()
     }
 
+    /// Whether this index's row ranges overlap, i.e. whether resolving a row
+    /// to a shard is ambiguous.
+    ///
+    /// Computed from the ranges the index holds rather than from the catalog,
+    /// so it is `false` on a `for_modality` index over a multimodal file — that
+    /// index holds one modality's tiling — and `true` only where a row genuinely
+    /// belongs to more than one shard. `shard_ranges` is sorted by `row_start`,
+    /// and the running **maximum** end is what makes a fully-contained range
+    /// count.
+    ///
+    /// The scan itself is `scx_format::csr_ranges_overlap`, the same one the
+    /// catalog's predicate and seam use — this asks it about a different set of
+    /// ranges, not with a different rule. A second copy of the loop is how two
+    /// overlap predicates come to disagree on a fully-contained range.
+    ///
+    /// O(n_shards), no I/O. Cached by [`BackedCsrReader`] at construction
+    /// rather than recomputed per gather.
+    pub fn ranges_overlap(&self) -> bool {
+        scx_format::catalog::csr_ranges_overlap(
+            self.shard_ranges.iter().map(|r| (r.row_start, r.row_end)),
+        )
+    }
+
     /// Find the shard index containing a single row, or `None` if the row
     /// falls outside every shard's range.
     ///
     /// O(log n) over `shard_ranges` via `partition_point`. Equivalent to a
     /// `shards_for_indices(&[row])` call without the sort/dedup overhead —
     /// useful when sorting plans by shard locality on a per-row basis.
+    ///
+    /// ⚠️ **Meaningful only over one non-overlapping tiling.** The
+    /// `partition_point(|r| r.row_start <= row)` / `pos - 1` idiom *answers*
+    /// over overlapping ranges by taking whichever shard sorted last, so on an
+    /// unscoped multimodal index it returns an arbitrary modality's shard with
+    /// no error. Callers that address rows go through
+    /// `BackedCsrReader::ensure_row_addressable` first; see
+    /// [`Self::ranges_overlap`].
     pub fn shard_for_row(&self, row: u64) -> Option<usize> {
         let pos = self.shard_ranges.partition_point(|r| r.row_start <= row);
         if pos == 0 {

@@ -364,6 +364,20 @@ impl CatalogView {
 
     /// CSR shard entries (`SectionType::CsrShard`) sorted by row range.
     /// Used by `BackedCsrReader::new` to build the X-shard table.
+    ///
+    /// **Multimodal caveat**, identical to
+    /// [`crate::FullCatalog::csr_shards_sorted`]'s: on a multimodal file every
+    /// modality independently tiles the shared obs axis `[0, n_obs)`, so this
+    /// flattened list carries **overlapping** `[row_start, row_end)` ranges and
+    /// a shard's positional index in it identifies neither an obs row nor a
+    /// modality. Use [`Self::csr_shards_for_modality`] for per-modality
+    /// iteration.
+    ///
+    /// There is deliberately no `single_tiling_csr_shards` on this type, unlike
+    /// [`crate::FullCatalog`]. The readers built from a view guard at the read
+    /// rather than at construction — `BackedCsrReader::read_all` routes through
+    /// the full catalog's seam, and `read_rows` runs its own positional tiling
+    /// check — so a view-level seam would be a public API with no caller.
     pub fn csr_shards_sorted(&self) -> Vec<&CatalogViewEntry> {
         self.shards_filter_sorted(|e| e.section_type == SectionType::CsrShard)
     }

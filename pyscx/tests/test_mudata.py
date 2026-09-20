@@ -845,6 +845,127 @@ def test_to_anndata_backed_multimodal_requires_modality(cite_seq_mudata, tmp_pat
     assert rna.shape[1] == cite_seq_mudata.mod["rna"].n_vars
 
 
+def test_to_anndata_without_a_modality_refuses_a_multimodal_file(
+    cite_seq_mudata, tmp_path
+):
+    """`to_anndata()` with no modality has no single matrix to return.
+
+    `docs/multimodal.md` has always documented this refusal; it did not exist.
+    The eager path reached the flattened whole-matrix read and returned an
+    `n_obs * n_modalities`-row AnnData over mixed column spaces — 60 rows for a
+    30-cell CITE-seq file — and the backed path built an unscoped handle whose
+    `shape` advertised one modality's width over an index spanning both.
+
+    All three entry points are covered because they take three different routes
+    into the reader: eager assembly, the backed handle constructor, and the
+    typed in-decode narrow.
+    """
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+    reader = pyscx.open(path)
+
+    for call in (
+        lambda: reader.to_anndata(),
+        lambda: reader.to_anndata(backed=True),
+        lambda: reader.to_anndata(data_dtype="uint16"),
+    ):
+        with pytest.raises(ValueError, match="to_mudata"):
+            call()
+
+    # The supported routes still answer.
+    assert set(reader.to_mudata().mod) == {"rna", "adt"}
+    assert (
+        reader.to_anndata(modality="rna", backed=True).shape[1]
+        == cite_seq_mudata.mod["rna"].n_vars
+    )
+
+
+def test_every_python_door_names_a_python_remedy(cite_seq_mudata, tmp_path):
+    """The doors that reach the core refusal without passing `to_anndata()`.
+
+    `to_anndata()` answers the multimodal case itself, before the read, so it
+    can name `to_mudata()`. Several other surfaces reach the same
+    `ScxError::MultimodalRequiresModality` from deeper in — eager
+    `to_h5ad(stream=False)` assembles the whole matrix, and `to_gpu_anndata`'s
+    host arm goes through the same assembler — and used to surface a message
+    naming `_for(modality_id)` and `scx subset --modality`, neither of which a
+    Python caller types. `to_pyerr` maps the variant once so every door says
+    what to do in Python.
+    """
+    pytest.importorskip("mudata")
+    import pyscx
+
+    path = str(tmp_path / "cite.scx")
+    pyscx.from_mudata(cite_seq_mudata, path)
+
+    with pytest.raises(ValueError, match="to_mudata"):
+        pyscx.to_h5ad(path, str(tmp_path / "out.h5ad"), stream=False)
+
+    # The streaming exporter has always had its own refusal; it must keep it
+    # rather than fall through to the generic one.
+    with pytest.raises((ValueError, RuntimeError), match="multimodal"):
+        pyscx.to_h5ad(path, str(tmp_path / "out2.h5ad"), stream=True)
+
+
+def test_to_anndata_accepts_a_file_whose_only_modality_is_id_1(tmp_path):
+    """The accept-side case a modality-table-based guard gets wrong.
+
+    `from_mudata(MuData({"rna": adata}))` writes a one-entry modality table, so
+    `is_multimodal` is True and the only X is stamped `modality_id = 1` — yet
+    its shards form one unambiguous tiling of the obs axis and `to_anndata()`
+    is well defined. The refusal above keys on shard geometry precisely so this
+    file keeps working; keying it on `is_multimodal` would reject every h5mu
+    ingest of a single-modality file.
+    """
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    rna = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.3, size=(12, 7)).astype(np.float32))
+    )
+    rna.obs_names = [f"c{i}" for i in range(12)]
+    rna.var_names = [f"g{i}" for i in range(7)]
+    rna.obs["ct"] = ["a"] * 6 + ["b"] * 6
+    path = str(tmp_path / "one_modality.scx")
+    pyscx.from_mudata(mudata.MuData({"rna": rna}), path)
+
+    reader = pyscx.open(path)
+    assert reader.is_multimodal, "fixture premise: the one-entry table sets the flag"
+    assert reader.to_anndata().shape == (12, 7)
+
+    # The **default eager** filtered read is the one that needs a modality: it
+    # goes through the query engine, which is modality-scoped and on this file
+    # finds modality 0 owning no shards and no `var` section. It used to raise a
+    # bare `section not found: var`; it now says what `query()` says. The other
+    # two filtered routes do not touch the query engine and are pinned below.
+    with pytest.raises(ValueError, match="modality="):
+        reader.to_anndata(obs_filter="`rna:ct` == 'a'")
+    with pytest.raises(ValueError, match="modality="):
+        reader.query()
+
+    # Two filtered routes are the exception, and pinning them is what keeps the
+    # refusal above from being read as "no filtered read works here". Neither
+    # touches the query engine: the backed one evaluates the predicate on obs
+    # with pandas, and `preserve_slots=True` evaluates it with `pandas.eval` on
+    # an assembled AnnData. Both need no modality and answer correctly.
+    assert reader.to_anndata(backed=True, obs_filter="`rna:ct` == 'a'").shape == (6, 7)
+    assert reader.to_anndata(
+        obs_filter="`rna:ct` == 'a'", preserve_slots=True
+    ).shape == (6, 7)
+
+    # Naming the sole modality works, and the scoped query answers over the
+    # whole obs axis. (MuData namespaces the per-modality obs column as
+    # `rna:ct`, which this predicate grammar has no quoting for — so assert on
+    # the collect rather than on a filter.)
+    assert reader.query(modality="rna").collect().n_obs == 12
+
+
 def test_to_mudata_backed_single_modality_wraps(tmp_path):
     """Phase 6b: `to_mudata(backed=True)` on a single-modality v1 file
     wraps the result in a one-modality `MuData` rather than raising

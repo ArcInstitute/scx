@@ -1876,3 +1876,107 @@ async fn test_selective_pull_carries_sharded_var_through() {
         .expect("read_var must work on the pulled output");
     assert_eq!(var.num_rows(), n_vars);
 }
+
+// ===== the multimodal tripwire on `scx pull --filter` =====
+
+/// A two-modality file with `cell_type` on obs, each modality holding one CSR
+/// shard per half of the obs axis — so the flattened shard list has four
+/// entries whose row ranges pair up across modalities.
+fn write_multimodal_file_with_cell_type(
+    dir: &tempfile::TempDir,
+    n_obs: usize,
+) -> std::path::PathBuf {
+    use scx_format_io::modality::ModalityType;
+    let path = dir.path().join("input_mm_filter.scx");
+    let header = sample_header(n_obs as u64, 8);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let types: Vec<String> = (0..n_obs)
+        .map(|i| if i < n_obs / 2 { "typeA" } else { "typeB" }.to_string())
+        .collect();
+    let obs_schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, false),
+    ]);
+    let obs_batch = arrow::array::RecordBatch::try_new(
+        Arc::new(obs_schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                types.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch).unwrap();
+
+    for (name, mtype, n_vars) in [
+        ("rna", ModalityType::Rna, 8usize),
+        ("adt", ModalityType::Protein, 4usize),
+    ] {
+        let mid = writer
+            .add_modality(name, mtype, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer.set_modality_n_vars(mid, n_vars as u64).unwrap();
+        writer.write_var_for(mid, &sample_var(n_vars)).unwrap();
+        let half = n_obs / 2;
+        for row_offset in [0usize, half] {
+            let (indptr, indices, values) = sample_shard_data(half, n_vars);
+            let shard = scx_format_io::writer::ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            );
+            writer
+                .write_csr_shard_for(mid, row_offset as u64, shard)
+                .unwrap();
+        }
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// `pull --filter` maps each matching obs row to a **position** in the
+/// flattened CSR shard list and downloads by that position, taking the first
+/// shard whose row range contains the row and `break`ing.
+///
+/// On a multimodal file every row is contained by one shard **per modality**,
+/// so the `break` silently kept whichever modality sorted first and the pull
+/// wrote an output whose catalog still advertises both modalities while its
+/// payload holds one. Refused instead — before any obs object is fetched, so a
+/// rejected pull costs one small GET — the guard runs as soon as `_catalog.bin`
+/// is parsed, before the header and before any obs object.
+#[tokio::test]
+async fn selective_pull_refuses_an_overlapping_shard_tiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_multimodal_file_with_cell_type(&dir, 100);
+    assert!(
+        ScxReader::open(&input).unwrap().is_multimodal(),
+        "fixture premise"
+    );
+    let exploded_dir = dir.path().join("exploded_mm_filter.scxd");
+    crate::explode::explode(&input, &exploded_dir).unwrap();
+
+    let output = dir.path().join("filtered_mm.scx");
+    let source = exploded_dir.to_string_lossy().to_string();
+
+    let err = pull_filtered(
+        &source,
+        &output,
+        "cell_type == 'typeA'",
+        PullOptions::default(),
+    )
+    .await
+    .expect_err("a shard-granular filtered pull cannot address a multimodal file");
+    let msg = err.to_string();
+    assert!(msg.contains("subset --modality"), "{msg}");
+    assert!(
+        !output.exists(),
+        "a refused pull must not leave a partial output file"
+    );
+}

@@ -66,6 +66,19 @@ pub(crate) fn open_handle_reader_shared(
 pub(crate) fn to_pyerr(e: ScxError) -> PyErr {
     use std::io::ErrorKind;
     let msg = e.to_string();
+    // Re-word the one variant whose remedy is spelled in Rust. The message
+    // names `_for(modality_id)` and `scx subset --modality`, neither of which a
+    // Python caller types. `to_anndata()` answers this itself, before the read,
+    // so it can name `to_mudata()` — but several doors reach the core refusal
+    // without passing through it: `to_gpu_anndata`'s host-assemble arm, eager
+    // `to_h5ad(stream=False)`, and anything reaching a backed `to_memory()`.
+    // Mapping here covers all of them without a third copy of the prose.
+    if let ScxError::MultimodalRequiresModality { .. } = e {
+        return PyValueError::new_err(format!(
+            "{msg} From Python: `to_mudata()` for every modality, \
+             `to_anndata(modality=..., backed=True)` or `query(modality=...)` for one."
+        ));
+    }
     match e.class() {
         // Bad input / inconsistent data (incl. the stale-sidecar error, whose
         // message already names the fix `scx build-csc` / `--rebuild-csc`).

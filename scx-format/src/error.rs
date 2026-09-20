@@ -53,6 +53,19 @@ pub enum ScxError {
     #[error("invalid catalog: {0}")]
     InvalidCatalog(String),
 
+    /// A whole-matrix read was asked of a file whose CSR shard row ranges
+    /// overlap. See [`crate::FullCatalog::single_tiling_csr_shards`].
+    #[error(
+        "{op}: this file's CSR shard row ranges overlap, so a read over the flattened \
+         shard list cannot attribute an obs row to one modality. Each modality \
+         independently tiles [0, n_obs), so the result would stack them into an \
+         n_obs x n_modalities matrix over mixed column spaces. Name a modality \
+         (the `_for(modality_id)` sibling of this call, `modality=` on the Python \
+         surfaces), or extract one first with `scx subset --modality NAME`. \
+         `scx info` lists the modalities and their shard row ranges."
+    )]
+    MultimodalRequiresModality { op: String },
+
     #[error(
         "duplicate section: (modality_id={modality_id}, section_type={section_type:?}, \
          name='{name}') was already written; readers resolve names to the first match"
@@ -299,7 +312,13 @@ impl ScxError {
             // written by an incompatible version; re-run conversion" suffix is
             // wrong on both. A writer-side inconsistency, which is what
             // `Validation` is for.
-            | ScxError::UnsTooDeep { .. } => ScxErrorClass::Validation,
+            | ScxError::UnsTooDeep { .. }
+            // Deliberately NOT `CorruptFile`: a multimodal file with overlapping
+            // CSR row ranges is exactly what the format prescribes, and the
+            // binding's "appears corrupt; re-run conversion" suffix would send
+            // the caller to fix a file that is intact. What is wrong is the
+            // *request* — a whole-matrix read of a file that holds several.
+            | ScxError::MultimodalRequiresModality { .. } => ScxErrorClass::Validation,
             // File is corrupt or was written by an incompatible/newer SCX:
             // bad magic/version/endian/checksum/catalog, an unknown on-disk
             // codec / value-encoding / section / shard-type byte, or an

@@ -14,6 +14,51 @@ pub const ROOT_CATALOG_MAX_SIZE: usize = 4096;
 /// Size of a single root catalog entry: 1 + 8 + 8 + 4 + 32 = 53 bytes.
 pub const ROOT_CATALOG_ENTRY_SIZE: usize = 53;
 
+/// Whether a sequence of `[start, end)` spans, already sorted ascending by
+/// `start`, contains an overlap.
+///
+/// Shared by [`FullCatalog::has_overlapping_csr_ranges`],
+/// [`FullCatalog::single_tiling_csr_shards`] and — across the crate boundary —
+/// `scx_format_io::BackedCsrIndex::ranges_overlap`, which asks the same
+/// question of the ranges *it* holds rather than of the catalog's. All three
+/// must agree by construction: the first is what documentation cites, the
+/// second is what refuses a whole-matrix read, and the third is what refuses a
+/// row lookup. A second copy of this loop is how they would come to disagree
+/// on, say, a fully-contained range.
+///
+/// Tracks the running **maximum** end rather than the previous one: sorting by
+/// `start` does not make the ends monotone, so a shard fully contained in an
+/// earlier one would otherwise slip past.
+pub fn csr_ranges_overlap(spans: impl IntoIterator<Item = (u64, u64)>) -> bool {
+    let mut max_end: Option<u64> = None;
+    for (start, end) in spans {
+        if let Some(prev_end) = max_end {
+            if start < prev_end {
+                return true;
+            }
+        }
+        max_end = Some(max_end.map_or(end, |m| m.max(end)));
+    }
+    false
+}
+
+/// The `[row_start, row_end)` spans of CSR shard entries, **skipping entries
+/// with no stats** — their rows cannot be located, so they can neither prove
+/// nor disprove an overlap. Callers that need every row accounted for must
+/// reject a stat-less entry themselves.
+fn csr_spans<'a, I: Iterator<Item = &'a FullCatalogEntry>>(
+    entries: I,
+) -> impl Iterator<Item = (u64, u64)> + use<'a, I> {
+    entries.filter_map(|e| {
+        e.stats.as_ref().map(|s| {
+            (
+                s.major_start(SectionType::CsrShard),
+                s.major_end(SectionType::CsrShard),
+            )
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // RootCatalog
 // ---------------------------------------------------------------------------
@@ -832,6 +877,12 @@ impl FullCatalog {
     /// Note: this name is retained for backward compatibility but the
     /// new `csr_shards_sorted()` form is preferred for readability when
     /// CSC sidecars are also present.
+    ///
+    /// **The multimodal caveat on [`Self::csr_shards_sorted`] applies here
+    /// verbatim** — this is that function. It is spelled out on both because
+    /// the caveat lived only on the other name while most of the unguarded
+    /// positional consumers were reaching the list through this one. A caller
+    /// that needs one clean tiling wants [`Self::single_tiling_csr_shards`].
     pub fn shards_sorted(&self) -> Vec<&FullCatalogEntry> {
         self.csr_shards_sorted()
     }
@@ -1037,30 +1088,74 @@ impl FullCatalog {
     }
 
     /// Whether the flattened [`Self::csr_shards_sorted`] list contains
-    /// overlapping `[row_start, row_end)` ranges. This is `true` for **any**
-    /// multimodal file (each modality independently tiles `[0, n_obs)`), and
-    /// `false` for a single clean tiling.
+    /// overlapping `[row_start, row_end)` ranges. That is the whole predicate —
+    /// it is `csr_ranges_overlap` over those shards' row ranges and nothing
+    /// else, and it is stated that way deliberately, because every shorthand
+    /// for it has been wrong. Two modalities that *partitioned* `[0, n_obs)`
+    /// between them would answer `false`; one modality whose own shards
+    /// overlapped would answer `true`.
+    ///
+    /// The usual multimodal layout — each modality independently tiling
+    /// `[0, n_obs)` — is how it becomes `true` in practice.
+    ///
+    /// ⚠️ Not the same as "is multimodal". A file with a **one-entry** modality
+    /// table — what `from_mudata(MuData({"rna": adata}))` and a single-modality
+    /// h5mu ingest write — sets the multimodal flag while presenting one
+    /// unambiguous tiling, and answers `false` here. That difference is the
+    /// whole reason the read guards key on this rather than on
+    /// `ScxReader::is_multimodal`.
     ///
     /// It is the cross-cutting tripwire against the class of bug this guards:
     /// code that positionally indexes `csr_shards_sorted()` as if it were one
     /// non-overlapping tiling. `debug_assert!(!catalog.has_overlapping_csr_ranges())`
     /// at any such site. O(n_shards) over the already-sorted list; no I/O.
     pub fn has_overlapping_csr_ranges(&self) -> bool {
-        let mut max_end: Option<u64> = None;
-        for entry in self.csr_shards_sorted() {
-            let Some(stats) = entry.stats.as_ref() else {
-                continue;
-            };
-            let start = stats.major_start(SectionType::CsrShard);
-            let end = stats.major_end(SectionType::CsrShard);
-            if let Some(prev_end) = max_end {
-                if start < prev_end {
-                    return true;
-                }
-            }
-            max_end = Some(max_end.map_or(end, |m| m.max(end)));
+        csr_ranges_overlap(csr_spans(self.csr_shards_sorted().into_iter()))
+    }
+
+    /// The CSR shards of a file that presents **exactly one** tiling of the obs
+    /// axis, or [`ScxError::MultimodalRequiresModality`] when the flattened
+    /// ranges overlap.
+    ///
+    /// This is [`Self::csr_shards_sorted`] with the hazard made unrepresentable
+    /// instead of assertable. Every read that takes the flat list *as a list* —
+    /// a whole-matrix assembly, a positional `shards[idx]` — goes through here,
+    /// so a new such caller inherits the refusal rather than having to remember
+    /// a `debug_assert!` that is compiled out in exactly the release builds
+    /// where this bites.
+    ///
+    /// ⚠️ **The row lookups are not covered by this**, and assuming they were
+    /// left a live hole. `BackedCsrIndex` is built from a shard list the caller
+    /// already has, and its `partition_point` row resolution *answers* on an
+    /// overlap rather than erroring. `BackedCsrReader` guards those separately,
+    /// at `ensure_row_addressable`. See `docs/conventions.md` § "Never
+    /// positionally index the flattened CSR shard list".
+    ///
+    /// `op` names the calling API in the error message, so the caller is told
+    /// which of *their* calls to replace with its `_for(modality_id)` sibling.
+    ///
+    /// # What this is not
+    ///
+    /// **It is the overlap predicate, not a tiling proof.** A cover with a
+    /// *gap*, one that stops short of `n_obs`, or one whose shards carry no
+    /// row-range stats passes this — [`Self::has_overlapping_csr_ranges`] skips
+    /// stat-less entries outright, and this function inherits that. A caller
+    /// that needs "claims every row exactly once" needs the contiguity half
+    /// too; `scx-loader`'s `ensure_csr_ranges_are_readable` is the worked
+    /// example, and it walks the list itself for precisely that reason.
+    ///
+    /// **It keys on geometry, never on the modality table.** A file with a
+    /// one-entry modality table — what `from_mudata(MuData({"rna": adata}))`
+    /// and a single-modality h5mu ingest emit — stamps its only X with
+    /// `modality_id = 1`, leaving modality 0 owning no shards, while its
+    /// flattened cover is perfectly unambiguous. Testing `is_multimodal()` or
+    /// keying on modality 0 rejects every such file with a false positive.
+    pub fn single_tiling_csr_shards(&self, op: &str) -> Result<Vec<&FullCatalogEntry>> {
+        let shards = self.csr_shards_sorted();
+        if csr_ranges_overlap(csr_spans(shards.iter().copied())) {
+            return Err(ScxError::MultimodalRequiresModality { op: op.to_string() });
         }
-        false
+        Ok(shards)
     }
 
     /// Return `adata.raw` CSR shard entries ([`SectionType::RawCsrShard`])

@@ -917,6 +917,104 @@ mod tests {
         assert!(indices.is_empty());
     }
 
+    /// A **framed** shard whose header disagrees with its block index, in both
+    /// directions and both value domains.
+    ///
+    /// Written while checking whether the framed reassemblers owed a
+    /// whole-shard shape check after their group loop, the way the unframed
+    /// decoders get one from `check_decoded_shape`. **They do not**, and this
+    /// test is the evidence rather than the fix: the invariant is already
+    /// established compositionally, by two checks that were each put there for
+    /// a different reason.
+    ///
+    /// * `resolve_block_index` pins `Σ entry.n_rows == header.n_major` and
+    ///   `Σ entry.nnz_in_block == header.nnz` before a single frame is
+    ///   decoded.
+    /// * `scx_codec::decode_row_group` runs the full `check_decoded_shape`
+    ///   gate on each group against *that group's* span.
+    ///
+    /// The reassembly loop then appends exactly `n_rows` indptr entries and
+    /// `nnz` indices/values per group, so the totals cannot come out anything
+    /// other than `n_major + 1` and `nnz`. Adding a third check over the
+    /// reassembled arrays would be the redundant per-consumer check
+    /// `docs/conventions.md` warns against — it can only fire when one of the
+    /// two above is already broken.
+    ///
+    /// What was genuinely missing is this test. Nothing pinned either sum from
+    /// the decoder's side, so a future refactor that moved the block-index
+    /// validation could have removed the guarantee without failing anything.
+    #[test]
+    fn a_framed_shard_disagreeing_with_its_header_is_rejected() {
+        use crate::encoder::{encode_one_shard, EncodeShardOptions, FramingConfig};
+
+        let indptr: Vec<u64> = vec![0, 2, 4, 6, 8];
+        let indices: Vec<u32> = vec![0, 1, 1, 2, 2, 3, 3, 4];
+        let values: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+        let mut opts = EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 16, 0, 1);
+        opts.explicit_codec = Some(CodecId::None);
+        opts.framing = Some(FramingConfig {
+            row_group_rows: 2,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        });
+        let enc = encode_one_shard(&indptr, &indices, &values, &opts).expect("encode");
+        let base = ShardHeader::read_from(&mut Cursor::new(&enc.header_buf[..])).unwrap();
+        assert_eq!(base.shard_format_version, 2, "fixture premise: framed");
+        assert_eq!((base.n_major, base.nnz), (4, 8), "fixture premise");
+
+        // The accept side first — the fixture decodes cleanly untouched, so a
+        // rejection below is about the patched field and not about the bytes.
+        let (ok_indptr, ok_indices, _) = decode_shard_regions_scipy(
+            &base,
+            &enc.encoded.indptr_bytes,
+            &enc.encoded.indices_bytes,
+            &enc.encoded.values_bytes,
+            &enc.block_index_bytes,
+        )
+        .expect("the unpatched framed shard must decode");
+        assert_eq!(ok_indptr.len(), 5);
+        assert_eq!(ok_indices.len(), 8);
+
+        // Each field patched on its own, so neither assertion can pass because
+        // of the other's disagreement.
+        for (what, patch, needle) in [
+            ("rows", (8u32, 8u64), "coverage 4 != header.n_major 8"),
+            (
+                "nnz",
+                (4u32, 16u64),
+                "\u{3a3} nnz_in_block 8 != header.nnz 16",
+            ),
+        ] {
+            let mut sh = base.clone();
+            sh.n_major = patch.0;
+            sh.nnz = patch.1;
+
+            let err = decode_shard_regions_scipy(
+                &sh,
+                &enc.encoded.indptr_bytes,
+                &enc.encoded.indices_bytes,
+                &enc.encoded.values_bytes,
+                &enc.block_index_bytes,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{what}: accepted a header the block index contradicts"));
+            assert!(err.to_string().contains(needle), "{what}: {err}");
+
+            // The native reassembler is a separate loop over the same spans.
+            let native = decode_shard_regions_native(
+                &sh,
+                &enc.encoded.indptr_bytes,
+                &enc.encoded.indices_bytes,
+                &enc.encoded.values_bytes,
+                &enc.block_index_bytes,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{what}: the native framed path accepted it"));
+            assert!(native.to_string().contains(needle), "{what}: {native}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Minor-axis index bounds
     // -----------------------------------------------------------------------

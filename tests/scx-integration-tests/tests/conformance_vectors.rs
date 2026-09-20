@@ -4,9 +4,11 @@
 //! Covers v1 layers/obsm/uns, CSC sidecar, predicate indexes, deletion
 //! vectors, v2 multimodal (CITE-seq + partial CSC), Phase 5b bitmap, and
 //! cloud-optimized + exploded layouts. Sidecar JSON captures the
-//! observable shape (header summary, catalog summary, CSR triplet for
-//! fixtures with X) so future readers can diff intentional format
-//! changes.
+//! observable shape (header summary, catalog summary, and the matrices:
+//! `expected_csr` for a fixture presenting one tiling of the obs axis,
+//! `expected_csr_per_modality` for a multimodal one, which holds one
+//! matrix per modality rather than one for the file) so future readers
+//! can diff intentional format changes.
 //!
 //! Mirrors the pattern in `golden_files.rs`:
 //!   - `#[ignore]`-d `generate_conformance_vectors()` writes every
@@ -19,6 +21,12 @@
 //! Regenerate with:
 //!     cargo test -p scx-integration-tests --test conformance_vectors \
 //!         generate_conformance_vectors -- --ignored
+//!
+//! To refresh only the sidecars — after a sidecar *schema* change, where
+//! rewriting the binaries would stamp fresh provenance and churn every
+//! MANIFEST hash for no format change:
+//!     cargo test -p scx-integration-tests --test conformance_vectors \
+//!         regenerate_conformance_sidecars -- --ignored
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -92,6 +100,40 @@ struct ExpectedCsr {
     data: Vec<f32>,
 }
 
+/// One modality's matrix, for a fixture that holds several.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct ExpectedModalityCsr {
+    modality_id: u8,
+    modality_name: String,
+    /// The modality's **declared** column count, present only when the file
+    /// declares one — and neither multimodal reference file does, because
+    /// their generators never call `set_modality_n_vars`.
+    ///
+    /// Omitted rather than published as `0`. The point of replacing the stacked
+    /// 60-row `expected_csr` was to stop a third-party reader treating a
+    /// published number as the spec when it is not, and `"n_vars": 0` sitting
+    /// beside a triplet whose indices run to 24 invites exactly that, however
+    /// carefully the prose explains that `0` means "undeclared" (the same
+    /// convention a shard header's `n_minor` uses — see
+    /// `scx_codec::clamp_index_bound`). Omitted is unambiguous; `0` is not.
+    ///
+    /// There is deliberately **no** derived width here either. The modality
+    /// table says 0, the file header's `n_vars` is 0 (a multimodal file's width
+    /// is per-modality), and `read_all_csr_shards_for` therefore assembles at
+    /// `shape.1 == 0`. `max_column_index + 1` would be a lower bound, not the
+    /// width, and publishing it as one would be the same class of fabrication
+    /// this field exists to avoid. What the file declares is nothing, and that
+    /// is what this records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declared_n_vars: Option<u64>,
+    /// The largest column index present, which a conforming reader *can* check
+    /// itself against. Derived from the triplet, and named as a maximum rather
+    /// than as a width for the reason above.
+    max_column_index: Option<i32>,
+    #[serde(flatten)]
+    csr: ExpectedCsr,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ConformanceSidecar {
     fixture_name: String,
@@ -99,8 +141,21 @@ struct ConformanceSidecar {
     catalog_summary: Vec<CatalogSummaryEntry>,
     /// Filled only for fixtures with a global X (skipped for cloud
     /// directory fixtures and pure-multimodal fixtures).
+    ///
+    /// The "skipped for pure-multimodal fixtures" half of that sentence used
+    /// to be aspirational: the extractor called `read_all_csr_shards()`, which
+    /// concatenated every modality's tiling of the obs axis and returned it as
+    /// one matrix. Both multimodal sidecars therefore published a **60-row**
+    /// expected CSR for a 30-cell file — a conformance vector that a
+    /// third-party reader could only match by reproducing the defect. Those
+    /// matrices now live in `expected_csr_per_modality`, which is what a
+    /// multimodal file actually holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_csr: Option<ExpectedCsr>,
+    /// One entry per modality, for multimodal fixtures. `None` on every
+    /// single-tiling fixture, where `expected_csr` is the matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_csr_per_modality: Option<Vec<ExpectedModalityCsr>>,
     /// Free-form prose: what this fixture exercises and any
     /// compatibility caveats.
     compatibility_notes: String,
@@ -631,12 +686,66 @@ fn extract_expected_csr(path: &Path) -> Option<ExpectedCsr> {
     if reader.header().n_csr_shards == 0 {
         return None;
     }
-    let csr = reader.read_all_csr_shards().ok()?;
+    // `None` on a multimodal file: `read_all_csr_shards` refuses an
+    // overlapping shard tiling, which is the whole point. Such a fixture is
+    // described by `extract_expected_csr_per_modality` instead.
+    //
+    // Matched on the variant rather than swallowed with `.ok()?`, which this
+    // used to do: a genuinely broken fixture would then read as "has no whole
+    // matrix", the comparison would skip, and the suite would go green on a
+    // file it could not decode.
+    let csr = match reader.read_all_csr_shards() {
+        Ok(csr) => csr,
+        Err(scx_format_io::ScxError::MultimodalRequiresModality { .. }) => return None,
+        Err(e) => panic!("{}: could not read the whole matrix: {e}", path.display()),
+    };
     Some(ExpectedCsr {
         indptr: csr.indptr,
         indices: csr.indices,
         data: csr.data,
     })
+}
+
+/// One expected matrix per modality, or `None` on a file that holds a single
+/// tiling of the obs axis (where `extract_expected_csr` is the description).
+fn extract_expected_csr_per_modality(path: &Path) -> Option<Vec<ExpectedModalityCsr>> {
+    let reader = ScxReader::open(path).unwrap();
+    // Geometry, not the modality table — the same rule the readers use, and for
+    // the same reason. A one-entry-table fixture (`from_mudata(MuData({"rna":
+    // adata}))`) has `is_multimodal() == true` and one unambiguous tiling: its
+    // whole matrix IS `expected_csr`, and keying on the flag would make a
+    // future refresh publish both fields for it, contradicting the schema's own
+    // "None on every single-tiling fixture".
+    if !reader.catalog().has_overlapping_csr_ranges() || reader.header().n_csr_shards == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    // Sorted by name so the vector's order is a property of the file rather
+    // than of the modality table's write order.
+    let mut names = reader.modality_names();
+    names.sort();
+    for name in names {
+        let mid = reader.modality_id(name).unwrap();
+        if reader.catalog().csr_shards_for_modality(mid).is_empty() {
+            continue;
+        }
+        let csr = reader.read_all_csr_shards_for(mid).unwrap();
+        out.push(ExpectedModalityCsr {
+            modality_id: mid,
+            modality_name: name.to_string(),
+            declared_n_vars: reader
+                .modality_info(mid)
+                .map(|i| i.n_vars)
+                .filter(|&n| n != 0),
+            max_column_index: csr.indices.iter().copied().max(),
+            csr: ExpectedCsr {
+                indptr: csr.indptr,
+                indices: csr.indices,
+                data: csr.data,
+            },
+        });
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 // =========================================================================
@@ -788,12 +897,13 @@ fn write_sidecar(fixture: &Fixture, dir: &Path) {
     let scx_path = dir.join(fixture.rel_path);
     // Cloud directory fixtures: load the catalog from `_catalog.bin`
     // and the header from `_header.bin`.
-    let (header_summary, catalog_summary, expected_csr) = match fixture.kind {
+    let (header_summary, catalog_summary, expected_csr, per_modality) = match fixture.kind {
         FixtureKind::File => {
             let h = extract_header_summary(&scx_path);
             let c = extract_catalog_summary(&scx_path);
             let csr = extract_expected_csr(&scx_path);
-            (h, c, csr)
+            let per = extract_expected_csr_per_modality(&scx_path);
+            (h, c, csr, per)
         }
         FixtureKind::Directory => {
             use scx_format_io::catalog::FullCatalog;
@@ -829,7 +939,7 @@ fn write_sidecar(fixture: &Fixture, dir: &Path) {
                     length: e.length,
                 })
                 .collect();
-            (h, c, None)
+            (h, c, None, None)
         }
     };
 
@@ -838,11 +948,36 @@ fn write_sidecar(fixture: &Fixture, dir: &Path) {
         header: header_summary,
         catalog_summary,
         expected_csr,
+        expected_csr_per_modality: per_modality,
         compatibility_notes: fixture.notes.to_string(),
     };
     let json = serde_json::to_string_pretty(&sidecar).unwrap();
     let sidecar_path = dir.join(format!("{}.json", fixture.name));
     fs::write(&sidecar_path, json).unwrap();
+}
+
+/// Rewrite the `.json` sidecars from the reference files **already on disk**,
+/// without regenerating the fixtures themselves.
+///
+/// Separate from `generate_conformance_vectors` because that one rewrites every
+/// `.scx`, and a rewritten fixture carries a fresh provenance entry — so its
+/// bytes, and its MANIFEST hash, change even when nothing about the format did.
+/// A sidecar schema change needs the sidecars refreshed and the binaries left
+/// exactly as they are.
+///
+/// `cargo test -p scx-integration-tests --test conformance_vectors \
+///     regenerate_conformance_sidecars -- --ignored`
+#[test]
+#[ignore]
+fn regenerate_conformance_sidecars() {
+    let dir = reference_dir();
+    for fixture in FIXTURES {
+        if !dir.join(fixture.rel_path).exists() {
+            continue;
+        }
+        write_sidecar(fixture, &dir);
+        eprintln!("Rewrote {}.json", fixture.name);
+    }
 }
 
 #[test]
@@ -1072,10 +1207,30 @@ fn test_conformance_files_csr_match() {
         if !matches!(fixture.kind, FixtureKind::File) {
             continue;
         }
+        if let Some(expected) = &sidecar.expected_csr_per_modality {
+            let actual = extract_expected_csr_per_modality(&path).unwrap_or_else(|| {
+                panic!(
+                    "{}: sidecar has per-modality CSR, file does not",
+                    fixture.rel_path
+                )
+            });
+            assert_eq!(
+                actual, *expected,
+                "{}: per-modality CSR mismatch",
+                fixture.rel_path
+            );
+        }
         let Some(expected) = &sidecar.expected_csr else {
             continue;
         };
-        let actual = extract_expected_csr(&path).unwrap();
+        let actual = extract_expected_csr(&path).unwrap_or_else(|| {
+            panic!(
+                "{}: sidecar carries a whole-matrix CSR but the file does not \
+                 present one (a multimodal file's matrices belong in \
+                 expected_csr_per_modality)",
+                fixture.rel_path
+            )
+        });
         assert_eq!(
             actual.indptr, expected.indptr,
             "{}: CSR indptr mismatch",
@@ -1293,4 +1448,71 @@ fn test_unknown_future_section_type_skipped() {
     // obs/var sections are intact, and the file header is unchanged.
     assert_eq!(reader.n_obs(), n_obs_expected);
     assert_eq!(reader.n_vars(), n_vars_expected);
+}
+
+/// The accept side of `extract_expected_csr_per_modality`'s geometry gate.
+///
+/// The gate was `!reader.is_multimodal()`, which is `true` for a file with a
+/// **one-entry** modality table — what `from_mudata(MuData({"rna": adata}))`
+/// and a single-modality h5mu ingest write. Such a file presents one
+/// unambiguous tiling, so its whole matrix *is* `expected_csr`; keying on the
+/// flag would have made a future sidecar refresh publish both fields for it,
+/// contradicting the schema's own "None on every single-tiling fixture".
+///
+/// No such fixture is in the reference set today, which is exactly why this
+/// builds one: the gate is right, and nothing in-tree pinned it.
+#[test]
+fn per_modality_extraction_is_keyed_on_geometry_not_the_modality_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("one_entry_table.scx");
+
+    // A one-entry modality table: `is_multimodal()` is true, the only X is
+    // stamped `modality_id = 1`, and the flattened cover is a single tiling.
+    let header = FileHeader::new_single_modality(4, 3, 4, 16384, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&make_obs(4)).unwrap();
+    let mid = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.set_modality_n_vars(mid, 3).unwrap();
+    writer.write_var_for(mid, &make_var(3)).unwrap();
+    writer
+        .write_csr_shard_for(
+            mid,
+            0,
+            scx_format_io::writer::ShardBuffers::new(
+                &[0u64, 1, 2, 3, 4],
+                &[0u32, 1, 2, 0],
+                &[1u8, 2, 3, 4],
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.is_multimodal(),
+        "fixture premise: the one-entry table sets the flag"
+    );
+    assert!(
+        !reader.catalog().has_overlapping_csr_ranges(),
+        "fixture premise: one unambiguous tiling"
+    );
+
+    assert!(
+        extract_expected_csr_per_modality(&path).is_none(),
+        "a single tiling is described by expected_csr, not per-modality vectors"
+    );
+    assert!(
+        extract_expected_csr(&path).is_some(),
+        "and expected_csr must be the one that describes it"
+    );
 }

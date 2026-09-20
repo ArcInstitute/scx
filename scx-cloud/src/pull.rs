@@ -666,6 +666,23 @@ pub async fn pull_filtered(
     let original_catalog =
         FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len(), true)?;
 
+    // Refused as soon as the catalog is in hand — before the header, before
+    // the obs objects — so a rejected pull costs one small GET and nothing
+    // else.
+    //
+    // Step 4 below resolves each matching obs row to a **position** in the
+    // flattened CSR shard list, taking the first shard whose row range
+    // contains the row and `break`ing. On a multimodal file every row is
+    // contained by one shard per modality, so that `break` kept whichever
+    // modality sorted first: the pull wrote an output whose catalog still
+    // advertises every modality while its payload holds one modality's shards.
+    // Measured on a 100-cell two-modality fixture with two shards each — 4
+    // shards total, 1 downloaded, reported back as a successful 50-cell pull.
+    //
+    // Shard-granular filtering has no correct multimodal answer to give: the
+    // unit it downloads is a shard, and the modalities do not share theirs.
+    original_catalog.single_tiling_csr_shards("scx pull --filter")?;
+
     let header_path = make_path("_header.bin");
     let header_data = get_with_retry(backend.as_ref(), &header_path).await?;
     let header = FileHeader::read_from(&mut Cursor::new(&header_data))?;

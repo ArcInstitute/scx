@@ -467,8 +467,17 @@ impl ScxReader {
     }
 
     /// Read a single CSR shard by index, returning scipy-compatible arrays.
+    ///
+    /// `shard_idx` is a **position in the flattened CSR shard list**, so it
+    /// identifies a shard only on a file that presents one tiling of the obs
+    /// axis. On a multimodal file the position names whichever modality sorted
+    /// there, which is not a choice the caller made — that is refused with
+    /// [`ScxError::MultimodalRequiresModality`]; use
+    /// [`read_csr_shard_for`](Self::read_csr_shard_for).
     pub fn read_csr_shard(&self, shard_idx: usize) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
-        let shards = self.full_catalog.shards_sorted();
+        let shards = self
+            .full_catalog
+            .single_tiling_csr_shards("ScxReader::read_csr_shard")?;
         if shard_idx >= shards.len() {
             return Err(ScxError::ShardIndexOutOfBounds {
                 index: shard_idx,
@@ -479,8 +488,16 @@ impl ScxReader {
     }
 
     /// Read all CSR shards and assemble into a single ScxCsr.
+    ///
+    /// Refuses a file whose CSR shard row ranges overlap — see
+    /// [`scx_format::FullCatalog::single_tiling_csr_shards`]. Concatenating a multimodal
+    /// file's flattened list produced an `n_obs * n_modalities`-row matrix over
+    /// mixed column spaces, returned as `Ok`. Name a modality with
+    /// [`read_all_csr_shards_for`](Self::read_all_csr_shards_for).
     pub fn read_all_csr_shards(&self) -> Result<ScxCsr> {
-        let shards = self.full_catalog.shards_sorted();
+        let shards = self
+            .full_catalog
+            .single_tiling_csr_shards("ScxReader::read_all_csr_shards")?;
         self.assemble_x_shards(&shards)
     }
 

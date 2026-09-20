@@ -2828,25 +2828,32 @@ fn multimodal_fallback_does_not_mix_modalities() {
     );
 }
 
-/// Characterization: what `BackedCsrReader::new` — the *unscoped* constructor —
-/// does on a multimodal file. Nothing pinned this before, and the answer is
-/// surprising enough to be worth a test rather than a reading of the source.
+/// What `BackedCsrReader::new` — the *unscoped* constructor — does on a
+/// multimodal file, and where the refusal now falls.
 ///
 /// `::new` builds its index from `CatalogView::csr_shards_sorted()`, which
 /// filters on `section_type == CsrShard` with **no `modality_id` predicate**.
 /// On a two-modality file that means one index over *both* modalities' shards,
 /// whose row ranges overlap (each modality independently tiles `[0, n_obs)`),
 /// while `n_vars` comes from the file header — the max across modalities, not
-/// any one modality's. `for_modality` is the scoped constructor and is what
-/// every production caller uses (`pyscx/src/experiment.rs`,
+/// any one modality's. `for_modality` is the scoped constructor, and is what
+/// most production callers use (`pyscx/src/experiment.rs`,
 /// `pyscx/src/backed/multimodal.rs`, `pyscx/src/convert/multimodal.rs`,
-/// `scx-convert/src/export_filter.rs`).
+/// `scx-convert/src/export_filter.rs`) — but not all: `pyscx`'s
+/// `open_backed_matrix_reader` and rscx's `x_backed()` / `x_lazy()` build the
+/// unscoped one, which is why the refusals below have to exist.
 ///
-/// This test asserts today's behaviour, deliberately. It is not an endorsement
-/// — it is the tripwire that makes a change to it visible, and the safety net
-/// for the `backed.rs` split in Phase 3b.
+/// **Construction still succeeds, and the index still spans both modalities**
+/// — that is what the first two assertions pin, and it is deliberate:
+/// `pyscx`'s `open_backed_matrix_reader` builds one of these before it knows
+/// whether an upstream guard will reject the file, so failing here would move
+/// a refusal out from under a better-worded one. The reads are what refuse.
+///
+/// This test used to assert that `read_all()` returned the folded 8-row matrix
+/// for a 4-cell file, describing itself as a tripwire rather than an
+/// endorsement. This is that tripwire firing.
 #[test]
-fn backed_csr_reader_new_on_a_multimodal_file_folds_every_modality() {
+fn backed_csr_reader_new_on_a_multimodal_file_refuses_whole_matrix_reads() {
     use crate::modality::ModalityType;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("multimodal_unscoped.scx");
@@ -2930,26 +2937,250 @@ fn backed_csr_reader_new_on_a_multimodal_file_folds_every_modality() {
         "n_obs from the header; n_vars is the file-wide max, not RNA's 3"
     );
 
-    // 3. `read_all` concatenates every shard, so it returns 8 rows for a
-    //    4-cell file, with both modalities' values folded together.
-    let all = unscoped.read_all().unwrap();
-    assert_eq!(
-        all.shape,
-        (8, ATAC_VARS as usize),
-        "read_all folds both modalities: 4 RNA rows + 4 ATAC rows"
+    // 3. `read_all` — which is what pyscx's `to_memory()` reaches — used to
+    //    concatenate every shard and return 8 rows for a 4-cell file, with both
+    //    modalities' values folded together and the header's file-wide width.
+    //    It now refuses.
+    let err = unscoped
+        .read_all()
+        .expect_err("a whole-matrix read over two overlapping tilings is not well defined");
+    assert!(
+        matches!(err, ScxError::MultimodalRequiresModality { .. }),
+        "expected MultimodalRequiresModality, got {err:?}"
     );
-    assert_eq!(
-        all.data,
-        vec![11.0, 12.0, 13.0, 14.0, 21.0, 22.0, 23.0, 24.0]
-    );
-    assert_eq!(all.indices, vec![0, 0, 0, 0, 4, 4, 4, 4]);
 
-    // 4. The scoped constructor is the one that answers per modality.
+    // 4. `read_rows` was already guarded, by the positional tiling check inside
+    //    it rather than at the catalog seam. Both refusals stand; they are
+    //    different checks and neither subsumes the other (the tiling check also
+    //    catches a gap, which the overlap predicate does not).
+    assert!(matches!(
+        unscoped.read_rows(0, n_obs).expect_err("already guarded"),
+        ScxError::InvalidCatalog(_)
+    ));
+
+    // 5. The scoped constructor is the one that answers per modality — and it
+    //    answers through `read_all()` too, so the refusal above is about the
+    //    flattened list, not about whole-matrix reads on multimodal files.
     let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 0);
     assert_eq!(rna.shape(), (4, RNA_VARS as usize));
     let rna_rows = rna.read_rows(0, 4).unwrap();
     assert_eq!(rna_rows.data, vec![11.0, 12.0, 13.0, 14.0]);
     assert_eq!(rna_rows.shape, (4, RNA_VARS as usize));
+    let rna_all = rna.read_all().unwrap();
+    assert_eq!(rna_all.shape, (4, RNA_VARS as usize));
+    assert_eq!(rna_all.data, vec![11.0, 12.0, 13.0, 14.0]);
+}
+
+/// A two-modality file, each modality one shard over the whole obs axis. RNA
+/// values are 11..=14 at column 0, ATAC 21..=24 at column 4, so "whose row came
+/// back?" has an answer. Returns `(path, rna_id, atac_id)`.
+///
+/// Both modalities declare the **same** width, deliberately. With differing
+/// widths `check_decoded_shard_minor` fires first on any read that decodes a
+/// shard — an unrelated guard, catching the fold by accident — and a test built
+/// on that fixture passes whether or not the multimodal guard exists. It is how
+/// `col_means_and_sum_sq`'s bypass hid from the first version of this test.
+fn write_two_modality_fixture(dir: &TempDir, name: &str) -> (std::path::PathBuf, u8, u8) {
+    use crate::modality::ModalityType;
+    let path = dir.path().join(name);
+    let header = sample_header(4, 5, 8);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(4)).unwrap();
+    let mut ids = Vec::new();
+    for (mname, mtype, n_vars, col, base) in [
+        ("rna", ModalityType::Rna, 5u64, 0u32, 11u8),
+        ("atac", ModalityType::Atac, 5u64, 4u32, 21u8),
+    ] {
+        let mid = writer
+            .add_modality(mname, mtype, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer.set_modality_n_vars(mid, n_vars).unwrap();
+        writer
+            .write_var_for(mid, &sample_var(n_vars as usize))
+            .unwrap();
+        let indptr: Vec<u64> = vec![0, 1, 2, 3, 4];
+        let indices: Vec<u32> = vec![col; 4];
+        let values: Vec<u8> = vec![base, base + 1, base + 2, base + 3];
+        let shard = ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(mid, 0, shard).unwrap();
+        ids.push(mid);
+    }
+    writer.finish().unwrap();
+    (path, ids[0], ids[1])
+}
+
+/// `catalog_int_value_max` on an unscoped multimodal reader.
+///
+/// It narrows the catalog with `e.modality_id == self.modality_id()`, and on an
+/// unscoped reader `modality_id()` is whichever modality sorted first — so it
+/// reported that modality's maximum as the file's. The fixture puts the
+/// **larger** value in the second-sorted modality (RNA maxes at 14, ATAC at
+/// 24), so the wrong answer is a falsely *small* `Some(14)` and the test cannot
+/// pass by picking the first.
+///
+/// `None` is the honest answer here, and it is already this method's documented
+/// "unknown": a caller that needs a real number streams `col_max` instead.
+#[test]
+fn catalog_int_value_max_is_unknown_on_an_unscoped_multimodal_reader() {
+    let dir = TempDir::new().unwrap();
+    let (path, rna_id, atac_id) = write_two_modality_fixture(&dir, "mm_max.scx");
+
+    let unscoped = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+    assert_eq!(
+        unscoped.catalog_int_value_max(),
+        None,
+        "an unscoped reader over two tilings has no one maximum to report"
+    );
+
+    // Each scoped reader reports its own, and they differ — without which the
+    // assertion above would hold for a method that always answered `None`.
+    let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 0);
+    let atac = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), atac_id, 0);
+    assert_eq!(rna.catalog_int_value_max(), Some(14));
+    assert_eq!(atac.catalog_int_value_max(), Some(24));
+
+    // And a single-modality file still answers.
+    let uni = dir.path().join("uni.scx");
+    write_fixture_at(&uni, 8, 4, 2);
+    assert!(BackedCsrReader::new(ScxReader::open(&uni).unwrap(), 0)
+        .catalog_int_value_max()
+        .is_some());
+}
+
+/// `modality_id()` on a scoped reader whose modality owns no CSR shards.
+///
+/// It read the first entry of the shard table, which is empty there, so a
+/// handle built by `for_modality(reader, mid, …)` reported `0` — the id of a
+/// different modality — to anything inspecting it, including the bitmap
+/// sidecar lookup. The scope the constructor was given is the answer.
+#[test]
+fn modality_id_reports_the_scope_even_when_that_modality_has_no_shards() {
+    let dir = TempDir::new().unwrap();
+    let (path, rna_id, atac_id) = write_two_modality_fixture(&dir, "mm_ids.scx");
+
+    let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 0);
+    assert_eq!(rna.modality_id(), rna_id);
+    assert_eq!(rna.index().n_shards(), 1, "fixture premise");
+
+    // A modality id the file does not use: the scoped table is empty, and the
+    // handle must still say which modality it was scoped to.
+    let empty_id = atac_id + 7;
+    let empty = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), empty_id, 0);
+    assert_eq!(empty.index().n_shards(), 0, "fixture premise: no shards");
+    assert_eq!(
+        empty.modality_id(),
+        empty_id,
+        "a scoped handle must report its scope, not the id of another modality"
+    );
+
+    // An unscoped handle has no scope to report and falls back to its table.
+    let uni = dir.path().join("uni.scx");
+    write_fixture_at(&uni, 8, 4, 2);
+    assert_eq!(
+        BackedCsrReader::new(ScxReader::open(&uni).unwrap(), 0).modality_id(),
+        0
+    );
+}
+
+/// The **row-addressed** reads on an unscoped multimodal reader.
+///
+/// `read_all` refuses at the catalog seam and `read_rows` refuses with its own
+/// positional tiling check — but `read_row_indices` and `read_rows_with` plan
+/// through `BackedCsrIndex::shard_for_row`, whose
+/// `partition_point(|r| r.row_start <= row)` / `pos - 1` lookup *answers* over
+/// overlapping ranges by taking whichever modality sorted last. No error and no
+/// warning: a gather for cell 0 returned some modality's cell 0, at the
+/// file-wide width.
+///
+/// Reachable from a binding, not only from a Rust misuse: rscx's `x_backed()`
+/// and `x_lazy()` both build the unscoped reader and export `read_row_indices`
+/// through it.
+#[test]
+fn row_addressed_reads_reject_an_unscoped_multimodal_reader() {
+    let dir = TempDir::new().unwrap();
+    let (path, rna_id, _atac_id) = write_two_modality_fixture(&dir, "mm_rows.scx");
+
+    let unscoped = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let gather = unscoped
+        .read_row_indices(&[0, 2])
+        .expect_err("a gather cannot attribute a row to one modality");
+    assert!(
+        matches!(gather, ScxError::MultimodalRequiresModality { .. }),
+        "read_row_indices: got {gather:?}"
+    );
+    let scattered = unscoped
+        .read_rows_with(&[0, 2], |_, _, _| Ok(()))
+        .expect_err("the scatter path plans through the same lookup");
+    assert!(
+        matches!(scattered, ScxError::MultimodalRequiresModality { .. }),
+        "read_rows_with: got {scattered:?}"
+    );
+
+    // The streaming reductions read the concatenation as one obs axis, so they
+    // are the same hazard in a different shape: `row_sums` sizes its vector
+    // `n_obs` and extends per shard, which over two tilings returned eight
+    // entries for a four-cell file. Most reach shards through `ShardSource`,
+    // which is where that family is guarded — but `col_means_and_sum_sq` is an
+    // *inherent* method looping `read_shard_cached_arc` directly, so Rust
+    // resolves a concrete-typed call to it and it never touches the trait. It
+    // accumulated RNA and ATAC into one `n_vars`-wide vector and divided by one
+    // modality's `n_obs`: means carrying 12.5 at RNA's column 0 *and* 22.5 at
+    // ATAC's column 4, a matrix no modality has.
+    for (what, err) in [
+        ("row_sums", unscoped.row_sums().expect_err("row reduction")),
+        (
+            "col_sums",
+            unscoped.col_sums().expect_err("column reduction"),
+        ),
+        (
+            "col_means_and_sum_sq",
+            unscoped
+                .col_means_and_sum_sq(true)
+                .expect_err("the PCA statistic surface"),
+        ),
+    ] {
+        assert!(
+            matches!(err, ScxError::MultimodalRequiresModality { .. }),
+            "{what}: got {err:?}"
+        );
+    }
+
+    // The scoped reader answers all of them, with that modality's values.
+    let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 4);
+    assert_eq!(rna.row_sums().unwrap(), vec![11.0, 12.0, 13.0, 14.0]);
+    let (means, _) = rna.col_means_and_sum_sq(true).unwrap();
+    let means = means.unwrap();
+    assert_eq!(means[0], 12.5, "RNA's column 0 mean, unmixed");
+    assert!(
+        means[1..].iter().all(|&m| m == 0.0),
+        "no other column has a mean: {means:?}"
+    );
+    assert_eq!(
+        rna.read_row_indices(&[0, 2]).unwrap().data,
+        vec![11.0, 13.0]
+    );
+    let mut seen: Vec<f32> = Vec::new();
+    rna.read_rows_with(&[0, 2], |_, _, vals| {
+        seen.extend_from_slice(vals);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, vec![11.0, 13.0]);
+
+    // A single-modality file is untouched: the guard is about overlap, not
+    // about these entry points.
+    let uni = dir.path().join("uni.scx");
+    write_fixture_at(&uni, 16, 8, 4);
+    let plain = BackedCsrReader::new(ScxReader::open(&uni).unwrap(), 4);
+    assert_eq!(plain.read_row_indices(&[0, 5, 11]).unwrap().shape.0, 3);
+    assert!(plain.read_rows_with(&[0, 5], |_, _, _| Ok(())).is_ok());
+    assert_eq!(plain.row_sums().unwrap().len(), 16);
 }
 
 /// Write a fixture `.scx` at an explicit path (peer of `write_test_file_and_open`

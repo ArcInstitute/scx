@@ -1,4 +1,5 @@
 use super::*;
+use crate::modality::ModalityType;
 use crate::provenance::ProvenanceEntry;
 use crate::shard::SHARD_HEADER_SIZE;
 use crate::writer::{ScxWriter, ShardBuffers};
@@ -3828,4 +3829,183 @@ fn test_min_dictionary_key_type_uses_capacity_not_max() {
         "Int16 holds 32768"
     );
     assert_eq!(min_dictionary_key_type(32_769), DataType::Int32);
+}
+
+// ---------------------------------------------------------------------------
+// The multimodal tripwire on the flattened whole-matrix reads
+// ---------------------------------------------------------------------------
+
+/// Write a file with `modalities` named modalities, each holding one CSR shard
+/// that covers the whole obs axis `[0, n_obs)` — the shape every real
+/// multimodal file has, and the one that makes the flattened shard list
+/// overlapping.
+///
+/// Each modality's values start at `(i + 1) * 100` and sit in a column no other
+/// modality uses, so "whose rows came back?" has an answer rather than a guess.
+fn write_overlapping_modalities(
+    dir: &tempfile::TempDir,
+    name: &str,
+    n_obs: usize,
+    modalities: &[(&str, ModalityType, usize)],
+) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    let max_vars = modalities.iter().map(|(_, _, nv)| *nv).max().unwrap() as u64;
+    let header = sample_header(n_obs as u64, max_vars, (n_obs * modalities.len()) as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    for (i, (mname, mtype, n_vars)) in modalities.iter().enumerate() {
+        let mid = writer
+            .add_modality(mname, *mtype, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer.set_modality_n_vars(mid, *n_vars as u64).unwrap();
+        writer.write_var_for(mid, &sample_var(*n_vars)).unwrap();
+        let indptr: Vec<u64> = (0..=n_obs as u64).collect();
+        let col = (*n_vars - 1) as u32;
+        let indices: Vec<u32> = vec![col; n_obs];
+        let values: Vec<u8> = (0..n_obs).map(|r| ((i + 1) * 100 + r) as u8).collect();
+        let shard = ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(mid, 0, shard).unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// Whole-matrix `X` read on a multimodal file.
+///
+/// Before the tripwire this returned an `n_obs * n_modalities`-row matrix over
+/// mixed column spaces — for a 4-cell, 2-modality file, 8 rows — as an `Ok`.
+/// Each modality independently tiles `[0, n_obs)`, so the flattened shard list
+/// claims every row once per modality and the assembler simply concatenates
+/// them.
+#[test]
+fn read_all_csr_shards_refuses_an_overlapping_shard_tiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_overlapping_modalities(
+        &dir,
+        "mm.scx",
+        4,
+        &[
+            ("rna", ModalityType::Rna, 3),
+            ("adt", ModalityType::Protein, 5),
+        ],
+    );
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(reader.is_multimodal(), "fixture premise");
+
+    let err = reader
+        .read_all_csr_shards()
+        .expect_err("a whole-matrix read of a two-modality file is not well defined");
+    assert!(
+        matches!(err, ScxError::MultimodalRequiresModality { .. }),
+        "expected MultimodalRequiresModality, got {err:?}"
+    );
+    // The message has to name the way out, not just the refusal.
+    let msg = err.to_string();
+    assert!(msg.contains("read_all_csr_shards"), "{msg}");
+    assert!(msg.contains("_for(modality_id)"), "{msg}");
+
+    // The deletion-vector-filtered twin is a wrapper around the same read, so
+    // it inherits the refusal rather than carrying a second copy of it. Pinned
+    // because "it inherits" is a claim about a call this test does not make.
+    #[cfg(feature = "deletion-vectors")]
+    assert!(matches!(
+        reader.read_all_csr_shards_filtered().unwrap_err(),
+        ScxError::MultimodalRequiresModality { .. }
+    ));
+
+    // The scoped siblings still answer, with that modality's values and width.
+    let rna_id = reader.modality_id("rna").unwrap();
+    let rna = reader.read_all_csr_shards_for(rna_id).unwrap();
+    assert_eq!(rna.shape.0, 4);
+    assert_eq!(rna.data, vec![100.0, 101.0, 102.0, 103.0]);
+    #[cfg(feature = "deletion-vectors")]
+    assert_eq!(
+        reader
+            .read_all_csr_shards_for_filtered(rna_id)
+            .unwrap()
+            .data,
+        vec![100.0, 101.0, 102.0, 103.0]
+    );
+}
+
+/// The positional single-shard read has the same hazard in a sharper form: the
+/// index is a position in the flattened list, so on a multimodal file
+/// `read_csr_shard(0)` returns whichever modality happened to sort first.
+#[test]
+fn read_csr_shard_refuses_an_overlapping_shard_tiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_overlapping_modalities(
+        &dir,
+        "mm.scx",
+        4,
+        &[
+            ("rna", ModalityType::Rna, 3),
+            ("adt", ModalityType::Protein, 5),
+        ],
+    );
+    let reader = ScxReader::open(&path).unwrap();
+
+    let err = reader
+        .read_csr_shard(0)
+        .expect_err("shard 0 of a flattened two-modality list names no modality");
+    assert!(
+        matches!(err, ScxError::MultimodalRequiresModality { .. }),
+        "expected MultimodalRequiresModality, got {err:?}"
+    );
+
+    // `read_csr_shard_for` is the positional read that does name one.
+    let adt_id = reader.modality_id("adt").unwrap();
+    let (_, _, data) = reader.read_csr_shard_for(adt_id, 0).unwrap();
+    assert_eq!(data, vec![200.0, 201.0, 202.0, 203.0]);
+}
+
+/// The accept side, without which the tests above pass on a guard that simply
+/// refuses everything: an ordinary multi-shard single-modality file still reads.
+#[test]
+fn read_all_csr_shards_accepts_a_single_modality_multi_shard_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "uni.scx", 16, 8, 4, false);
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(!reader.is_multimodal(), "fixture premise");
+
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 16);
+    assert!(reader.read_csr_shard(0).is_ok());
+}
+
+/// The accept-side case a modality-table-based guard gets wrong.
+///
+/// `from_mudata(MuData({"rna": adata}))` and a single-modality h5mu ingest emit
+/// a file with a **one-entry modality table**, so `is_multimodal()` is `true`
+/// and the only X is stamped `modality_id = 1` — leaving modality 0 owning no
+/// shards. Its flattened cover is nonetheless a perfectly unambiguous single
+/// tiling, and a whole-matrix read of it is well defined.
+///
+/// Guarding on `is_multimodal()`, or on "modality 0 tiles the obs axis", would
+/// reject every such file. The tripwire keys on shard geometry for exactly this
+/// reason.
+#[test]
+fn read_all_csr_shards_accepts_a_file_whose_only_modality_is_id_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_overlapping_modalities(&dir, "one.scx", 4, &[("rna", ModalityType::Rna, 3)]);
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.is_multimodal(),
+        "fixture premise: a one-entry modality table still sets the flag"
+    );
+    assert_eq!(
+        reader.catalog().csr_shards_for_modality(0).len(),
+        0,
+        "fixture premise: modality 0 owns no shards"
+    );
+
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 4);
+    assert_eq!(csr.data, vec![100.0, 101.0, 102.0, 103.0]);
 }

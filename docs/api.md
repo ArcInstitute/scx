@@ -91,6 +91,19 @@ GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
 - `read_csr_shard(idx)` — Single shard as `(Vec<i64>, Vec<i32>, Vec<f32>)`
 - `read_all_csr_shards()` — Full matrix as `ScxCsr` (parallel via rayon)
 - `read_all_csr_shards_typed(plan)` — Full matrix as a `TypedCsr` at the plan's value / index dtypes, assembled directly at that width (also parallel via rayon)
+
+  > **These three address the flattened, all-modality CSR shard list**, so they
+  > are defined only on a file that presents one tiling of the obs axis. On a
+  > multimodal file each modality independently tiles `[0, n_obs)`, and they
+  > return `ScxError::MultimodalRequiresModality` naming the `_for(modality_id)`
+  > sibling rather than an `n_obs x n_modalities`-row matrix over mixed column
+  > spaces. `FullCatalog::single_tiling_csr_shards` is the seam; the predicate
+  > is shard geometry, never the modality table, so a file with a one-entry
+  > modality table (what a single-modality h5mu ingest writes, stamping
+  > `modality_id = 1`) still reads. `BackedCsrReader::read_all` — `to_memory()`
+  > on the Python side — inherits the refusal when it was built unscoped, and
+  > reads its own modality when built with `for_modality`.
+
 - `read_csc_shard(idx)` — Single CSC sidecar shard as `ScxCsc`
 - `read_all_csc_shards()` — Concatenated CSC matrix as `ScxCsc`
 - `read_csc_columns(col_range)` — CSC columns covering a half-open
