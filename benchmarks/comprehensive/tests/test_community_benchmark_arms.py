@@ -17,6 +17,7 @@ reads exactly like coverage.
 from __future__ import annotations
 
 import ast
+import json
 import sys
 from pathlib import Path
 
@@ -528,3 +529,298 @@ def _subscript_assign_guards(mod, subscript_key: str) -> list[str]:
                 break
         guards.append(found)
     return guards
+
+
+# ---------------------------------------------------------------------------
+# pipeline_ooc_constrained
+# ---------------------------------------------------------------------------
+
+from benchmarks.comprehensive.benchmarks import pipeline_ooc_constrained as poc  # noqa: E402
+
+
+class _FakeOutcome:
+    """Enough of `ArmOutcome` for `summarize_outcome`, with no subprocess."""
+
+    def __init__(self, records, *, returncode=0, timed_out=False, wall_s=12.0,
+                 stderr=""):
+        self.records = records
+        self.returncode = returncode
+        self.timed_out = timed_out
+        self.wall_s = wall_s
+        self.stderr = stderr
+
+    @property
+    def killed_by_oom(self):
+        return self.returncode in subproc_arm.OOM_RETURNCODES
+
+
+def _stage_records(n: int) -> list[dict]:
+    return [
+        {"kind": "stage", "name": poc.STAGES[i], "index": i,
+         "wall_s": 1.0 + i, "peak_rss_mb": 100.0 * (i + 1)}
+        for i in range(n)
+    ]
+
+
+def test_a_completed_pipeline_reports_one_and_no_failed_stage():
+    recs = _stage_records(len(poc.STAGES)) + [{
+        "kind": "done", "total_wall_s": 99.0, "n_clusters": 12,
+        "n_obs_final": 1000, "n_vars_final": 2000,
+    }]
+    extras, reason = poc.summarize_outcome(_FakeOutcome(recs), 16)
+    assert extras["pipeline_completed_int"] == 1.0
+    assert reason == poc.OUTCOME_COMPLETED
+    assert extras["failed_stage"] == ""
+    assert extras["total_wall_s"] == 99.0
+    for stage in poc.STAGES:
+        assert f"stage_wall_s__{stage}" in extras
+        assert f"stage_peak_rss_mb__{stage}" in extras
+
+
+def test_an_oom_kill_is_recorded_as_a_zero_and_names_the_stage():
+    """The case the whole benchmark rests on, and the one a happy-path suite
+    never reaches.
+
+    `check_absolute_floors` skips a triple whose *result* is missing, so a cell
+    that simply vanishes when the cgroup kills it reads exactly like coverage.
+    The metric has to exist and be `0.0`.
+    """
+    outcome = _FakeOutcome(_stage_records(3), returncode=-9)
+    extras, reason = poc.summarize_outcome(outcome, 16)
+    assert reason == poc.OUTCOME_OOM
+    assert extras["pipeline_completed_int"] == 0.0
+    # Three stages finished, so it died in the fourth.
+    assert extras["failed_stage"] == poc.STAGES[3]
+    assert extras["oom_at_stage_index"] == 3.0
+
+
+def test_an_oom_kill_reports_the_budget_not_the_last_sample():
+    """A `max: 15360` ceiling must not pass on a run that blew through it.
+
+    SIGKILL gives the sampler no chance to take a final reading, so the largest
+    *observed* stage peak can be far below what the run actually demanded — and
+    for a kill during the first stage it would be 0.0, which sails under any
+    ceiling. The budget is the one figure certain to be a lower bound.
+    """
+    outcome = _FakeOutcome(_stage_records(2), returncode=-9)
+    extras, _ = poc.summarize_outcome(outcome, 16)
+    assert extras["pipeline_peak_rss_mb"] == 16 * 1024.0
+    assert extras["pipeline_peak_rss_mb"] > max(
+        r["peak_rss_mb"] for r in _stage_records(2)
+    )
+
+
+def test_a_kill_before_any_stage_still_yields_a_usable_record():
+    outcome = _FakeOutcome([], returncode=137)
+    extras, reason = poc.summarize_outcome(outcome, 32)
+    assert reason == poc.OUTCOME_OOM
+    assert extras["pipeline_completed_int"] == 0.0
+    assert extras["failed_stage"] == poc.STAGES[0]
+    assert extras["pipeline_peak_rss_mb"] == 32 * 1024.0
+
+
+def test_a_timeout_is_not_reported_as_an_oom():
+    """Three different things give 0.0; only one is the claim being made."""
+    outcome = _FakeOutcome(_stage_records(5), returncode=-1, timed_out=True)
+    extras, reason = poc.summarize_outcome(outcome, 16)
+    assert reason == poc.OUTCOME_TIMEOUT
+    assert extras["pipeline_completed_int"] == 0.0
+    # Not the budget: nothing here says the ceiling was reached.
+    assert extras["pipeline_peak_rss_mb"] == 500.0
+
+
+def test_a_degenerate_clustering_is_not_reported_as_an_oom():
+    recs = _stage_records(8) + [{"kind": "degenerate", "n_clusters": 1}]
+    extras, reason = poc.summarize_outcome(
+        _FakeOutcome(recs, returncode=4), 16,
+    )
+    assert reason == poc.OUTCOME_DEGENERATE
+    assert extras["pipeline_completed_int"] == 0.0
+    assert extras["n_clusters"] == 1.0
+
+
+def test_an_ordinary_crash_is_flagged_for_the_caller_to_raise():
+    """Exit 1 must not be laundered into "scanpy hit the ceiling"."""
+    extras, reason = poc.summarize_outcome(
+        _FakeOutcome(_stage_records(1), returncode=1), 16,
+    )
+    assert reason == poc.OUTCOME_FAILED
+    assert extras["pipeline_completed_int"] == 0.0
+
+
+def test_every_outcome_path_emits_the_gated_metric():
+    """No branch of `summarize_outcome` may omit `pipeline_completed_int`.
+
+    A result that exists with the metric absent is a violation the gate blames
+    on the benchmark; a result that is missing is skipped in silence. Neither
+    is the measurement.
+    """
+    cases = [
+        _FakeOutcome(_stage_records(9) + [{"kind": "done", "total_wall_s": 1.0}]),
+        _FakeOutcome(_stage_records(3), returncode=-9),
+        _FakeOutcome([], returncode=137),
+        _FakeOutcome(_stage_records(5), returncode=-1, timed_out=True),
+        _FakeOutcome(
+            _stage_records(8) + [{"kind": "degenerate", "n_clusters": 1}],
+            returncode=4,
+        ),
+        _FakeOutcome(_stage_records(1), returncode=1),
+    ]
+    for outcome in cases:
+        extras, _ = poc.summarize_outcome(outcome, 16)
+        assert "pipeline_completed_int" in extras
+        assert "pipeline_peak_rss_mb" in extras
+        assert "total_wall_s" in extras
+
+
+def test_stage_reporter_flushes_each_stage_as_it_finishes():
+    """Buffered output is lost to SIGKILL, and with it the whole measurement."""
+    emitted = []
+
+    def emit(line, flush=False):
+        emitted.append((line, flush))
+
+    rep = poc.StageReporter(emit=emit)
+    rep.stage("load", lambda: None)
+    rep.stage("qc_metrics", lambda: None)
+    assert len(emitted) == 2
+    assert all(flush for _line, flush in emitted), "each stage must flush"
+    names = [json.loads(line)["name"] for line, _ in emitted]
+    assert names == ["load", "qc_metrics"]
+    assert [json.loads(line)["index"] for line, _ in emitted] == [0, 1]
+
+
+def test_hvg_runs_on_raw_counts_before_normalisation_on_both_arms():
+    """`seurat_v3` is a statistic of the count distribution.
+
+    The spec's stage order puts it after normalize+log1p, where it computes
+    something else. It is moved ahead of normalisation and left unsubset, so
+    normalisation still runs over the full gene axis and PCA picks the mask up.
+    Both arms must agree, or the two are not the same pipeline.
+    """
+    assert poc.STAGES.index("hvg") < poc.STAGES.index("normalize_log1p")
+    assert poc.STAGES.index("normalize_log1p") < poc.STAGES.index("pca")
+    fn = _function_def(poc, "run_pipeline")
+    hvg_calls = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) == "highly_variable_genes"
+    ]
+    assert len(hvg_calls) == 2, "one HVG call per engine"
+    for call in hvg_calls:
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "flavor" in kw and kw["flavor"].value == "seurat_v3"
+        assert "subset" in kw and kw["subset"].value is False, (
+            "subsetting here would make normalize_total compute size factors "
+            "over 2000 genes instead of the full axis"
+        )
+
+
+def test_the_scoped_datasets_exist_and_exclude_the_meaningless_ones():
+    from benchmarks.comprehensive.config import DATASETS
+
+    assert set(poc.FORMAT_DATASET_SCOPE) == set(poc.SUPPORTED_FORMATS)
+    for names in poc.FORMAT_DATASET_SCOPE.values():
+        assert names, "an empty scope schedules nothing at all"
+        unknown = sorted(set(names) - set(DATASETS))
+        assert not unknown, f"scope names datasets that do not exist: {unknown}"
+        # A 16 GB ceiling on 2,700 cells is not an experiment.
+        assert "pbmc3k" not in names
+
+
+def test_the_orchestrator_reads_the_declared_scope():
+    """The scope has to be enforced at cohort-build time, not inside run().
+
+    Stubbing an out-of-scope dataset inside `run()` is a typed result, but only
+    after Chimera has started a task, activated conda and imported pyscx.
+    """
+    import benchmarks.comprehensive.scripts.run_parallel as rp
+
+    scope = rp._bench_format_dataset_scope("pipeline_ooc_constrained")
+    assert scope, "run_parallel does not see FORMAT_DATASET_SCOPE"
+    key = "pipeline_ooc_constrained__pyscx_16g"
+    assert rp._triple_compatible("pipeline_ooc_constrained", "pbmc10k", key)
+    assert not rp._triple_compatible("pipeline_ooc_constrained", "pbmc3k", key)
+
+
+def test_the_budget_is_still_declared_consistently():
+    """Phase 0 pinned this; the arm implementation must not have drifted."""
+    assert set(poc.MEMORY_BUDGET_GB) == set(poc.SUPPORTED_FORMATS)
+    for key, gb in poc.MEMORY_BUDGET_GB.items():
+        assert key.endswith(f"_{gb}g")
+        assert poc.engine_for(key) in ("pyscx", "scanpy")
+
+
+def test_a_worker_reported_oom_names_the_stage_and_the_spelling():
+    """The ceiling does not always arrive as SIGKILL.
+
+    Under an explicit RLIMIT_DATA, and on some cgroup paths, the allocation
+    simply fails and Python raises MemoryError. The worker says so, which is
+    better evidence than inferring it from a signal — it names the stage.
+    """
+    recs = _stage_records(4) + [
+        {"kind": "oom", "stage_index": 4, "how": "MemoryError", "detail": "..."},
+    ]
+    extras, reason = poc.summarize_outcome(_FakeOutcome(recs, returncode=5), 16)
+    assert reason == poc.OUTCOME_OOM
+    assert extras["pipeline_completed_int"] == 0.0
+    assert extras["failed_stage"] == poc.STAGES[4]
+    assert extras["oom_detected_as"] == "MemoryError"
+    assert extras["pipeline_peak_rss_mb"] == 16 * 1024.0
+
+
+def test_a_capture_run_never_classifies_on_stderr():
+    """A text match is only safe where a misclassification cannot be published.
+
+    `conversion_streaming` learned this: once the parent classifies on a
+    string, every unrelated failure carrying it is silently relabelled as the
+    expected outcome. On SLURM the ceiling arrives as a signal, so the capture
+    path needs no guessing and does none.
+    """
+    outcome = _FakeOutcome(
+        _stage_records(6), returncode=-6,
+        stderr="OpenBLAS error: Memory allocation still failed after 10 retries",
+    )
+    _extras, reason = poc.summarize_outcome(outcome, 16)
+    assert reason == poc.OUTCOME_FAILED, (
+        "the default path must not read an allocation message as the ceiling"
+    )
+
+
+def test_the_local_hatch_does_classify_a_native_abort_as_the_ceiling():
+    """Measured: under RLIMIT_DATA=2G the scanpy arm aborts inside OpenBLAS
+    with exit -6 at the `neighbors` stage rather than raising MemoryError.
+
+    Without this the local reproduction of the constrained regime — the only
+    way to exercise the OOM path off SLURM — reports a bug instead of a result.
+    """
+    outcome = _FakeOutcome(
+        _stage_records(6), returncode=-6,
+        stderr="OpenBLAS error: Memory allocation still failed after 10 retries",
+    )
+    extras, reason = poc.summarize_outcome(outcome, 16, trust_stderr=True)
+    assert reason == poc.OUTCOME_OOM
+    assert extras["oom_detected_as"] == "native_abort"
+    assert extras["failed_stage"] == poc.STAGES[6]
+
+
+def test_an_unrelated_crash_under_the_hatch_is_still_a_crash():
+    outcome = _FakeOutcome(
+        _stage_records(2), returncode=1, stderr="ImportError: no module named x",
+    )
+    _extras, reason = poc.summarize_outcome(outcome, 16, trust_stderr=True)
+    assert reason == poc.OUTCOME_FAILED
+
+
+def test_the_local_memory_hatch_is_off_by_default(monkeypatch):
+    """A real capture must take its ceiling from the cgroup and nowhere else.
+
+    A second, differently-accounted limit on top of the cgroup would make
+    `pipeline_peak_rss_mb` describe neither.
+    """
+    monkeypatch.delenv("SCX_BENCH_PIPELINE_MEM_LIMIT_GB", raising=False)
+    assert poc._local_mem_limit_bytes() is None
+    monkeypatch.setenv("SCX_BENCH_PIPELINE_MEM_LIMIT_GB", "2")
+    assert poc._local_mem_limit_bytes() == 2 * 1024**3
+    monkeypatch.setenv("SCX_BENCH_PIPELINE_MEM_LIMIT_GB", "not-a-number")
+    assert poc._local_mem_limit_bytes() is None

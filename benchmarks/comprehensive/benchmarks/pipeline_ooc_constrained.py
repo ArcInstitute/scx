@@ -46,6 +46,29 @@ result that exists with the metric absent as a violation, so an omitted metric
 and a `0.0` are not interchangeable — and a cell that simply vanishes reads
 exactly like coverage.
 
+The ceiling has three spellings and they are kept apart, because only one of
+them is the claim. A cgroup SIGKILL is `oom_killed`. An allocation that merely
+*fails* — MemoryError, or `OSError(ENOMEM)` — is also `oom_killed`, reported by
+the worker itself so it names the stage. Running out of wall clock is
+`timeout`, and Leiden collapsing to one group (which leaves DE unable to run)
+is `degenerate_clustering`; all three give `0.0`, and conflating them would
+publish "scanpy hit the ceiling" for a run that did something else. Anything
+else is a real bug and fails the cell rather than being laundered into a
+result.
+
+Verified end to end on pbmc3k off SLURM, via the
+`SCX_BENCH_PIPELINE_MEM_LIMIT_GB` hatch: at a 2 GB ceiling the scanpy arm dies
+in the `neighbors` stage and records `pipeline_completed_int = 0.0` with six
+stage records recovered; at 3 GB it completes at a 977 MB peak. The pyscx arm
+completes all nine stages at a 730 MB peak.
+
+That 2 GB run also shows why the hatch needs its own classifier: under a hard
+`RLIMIT_DATA` OpenBLAS aborts the process (exit -6) rather than letting Python
+raise, so there is no signal to read. The stderr text match that covers it is
+enabled **only** under the hatch — on a real capture the cgroup sends SIGKILL,
+which needs no guessing, and a parent that classifies on a string eventually
+relabels every unrelated failure carrying it.
+
 ## Stage order
 
 The spec's §4.2 lists HVG (`flavor="seurat_v3"`) *after* normalize+log1p.
@@ -390,6 +413,23 @@ _WORKER_SCRIPT = textwrap.dedent("""\
         print(json.dumps({"kind": "degenerate", "n_clusters": exc.n_clusters}),
               flush=True)
         raise SystemExit(4)
+    except MemoryError as exc:
+        # The ceiling does not always arrive as SIGKILL. Under an explicit
+        # RLIMIT_DATA, and on some cgroup paths, the allocation simply fails
+        # and Python raises here. Same outcome, different spelling.
+        print(json.dumps({"kind": "oom", "stage_index": reporter.index,
+                          "how": "MemoryError", "detail": str(exc)[:200]}),
+              flush=True)
+        raise SystemExit(5)
+    except OSError as exc:
+        import errno as _errno
+
+        if exc.errno != _errno.ENOMEM:
+            raise
+        print(json.dumps({"kind": "oom", "stage_index": reporter.index,
+                          "how": "ENOMEM", "detail": str(exc)[:200]}),
+              flush=True)
+        raise SystemExit(5)
     summary["kind"] = "done"
     print(json.dumps(summary), flush=True)
 """)
@@ -398,6 +438,27 @@ _WORKER_SCRIPT = textwrap.dedent("""\
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+def _local_mem_limit_bytes() -> int | None:
+    """`SCX_BENCH_PIPELINE_MEM_LIMIT_GB`, for reproducing the regime off SLURM.
+
+    Returns `None` on a normal capture. See `run()` for why this is not the
+    default, and `subproc_arm` for why it is RLIMIT_DATA and never RLIMIT_AS.
+    """
+    import os
+
+    raw = os.environ.get("SCX_BENCH_PIPELINE_MEM_LIMIT_GB", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(float(raw) * 1024**3)
+    except ValueError:
+        logger.warning(
+            "pipeline_ooc_constrained: ignoring unparseable "
+            "SCX_BENCH_PIPELINE_MEM_LIMIT_GB=%r", raw,
+        )
+        return None
+
 
 def _timeout_for(dataset: DatasetConfig, key: str) -> int:
     """Stay under the SLURM job's own wall limit so a partial is still recorded.
@@ -416,8 +477,34 @@ def _timeout_for(dataset: DatasetConfig, key: str) -> int:
         return _DEFAULT_TIMEOUT_S
 
 
+#: Signatures a native library prints when an allocation fails hard.
+#:
+#: Consulted **only** under the local `SCX_BENCH_PIPELINE_MEM_LIMIT_GB` hatch,
+#: never on a real capture. Under a hard RLIMIT, OpenBLAS and friends abort the
+#: process with exit 1 and a message rather than letting Python raise
+#: MemoryError — observed as `OpenBLAS error: Memory allocation still failed
+#: after 10 retries, giving up.` So the hatch needs a text match to be usable
+#: at all.
+#:
+#: It stays out of the capture path on purpose. `conversion_streaming` learned
+#: this the hard way: once the parent classifies on a string, every unrelated
+#: failure that happens to carry it is silently relabelled as the expected
+#: outcome. On SLURM the ceiling arrives as SIGKILL, which needs no guessing.
+_ALLOCATION_ABORT_SIGNATURES = (
+    "memory allocation",
+    "cannot allocate memory",
+    "std::bad_alloc",
+    "out of memory",
+)
+
+
+def _looks_like_an_allocation_abort(stderr: str) -> bool:
+    low = stderr.lower()
+    return any(sig in low for sig in _ALLOCATION_ABORT_SIGNATURES)
+
+
 def summarize_outcome(
-    outcome, budget_gb: int,
+    outcome, budget_gb: int, *, trust_stderr: bool = False,
 ) -> tuple[dict[str, Any], str]:
     """Turn a worker outcome into the metric block, completed or not.
 
@@ -459,6 +546,20 @@ def summarize_outcome(
     extras["failed_stage"] = first_missing or STAGES[-1]
     extras["oom_at_stage_index"] = float(len(stages))
 
+    reported_oom = next((r for r in outcome.records if r.get("kind") == "oom"), None)
+
+    if reported_oom is not None:
+        # The worker saw the allocation fail and said so, which is strictly
+        # better evidence than inferring it from a signal — it names the stage
+        # and the spelling (MemoryError vs ENOMEM).
+        extras["outcome_reason"] = OUTCOME_OOM
+        extras["oom_detected_as"] = reported_oom.get("how", "MemoryError")
+        extras["pipeline_peak_rss_mb"] = float(budget_gb) * 1024.0
+        idx = int(reported_oom.get("stage_index", len(stages)))
+        extras["oom_at_stage_index"] = float(idx)
+        extras["failed_stage"] = STAGES[min(idx, len(STAGES) - 1)]
+        return extras, OUTCOME_OOM
+
     if degenerate is not None:
         reason = OUTCOME_DEGENERATE
         extras["n_clusters"] = float(degenerate.get("n_clusters", float("nan")))
@@ -472,6 +573,12 @@ def summarize_outcome(
         # whenever the poll happened to fire, and a SIGKILL gives no chance to
         # take one at the top. Reporting the budget is the one figure that is
         # certainly a lower bound on what the run demanded.
+        extras["pipeline_peak_rss_mb"] = float(budget_gb) * 1024.0
+    elif trust_stderr and _looks_like_an_allocation_abort(
+        getattr(outcome, "stderr", "") or ""
+    ):
+        reason = OUTCOME_OOM
+        extras["oom_detected_as"] = "native_abort"
         extras["pipeline_peak_rss_mb"] = float(budget_gb) * 1024.0
     else:
         reason = OUTCOME_FAILED
@@ -559,6 +666,13 @@ def run(
         outcome = run_arm(
             _WORKER_SCRIPT, [engine, str(source_path)],
             timeout_s=timeout_s,
+            # Off SLURM there is no cgroup, so the ceiling has to come from
+            # somewhere. RLIMIT_DATA is the local stand-in and is opt-in:
+            # `SCX_BENCH_PIPELINE_MEM_LIMIT_GB=1`. It is never set by default
+            # because on a real capture the cgroup already is the ceiling, and
+            # a second, differently-accounted limit would make the number
+            # describe neither.
+            mem_limit_bytes=_local_mem_limit_bytes(),
             # The child volunteers as the OOM killer's first pick. Without it
             # the kernel may choose this parent — which does no data work and
             # has to survive to record the refusal — and the cell is lost
@@ -566,7 +680,12 @@ def run(
             oom_first=True,
             label=f"{key} run {i + 1}",
         )
-        extras, reason = summarize_outcome(outcome, budget_gb)
+        extras, reason = summarize_outcome(
+            outcome, budget_gb,
+            # Only the local hatch may classify on stderr; see
+            # `_ALLOCATION_ABORT_SIGNATURES`.
+            trust_stderr=_local_mem_limit_bytes() is not None,
+        )
         if reason == OUTCOME_FAILED:
             # Not an OOM, not a timeout, not a degenerate clustering: a real
             # bug. Publishing it as `pipeline_completed_int = 0.0` would claim
