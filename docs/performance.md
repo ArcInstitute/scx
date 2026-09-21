@@ -408,6 +408,87 @@ The lazy preprocessing peak (~3.5 GB) covers QC through streaming PCA; kNN graph
 construction and UMAP dominate the remaining RSS in the full pipeline (~10.9 GB).
 Source: `benchmarks/comprehensive/results/reports/phase5A_ooc_rss.md` and `benchmarks/comprehensive/results/raw/memory__scx_auto__census_1m.json`.
 
+
+#### The laptop test: a full pipeline under a fixed ceiling
+
+The numbers above are unconstrained — the process could have used more RAM
+had it wanted to. `pipeline_ooc_constrained` instead **enforces** a ceiling
+with a SLURM cgroup and asks whether the nine-stage pipeline (load, QC,
+filter, HVG, normalize+log1p, PCA, kNN, UMAP+Leiden, Wilcoxon DE) finishes
+inside it. Both engines run the identical stage order, including HVG
+(`seurat_v3`, `subset=False`) **before** normalisation, because `seurat_v3`
+is a statistic of the count distribution.
+
+The ceiling is a cgroup and deliberately **not** `RLIMIT_AS`: an SCX open
+mmaps the whole file, so an address-space cap refuses a mapping the backed
+path never makes resident and would break the very arm under test.
+
+| Dataset | pyscx @ 16 GB | pyscx @ 32 GB | scanpy @ 16 GB | scanpy @ 32 GB |
+|---|---|---|---|---|
+| pbmc10k (11.5K) | 61.2 s / 1,083 MB | 61.5 s / 1,083 MB | 51.6 s / 1,336 MB | 53.1 s / 1,339 MB |
+| tabula_sapiens_100k | 266.8 s / 4,259 MB | 267.1 s / 4,177 MB | 289.8 s / 5,006 MB | 249.6 s / 5,007 MB |
+| census_500k | **1,494 s / 6,336 MB** | 1,506 s / 6,425 MB | **OOM** (`filter`) | 2,574 s / 17,825 MB |
+| census_1m | **3,186 s / 8,819 MB** | 3,373 s / 8,898 MB | **OOM** (`qc_metrics`) | **OOM** (`filter`) |
+
+SCX completes a 1M-cell pipeline inside a **16 GB** ceiling at 8.6 GB peak.
+scanpy needs more than 16 GB at 500K cells and more than 32 GB at 1M. Where
+both finish — census_500k, scanpy given 32 GB — SCX is **1.72× faster on
+2.8× less resident memory**.
+
+An OOM here is a recorded result, not a missing one: the worker prints one
+JSON line per completed stage and raises its own `oom_score_adj` so the
+kernel takes the child rather than the parent, which then writes
+`pipeline_completed_int = 0.0` and the first stage with no completion line.
+A cell that merely vanished would be skipped by the regression gate in
+silence and read as coverage.
+
+**Where the time goes, and where SCX loses.** At census_1m the aggregate is
+dominated by one stage:
+
+| Stage | pyscx @ 16 GB, census_1m | share |
+|---|---:|---:|
+| `rank_genes_groups` (Wilcoxon) | 2,022 s | 63 % |
+| `umap_leiden` | 642 s | 20 % |
+| `neighbors` | 314 s | 10 % |
+| `pca` | 48 s | 1.5 % |
+| `normalize_log1p` | 39 s | 1.2 % |
+| `hvg` (seurat_v3) | 36 s | 1.1 % |
+| everything else (load, QC, filter) | 30 s | 1.0 % |
+
+DE is not where SCX is strong. On pbmc10k, where both engines complete,
+SCX's `rank_genes_groups` takes **45.5 s against scanpy's 6.5 s — a 7×
+loss** — while its `neighbors` takes **1.5 s against scanpy's 26.3 s, a 17×
+win**. The two roughly cancel at that size (61 s vs 52 s, SCX behind); at
+100K they cancel the other way (267 s vs 290 s). What actually changes the
+outcome at census scale is not speed but whether the run finishes at all.
+
+Source: `benchmarks/comprehensive/results/raw/pipeline_ooc_constrained__pipeline_ooc_constrained__{pyscx,scanpy}_{16g,32g}__{pbmc10k,tabula_sapiens_100k,census_500k,census_1m}.json`,
+capture `candidate_community_20260920` (`--tier full`, pyscx 0.18.0 release,
+median of 3 runs at census scale).
+
+> [!NOTE]
+> **Manifest entries** for all four community benchmarks are the 70
+> schema-v2 results named in the `Source:` lines of this section and of
+> [Read iteration](#read-iteration-streaming-vs-in-memory),
+> [Fused QC + filtering](#fused-qc--filtering-vs-scanpy-accel_qc_filter) and
+> [Gene-set scoring](#gene-set-scoring-vs-scanpy-accel_score_genes) — one
+> file per `(benchmark, arm, dataset)` cell, because a `BenchmarkResult`
+> pooling a 23 s backed arm with a 52 s scanpy one yields a `median_wall_s`
+> describing neither. They are **force-added** (`results/raw/` is
+> gitignored), and the promoted snapshot
+> `results/baselines/v0.18.0-community-benchmarks/summary.json` carries the
+> same 82 rows in medianed form.
+>
+> Captured on `scx-bench`'s **pyscx 0.18.0 release** — not the 0.19.0 of the
+> tree these docs ship with — which is why the baseline is named 0.18.0.
+> `system.provenance.git_dirty` is `true`: during the five-hour wave the
+> only dirty tracked paths were `benchmarks/comprehensive/reporting/*` and
+> `tests/test_reporting_pipeline.py`, landed mid-capture, and no benchmark
+> worker imports either. The measured modules under
+> `benchmarks/comprehensive/benchmarks/` and pyscx itself were unmodified at
+> `ba3a2bbc` throughout. This is the documented-as-acceptable case in
+> [`docs/benchmark_manifest.md` § Workflow](benchmark_manifest.md#workflow).
+
 ### Read iteration: streaming vs in-memory
 
 `pyscx.open(path).to_anndata(backed=True)` and `to_mudata(backed=True)` walk
@@ -453,9 +534,54 @@ matrix sums across both modes:
 | cite_seq_pbmc_5k (5.2K × 33K + 32) | rna + adt | 16 MB | 0.61 s | 0.59 s | 312 MB | 315 MB |
 | multiome_pbmc_10k (11.9K × 36K + 144K) | rna + atac | 228 MB | 25.4 s | 24.5 s | 1.58 GB | 1.59 GB |
 
-The RSS-saving regime activates at census-scale CITE-seq / Multiome
-(not staged on the current Lambda fleet); the pattern at single-modality
-``census_500k`` / ``census_1m`` is the load-bearing extrapolation.
+That regime is no longer an extrapolation. `multimodal_atlas_streaming`
+runs the same question on two synthetic atlases staged by
+`benchmarks/scripts/build_multimodal_atlas.py` — `multiome_atlas_500k`
+(500K cells × 35K RNA + 150K ATAC, 1.80 B nonzeros; 14.54 GB `.h5mu`,
+3.25 GB `.scx`) and `citeseq_atlas_1m` (1M × 30K RNA + 250 ADT, 1.14 B;
+9.27 GB / 1.34 GB) — across six ways of reading one file:
+
+| Arm | multiome_atlas_500k | | citeseq_atlas_1m | |
+|---|---:|---:|---:|---:|
+| | **wall** | **peak RSS** | **wall** | **peak RSS** |
+| SCX modality pushdown (`scx query --modality`) | **0.017 s** | **50 MB** | **0.022 s** | **50 MB** |
+| SCX eager f32 (`to_mudata()`) | 12.7 s | 26,268 MB | 7.3 s | 17,396 MB |
+| MuData backed (`read_h5mu(backed="r")`) | 19.9 s | 2,722 MB | 11.9 s | 1,427 MB |
+| SCX backed stream (`to_mudata(backed=True)`) | 22.4 s | 6,646 MB | 15.4 s | 3,403 MB |
+| MuData eager (`read_h5mu`) | 26.4 s | 22,764 MB | 11.6 s | 15,999 MB |
+| SCX eager uint16 (`data_dtype="uint16"`) | 32.5 s | 22,451 MB | 24.2 s | 15,178 MB |
+
+Three readings, two of them favourable and one not:
+
+- **Modality-scoped pushdown is the real result.** Answering "give me one
+  modality's cells matching a `batch` predicate" costs 17 ms and 50 MB
+  through `scx query --modality`, against 26 s and 22.8 GB for MuData, which
+  has to load the whole container before it can answer. That is not a
+  1.5× — it is a different shape of operation.
+- **Eager SCX beats eager MuData on the Multiome atlas** (12.7 s vs 26.4 s)
+  while reading 3.25 GB off disk instead of 14.54 GB, and by 1.6× on the
+  CITE-seq atlas (7.3 s vs 11.6 s). Peak RSS is the other way on that one
+  (17.4 GB vs 16.0 GB): its second modality is 250 dense columns, so there
+  is little for a codec to win back and SCX pays the decode without the
+  compression payoff.
+- **SCX's backed arm is slower and heavier than MuData's** — 22.4 s /
+  6,646 MB against 19.9 s / 2,722 MB on the Multiome atlas. A 64K-row chunk
+  of a 150K-column ATAC matrix is ~1.7 GB before the shard cache, so
+  `STREAMING_CHUNK_ROWS` is the first thing to question. The fixture is also
+  uniform random with no biological structure, which is the worst case for a
+  codec that then has to decode what it compressed 4.5×. This is a real
+  regression against MuData on this access pattern and is recorded as one.
+
+All six arms agree on every modality's total, compared through a **float64**
+accumulator rather than `X.sum()` — scipy accumulates in the array's own
+dtype, and on `cite_seq_pbmc_5k` the identical values read as float32 and as
+uint16 give 32,173,180 and 32,173,181. That one-unit gap would have flagged
+the narrowing arm as corrupting data it reproduces exactly.
+
+Source: `benchmarks/comprehensive/results/raw/multimodal_atlas_streaming__multimodal_atlas_streaming__{scx_stream,scx_eager_u16,scx_eager_f32,mudata_h5mu,mudata_backed,scx_query_mod}__{multiome_atlas_500k,citeseq_atlas_1m}.json`,
+capture `candidate_community_20260920` (pyscx 0.18.0 release, median of 3).
+ Manifest provenance for every community-benchmark number is recorded
+once under [The laptop test](#the-laptop-test-a-full-pipeline-under-a-fixed-ceiling).
 
 #### Per-modality in-decode narrow (eager `to_mudata`)
 
@@ -486,6 +612,25 @@ available Multiome fixture's ATAC counts exceed 255 (max 762), so `uint8` there
 needs `allow_lossy=True` and is not lossless. Default (no override) modalities
 keep the byte-identical zero-copy f32 path. A dict key naming no modality raises
 `ValueError`; `container="dense"` is not yet supported for `to_mudata`.
+
+**At atlas scale the value buffers still halve and the process peak does
+not.** `multimodal_atlas_streaming` measures the same eager call on the two
+atlases with each arm in its own process, self-sampling its RSS, and the
+uint16 arm running its own f32 control in a second child so the ratio comes
+from one result rather than a cross-arm join:
+
+| Fixture | eager f32 peak | eager uint16 peak | ratio | saving |
+|---|---:|---:|---:|---:|
+| `multiome_atlas_500k` (1.80 B nnz) | 26,268 MB | 22,451 MB | **1.171×** | 3.7 GB |
+| `citeseq_atlas_1m` (1.14 B nnz) | 17,396 MB | 15,178 MB | **1.146×** | 2.2 GB |
+
+Both are far short of 2×, and that is arithmetic rather than a defect: only
+the **value** buffer narrows. `indices` stays `int32` at 4 B/nnz, so the CSR
+pair goes from 8 B/nnz to 6 B/nnz — a 1.33× ceiling before any of the
+process's other resident state is counted. The absolute saving matches what
+the data array gives up exactly (1.80 B nnz × 2 B = 3.6 GB against 3.7 GB
+measured). Read the 2× as a claim about the value buffer, which it is, and
+the 1.17× as what a process actually observes.
 
 Source: ``benchmarks/comprehensive/results/raw/read_streaming_vs_inmemory__scx_auto__{census_500k,census_1m}.json``
 and ``benchmarks/comprehensive/results/raw/multimodal_read_streaming_vs_inmemory__scx_multimodal_per_modality_auto__{cite_seq_pbmc_5k,multiome_pbmc_10k}.json``.
@@ -1551,6 +1696,61 @@ decode-pass counts above are unchanged, which `test_qc_metrics_fused.py`'s
 `cpu_profile_snapshot()` test pins. Lazy `obsp` / `varp` / `varm` entries are not decoded
 by a subset at all; the subset is recorded and applied if and when the key is read.
 
+### Fused QC + filtering vs scanpy (`accel_qc_filter`)
+
+The section above measures the fusion against SCX's own unfused predecessor.
+This one measures the fused kernel against **scanpy**, on the call sequence
+that opens essentially every workflow — `calculate_qc_metrics(qc_vars=["mt",
+"ribo"])` → `filter_cells(min_genes=200)` → `filter_genes(min_cells=3)`.
+The two are different comparands and give different numbers (3.36× there,
+2.3–4.1× here); neither contradicts the other.
+
+`percent_top=(50, 100, 200, 500)` is passed **explicitly on both sides**,
+clamped to the gene axis. pyscx defaults it to `None` and scanpy to that
+tuple, so leaving the defaults alone would have the scanpy arm computing
+four extra order statistics the SCX arm skips.
+
+| Dataset | pyscx backed | pyscx in-memory | scanpy | speedup | RSS ratio |
+|---|---:|---:|---:|---:|---:|
+| pbmc3k (2.7K) | 0.13 s / 341 MB | 1.09 s / 514 MB | 1.21 s / 550 MB | 9.6× | 1.6× |
+| pbmc10k (11.5K) | 1.48 s / 554 MB | 2.23 s / 1,045 MB | 2.55 s / 1,082 MB | 1.7× | 2.0× |
+| smartseq2 (50K) | 4.00 s / 1,510 MB | 12.88 s / 3,521 MB | 14.47 s / 3,553 MB | 3.6× | 2.4× |
+| tabula_sapiens_100k | 3.82 s / 1,525 MB | 16.44 s / 5,019 MB | 15.52 s / 5,047 MB | 4.1× | 3.3× |
+| census_500k | 13.54 s / 1,871 MB | 24.50 s / 17,916 MB | 31.04 s / 17,959 MB | 2.3× | 9.6× |
+| census_1m | **23.16 s / 2,196 MB** | 44.54 s / 33,311 MB | **52.47 s / 33,366 MB** | **2.3×** | **15.2×** |
+
+Speedup and RSS ratio are the backed arm against scanpy. The memory ratio is
+the one that grows: at 1M cells scanpy holds the whole CSR at 33 GB while the
+backed arm streams in 2.2 GB, and that gap is what decides whether the work
+runs on the machine in front of you.
+
+Only **pyscx backed** is native end to end. `accel.filter_cells` /
+`accel.filter_genes` delegate to `sc.pp.*` when `X` is an in-memory scipy
+matrix, so the in-memory column is a native QC pass followed by a scanpy
+filter — read it as the cost of the QC kernel alone, not as a
+native-vs-scanpy result.
+
+> [!NOTE]
+> **On `smartseq2`, SCX and scanpy disagree — and SCX is right.** Its
+> `qc_metrics_max_abs_diff` is 9.0 where every other fixture measures
+> exactly 0.0. scanpy reduces `X` in the array's own dtype and every fixture
+> stores float32; smartseq2's per-cell totals are 2–3 × 10⁷, past float32's
+> 2²⁴ exact-integer range, where consecutive integers are no longer
+> representable. 37 of 50,000 cells differ, and against the exact `int64`
+> sum of the raw data SCX matches every time (22,989,693 / 20,484,705 /
+> 34,427,105) while scanpy is one out. SCX accumulates in f64. The benchmark
+> therefore judges each column against four ULPs of its own magnitude
+> (`accel_qc_filter.float32_sum_tolerance`) rather than one flat tolerance,
+> and `thresholds.yaml` carries no parity floor for that fixture.
+
+Source: `benchmarks/comprehensive/results/raw/accel_qc_filter__accel_qc_filter__{pyscx_cpu,pyscx_inmem,scanpy_cpu}__{pbmc3k,pbmc10k,smartseq2,tabula_sapiens_100k,census_500k,census_1m}.json`,
+capture `candidate_community_20260920` (`--tier full`, pyscx 0.18.0 release,
+median of 3 runs at ≥100K cells and 5 below it). Each arm runs in its own
+process and samples its own peak RSS; parity is computed against an untimed
+scanpy reference in a fourth process.
+ Manifest provenance for every community-benchmark number is recorded
+once under [The laptop test](#the-laptop-test-a-full-pipeline-under-a-fixed-ceiling).
+
 ### Axis subsetting — what delegating to anndata costs (Phase-4 task 4.0b)
 
 Task 4.0b stopped reimplementing anndata's axis bookkeeping: `filter_cells`,
@@ -1679,6 +1879,63 @@ identical to the dense kernel (property-tested). Source: `bench_de_csc_routes.py
 on `cpu_preemptible`; the nnz kernel stays opt-in pending a promotion decision.
 
 Source: 2026-05-25 full-tier gate (post-G10 graph capture + bench env-routing fix), candidate `candidate_2623788_20260525`. Benchmark module: `benchmarks/comprehensive/benchmarks/accel_de.py` — picks the best obs column from `cell_type`/`leiden`/`louvain`/`cluster`/`perturbation`/`target` or falls back to a deterministic 50/50 synthetic split, restricts to top-4 test groups + reference, and records the chosen `groupby` in `metadata`. Each SLURM bench job is allocated 16 CPUs; `pyscx_cpu`'s `user_s/wall_s` ratio shows ~3-5 effective cores per run.
+
+### Gene-set scoring vs scanpy (`accel_score_genes`)
+
+`pyscx.accel.score_genes` scores a per-cell signature by streaming the
+matrix shard by shard, so it runs on a **backed** `X` — which
+`sc.tl.score_genes` refuses outright with `NotImplementedError`. The
+benchmark scores three panel sizes (K = 25 / 100 / 500), derived
+deterministically per fixture by ranking `var_names` on total counts,
+keeping the top 2,000 and taking each K by a **stride** through that pool
+(a head would land every gene of a K=500 panel in one bin of the
+expression-matched control sampler).
+
+| Dataset | pyscx (backed, control) | scanpy (eager) | speedup | RSS ratio |
+|---|---:|---:|---:|---:|
+| pbmc3k (2.7K) | 0.11 s / 323 MB | 0.13 s / 484 MB | 1.2× | 1.5× |
+| pbmc10k (11.5K) | 1.28 s / 327 MB | 0.94 s / 848 MB | **0.7×** | 2.6× |
+| smartseq2 (50K) | 3.05 s / 453 MB | 4.96 s / 2,602 MB | 1.6× | 5.7× |
+| tabula_sapiens_100k | 3.21 s / 487 MB | 22.09 s / 3,666 MB | 6.9× | 7.5× |
+| census_500k | 10.55 s / 675 MB | 29.05 s / 12,732 MB | 2.8× | 18.9× |
+| census_1m | **18.76 s / 821 MB** | **55.76 s / 23,531 MB** | **3.0×** | **28.7×** |
+
+SCX is **slower than scanpy on pbmc10k** (1.28 s vs 0.94 s). At that size
+the matrix fits in cache and the streaming decode is overhead the eager path
+does not pay; the crossover is somewhere above 10K cells. The memory side
+never crosses: 327 MB against 848 MB even where SCX loses on time, and
+28.7× at 1M cells, where the whole point is that scanpy's path needs 23 GB
+resident and this one needs 0.8.
+
+The two other methods trade accuracy for speed on the same fixtures:
+`method="mean"` is 18.34 s at census_1m (no control set) and
+`method="zscore"` is 34.21 s.
+
+**Parity is exact.** Spearman is 1.0 and the maximum absolute score
+difference is 0.0 at all three panel sizes on pbmc3k, pbmc10k,
+tabula_sapiens_100k, census_500k and census_1m. That requires passing
+scanpy's own control genes to SCX via `ctrl_genes=`, which the benchmark
+reconstructs through scanpy's private binning helpers — scanpy 1.12 keeps
+`control_genes` as a function local and writes nothing to `uns`. The route
+is load-bearing rather than ceremonial: SCX's own sampler is seeded
+independently of numpy and draws a different set, scoring Spearman
+0.92 / 0.73 / 0.81 at K = 25 / 100 / 500 on pbmc3k. A silent fallback to it
+would leave the parity column comparing two different control sets and
+reporting agreement, so the module records a typed
+`scanpy_private_api_drift` gap instead of falling back.
+
+On `smartseq2` the absolute difference is 0.017–0.038 rather than 0.0, for
+the same float32-accumulator reason described under
+[Fused QC + filtering](#fused-qc--filtering-vs-scanpy-accel_qc_filter). Its
+Spearman is still exactly 1.0.
+
+Source: `benchmarks/comprehensive/results/raw/accel_score_genes__accel_score_genes__{pyscx_cpu_scanpy,pyscx_cpu_mean,pyscx_cpu_zscore,scanpy_cpu}__{pbmc3k,pbmc10k,smartseq2,tabula_sapiens_100k,census_500k,census_1m}.json`,
+capture `candidate_community_20260920` (pyscx 0.18.0 release). Each arm
+primes with a discarded scoring call before the timed loop — the first
+`sc.tl.score_genes` in a process pays a fixed 1.0 s cost the rest do not,
+and panels are scored smallest-first.
+ Manifest provenance for every community-benchmark number is recorded
+once under [The laptop test](#the-laptop-test-a-full-pipeline-under-a-fixed-ceiling).
 
 ### Harmony2 batch integration + LISI
 

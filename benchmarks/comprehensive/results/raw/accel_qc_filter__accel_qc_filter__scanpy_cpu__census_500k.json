@@ -1,0 +1,156 @@
+{
+  "schema_version": 2,
+  "benchmark": "accel_qc_filter",
+  "format": "accel_qc_filter__scanpy_cpu",
+  "dataset": "census_500k",
+  "timestamp": "2026-09-20T19:30:02",
+  "system": {
+    "hostname": "CPUDFDE34",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2016,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": false
+    },
+    "gpu": {
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M30WRS18H3PG0TSCSWAGCZEQ",
+      "git_sha": "ba3a2bbc9b395d7930a0db924b7e1a8ce8b80869",
+      "git_branch": "bench-community-benchmarks",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.19.0-14-gba3a2bbc",
+      "rayon_threads": "",
+      "omp_threads": "",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 27.939997767098248,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 17957.0078125,
+      "extra": {
+        "qc_wall_s__qc_metrics": 9.261622701771557,
+        "qc_peak_rss_mb__qc_metrics": 12805.046875,
+        "qc_wall_s__filter_cells": 7.720096182078123,
+        "qc_peak_rss_mb__filter_cells": 17845.70703125,
+        "qc_wall_s__filter_genes": 9.957243348006159,
+        "qc_peak_rss_mb__filter_genes": 17949.0078125,
+        "qc_wall_s": 27.939997767098248,
+        "qc_peak_rss_mb": 17957.0078125,
+        "cache_policy": "warm",
+        "x_type": "csr_matrix"
+      }
+    },
+    {
+      "wall_s": 40.34588933503255,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 17958.8828125,
+      "extra": {
+        "qc_wall_s__qc_metrics": 20.166615707799792,
+        "qc_peak_rss_mb__qc_metrics": 12807.16796875,
+        "qc_wall_s__filter_cells": 8.89780128095299,
+        "qc_peak_rss_mb__filter_cells": 17852.48046875,
+        "qc_wall_s__filter_genes": 10.279758045915514,
+        "qc_peak_rss_mb__filter_genes": 17948.8828125,
+        "qc_wall_s": 40.34588933503255,
+        "qc_peak_rss_mb": 17958.8828125,
+        "cache_policy": "warm",
+        "x_type": "csr_matrix"
+      }
+    },
+    {
+      "wall_s": 31.043423877097666,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 17960.75,
+      "extra": {
+        "qc_wall_s__qc_metrics": 12.164613000117242,
+        "qc_peak_rss_mb__qc_metrics": 12807.328125,
+        "qc_wall_s__filter_cells": 8.05810308502987,
+        "qc_peak_rss_mb__filter_cells": 17845.61328125,
+        "qc_wall_s__filter_genes": 9.82611660612747,
+        "qc_peak_rss_mb__filter_genes": 17954.75,
+        "qc_wall_s": 31.043423877097666,
+        "qc_peak_rss_mb": 17960.75,
+        "cache_policy": "warm",
+        "x_type": "csr_matrix"
+      }
+    }
+  ],
+  "median_wall_s": 31.043423877097666,
+  "wall_s_iqr": 12.405891567934304,
+  "n_runs": 3,
+  "metadata": {
+    "cold_cache": false,
+    "n_warmup": 1,
+    "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/census_500k.h5ad",
+    "min_genes": 200,
+    "min_cells": 3,
+    "percent_top": [
+      50,
+      100,
+      200,
+      500
+    ],
+    "stages": [
+      "qc_metrics",
+      "filter_cells",
+      "filter_genes"
+    ],
+    "parity_reference": null,
+    "qc_var_counts": {
+      "mt": 0,
+      "ribo": 0
+    }
+  },
+  "scenario": {
+    "name": "qc_metrics_then_filter",
+    "engine": "scanpy",
+    "residency": "in_memory",
+    "cache_state": "warm",
+    "device": "cpu"
+  },
+  "comparison": {
+    "subject": {
+      "impl": "accel_qc_filter__scanpy_cpu"
+    },
+    "baseline": {
+      "impl": "accel_qc_filter__scanpy_cpu"
+    },
+    "metric": "qc_wall_s",
+    "status": "pending"
+  }
+}

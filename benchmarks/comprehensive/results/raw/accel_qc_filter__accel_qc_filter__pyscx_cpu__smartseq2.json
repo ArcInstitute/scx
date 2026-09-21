@@ -1,0 +1,214 @@
+{
+  "schema_version": 2,
+  "benchmark": "accel_qc_filter",
+  "format": "accel_qc_filter__pyscx_cpu",
+  "dataset": "smartseq2",
+  "timestamp": "2026-09-20T19:30:17",
+  "system": {
+    "hostname": "CPUDFDC84",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2016,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": false
+    },
+    "gpu": {
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M30WRS18H3PG0TSCSWAGCZEQ",
+      "git_sha": "ba3a2bbc9b395d7930a0db924b7e1a8ce8b80869",
+      "git_branch": "bench-community-benchmarks",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.19.0-14-gba3a2bbc",
+      "rayon_threads": "",
+      "omp_threads": "",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 3.9013986508361995,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 1505.39453125,
+      "extra": {
+        "qc_wall_s__qc_metrics": 2.131354650016874,
+        "qc_peak_rss_mb__qc_metrics": 1510.3984375,
+        "qc_wall_s__filter_cells": 0.7866293452680111,
+        "qc_peak_rss_mb__filter_cells": 1437.3359375,
+        "qc_wall_s__filter_genes": 0.9821670292876661,
+        "qc_peak_rss_mb__filter_genes": 1473.6171875,
+        "qc_wall_s": 3.9013986508361995,
+        "qc_peak_rss_mb": 1505.39453125,
+        "cache_policy": "warm",
+        "x_type": "ScxBackedSparseDataset",
+        "qc_metrics_max_abs_diff": 9.0,
+        "filtered_shape_match_int": 1.0,
+        "n_obs_after": 49995.0,
+        "n_vars_after": 58458.0
+      }
+    },
+    {
+      "wall_s": 4.158010963816196,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 1508.3125,
+      "extra": {
+        "qc_wall_s__qc_metrics": 2.2799056051298976,
+        "qc_peak_rss_mb__qc_metrics": 1505.62890625,
+        "qc_wall_s__filter_cells": 0.8684585900045931,
+        "qc_peak_rss_mb__filter_cells": 1415.50390625,
+        "qc_wall_s__filter_genes": 1.00836576288566,
+        "qc_peak_rss_mb__filter_genes": 1455.24609375,
+        "qc_wall_s": 4.158010963816196,
+        "qc_peak_rss_mb": 1508.3125,
+        "cache_policy": "warm",
+        "x_type": "ScxBackedSparseDataset",
+        "qc_metrics_max_abs_diff": 9.0,
+        "filtered_shape_match_int": 1.0,
+        "n_obs_after": 49995.0,
+        "n_vars_after": 58458.0
+      }
+    },
+    {
+      "wall_s": 4.098052457906306,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 1523.31640625,
+      "extra": {
+        "qc_wall_s__qc_metrics": 2.306383923161775,
+        "qc_peak_rss_mb__qc_metrics": 1506.3046875,
+        "qc_wall_s__filter_cells": 0.7997158011421561,
+        "qc_peak_rss_mb__filter_cells": 1520.75,
+        "qc_wall_s__filter_genes": 0.9904581205919385,
+        "qc_peak_rss_mb__filter_genes": 1487.36328125,
+        "qc_wall_s": 4.098052457906306,
+        "qc_peak_rss_mb": 1523.31640625,
+        "cache_policy": "warm",
+        "x_type": "ScxBackedSparseDataset",
+        "qc_metrics_max_abs_diff": 9.0,
+        "filtered_shape_match_int": 1.0,
+        "n_obs_after": 49995.0,
+        "n_vars_after": 58458.0
+      }
+    },
+    {
+      "wall_s": 4.0045151500962675,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 1511.2421875,
+      "extra": {
+        "qc_wall_s__qc_metrics": 2.172336282208562,
+        "qc_peak_rss_mb__qc_metrics": 1505.20703125,
+        "qc_wall_s__filter_cells": 0.8237191238440573,
+        "qc_peak_rss_mb__filter_cells": 1438.23046875,
+        "qc_wall_s__filter_genes": 1.0071062250062823,
+        "qc_peak_rss_mb__filter_genes": 1468.81640625,
+        "qc_wall_s": 4.0045151500962675,
+        "qc_peak_rss_mb": 1511.2421875,
+        "cache_policy": "warm",
+        "x_type": "ScxBackedSparseDataset",
+        "qc_metrics_max_abs_diff": 9.0,
+        "filtered_shape_match_int": 1.0,
+        "n_obs_after": 49995.0,
+        "n_vars_after": 58458.0
+      }
+    },
+    {
+      "wall_s": 3.9743829159997404,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 1510.3046875,
+      "extra": {
+        "qc_wall_s__qc_metrics": 2.160312274005264,
+        "qc_peak_rss_mb__qc_metrics": 1510.046875,
+        "qc_wall_s__filter_cells": 0.8076056828722358,
+        "qc_peak_rss_mb__filter_cells": 1454.4765625,
+        "qc_wall_s__filter_genes": 1.0050435760058463,
+        "qc_peak_rss_mb__filter_genes": 1499.50390625,
+        "qc_wall_s": 3.9743829159997404,
+        "qc_peak_rss_mb": 1510.3046875,
+        "cache_policy": "warm",
+        "x_type": "ScxBackedSparseDataset",
+        "qc_metrics_max_abs_diff": 9.0,
+        "filtered_shape_match_int": 1.0,
+        "n_obs_after": 49995.0,
+        "n_vars_after": 58458.0
+      }
+    }
+  ],
+  "median_wall_s": 4.0045151500962675,
+  "wall_s_iqr": 0.19014092744328082,
+  "n_runs": 5,
+  "overall_passed": false,
+  "metadata": {
+    "cold_cache": false,
+    "n_warmup": 1,
+    "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/smartseq2_auto.scx",
+    "min_genes": 200,
+    "min_cells": 3,
+    "percent_top": [
+      50,
+      100,
+      200,
+      500
+    ],
+    "stages": [
+      "qc_metrics",
+      "filter_cells",
+      "filter_genes"
+    ],
+    "parity_reference": "/large_storage/arcinfra/projects/scx/scx_bench_qc_reference/smartseq2.4b8c7c7aa60f5f5e.npz",
+    "qc_var_counts": {
+      "mt": 0,
+      "ribo": 0
+    },
+    "qc_metrics_max_abs_diff": 9.0
+  },
+  "scenario": {
+    "name": "qc_metrics_then_filter",
+    "engine": "pyscx",
+    "residency": "backed",
+    "cache_state": "warm",
+    "device": "cpu"
+  },
+  "comparison": {
+    "subject": {
+      "impl": "accel_qc_filter__pyscx_cpu"
+    },
+    "baseline": {
+      "impl": "accel_qc_filter__scanpy_cpu"
+    },
+    "metric": "qc_wall_s",
+    "status": "pending"
+  }
+}

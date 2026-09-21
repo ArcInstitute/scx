@@ -3177,15 +3177,23 @@ def community_pipeline_ooc_stage_table() -> TableBlock | TextBlock:
 
     from benchmarks.comprehensive.benchmarks.pipeline_ooc_constrained import STAGES
 
-    headers = ["Dataset", "Arm"] + [s.replace("_", " ") for s in STAGES]
+    # `Notes` is load-bearing, not decoration: an arm killed by the ceiling
+    # legitimately has no wall time for the stages it never reached, and the
+    # empty-cell lint asks for a reason on any row that is mostly blank. The
+    # reason is the outcome, which is also the most useful thing in the row.
+    headers = ["Dataset", "Arm"] + [s.replace("_", " ") for s in STAGES] + ["Notes"]
     rows: list[list[str]] = []
     for row in sorted(rows_data, key=lambda r: (r.dataset, r.format)):
+        reason = str(_de_first_extra(row, "outcome_reason") or "—")
+        failed = _de_first_extra(row, "failed_stage")
+        note = f"{reason} @ {failed}" if reason != "completed" and failed else reason
         rows.append(
             [
                 SHORT_NAMES.get(row.dataset, row.dataset),
                 _community_arm("pipeline_ooc_constrained", row.format),
             ]
             + [_fmt_time(_de_median_extra(row, f"stage_wall_s__{s}")) for s in STAGES]
+            + [note]
         )
 
     return TableBlock(
@@ -3248,10 +3256,12 @@ def community_multimodal_atlas_table() -> TableBlock | TextBlock:
     return TableBlock(
         headers=headers, rows=rows, wide=True,
         caption=(
-            "multimodal_atlas_streaming — six arms over the same file. The "
-            "f32/u16 ratio is measured on the narrowing arm, which runs its "
-            "own f32 control in a second process; `Sums match` compares every "
-            "modality's float64-accumulated total across arms."
+            "multimodal_atlas_streaming — six arms over the same file: "
+            "backed streaming, eager f32, eager uint16, MuData eager, MuData "
+            "backed, and a modality-scoped query. The f32/u16 ratio is "
+            "measured on the narrowing arm, which runs its own f32 control in "
+            "a second process; `Sums match` compares every modality's "
+            "float64-accumulated total across arms."
         ),
         source=SourceRef(
             kind=SourceKind.raw_json, path=_community_src(rows_data),

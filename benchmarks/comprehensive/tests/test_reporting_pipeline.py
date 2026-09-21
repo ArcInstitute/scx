@@ -876,7 +876,9 @@ class TestCommunityBenchmarkTables:
             self._restore(previous)
 
         for row in block.rows:
-            data_cells = row[2:]  # first two are Dataset / Arm labels
+            # First two are Dataset / Arm labels; a trailing `Notes` column is
+            # an explanation, not a measurement, so it does not count either.
+            data_cells = row[2:-1] if block.headers[-1] == "Notes" else row[2:]
             assert any(c != "—" for c in data_cells), (
                 f"{builder}: {row[0]} / {row[1]} rendered no values at all"
             )
