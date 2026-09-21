@@ -545,6 +545,14 @@ _BENCHMARK_DOMAIN_MAP: dict[str, str] = {
     # Accelerators chapter and never appear in the report.
     "accel_de": "accelerator",
     "accel_de_nb_glm": "accelerator",
+    # Community analytical workflows. Unmapped is
+    # not an error — `by_domain` does `mapping.get(...)`, so the rows simply
+    # never reach a domain-grouped report section. Several existing benchmarks
+    # are already in that state; don't copy the omission.
+    "accel_qc_filter": "accelerator",
+    "accel_score_genes": "accelerator",
+    "pipeline_ooc_constrained": "specialized",
+    "multimodal_atlas_streaming": "specialized",
 }
 
 

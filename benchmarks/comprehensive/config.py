@@ -308,16 +308,39 @@ class DatasetConfig:
     def path_for_format(self, format_key: str) -> Path:
         """Return the persistent on-disk path for a given format key.
 
-        Accelerator variants (`accel_*__<impl>`) don't correspond to a
-        file format — they run on the source h5ad directly via
-        `pyscx.accel.*` / `scanpy.*`. For those keys we return the
-        source h5ad path itself, which is what the `accel_*.py`
-        benchmark modules already use through `dataset.h5ad_path`.
+        Implementation-arm variants don't correspond to a file format — they
+        name an engine / device / strategy and all read the same source file.
+        `accel_*__<impl>` runs on the source h5ad directly via
+        `pyscx.accel.*` / `scanpy.*`, so for those keys we return the source
+        h5ad path itself, which is what the `accel_*.py` benchmark modules
+        already use through `dataset.h5ad_path`. `bench_csc__*` and
+        `pipeline_ooc_constrained__*` are the same shape;
+        `multimodal_atlas_streaming__*` is too, but on the `.h5mu` axis.
         """
-        if format_key.startswith("accel_") or format_key.startswith("bench_csc__"):
+        if format_key.startswith("multimodal_atlas_streaming__"):
+            # Same impl-arm rule as the accel keys below, but on the multimodal
+            # axis: the arms read `.h5mu` / the multimodal `.scx`, and the
+            # bench builds whatever else it needs. Returning `h5ad_path` here
+            # would break `run_parallel`'s Phase-A invariant
+            # `cfg.multimodal != _is_multimodal_format(fmt.key)`.
+            return self.h5mu_path
+        if (
+            format_key.startswith("accel_")
+            or format_key.startswith("bench_csc__")
+            or format_key.startswith("pipeline_ooc_constrained__")
+        ):
             # `bench_csc_dispatch` variants run on the source h5ad
             # directly; the bench module converts to a CSC-equipped
             # SCX file once per dataset and caches it.
+            #
+            # `pipeline_ooc_constrained` is the same shape under a different
+            # name (see its module docstring). Note what this return value is
+            # load-bearing for beyond path resolution: Phase A
+            # (`run_parallel.py`) decides whether to submit a conversion job by
+            # testing `path_for_format(...).exists()`, so resolving an impl-arm
+            # key to an already-present source file is exactly what makes these
+            # keys a no-op there — no conversion, no `afterok` edge, and hence
+            # no `_NO_CONVERSION` entry needed.
             return self.h5ad_path
         prop = _FORMAT_KEY_TO_PROP.get(format_key)
         if prop is None:
@@ -716,6 +739,51 @@ DATASETS: dict[str, DatasetConfig] = {
         approx_h5ad_mb=1_086, available=True,
         multimodal=True, modality_names=("rna", "atac"),
     ),
+    # Synthetic atlas-scale multimodal fixtures for the
+    # `multimodal_atlas_streaming` benchmark. The two real Phase-K fixtures
+    # above are 5.2K and 11.9K cells; `to_mudata(data_dtype=...)`'s in-decode
+    # narrowing only matters where MuData's all-f32 value buffers do, which is
+    # >= 500K.
+    #
+    # NOT in any `capture_baseline.TIERS` list until
+    # `benchmarks/scripts/build_multimodal_atlas.py` (Phase 4.1) has staged
+    # them. That is deliberate and it is the whole point: a dataset outside
+    # every tier is never scheduled by the default gate, and
+    # `check_absolute_floors` skips a triple that did not run *silently* — so a
+    # floor declared against one of these today would read as coverage and
+    # provide none. See `DatasetConfig.scx_full_path`'s docstring above; 53
+    # floors are in exactly that state. Add to TIERS in Phase 4.2, with the
+    # fixtures, not before.
+    #
+    # `available=False` is documentation only — `DatasetConfig.available` is
+    # read nowhere in the tree. What actually keeps these two out of an
+    # unscoped run is `run_parallel`'s default dataset resolution, which keeps
+    # a dataset only if `cfg.h5ad_path.exists()`, plus their absence from
+    # TIERS. Do not rely on the flag.
+    #
+    # `approx_h5ad_mb` is derived from the declared geometry at the ~8 B/nnz
+    # uncompressed CSR rate the other entries use (pbmc10k checks out at 196 vs
+    # its recorded 194), NOT guessed — it feeds `estimate_memory_gb`'s
+    # `base_mb = h5ad_mb * 2`. The numbers are a real staging cost worth seeing
+    # before Phase 4.1 is written: multiome is 1.8 B nnz / ~13.6 GB (700 M RNA
+    # + 1.125 B ATAC) and CITE-seq 1.15 B nnz / ~8.6 GB. If that is too much to
+    # stage, the lever is the density, and this is the place to revisit it.
+    "multiome_atlas_500k": DatasetConfig(
+        id="K3", name="multiome_atlas_500k",
+        n_obs=500_000, n_vars=35_000 + 150_000,
+        protocol="synthetic 10x Multiome (RNA 4% + ATAC 1.5%)",
+        source="benchmarks/scripts/build_multimodal_atlas.py",
+        approx_h5ad_mb=13_924, available=False, synthetic=True,
+        multimodal=True, modality_names=("rna", "atac"),
+    ),
+    "citeseq_atlas_1m": DatasetConfig(
+        id="K4", name="citeseq_atlas_1m",
+        n_obs=1_000_000, n_vars=30_000 + 250,
+        protocol="synthetic CITE-seq (RNA 3% + dense ADT panel)",
+        source="benchmarks/scripts/build_multimodal_atlas.py",
+        approx_h5ad_mb=8_774, available=False, synthetic=True,
+        multimodal=True, modality_names=("rna", "adt"),
+    ),
     # Tiny synthetic h5ad used by the streaming-conversion smoke job.
     # The fixture is generated on-node by `scripts/_synth_h5ad.py` and
     # lives under SCX_DATA_DIR, so it's marked `synthetic=False` (the
@@ -1004,6 +1072,38 @@ def accel_formats() -> list[FormatVariant]:
         out.extend(accel_format_pipeline_variants())
     except ImportError:
         pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_qc_filter import (
+            accel_qc_filter_variants,
+        )
+        out.extend(accel_qc_filter_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_score_genes import (
+            accel_score_genes_variants,
+        )
+        out.extend(accel_score_genes_variants())
+    except ImportError:
+        pass
+    # The last two benchmark names don't carry the `accel_` prefix, but their
+    # variants are still implementation arms rather than storage formats, so
+    # they register here — the same arrangement `bench_csc_dispatch` uses.
+    # `run_parallel` adds this pool whenever one of them is scheduled.
+    try:
+        from benchmarks.comprehensive.benchmarks.pipeline_ooc_constrained import (
+            pipeline_ooc_constrained_variants,
+        )
+        out.extend(pipeline_ooc_constrained_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.multimodal_atlas_streaming import (
+            multimodal_atlas_streaming_variants,
+        )
+        out.extend(multimodal_atlas_streaming_variants())
+    except ImportError:
+        pass
     return out
 
 
@@ -1137,6 +1237,35 @@ def estimate_memory_gb(
     is_h5ad = format_key.startswith("h5ad")
     is_zarr = format_key.startswith("zarr")
     is_dense_path = is_h5ad or is_zarr  # densify on read in scanpy/h5py path
+
+    # `pipeline_ooc_constrained` returns before the shared tail below, because
+    # for it the allocation IS the experiment: the arm is named for the 16 or
+    # 32 GB ceiling it must run under, and the tail's `+50% safety` / round-to-
+    # 8 GB / MEM_FLOOR_GB would inflate a 16 GB budget into a 24 GB one and
+    # silently test nothing. Same shape as the `SCX_BENCH_OOC_MEM_CAP_GB` early
+    # return further down, which exists for the same reason — capping the SLURM
+    # request below the footprint is how this suite forces an out-of-core
+    # regime, and is the cgroup-level mechanism the memory clamp should use.
+    #
+    # The budget is read from the bench module rather than parsed from the key
+    # suffix here: it is that benchmark's property, and config.py should not
+    # have to know the spelling of an arm.
+    if benchmark == "pipeline_ooc_constrained":
+        try:
+            from benchmarks.comprehensive.benchmarks.pipeline_ooc_constrained import (
+                MEMORY_BUDGET_GB,
+            )
+            budget = MEMORY_BUDGET_GB.get(format_key)
+        except ImportError:
+            budget = None
+        if budget is not None:
+            return max(budget, MEM_FLOOR_GB)
+        logger.warning(
+            "estimate_memory_gb(pipeline_ooc_constrained/%s/%s): no declared "
+            "budget for this format key; falling through to the generic "
+            "estimate, which does NOT enforce the arm's ceiling",
+            format_key, dataset.name,
+        )
 
     if benchmark in ("read_full", "memory"):
         if is_dense_path:
@@ -1430,10 +1559,33 @@ def estimate_memory_gb(
         # which over-budgeted census_1m at 352 GB. The decoded matrix lives in
         # VRAM (H100 80 GB), not host RAM.
         peak_mb = max(base_mb * 1.5, dense_mb * 0.05)
+    elif benchmark == "accel_qc_filter":
+        # Two arms stream (backed SCX: one shard resident, per-subset
+        # accumulators are O(n_obs) + O(n_vars) f64), but the `pyscx_inmem` and
+        # `scanpy_cpu` arms hold the whole sparse matrix AND scanpy's filtered
+        # copy — `filter_cells` / `filter_genes` are not in-place on an eager
+        # AnnData, so peak is two CSR copies. Size to the sparse pair, which is
+        # ~base_mb (itself 2 × h5ad), with headroom for the QC frames.
+        peak_mb = max(base_mb * 2, dense_mb * 0.2)
+    elif benchmark == "accel_score_genes":
+        # Scoring is one streaming pass with O(n_obs) score vectors and an
+        # O(n_genes) binning table; the resident term is the scanpy comparator
+        # arm's eager AnnData (`sc.tl.score_genes` raises on a backed `X`,
+        # which is the point of the benchmark) plus the control-gene panels.
+        # Lighter than accel_qc_filter — no second filtered copy.
+        peak_mb = max(base_mb, dense_mb * 0.1)
     elif benchmark.startswith("accel_"):
         # PCA / kNN stream through sparse or GPU buffers. Observed 2-10 GB
         # on 1M cells.
         peak_mb = max(base_mb, dense_mb * 0.1)
+    elif benchmark == "multimodal_atlas_streaming":
+        # The `mudata_h5mu` / `scx_eager_f32` arms deliberately materialise
+        # every modality at f32 — that is the control the narrowing ratio is
+        # measured against — so this benchmark's peak is the one arm we expect
+        # to be largest, not the one we are advertising. base_mb already sums
+        # both modalities (approx_h5ad_mb is the whole `.h5mu`); hold two such
+        # copies for the sums comparison plus scipy temporaries.
+        peak_mb = max(base_mb * 3, dense_mb * 0.2)
     elif benchmark == "multimodal_compression":
         # Five-format sweep on a `.h5mu` source. Loads MuData once + writes
         # multiple variants (h5mu raw/gzip, zarr, two SCX). Like
@@ -1608,6 +1760,14 @@ def estimate_time_minutes(
         "accel_harmony":          90,
         "accel_preprocess":       60,
         "accel_hvg":              45,
+        # Community analytical workflows. Both are single-pass kernels, but
+        # each carries a scanpy comparator arm that is the slow half: `sc.pp.calculate_qc_metrics` with two `qc_vars` makes
+        # seven passes over X where the fused kernel makes two, and
+        # `sc.tl.score_genes` re-bins and re-samples control genes per gene set
+        # (three sizes: K=25 / 100 / 500). Budget above the 15-min fall-through
+        # so the census tiers don't time out on the reference arm.
+        "accel_qc_filter":        45,
+        "accel_score_genes":      45,
         # V3 task 2.7 — end-to-end PCA→kNN→UMAP residency benchmark runs all
         # three stages back-to-back per variant (the CPU reference is the
         # slowest), so budget ≈ accel_pca + accel_knn + accel_umap (30+60+120)
@@ -1646,6 +1806,20 @@ def estimate_time_minutes(
         # within 30 minutes even at Multiome's 144K-feature ATAC width.
         "multimodal_compression": 10,
         "multimodal_training":    30,
+        # Atlas-scale multimodal streaming (§ 5). Six arms, two of which
+        # deliberately materialise every modality at f32 (the control the
+        # narrowing ratio is measured against) and one of which shells the CLI.
+        # On the small Phase-K fixtures this finishes in minutes; on the Phase-
+        # 4.1 atlases the eager arms dominate, hence the steeper slope below.
+        "multimodal_atlas_streaming": 60,
+        # The "laptop test" (§ 4): nine pipeline stages end to end, once per
+        # arm, with UMAP and Leiden in the middle and a Wilcoxon DE per cluster
+        # at the end. `accel_pipeline` budgets 210 min for three of those nine
+        # stages; this runs all nine, and its whole premise is a constrained
+        # memory ceiling that makes each stage slower, not faster. The scanpy
+        # arms are expected to die early (OOM is the recorded result, not a
+        # failure), so the budget is set by the pyscx arms completing.
+        "pipeline_ooc_constrained": 240,
         # Data-load Phase 0. `ooc_loader` drops the page cache before every
         # timed epoch, so each run re-reads from disk (no warm reuse) across up
         # to 6 loader arms × 2 scenarios × n_runs — generous base + a steeper
@@ -1720,6 +1894,25 @@ def estimate_time_minutes(
     slope_minutes_per_million = 8
     if benchmark in ("cloud_large_atlas",):
         slope_minutes_per_million = 30
+    elif benchmark == "pipeline_ooc_constrained":
+        # Nine stages, and the two expensive ones (kNN + UMAP) are superlinear
+        # in n_obs while Leiden and the per-cluster Wilcoxon DE scale with
+        # n_obs × n_clusters. The constrained ceiling makes every stage slower
+        # than its isolated benchmark, not faster: PCA and HVG stream instead
+        # of holding the matrix, and the kNN graph spills. Calibrated off
+        # `accel_pipeline`'s 210-min base for three of these stages — 300/M
+        # puts census_1m at ~540 min, which is the arm this benchmark exists
+        # to show completing. Re-derive from the first real capture; a timeout
+        # here loses the `pipeline_completed_bool` evidence entirely, which is
+        # the one number the benchmark is for.
+        slope_minutes_per_million = 300
+    elif benchmark == "multimodal_atlas_streaming":
+        # The eager f32 / MuData control arms materialise every modality, so
+        # wall time tracks total nnz across both — and a Multiome ATAC width
+        # (150K peaks) makes that much larger per cell than a single-modality
+        # fixture of the same n_obs. 60/M puts the 500K Multiome atlas at
+        # ~90 min and the 1M CITE-seq atlas at ~120 min.
+        slope_minutes_per_million = 60
     elif benchmark == "ooc_loader":
         # Cold-cache re-reads from disk every epoch; census_5m/10m cold reads
         # dominate. Steeper than the 8/M default so the larger OOC tiers don't
