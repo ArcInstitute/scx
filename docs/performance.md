@@ -1929,7 +1929,8 @@ the same float32-accumulator reason described under
 [Fused QC + filtering](#fused-qc--filtering-vs-scanpy-accel_qc_filter). Its
 Spearman is still exactly 1.0.
 
-Source: `benchmarks/comprehensive/results/raw/accel_score_genes__accel_score_genes__{pyscx_cpu_scanpy,pyscx_cpu_mean,pyscx_cpu_zscore,scanpy_cpu}__{pbmc3k,pbmc10k,smartseq2,tabula_sapiens_100k,census_500k,census_1m}.json`,
+Source: `benchmarks/comprehensive/results/raw/accel_score_genes__accel_score_genes__{pyscx_cpu_scanpy,scanpy_cpu}__{pbmc3k,pbmc10k,smartseq2,tabula_sapiens_100k,census_500k,census_1m}.json`
+and `…__{pyscx_cpu_mean,pyscx_cpu_zscore}__census_1m.json`,
 capture `candidate_community_20260920` (pyscx 0.18.0 release). Each arm
 primes with a discarded scoring call before the timed loop — the first
 `sc.tl.score_genes` in a process pays a fixed 1.0 s cost the rest do not,
