@@ -7,8 +7,13 @@
 use crate::error::AccelError;
 use scx_format_io::ColumnShardSource;
 
-/// Caller-requested column format. There is intentionally no `Auto`
-/// variant — CSC dispatch is explicit-opt-in by design.
+/// Caller-requested column format.
+///
+/// There is intentionally no `Auto` variant **in this enum**: by the time a
+/// kernel is called the choice has been made. `"auto"` is a pyscx-side policy
+/// (`pyscx::accel::de::resolve_de_format`, DE's default) that probes the
+/// dataset's CSC capability and resolves to one of these two before crossing
+/// the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreferFormat {
     Csr,
@@ -41,8 +46,7 @@ impl PreferFormat {
 ///   [`AccelError::CscRequestedNotAvailable`] with `reason` describing
 ///   the missing capability (caller's responsibility to populate this
 ///   string with the most specific cause they know — typical messages
-///   name the missing CSC sidecar, a non-column-local transform in the
-///   chain, or an active row deletion vector).
+///   name the missing CSC sidecar or an active row deletion vector).
 /// - `prefer == Csr` → returns [`AccelError::CscNotRequested`]
 ///   (sentinel; the caller's match arm should immediately fall through
 ///   to the existing CSR path).

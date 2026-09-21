@@ -99,13 +99,9 @@ fn run_pdex_ref_inner(
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
         }
         if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
-            let lazy_src = lazy.as_column_source().ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "CSC requested but unavailable: file has no CSC sidecar, \
-                     the transform chain contains a non-column-local op, or \
-                     a row deletion vector is active",
-                )
-            })?;
+            let lazy_src = lazy
+                .as_column_source()
+                .ok_or_else(crate::accel::csc_unavailable)?;
             drop(lazy);
             return py
                 .detach(|| {

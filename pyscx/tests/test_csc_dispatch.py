@@ -483,13 +483,12 @@ def test_pca_csc_raises(small_adata, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Lazy chain: log1p preserves CSC capability; normalize_total breaks it.
+# Lazy chain: both log1p and normalize_total keep CSC capability.
 # ---------------------------------------------------------------------------
 
 
 def test_log1p_lazy_csc_capability(small_adata, tmp_path):
-    """log1p is column-local — the resulting lazy wrapper should still
-    accept prefer_format='csc'.
+    """Wrapping a backed dataset in a lazy log1p keeps prefer_format='csc'.
 
     The reference is computed by materialising the lazy dataset and
     summing per column (the CSR-side `col_sums` pyfunction currently
@@ -507,14 +506,22 @@ def test_log1p_lazy_csc_capability(small_adata, tmp_path):
     np.testing.assert_allclose(csc_sums, expected, atol=1e-5)
 
 
-def test_normalize_total_lazy_csc_unavailable(small_adata, tmp_path):
-    """NormalizeTotal is row-local — CSC capability gate must reject."""
+def test_normalize_total_lazy_csc_is_available_and_matches_csr(small_adata, tmp_path):
+    """NormalizeTotal is row-*indexed*, which CSC can serve.
+
+    Previously asserted the opposite. The gate used to ask whether each
+    transform was column-local; it now asks whether it is computable from the
+    element, its column and its row index — which a CSC reader always has,
+    since `indices` is the row.
+    """
     import pyscx
 
     a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    pyscx.accel.normalize_total(a_csc)
-    with pytest.raises(RuntimeError, match="CSC"):
-        pyscx.accel.col_sums(a_csc.X, prefer_format="csc")
+    pyscx.accel.normalize_total(a_csc, target_sum=1e4)
+    csc_sums = np.asarray(pyscx.accel.col_sums(a_csc.X, prefer_format="csc"))
+    materialised = a_csc.X[:]
+    dense = materialised.toarray() if sp.issparse(materialised) else np.asarray(materialised)
+    np.testing.assert_allclose(csc_sums, dense.sum(axis=0).astype(np.float64), rtol=1e-6)
 
 
 # ---------------------------------------------------------------------------

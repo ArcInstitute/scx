@@ -1,12 +1,16 @@
 """CSC dispatch on `ScxLazyTransformedDataset`.
 
-Verifies the column-local capability gate on lazy datasets:
+Verifies the capability gate on lazy datasets:
 
-  - `Log1p` is column-local → `prefer_format="csc"` succeeds and
-    matches the CSR equivalent.
-  - `NormalizeTotal` is row-local → `prefer_format="csc"` raises
-    `RuntimeError` (no silent fallback).
-  - `prefer_format="csr"` works on both transform chains.
+  - `Log1p` → `prefer_format="csc"` succeeds and matches the CSR
+    equivalent.
+  - `NormalizeTotal` is row-*indexed*, not column-local, and `csc`
+    serves it anyway by looking up `row_sums[indices[k]]` — `indices`
+    *is* the global row. Bit-identical to CSR.
+  - A row deletion vector still disqualifies, and that one is a
+    correctness barrier rather than conservatism: it renumbers the live
+    rows while CSC `indices` stay global.
+  - `prefer_format="csr"` works on every transform chain.
 
 Sibling to `test_csc_dispatch.py`. The point of this file is the
 *lazy* path specifically — `test_csc_dispatch.py` exercises the
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import pandas as pd
 import scipy.sparse as sp
 
 
@@ -61,7 +66,7 @@ def _open_with_csc(path, adata):
 
 
 # ---------------------------------------------------------------------------
-# Log1p path: column-local; CSC dispatch must succeed and match CSR.
+# Log1p path: CSC dispatch must succeed and match CSR.
 # ---------------------------------------------------------------------------
 
 
@@ -92,19 +97,35 @@ def test_lazy_log1p_csc_col_var_matches_materialized(small_adata, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# NormalizeTotal path: row-local; CSC dispatch must raise without
-# silent fallback.
+# NormalizeTotal path: row-*indexed*, not column-local — CSC dispatch
+# serves it by looking the row up, and must agree with CSR exactly.
+#
+# These two tests previously asserted that `prefer_format="csc"` **raises**
+# here. That was a faithful spec of the old gate, which tested
+# `is_column_local()`: does an element's output depend only on its own
+# column? For `NormalizeTotal` it does not. But that is the wrong question
+# for a CSC reader, which knows each nonzero's global row because
+# `ScxCsc::indices` *is* that row, and `NormalizeTotal` carries its
+# `row_sums` vector with it. The gate now tests `is_csc_applicable()`.
 # ---------------------------------------------------------------------------
 
 
-def test_lazy_normalize_total_csc_raises(small_adata, tmp_path):
+def test_lazy_normalize_total_csc_matches_csr(small_adata, tmp_path):
     import pyscx
 
     a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
-    pyscx.accel.normalize_total(a_csc)
+    pyscx.accel.normalize_total(a_csc, target_sum=1e4)
 
-    with pytest.raises(RuntimeError, match="CSC|column-local"):
-        pyscx.accel.col_sums(a_csc.X, prefer_format="csc")
+    # `col_sums(prefer_format="csr")` has no lazy path (documented limitation
+    # in col_aggs.rs), so the CSR reference is the dunder sum — the same one
+    # `test_lazy_normalize_total_csr_works` below uses. Tolerance, not
+    # equality: the two accumulate in different orders. Exactness of the
+    # *transform* is pinned bit-for-bit in the Rust unit tests
+    # (`normalize_total_is_bit_identical_across_layouts`).
+    csc_sums = np.asarray(pyscx.accel.col_sums(a_csc.X, prefer_format="csc"))
+    materialised = a_csc.X[:]
+    dense = materialised.toarray() if sp.issparse(materialised) else np.asarray(materialised)
+    np.testing.assert_allclose(csc_sums, dense.sum(axis=0).astype(np.float64), rtol=1e-6)
 
 
 def test_lazy_normalize_total_csr_works(small_adata, tmp_path):
@@ -134,18 +155,48 @@ def test_lazy_normalize_total_csr_works(small_adata, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_lazy_log1p_then_normalize_total_csc_raises(small_adata, tmp_path):
-    """A column-local op followed by a row-local op disqualifies the
-    chain — the gate must reject CSC dispatch."""
+def test_lazy_log1p_then_normalize_total_stays_csc_capable(small_adata, tmp_path):
+    """A mixed chain keeps CSC dispatch, and still agrees with CSR."""
     import pyscx
 
     a_csc = _open_with_csc(tmp_path / "with_csc.scx", small_adata)
     pyscx.accel.log1p(a_csc)
-    # CSC dispatch should still work after log1p alone.
-    _ = pyscx.accel.col_sums(a_csc.X, prefer_format="csc")
-    pyscx.accel.normalize_total(a_csc)
-    with pytest.raises(RuntimeError, match="CSC|column-local"):
-        pyscx.accel.col_sums(a_csc.X, prefer_format="csc")
+    after_log1p = np.asarray(pyscx.accel.col_sums(a_csc.X, prefer_format="csc"))
+
+    pyscx.accel.normalize_total(a_csc, target_sum=1e4)
+    csc_sums = np.asarray(pyscx.accel.col_sums(a_csc.X, prefer_format="csc"))
+    materialised = a_csc.X[:]
+    dense = materialised.toarray() if sp.issparse(materialised) else np.asarray(materialised)
+    np.testing.assert_allclose(csc_sums, dense.sum(axis=0).astype(np.float64), rtol=1e-6)
+    # Premise: appending normalize_total actually changed the values, so the
+    # comparison above is not checking the chain against itself.
+    assert not np.allclose(after_log1p, csc_sums)
+
+
+def test_a_row_deletion_vector_still_disqualifies_csc(small_adata, tmp_path):
+    """The one gate condition this change does *not* relax.
+
+    CSC `indices` encode **global** row ids. A deletion vector renumbers the
+    live rows, so a row-indexed transform would read the wrong entry of its
+    per-row vector — unlike `normalize_total`, this is not a lookup away.
+    """
+    import pyscx
+
+    path = tmp_path / "with_csc.scx"
+    pyscx.from_anndata(small_adata, str(path), csc="always", csc_cols_per_shard=4)
+    exp = pyscx.open(str(path))
+    mask = np.zeros(small_adata.n_obs, dtype=bool)
+    mask[:2] = True
+    exp.mark_deleted(mask)
+    a = pyscx.open(str(path)).to_anndata(backed=True)
+    # Premise: the deletion vector really is active on this handle, so the
+    # refusal below is the row filter's doing and not a missing sidecar.
+    assert a.n_obs == small_adata.n_obs - 2
+    pyscx.accel.normalize_total(a, target_sum=1e4)
+    # The shared message lists both remaining causes and cannot say which
+    # fired, so match its stem; the premise above is what pins the cause.
+    with pytest.raises(RuntimeError, match="CSC requested but unavailable"):
+        pyscx.accel.col_sums(a.X, prefer_format="csc")
 
 
 # ---------------------------------------------------------------------------
@@ -232,3 +283,85 @@ def test_lazy_csc_with_col_projection_hvg_matches_csr(small_adata, tmp_path):
         err_msg="CSC variances diverge from CSR after col_projection — "
                 "LazyShardSource::read_csc_shard projection remap regression",
     )
+
+
+# ---------------------------------------------------------------------------
+# The payoff path: Wilcoxon DE on `normalize_total -> log1p`.
+#
+# This is the chain essentially every analyst runs before differential
+# expression, and it is the one the old gate refused. Measured on census_1m
+# (1M x 61,497, 50 groups): 1,270 s / 7,319 MB on cpu_csr against 226 s /
+# 5,652 MB on cpu_csc. The speed is the reason to care; these tests are about
+# the part that has to be true for the speed to be worth anything.
+# ---------------------------------------------------------------------------
+
+
+def _de_fixture():
+    import anndata as ad
+
+    rng = np.random.default_rng(7)
+    mat = sp.random(120, 24, density=0.5, format="csr", dtype=np.float32, random_state=rng)
+    mat.data = (mat.data * 100).astype(np.float32).round() + 1.0
+    adata = ad.AnnData(X=mat)
+    adata.obs["cell_id"] = [f"c{i}" for i in range(120)]
+    adata.obs["grp"] = pd.Categorical(["A"] * 40 + ["B"] * 40 + ["C"] * 40)
+    adata.var["gene_id"] = [f"g{i}" for i in range(24)]
+    return adata
+
+
+def _de_on(path, adata, prefer):
+    import pyscx
+
+    a = pyscx.open(str(path)).to_anndata(backed=True)
+    a.obs["grp"] = adata.obs["grp"].to_numpy()
+    a.obs["grp"] = pd.Categorical(a.obs["grp"])
+    pyscx.accel.normalize_total(a, target_sum=1e4)
+    pyscx.accel.log1p(a)
+    pyscx.accel.rank_genes_groups(
+        a, groupby="grp", method="wilcoxon", device="cpu", prefer_format=prefer,
+    )
+    route = (a.uns.get("scx_accel") or {}).get("rank_genes_groups", {}).get("route")
+    return route, a.uns["rank_genes_groups"]
+
+
+def test_de_on_the_normalize_log1p_chain_routes_csc_and_is_bit_identical(tmp_path):
+    import pyscx
+
+    adata = _de_fixture()
+    path = tmp_path / "de_csc.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=6)
+
+    route_csr, res_csr = _de_on(path, adata, "csr")
+    route_csc, res_csc = _de_on(path, adata, "csc")
+    route_auto, _ = _de_on(path, adata, "auto")
+
+    assert route_csr == "cpu_csr"
+    assert route_csc == "cpu_csc"
+    # `auto` is DE's default, so this is what an ordinary caller now gets.
+    assert route_auto == "cpu_csc"
+
+    for field in ("scores", "pvals", "logfoldchanges"):
+        a = np.array([list(r) for r in res_csr[field]])
+        b = np.array([list(r) for r in res_csc[field]])
+        assert a.shape == b.shape
+        # Bit-level, not `allclose`: these are element-wise maps feeding the
+        # same kernel, so exact agreement is achievable and anything less
+        # would mean one route is computing something different.
+        assert np.array_equal(a.view(np.uint32 if a.dtype == np.float32 else np.uint64),
+                              b.view(np.uint32 if b.dtype == np.float32 else np.uint64)), (
+            f"{field} differs between routes; max|diff| = {np.nanmax(np.abs(a - b))}"
+        )
+    names_csr = np.array([list(r) for r in res_csr["names"]])
+    names_csc = np.array([list(r) for r in res_csc["names"]])
+    assert np.array_equal(names_csr, names_csc)
+
+
+def test_de_without_a_sidecar_still_routes_csr(tmp_path):
+    """Premise: the route above is the sidecar's doing, not the default."""
+    import pyscx
+
+    adata = _de_fixture()
+    path = tmp_path / "de_nocsc.scx"
+    pyscx.from_anndata(adata, str(path), csc="off")
+    route, _ = _de_on(path, adata, "auto")
+    assert route == "cpu_csr"

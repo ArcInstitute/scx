@@ -481,13 +481,9 @@ fn dispatch_rank_genes_kernels(
             return Ok(result);
         }
         if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
-            let lazy_src = lazy.as_column_source().ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "CSC requested but unavailable: file has no CSC sidecar, \
-                     the transform chain contains a non-column-local op, or \
-                     a row deletion vector is active",
-                )
-            })?;
+            let lazy_src = lazy
+                .as_column_source()
+                .ok_or_else(crate::accel::csc_unavailable)?;
             drop(lazy);
             let result = py
                 .detach(|| {

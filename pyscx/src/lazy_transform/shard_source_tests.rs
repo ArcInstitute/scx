@@ -482,3 +482,254 @@ fn shard_size_hint_survives_transforms_projection_and_row_filter() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// CSR / CSC transform parity
+//
+// `NormalizeTotal` and `RowScale` used to disqualify a lazy chain from CSC
+// dispatch, on the grounds that they are not "column-local". They are not —
+// but column-locality is the wrong test for a CSC reader, which knows each
+// nonzero's global row because `ScxCsc::indices` *is* that row. Both
+// transforms carry their per-row vector with them, so the CSC path needs a
+// lookup, not a pass.
+//
+// What that buys, measured on `census_1m` (1M x 61,497, 50 groups, one
+// `log1p` chain so the old gate admitted it): Wilcoxon DE 1,270 s / 7,319 MB
+// on `cpu_csr` against 226 s / 5,652 MB on `cpu_csc`. The standard analyst
+// chain is `normalize_total -> log1p`, which the old gate refused, so that
+// 5.6x was unreachable from the path essentially everyone takes.
+//
+// The tests below are about the half that matters more than the speed: the
+// two routes must agree **bit for bit**. They can, because every transform
+// here is an element-wise map and none of them accumulates.
+// ---------------------------------------------------------------------------
+
+use scx_sparse::{ScxCsc, ScxCsr};
+
+/// A small matrix chosen so each arm of the comparison can actually fail.
+///
+/// Every value/​sum pair here is adversarial on purpose, because a fixture of
+/// round numbers makes this whole file vacuous: with `sum = 10` the factor
+/// `1e4 / sum` is exactly representable, so widening or narrowing the
+/// intermediate changes nothing and a mutant passes. The first draft of these
+/// tests had exactly that hole — two of three mutations survived it.
+///
+/// - **Row 0** sums to 3, so `1e4 / 3` is not representable in f32, and its
+///   value 7 is one of the pairs where an f64 intermediate (23333.334) and an
+///   f32 one (23333.332) land on different floats.
+/// - **Row 1** carries 4097 against the same sum, a second such pair at a
+///   different magnitude.
+/// - **Row 2** is structurally empty and **row 3** is stored zeros: two
+///   distinct spellings of the zero-sum row whose normalisation CSR skips.
+/// - **Row 4** holds 16,777,219, past f32's 2²⁴ exact-integer range.
+fn parity_matrix() -> (ScxCsr, ScxCsc, Vec<f64>) {
+    // row -> [(col, value)]
+    let rows: Vec<Vec<(usize, f32)>> = vec![
+        vec![(0, 1.0), (2, 2.0)],                    // sum 3 -> factor 3333.333...
+        vec![(0, 4097.0), (1, 1.0), (2, 1.0)],       // sum 4099
+        vec![],                                      // structurally empty
+        vec![(0, 0.0), (1, 0.0)],                    // stored zeros -> zero-sum row
+        vec![(0, 1.0), (1, 2.0), (2, 16_777_219.0)], // past f32's 2^24
+        vec![(2, 7.0)],                              // sum 7
+    ];
+    let n_rows = rows.len();
+    let n_cols = 3;
+
+    let mut indptr = vec![0i64];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    for r in &rows {
+        for &(c, v) in r {
+            indices.push(c as i32);
+            data.push(v);
+        }
+        indptr.push(data.len() as i64);
+    }
+    let csr = ScxCsr {
+        shape: (n_rows, n_cols),
+        indptr,
+        indices,
+        data,
+    };
+
+    // The same matrix column-major. Built independently of the CSR rather
+    // than transposed from it, so a bug in one construction cannot hide in
+    // both.
+    let mut c_indptr = vec![0i64];
+    let mut c_indices = Vec::new();
+    let mut c_data = Vec::new();
+    for c in 0..n_cols {
+        for (r, row) in rows.iter().enumerate() {
+            for &(cc, v) in row {
+                if cc == c {
+                    c_indices.push(r as i32);
+                    c_data.push(v);
+                }
+            }
+        }
+        c_indptr.push(c_data.len() as i64);
+    }
+    let csc = ScxCsc {
+        shape: (n_rows, n_cols),
+        indptr: c_indptr,
+        indices: c_indices,
+        data: c_data,
+    };
+
+    let row_sums: Vec<f64> = rows
+        .iter()
+        .map(|r| r.iter().map(|&(_, v)| v as f64).sum())
+        .collect();
+    (csr, csc, row_sums)
+}
+
+/// Gather `(row, col) -> value` from each layout so the two can be compared
+/// without depending on either's storage order.
+fn csr_cells(csr: &ScxCsr) -> Vec<((usize, usize), f32)> {
+    let mut out = Vec::new();
+    for row in 0..csr.shape.0 {
+        for k in csr.indptr[row] as usize..csr.indptr[row + 1] as usize {
+            out.push(((row, csr.indices[k] as usize), csr.data[k]));
+        }
+    }
+    out.sort_by_key(|&(rc, _)| rc);
+    out
+}
+
+fn csc_cells(csc: &ScxCsc) -> Vec<((usize, usize), f32)> {
+    let mut out = Vec::new();
+    for col in 0..csc.shape.1 {
+        for k in csc.indptr[col] as usize..csc.indptr[col + 1] as usize {
+            out.push(((csc.indices[k] as usize, col), csc.data[k]));
+        }
+    }
+    out.sort_by_key(|&(rc, _)| rc);
+    out
+}
+
+fn assert_bit_identical(chain: &[Transform], label: &str) {
+    let (mut csr, mut csc, _) = parity_matrix();
+    super::super::transforms::apply_transforms_to_csr(chain, &mut csr, 0);
+    super::apply_transforms_to_csc(chain, &mut csc);
+
+    let a = csr_cells(&csr);
+    let b = csc_cells(&csc);
+    assert_eq!(a.len(), b.len(), "{label}: nnz differs");
+    for ((rc_a, va), (rc_b, vb)) in a.iter().zip(b.iter()) {
+        assert_eq!(rc_a, rc_b, "{label}: cell coordinates diverged");
+        // `to_bits`, not `==`: this contract is exact agreement, and `==`
+        // would also call two different NaNs unequal and two zeros of
+        // opposite sign equal.
+        assert_eq!(
+            va.to_bits(),
+            vb.to_bits(),
+            "{label}: cell {rc_a:?} differs — CSR {va} vs CSC {vb}",
+        );
+    }
+}
+
+fn normalize(row_sums: &[f64]) -> Transform {
+    Transform::NormalizeTotal {
+        row_sums: Arc::new(row_sums.to_vec()),
+        target_sum: 1e4,
+    }
+}
+
+#[test]
+fn normalize_total_is_bit_identical_across_layouts() {
+    let (_, _, sums) = parity_matrix();
+    assert_bit_identical(&[normalize(&sums)], "normalize_total");
+}
+
+#[test]
+fn the_standard_normalize_then_log1p_chain_is_bit_identical() {
+    // The chain `pipeline_ooc_constrained` runs, and the one the old gate
+    // refused. CSR takes a *fused* path for this exact pair
+    // (`((v * factor) as f32).ln_1p()`); CSC applies the two in sequence.
+    // Agreement is not a coincidence — the fused form rounds to f32 between
+    // the multiply and the log, which is what sequencing does too.
+    let (_, _, sums) = parity_matrix();
+    assert_bit_identical(&[normalize(&sums), Transform::Log1p], "normalize+log1p");
+}
+
+#[test]
+fn row_scale_is_bit_identical_across_layouts() {
+    // Not 0.5 / 0.75 / 1.0: those are f32-exact, so `factors[row] as f32`
+    // and an f64 multiply agree and the test cannot see the difference.
+    let factors: Vec<f64> = vec![1.0 / 3.0, 0.1, 1.0 / 7.0, 1.1, 0.7, 1.0 / 3.0];
+    assert_bit_identical(
+        &[Transform::RowScale {
+            factors: Arc::new(factors),
+        }],
+        "row_scale",
+    );
+}
+
+#[test]
+fn a_mixed_chain_is_bit_identical_across_layouts() {
+    let (_, _, sums) = parity_matrix();
+    let factors: Vec<f64> = vec![1.0 / 3.0, 0.1, 1.0 / 7.0, 1.1, 0.7, 1.0 / 3.0];
+    assert_bit_identical(
+        &[
+            normalize(&sums),
+            Transform::Log1p,
+            Transform::Scale { factor: 2.5 },
+            Transform::RowScale {
+                factors: Arc::new(factors),
+            },
+        ],
+        "mixed",
+    );
+}
+
+#[test]
+fn a_zero_sum_row_is_left_alone_on_both_paths() {
+    // Premise assertion for the three tests above: without a zero-sum row in
+    // the fixture, `sum > 0.0` is never false and the branch that skips
+    // normalisation is never taken, so the parity tests would pass without
+    // exercising it. Row 3 is stored zeros; row 2 is structurally empty.
+    let (_, _, sums) = parity_matrix();
+    assert_eq!(sums[2], 0.0, "row 2 should be structurally empty");
+    assert_eq!(sums[3], 0.0, "row 3 should be a stored-zero row");
+
+    let (mut csr, mut csc, _) = parity_matrix();
+    let chain = [normalize(&sums)];
+    super::super::transforms::apply_transforms_to_csr(&chain, &mut csr, 0);
+    super::apply_transforms_to_csc(&chain, &mut csc);
+    for ((r, _), v) in csr_cells(&csr) {
+        if r == 3 {
+            assert_eq!(v, 0.0, "CSR changed a zero-sum row's values");
+        }
+    }
+    for ((r, _), v) in csc_cells(&csc) {
+        if r == 3 {
+            assert_eq!(v, 0.0, "CSC changed a zero-sum row's values");
+        }
+    }
+}
+
+#[test]
+fn every_transform_variant_is_csc_applicable_and_the_gate_admits_the_chain() {
+    // One instance of every `Transform` variant. Two of them (`NormalizeTotal`,
+    // `RowScale`) are *not* column-local — that was the old predicate, and its
+    // answer is what this change stopped asking. What matters now is that each
+    // is applicable column-major, and that `supports_csc`'s transform clause
+    // therefore admits a chain containing them.
+    //
+    // This is a list, so it cannot notice a variant nobody added here. The
+    // compile-time half of the guard is the exhaustive `match` in
+    // `Transform::is_csc_applicable`, which a new variant breaks.
+    let (_, _, sums) = parity_matrix();
+    let all = [
+        Transform::Log1p,
+        Transform::Scale { factor: 2.0 },
+        normalize(&sums),
+        Transform::RowScale {
+            factors: Arc::new(vec![1.0; 6]),
+        },
+    ];
+    assert!(all.iter().all(Transform::is_csc_applicable));
+    // The chain the old gate refused, through the predicate the gate calls.
+    let standard = [normalize(&sums), Transform::Log1p];
+    assert!(standard.iter().all(Transform::is_csc_applicable));
+}

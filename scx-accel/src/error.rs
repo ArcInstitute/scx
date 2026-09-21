@@ -58,9 +58,10 @@ pub enum AccelError {
 
     /// `prefer_format="csc"` was requested but the dataset cannot
     /// service CSC reads. The inner string names the missing
-    /// capability — for example: no CSC sidecar on disk, a
-    /// non-column-local transform in the chain, or an active row
-    /// deletion vector. Surfaced as `RuntimeError` on the Python side.
+    /// capability — for example: no CSC sidecar on disk, or an active
+    /// row deletion vector (which renumbers the live rows while CSC
+    /// `indices` stay global). Surfaced as `RuntimeError` on the Python
+    /// side.
     #[error("CSC requested but unavailable: {0}")]
     CscRequestedNotAvailable(String),
 

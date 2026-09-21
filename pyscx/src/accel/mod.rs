@@ -113,6 +113,31 @@ pub(crate) fn reject_presentation_ordered_source(x: &Bound<'_, PyAny>, op: &str)
     Ok(())
 }
 
+/// The one reason string for `as_column_source()` returning `None`.
+///
+/// A lazy transform chain is **not** among the causes: every [`Transform`] is
+/// CSC-applicable ([`Transform::is_csc_applicable`]), because a CSC reader
+/// knows each nonzero's global row and the two row-indexed transforms carry
+/// their per-row vector with them. What remains is a missing sidecar and an
+/// active row deletion vector — two causes the backed and lazy paths share,
+/// which is why one helper serves both and this text lives in one place
+/// instead of the nine copies it replaced.
+///
+/// Call sites that can distinguish *which* of the two it is say so themselves
+/// (`accel::hvg::csc`) rather than using this; a more specific message beats a
+/// shared one.
+///
+/// [`Transform`]: crate::lazy_transform::Transform
+/// [`Transform::is_csc_applicable`]: crate::lazy_transform::Transform::is_csc_applicable
+pub(crate) fn csc_unavailable() -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(
+        "CSC requested but unavailable: the file has no CSC sidecar (add one \
+         with `pyscx.build_csc(path)` / `scx build-csc`, or re-import with \
+         `csc=\"always\"`), or a row deletion vector is active (e.g. after \
+         `filter_cells`). Pass `prefer_format='csr'` to use the row-major path.",
+    )
+}
+
 /// A borrow of the backed dataset behind `adata.X` **or** a backed layer handle.
 ///
 /// `adata.X` on a backed file is [`crate::backed::ScxBackedSparseDataset`];

@@ -354,10 +354,14 @@ abstracts CSC access. Both `BackedCscReader` (raw on-disk) and pyscx's
 are generic over this trait — no concrete type dependency.
 
 **`PreferFormat` + `require_csc()`** (`scx-accel/src/csc/dispatch.rs`):
-Explicit opt-in dispatch. There is intentionally no `Auto` variant — every
-CSC dispatch is explicit at the call site. Callers pass `prefer_format="csc"`
-through pyscx kwargs; `require_csc()` either returns the `ColumnShardSource`
-or a clean error explaining why CSC is unavailable.
+Explicit dispatch at the kernel boundary. There is intentionally no `Auto`
+variant *in the enum* — by the time a kernel is called the choice has been
+made. Callers pass `prefer_format="csc"` through pyscx kwargs; `require_csc()`
+either returns the `ColumnShardSource` or a clean error explaining why CSC is
+unavailable. `"auto"` lives one level up, as a pyscx-side policy
+(`accel::de::resolve_de_format`, the default for `rank_genes_groups` and
+`pdex_ref`): it probes the dataset's CSC capability per call and resolves to
+`Csr` or `Csc` before crossing the boundary.
 
 ### Creation pipeline
 

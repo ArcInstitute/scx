@@ -294,12 +294,9 @@ pub(super) fn aggregate_pseudobulk(
             .collect::<PyResult<Vec<_>>>()?;
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            let source = backed.as_column_source().ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "CSC requested but unavailable: file has no CSC sidecar, \
-                     or a row deletion vector is active",
-                )
-            })?;
+            let source = backed
+                .as_column_source()
+                .ok_or_else(crate::accel::csc_unavailable)?;
             scx_accel::pseudobulk_aggregate_csc(
                 source,
                 &cell_to_group,
@@ -315,13 +312,9 @@ pub(super) fn aggregate_pseudobulk(
         } else if let Ok(lazy) =
             x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
         {
-            let lazy_src = lazy.as_column_source().ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "CSC requested but unavailable: file has no CSC sidecar, \
-                     the transform chain contains a non-column-local op, or \
-                     a row deletion vector is active",
-                )
-            })?;
+            let lazy_src = lazy
+                .as_column_source()
+                .ok_or_else(crate::accel::csc_unavailable)?;
             scx_accel::pseudobulk_aggregate_csc(
                 &lazy_src,
                 &cell_to_group,

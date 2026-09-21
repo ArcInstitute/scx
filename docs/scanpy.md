@@ -2013,9 +2013,9 @@ other `prefer_format`-taking function defaults to `"csr"`.**
 work — DE previously defaulted to `"csr"`) resolves at call time
 against the *selected* matrix: on CPU it takes the CSC-direct route
 when a valid sidecar is available (sidecar present ∧ no active row
-deletion vector ∧ column-local transform chain — the same capability
-gate `"csc"` enforces) and CSR otherwise; on GPU it stays CSR so the
-planner routes `gpu_csc_v3` when a sidecar is present. The route and
+deletion vector — the same capability gate `"csc"` enforces) and CSR
+otherwise; on GPU it stays CSR so the planner routes `gpu_csc_v3` when a
+sidecar is present. The route and
 `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`
 (`cpu_csc` vs `cpu_csr`; `cpu_csc_nnz` when the 1-vs-rest exact-nnz Wilcoxon
 kernel is opted into with `SCX_ACCEL_WILCOXON_NNZ=1`). Pass `prefer_format="csr"` explicitly to pin
@@ -2029,23 +2029,36 @@ raises `RuntimeError` with a message naming the missing capability:
 1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always"|"auto")`,
    `scx convert --csc=always|auto`, `scx build-csc`, or the standalone
    `pyscx.build_csc(path)` to add one to an existing file in place, or pass an `output` to write a copy).
-2. The transform chain on `adata.X` contains only column-local
-   operations. `Log1p` is column-local; `NormalizeTotal` and
-   `RowScale` are not (per-row state). The common `normalize_total →
-   log1p` chain is *not* column-local — use `prefer_format="csr"`.
-3. No active row deletion vector. After
+2. No active row deletion vector. After
    `pyscx.accel.filter_cells()` or `pyscx.accel.subset_obs()`, the
    dataset has `kept_to_global` set; CSC dispatch then raises until
    you `materialize()` or rebuild the file.
-4. No active column projection. After `pyscx.accel.filter_genes()`,
-   `pyscx.accel.subset_var()`, `highly_variable_genes(subset=True)` or
-   `adata[:, mask]`, the sidecar (written against the *full* gene axis)
-   no longer describes the visible one, so CSC dispatch raises. The CSR
-   path streams the projected window and works normally.
+3. No active column projection **on a backed handle**. After
+   `pyscx.accel.filter_genes()`, `pyscx.accel.subset_var()`,
+   `highly_variable_genes(subset=True)` or `adata[:, mask]`, the sidecar
+   (written against the *full* gene axis) no longer describes the visible
+   one, so CSC dispatch on a backed `X` raises. A *lazy* `X` — anything
+   carrying a transform chain — honours the projection instead: its CSC
+   reader remaps each shard's columns, so a projected lazy handle routes
+   CSC normally. The CSR path streams the projected window either way.
 
-Both subset cases are refusals, not silent fallbacks — the CSR default
-handles them, so reach for `prefer_format="csc"` before you subset, not
-after.
+**The transform chain is not a condition.** It used to be: the gate
+required every transform to be *column-local* (output depending only on
+the element's own column), which `Log1p` and `Scale` satisfy and
+`NormalizeTotal` and `RowScale` do not — so the standard
+`normalize_total → log1p` chain was refused. That was the wrong question
+for a CSC reader, which always knows a nonzero's row because
+`ScxCsc::indices` *is* the global row, and both row-indexed transforms
+carry their per-row vector (`row_sums`, `factors`) with them. They are
+now applied column-major by lookup, bit-identically to the CSR path —
+element-wise maps with no accumulation, so exact agreement is achievable
+and is asserted, not approximated.
+
+The row deletion vector is the one that stays, and it is a correctness
+barrier rather than caution: it renumbers the live rows while CSC
+`indices` stay global. It is a refusal, not a silent fallback — the CSR
+default handles a filtered handle fine, so reach for
+`prefer_format="csc"` before you filter cells, not after.
 
 Unknown values (e.g. `"CSC"`, `"bogus"`) raise `ValueError`. `"auto"`
 is accepted by `rank_genes_groups` / `pdex_ref` (and is their default);
@@ -2064,12 +2077,15 @@ pyscx.accel.rank_genes_groups(
     prefer_format="csc",
 )
 
-# log1p preserves CSC capability (column-local)
+# A lazy transform chain keeps CSC capability — including the standard
+# normalize_total -> log1p, whose per-row factor is read at the global row
+# CSC `indices` already carries.
+pyscx.accel.normalize_total(adata, target_sum=1e4)
 pyscx.accel.log1p(adata)
 pyscx.accel.col_sums(adata.X, prefer_format="csc")  # works
 
-# normalize_total breaks it (row-local)
-pyscx.accel.normalize_total(adata, target_sum=1e4)
+# A row filter does not — CSC `indices` are global and this renumbers them.
+pyscx.accel.filter_cells(adata, min_genes=200)
 pyscx.accel.col_sums(adata.X, prefer_format="csc")  # raises RuntimeError
 ```
 

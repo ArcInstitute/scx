@@ -261,10 +261,17 @@ fn reject_csc_on_subset(backed: &ScxBackedSparseDataset) -> PyResult<()> {
 /// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
 ///
 /// Mirrors the single capability-detection point (`as_column_source`): a valid
-/// CSC route needs a sidecar present, no active row-deletion vector, and — for a
-/// lazy source — only column-local transforms. Never errors: a `false` result
-/// just routes `auto` to the CSR streamer. A materialized matrix (numpy/scipy,
-/// e.g. `use_raw`/`layer`) is not a backed/lazy SCX dataset → `false`.
+/// CSC route needs a sidecar present and no active row-deletion vector. A lazy
+/// transform chain is no longer a disqualifier — every `Transform` is
+/// CSC-applicable — which **widens what `auto` picks**: a
+/// `normalize_total → log1p` chain used to resolve to `cpu_csr` here and now
+/// resolves to `cpu_csc`. The two produce bit-identical output (pinned in
+/// `pyscx/src/lazy_transform/shard_source_tests.rs`), so the visible difference
+/// is the recorded route and the wall time.
+///
+/// Never errors: a `false` result just routes `auto` to the CSR streamer. A
+/// materialized matrix (numpy/scipy, e.g. `use_raw`/`layer`) is not a
+/// backed/lazy SCX dataset → `false`.
 fn csc_route_available(x: &Bound<'_, PyAny>) -> bool {
     if let Some(handle) = crate::accel::backed_dataset_ref(x) {
         let backed = handle.get();

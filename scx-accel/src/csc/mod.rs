@@ -5,12 +5,15 @@
 //! `S: ColumnShardSource` from `scx-format` so it works with both
 //! `BackedCscReader` and the pyscx `LazyShardSource` (transform-aware).
 //!
-//! Dispatch is explicit: callers thread a `PreferFormat` enum or
+//! Dispatch is explicit *here*: callers thread a `PreferFormat` enum or
 //! `prefer_format` kwarg through their entry points and use
 //! [`require_csc`] to translate that into a CSC-capable source or a
 //! clean error when the dataset doesn't support CSC. There is no
-//! heuristic / thread-local default — every CSC dispatch is opt-in
-//! at the call site.
+//! heuristic / thread-local default in this crate.
+//!
+//! One level up there is a policy: pyscx's DE entry points default to
+//! `prefer_format="auto"`, which probes the dataset and resolves to `Csr` or
+//! `Csc` per call before reaching these kernels.
 
 pub mod dispatch;
 pub mod mean_var;
