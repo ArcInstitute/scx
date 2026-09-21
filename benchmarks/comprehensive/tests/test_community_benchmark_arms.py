@@ -751,6 +751,62 @@ def test_the_budget_is_still_declared_consistently():
         assert poc.engine_for(key) in ("pyscx", "scanpy")
 
 
+def test_the_worker_timeout_leaves_room_for_every_run_in_the_job():
+    """One arm may not spend the whole job's allocation.
+
+    `estimate_time_minutes` sizes the SLURM job; `run()` spends that on
+    `n_runs` sequential arms. If an arm's timeout is the whole budget, run 1
+    can finish at the wall and SLURM kills the parent before runs 2 and 3 —
+    the cell disappears, and `check_absolute_floors` skips a missing triple in
+    silence, which is exactly what `_timeout_for` exists to prevent.
+    """
+    from benchmarks.comprehensive.config import (
+        DATASETS, estimate_time_minutes, n_runs_for_dataset,
+    )
+
+    checked = 0
+    for ds_name in sorted(poc._SCOPED_DATASETS):
+        dataset = DATASETS[ds_name]
+        n_runs = n_runs_for_dataset(ds_name)
+        for key in poc.SUPPORTED_FORMATS:
+            budget_s = int(
+                estimate_time_minutes(dataset, key, "pipeline_ooc_constrained")
+            ) * 60
+            per_run = poc._timeout_for(dataset, key, n_runs)
+            assert n_runs * per_run + poc._TIMEOUT_MARGIN_S <= budget_s, (
+                f"{key} @ {ds_name}: {n_runs} x {per_run}s overruns the "
+                f"{budget_s}s job budget"
+            )
+            checked += 1
+    assert checked >= 16, "the scope shrank; this guard covers less than it reads"
+
+
+def test_the_undivided_timeout_would_overrun_the_census_budget():
+    """Premise assertion: the guard above is not vacuous.
+
+    Without the `n_runs` division, census_1m grants run 1 a 530-minute timeout
+    inside a 540-minute job. If this ever stops being true — a smaller slope, a
+    single run at census scale — the guard above is passing for a reason other
+    than the fix.
+    """
+    from benchmarks.comprehensive.config import (
+        DATASETS, estimate_time_minutes, n_runs_for_dataset,
+    )
+
+    dataset = DATASETS["census_1m"]
+    key = "pipeline_ooc_constrained__pyscx_16g"
+    n_runs = n_runs_for_dataset("census_1m")
+    assert n_runs > 1
+    budget_s = int(
+        estimate_time_minutes(dataset, key, "pipeline_ooc_constrained")
+    ) * 60
+    undivided = poc._timeout_for(dataset, key, 1)
+    assert n_runs * undivided > budget_s, (
+        "an undivided per-run timeout no longer overruns the job budget, so "
+        "the division it motivates is untested"
+    )
+
+
 def test_a_worker_reported_oom_names_the_stage_and_the_spelling():
     """The ceiling does not always arrive as SIGKILL.
 

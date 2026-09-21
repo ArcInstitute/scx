@@ -460,21 +460,30 @@ def _local_mem_limit_bytes() -> int | None:
         return None
 
 
-def _timeout_for(dataset: DatasetConfig, key: str) -> int:
+def _timeout_for(dataset: DatasetConfig, key: str, n_runs: int = 1) -> int:
     """Stay under the SLURM job's own wall limit so a partial is still recorded.
 
     If SLURM kills the job, the parent never runs and the cell is lost — which
     reads as "not run" and is skipped by the gate in silence. A worker timeout
     that fires first leaves a partial trail and a recorded `0.0`.
+
+    `estimate_time_minutes` sizes the **job**, and `run()` spends that on
+    `n_runs` sequential arms, so an arm's share is the budget divided by
+    `n_runs`. Granting run 1 the whole allocation loses the cell by a slower
+    route than the one above: run 1 finishes at the wall, SLURM kills the
+    parent before runs 2 and 3, and nothing is recorded at all. At census_1m
+    (540 min budgeted, N_RUNS_LARGE=3) that is 530 min handed to the first arm
+    against a 540-minute job.
     """
     try:
         from benchmarks.comprehensive.config import estimate_time_minutes
 
         minutes = estimate_time_minutes(dataset, key, "pipeline_ooc_constrained")
-        return max(600, int(minutes) * 60 - _TIMEOUT_MARGIN_S)
+        budget_s = int(minutes) * 60 - _TIMEOUT_MARGIN_S
     except Exception as exc:  # noqa: BLE001
         logger.warning("pipeline_ooc_constrained: time estimate unavailable (%s)", exc)
-        return _DEFAULT_TIMEOUT_S
+        budget_s = _DEFAULT_TIMEOUT_S
+    return max(600, budget_s // max(1, n_runs))
 
 
 #: Signatures a native library prints when an allocation fails hard.
@@ -615,7 +624,7 @@ def run(
         )
         return None
 
-    timeout_s = _timeout_for(dataset, key)
+    timeout_s = _timeout_for(dataset, key, n_runs)
     result = BenchmarkResult(
         benchmark="pipeline_ooc_constrained",
         format=key,
