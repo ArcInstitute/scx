@@ -3157,6 +3157,384 @@ absolute_floors:
     dataset: census_500k
     metric: obs_open_s_per_file__open_1file
     max: 0.738
+  # =========================================================================
+  # Community analytical workflows (Phase 5)
+  #
+  # Four benchmarks that measure SCX against what a scanpy / MuData user
+  # actually runs. Calibrated from `candidate_community_20260920` — the
+  # 82-cell `--tier full` capture at `ba3a2bbc`, `scx-bench` / pyscx 0.18.0
+  # release, n=3 at census and atlas scale, n=5 below it. Every bound below
+  # names the median it came from.
+  #
+  # Two calibration rules, both from that capture's own spread:
+  #
+  #  * **Peak RSS is floored, wall time mostly is not.** Within a capture the
+  #    run-to-run spread is 1.0-1.3x on both. *Between* captures it is not:
+  #    the same `accel_qc_filter__scanpy_cpu / tabula_sapiens_100k` triple
+  #    measured 8.07 s in the Phase-1 wave and 15.52 s here — 1.9x — while
+  #    its peak RSS moved 5,041 -> 5,047 MB (0.1%). The eager arms are
+  #    memory-bandwidth bound and 82 co-scheduled jobs is a different machine
+  #    from 11. So wall is floored only where the arm is streaming (stable to
+  #    ~1.1x across captures) and the absolute number is large enough to
+  #    separate a regression from a busy node, which in practice means
+  #    census scale and the pipeline.
+  #  * **Only the SCX contract arms are floored.** The scanpy / MuData arms
+  #    are the comparand. A floor on a competitor's number fails the build
+  #    when the competitor changes, which is not a regression in this repo.
+  #
+  # --- accel_qc_filter: fused QC metrics + atomic filtering ----------------
+  #
+  # `pyscx_cpu` is the backed arm and the only one native end to end
+  # (`filter_cells` / `filter_genes` delegate to `sc.pp.*` on an in-memory
+  # scipy X). census_1m: 23.16 s / 2,196 MB against scanpy's 52.47 s /
+  # 33,366 MB — 2.3x faster on 15.2x less resident memory.
+  #
+  # `qc_metrics_max_abs_diff` is floored at 1e-5 on the four fixtures that
+  # measured exactly 0.0, and **deliberately not on smartseq2**, which
+  # measured 9.0. That is not a defect: smartseq2's per-cell totals are
+  # 2-3e7, past float32's 2**24 exact-integer range, and scanpy reduces X in
+  # the array's own dtype. Against the exact int64 sum of the raw data SCX is
+  # right on all 37 disagreeing cells and scanpy is off by one. A floor there
+  # would require SCX to reproduce a rounding error. The per-column bar in
+  # `accel_qc_filter.float32_sum_tolerance` is what judges that arm instead.
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: census_1m
+    metric: qc_wall_s
+    max: 35.0             # 1.5x measured 23.16 s
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: census_1m
+    metric: qc_peak_rss_mb
+    max: 3000.0           # 1.37x measured 2,196 MB; scanpy needs 33,366 MB
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: census_1m
+    metric: qc_metrics_max_abs_diff
+    max: 1.0e-5
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: census_1m
+    metric: filtered_shape_match_int
+    min: 1.0
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: census_500k
+    metric: qc_wall_s
+    max: 20.5             # 1.51x measured 13.54 s
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: census_500k
+    metric: qc_peak_rss_mb
+    max: 2550.0           # 1.36x measured 1,871 MB; scanpy needs 17,959 MB
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: census_500k
+    metric: qc_metrics_max_abs_diff
+    max: 1.0e-5
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: census_500k
+    metric: filtered_shape_match_int
+    min: 1.0
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: tabula_sapiens_100k
+    metric: qc_peak_rss_mb
+    max: 2100.0           # 1.38x measured 1,525 MB
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: tabula_sapiens_100k
+    metric: qc_metrics_max_abs_diff
+    max: 1.0e-5
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: tabula_sapiens_100k
+    metric: filtered_shape_match_int
+    min: 1.0
+  - benchmark: accel_qc_filter
+    format: accel_qc_filter__pyscx_cpu
+    dataset: pbmc10k
+    metric: filtered_shape_match_int
+    min: 1.0
+
+  # --- accel_score_genes: streaming gene-set scoring -----------------------
+  #
+  # `pyscx_cpu_scanpy` scores a **backed** X, which `sc.tl.score_genes`
+  # refuses outright, and passes scanpy's own control set via `ctrl_genes=`
+  # so the comparison isolates the numerical kernel. census_1m: 18.76 s /
+  # 821 MB against scanpy's 55.76 s / 23,531 MB — 3.0x faster on 28.7x less
+  # resident memory, and bit-exact at all three panel sizes.
+  #
+  # The parity route is load-bearing rather than ceremonial: SCX's own
+  # control sampler is seeded independently of numpy and draws a different
+  # set, scoring Spearman 0.92 / 0.73 / 0.81 on pbmc3k. A silent fallback to
+  # it would leave these floors comparing two different control sets and
+  # calling the result agreement, so `accel_score_genes` records a typed
+  # `scanpy_private_api_drift` gap instead of falling back.
+  #
+  # `score_max_abs_diff__*` is floored only where it measured 0.0. smartseq2
+  # measured 0.017-0.038 for the same float32 reason as `accel_qc_filter`
+  # above; its Spearman is still exactly 1.0, so the rank floor covers it and
+  # the absolute one does not.
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_1m
+    metric: score_wall_s
+    max: 28.0             # 1.49x measured 18.76 s
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_1m
+    metric: score_peak_rss_mb
+    max: 1150.0           # 1.40x measured 821 MB; scanpy needs 23,531 MB
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_1m
+    metric: score_spearman_vs_scanpy__k25
+    min: 0.999
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_1m
+    metric: score_spearman_vs_scanpy__k100
+    min: 0.999
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_1m
+    metric: score_spearman_vs_scanpy__k500
+    min: 0.999
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_1m
+    metric: score_max_abs_diff__k500
+    max: 1.0e-4
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_500k
+    metric: score_wall_s
+    max: 16.0             # 1.52x measured 10.55 s
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_500k
+    metric: score_peak_rss_mb
+    max: 950.0            # 1.41x measured 675 MB; scanpy needs 12,732 MB
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: census_500k
+    metric: score_spearman_vs_scanpy__k500
+    min: 0.999
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: tabula_sapiens_100k
+    metric: score_peak_rss_mb
+    max: 700.0            # 1.44x measured 487 MB
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: tabula_sapiens_100k
+    metric: score_spearman_vs_scanpy__k25
+    min: 0.999
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: tabula_sapiens_100k
+    metric: score_spearman_vs_scanpy__k100
+    min: 0.999
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: tabula_sapiens_100k
+    metric: score_spearman_vs_scanpy__k500
+    min: 0.999
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: tabula_sapiens_100k
+    metric: score_max_abs_diff__k500
+    max: 1.0e-4
+  - benchmark: accel_score_genes
+    format: accel_score_genes__pyscx_cpu_scanpy
+    dataset: smartseq2
+    metric: score_spearman_vs_scanpy__k500
+    min: 0.999
+
+  # --- pipeline_ooc_constrained: the laptop test ---------------------------
+  #
+  # The nine-stage pipeline under a cgroup ceiling. This capture is the first
+  # to run it at census scale, and it is where the benchmark's reason for
+  # existing is settled:
+  #
+  #   dataset      pyscx 16G              scanpy 16G        scanpy 32G
+  #   census_500k  1,494 s / 6,336 MB     OOM @ filter      2,574 s / 17,825 MB
+  #   census_1m    3,186 s / 8,819 MB     OOM @ qc_metrics  OOM @ filter
+  #
+  # SCX completes a 1M-cell pipeline inside a 16 GB ceiling at 8.6 GB peak.
+  # scanpy needs more than 16 GB at 500K and more than 32 GB at 1M. Where
+  # both finish (census_500k, scanpy at 32 GB) SCX is 1.72x faster on 2.8x
+  # less resident memory.
+  #
+  # The scanpy arms are **not** floored. `pipeline_completed_int: max 0.0`
+  # would assert that scanpy still runs out of memory, and a scanpy release
+  # that fixed it would fail this build — an upstream improvement is not a
+  # regression here. The OOM cells remain as recorded evidence for the claim,
+  # gated by nothing.
+  #
+  # `total_wall_s` carries wider headroom than the accel floors: the
+  # within-capture spread on `pyscx_16g / census_1m` was 1.29x (3,036-3,909 s),
+  # because `rank_genes_groups` is 63% of the run and its cluster count varies
+  # with the Leiden seed.
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_1m
+    metric: pipeline_completed_int
+    min: 1.0
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_1m
+    metric: pipeline_peak_rss_mb
+    max: 12000.0          # 1.36x measured 8,819 MB, inside the 16,384 ceiling
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_1m
+    metric: total_wall_s
+    max: 5500.0           # 1.73x measured 3,186 s; within-capture spread 1.29x
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_32g
+    dataset: census_1m
+    metric: pipeline_completed_int
+    min: 1.0
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_500k
+    metric: pipeline_completed_int
+    min: 1.0
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_500k
+    metric: pipeline_peak_rss_mb
+    max: 8700.0           # 1.37x measured 6,336 MB
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_500k
+    metric: total_wall_s
+    max: 2300.0           # 1.54x measured 1,494 s
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: tabula_sapiens_100k
+    metric: pipeline_completed_int
+    min: 1.0
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: tabula_sapiens_100k
+    metric: pipeline_peak_rss_mb
+    max: 5900.0           # 1.39x measured 4,259 MB
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: pbmc10k
+    metric: pipeline_completed_int
+    min: 1.0
+
+  # --- multimodal_atlas_streaming: atlas-scale multiome / CITE-seq ---------
+  #
+  # Six arms over the same file, on the two synthetic atlases staged in
+  # Phase 4 (`multiome_atlas_500k`: 500K x 35K RNA + 150K ATAC, 1.80 B
+  # nonzeros; `citeseq_atlas_1m`: 1M x 30K RNA + 250 ADT, 1.14 B). Both live
+  # only in `TIERS["full"]` — `xl` has never carried a multimodal dataset, so
+  # an xl capture skips every floor below in silence.
+  #
+  # Wall time is unfloored here: the eager arms materialise 20+ GB and are
+  # the most contention-sensitive cells in the suite (mudata_h5mu on
+  # multiome_atlas_500k moved 18.75 -> 26.35 s between the two captures).
+  # Peak RSS moved 22,764 -> 22,768 MB over the same pair.
+  #
+  # `eager_peak_rss_ratio_f32_over_u16` is floored at 1.08 rather than the
+  # house 0.85x of its 1.17 median, which would be 0.996. A ratio floor at or
+  # below 1.0 is vacuous — a build that dropped the in-decode narrow
+  # altogether would score ~1.0 and pass. 1.08 is the lowest bound that still
+  # fails that build. The ratio is 1.17 and not the 2.0 the value buffers
+  # halve by, because `indices` stays int32 and does not narrow.
+  #
+  # `modality_query_wall_s: max 1.0` is ~60x above the 16 ms measured. The
+  # floor is not policing jitter; it fails if modality-scoped pushdown
+  # degrades into the whole-file load MuData needs for the same question
+  # (26.35 s). 1.0 s sits 26x below that.
+  #
+  # `scx_query_mod` is floored on the two atlases only. On
+  # `cite_seq_pbmc_5k` and `multiome_pbmc_10k` the arm writes a runs-empty
+  # `no_selective_obs_column` result — those fixtures carry no obs columns —
+  # and a floor on a result that exists with no runs is a violation, not a
+  # skip.
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_stream
+    dataset: multiome_atlas_500k
+    metric: streaming_peak_rss_mb
+    max: 9000.0           # 1.35x measured 6,646 MB; eager f32 needs 26,268 MB
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_stream
+    dataset: multiome_atlas_500k
+    metric: modality_sums_match_int
+    min: 1.0
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_stream
+    dataset: citeseq_atlas_1m
+    metric: streaming_peak_rss_mb
+    max: 4600.0           # 1.35x measured 3,403 MB; eager f32 needs 17,396 MB
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_stream
+    dataset: citeseq_atlas_1m
+    metric: modality_sums_match_int
+    min: 1.0
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_eager_u16
+    dataset: multiome_atlas_500k
+    metric: eager_peak_rss_ratio_f32_over_u16
+    min: 1.08             # measured 1.171; 1.0 would pass a build with no narrow
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_eager_u16
+    dataset: multiome_atlas_500k
+    metric: eager_u16_peak_rss_mb
+    max: 30000.0          # 1.34x measured 22,451 MB
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_eager_u16
+    dataset: multiome_atlas_500k
+    metric: modality_sums_match_int
+    min: 1.0
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_eager_u16
+    dataset: citeseq_atlas_1m
+    metric: eager_peak_rss_ratio_f32_over_u16
+    min: 1.08             # measured 1.146
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_eager_u16
+    dataset: citeseq_atlas_1m
+    metric: modality_sums_match_int
+    min: 1.0
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_eager_f32
+    dataset: multiome_atlas_500k
+    metric: modality_sums_match_int
+    min: 1.0
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_eager_f32
+    dataset: citeseq_atlas_1m
+    metric: modality_sums_match_int
+    min: 1.0
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_query_mod
+    dataset: multiome_atlas_500k
+    metric: modality_query_wall_s
+    max: 1.0              # measured 0.017 s; MuData needs 26.35 s to answer it
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_query_mod
+    dataset: multiome_atlas_500k
+    metric: query_peak_rss_mb
+    max: 200.0            # measured 50 MB; MuData's eager read peaks at 22,764
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_query_mod
+    dataset: citeseq_atlas_1m
+    metric: modality_query_wall_s
+    max: 1.0              # measured 0.022 s
+  - benchmark: multimodal_atlas_streaming
+    format: multimodal_atlas_streaming__scx_query_mod
+    dataset: citeseq_atlas_1m
+    metric: query_peak_rss_mb
+    max: 200.0            # measured 50 MB
+
 
 # ---------------------------------------------------------------------------
 # Deferred floors — known gaps tracked here so operators can see what's
