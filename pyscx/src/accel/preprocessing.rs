@@ -1857,9 +1857,12 @@ impl RowQcOutputs {
 
 fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<u32>)> {
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-        let source = backed
-            .as_column_source()
-            .ok_or_else(crate::accel::csc_unavailable)?;
+        let source = backed.as_column_source().ok_or_else(|| {
+            crate::accel::csc_unavailable(
+                backed.backed_csc.is_some(),
+                backed.kept_to_global.is_some(),
+            )
+        })?;
         let cols_owned: Vec<u32> = match backed.col_projection() {
             Some(c) => c.to_vec(),
             None => (0..backed.shape_val.1 as u32).collect(),
@@ -1868,9 +1871,9 @@ fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<u32>)>
             .map_err(|e| PyRuntimeError::new_err(e.to_string()));
     }
     if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
-        let lazy_src = lazy
-            .as_column_source()
-            .ok_or_else(crate::accel::csc_unavailable)?;
+        let lazy_src = lazy.as_column_source().ok_or_else(|| {
+            crate::accel::csc_unavailable(lazy.backed_csc.is_some(), lazy.kept_to_global.is_some())
+        })?;
         let cols_owned: Vec<u32> = match lazy.col_projection() {
             Some(c) => c.to_vec(),
             None => (0..lazy.shape_val.1 as u32).collect(),

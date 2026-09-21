@@ -294,9 +294,12 @@ pub(super) fn aggregate_pseudobulk(
             .collect::<PyResult<Vec<_>>>()?;
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            let source = backed
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
+            let source = backed.as_column_source().ok_or_else(|| {
+                crate::accel::csc_unavailable(
+                    backed.backed_csc.is_some(),
+                    backed.kept_to_global.is_some(),
+                )
+            })?;
             scx_accel::pseudobulk_aggregate_csc(
                 source,
                 &cell_to_group,
@@ -312,9 +315,12 @@ pub(super) fn aggregate_pseudobulk(
         } else if let Ok(lazy) =
             x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
         {
-            let lazy_src = lazy
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
+            let lazy_src = lazy.as_column_source().ok_or_else(|| {
+                crate::accel::csc_unavailable(
+                    lazy.backed_csc.is_some(),
+                    lazy.kept_to_global.is_some(),
+                )
+            })?;
             scx_accel::pseudobulk_aggregate_csc(
                 &lazy_src,
                 &cell_to_group,

@@ -99,9 +99,12 @@ fn run_pdex_ref_inner(
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
         }
         if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
-            let lazy_src = lazy
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
+            let lazy_src = lazy.as_column_source().ok_or_else(|| {
+                crate::accel::csc_unavailable(
+                    lazy.backed_csc.is_some(),
+                    lazy.kept_to_global.is_some(),
+                )
+            })?;
             drop(lazy);
             return py
                 .detach(|| {

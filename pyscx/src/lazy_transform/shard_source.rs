@@ -125,9 +125,13 @@ impl LazyShardSource {
     }
 
     /// Returns `true` if this lazy source can serve CSC reads: CSC sidecar
-    /// present, every transform in the chain CSC-applicable
-    /// ([`Transform::is_csc_applicable`] — today that is all of them), and no
-    /// row deletion vector active.
+    /// present and no row deletion vector active.
+    ///
+    /// The transform chain is deliberately **not** a condition. Every
+    /// `Transform` is applied column-major by `apply_transforms_to_csc`,
+    /// including the row-indexed `NormalizeTotal` / `RowScale`, which read
+    /// their per-row vector at the global row `ScxCsc::indices` already
+    /// carries. A predicate here would have no false case to return.
     ///
     /// The deletion-vector clause is the one that is a correctness barrier
     /// rather than conservatism: CSC `indices` are *global* row ids, and a row
@@ -137,9 +141,7 @@ impl LazyShardSource {
     /// (the analog to `ScxBackedSparseDataset::as_column_source` for
     /// the lazy-transformed wrapper).
     pub(crate) fn supports_csc(&self) -> bool {
-        self.backed_csc.is_some()
-            && self.transforms.iter().all(Transform::is_csc_applicable)
-            && self.kept_to_global.is_none()
+        self.backed_csc.is_some() && self.kept_to_global.is_none()
     }
 }
 
@@ -344,10 +346,13 @@ impl scx_format_io::ShardSource for LazyShardSource {
 /// `ln_1p(0) == 0` — an invariant `apply_transforms_to_csr` already asserts in
 /// debug builds rather than one this function assumes.
 ///
-/// Infallible by construction: every `Transform` is CSC-applicable, so there is
-/// no arm left to refuse. The exhaustive `match` below is what forces a future
-/// variant to be considered, where the removed `Result` used to be a
-/// defence-in-depth against one slipping past the gate.
+/// Infallible by construction: every `Transform` has a column-major form, so
+/// there is no arm left to refuse. The `match` below is exhaustive with no
+/// wildcard, and that is the whole guard — a new variant fails to compile here
+/// until someone decides what it means column-major. **If that decision is
+/// "it cannot be served column-major", refuse it in
+/// [`LazyShardSource::supports_csc`] rather than writing an approximate arm
+/// here**; the gate is the right place for that and this function is not.
 fn apply_transforms_to_csc(transforms: &[Transform], csc: &mut ScxCsc) {
     for transform in transforms {
         match transform {
@@ -368,6 +373,14 @@ fn apply_transforms_to_csc(transforms: &[Transform], csc: &mut ScxCsc) {
                 // Split the borrow: the value being written and the row index
                 // being read live in two fields of the same struct.
                 let (data, indices) = (&mut csc.data, &csc.indices);
+                debug_assert!(
+                    indices
+                        .iter()
+                        .all(|&r| r >= 0 && (r as usize) < row_sums.len()),
+                    "CSC row index outside row_sums ({}); a shard's indices must be \
+                     global physical rows",
+                    row_sums.len(),
+                );
                 for (v, &row) in data.iter_mut().zip(indices.iter()) {
                     let sum = row_sums[row as usize];
                     // `sum > 0.0` and *not* an else-branch: CSR leaves a
@@ -380,6 +393,14 @@ fn apply_transforms_to_csc(transforms: &[Transform], csc: &mut ScxCsc) {
             }
             Transform::RowScale { factors } => {
                 let (data, indices) = (&mut csc.data, &csc.indices);
+                debug_assert!(
+                    indices
+                        .iter()
+                        .all(|&r| r >= 0 && (r as usize) < factors.len()),
+                    "CSC row index outside factors ({}); a shard's indices must be \
+                     global physical rows",
+                    factors.len(),
+                );
                 for (v, &row) in data.iter_mut().zip(indices.iter()) {
                     // f32 multiply, matching CSR. NormalizeTotal above goes
                     // through f64 and this one does not; that asymmetry is

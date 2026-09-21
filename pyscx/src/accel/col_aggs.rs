@@ -119,9 +119,12 @@ enum CscHandle {
 impl CscHandle {
     fn extract(dataset: &Bound<'_, PyAny>) -> PyResult<(Self, Vec<u32>, usize)> {
         if let Ok(backed) = dataset.extract::<PyRef<ScxBackedSparseDataset>>() {
-            let csc = backed
-                .as_column_source_owned()
-                .ok_or_else(crate::accel::csc_unavailable)?;
+            let csc = backed.as_column_source_owned().ok_or_else(|| {
+                crate::accel::csc_unavailable(
+                    backed.backed_csc.is_some(),
+                    backed.kept_to_global.is_some(),
+                )
+            })?;
             let cols: Vec<u32> = match backed.col_projection() {
                 Some(c) => c.to_vec(),
                 None => (0..backed.shape_val.1 as u32).collect(),
@@ -129,9 +132,12 @@ impl CscHandle {
             return Ok((CscHandle::Backed(csc), cols, backed.shape_val.0));
         }
         if let Ok(lazy) = dataset.extract::<PyRef<ScxLazyTransformedDataset>>() {
-            let src = lazy
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
+            let src = lazy.as_column_source().ok_or_else(|| {
+                crate::accel::csc_unavailable(
+                    lazy.backed_csc.is_some(),
+                    lazy.kept_to_global.is_some(),
+                )
+            })?;
             let cols: Vec<u32> = match lazy.col_projection() {
                 Some(c) => c.to_vec(),
                 None => (0..lazy.shape_val.1 as u32).collect(),

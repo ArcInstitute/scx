@@ -224,10 +224,6 @@ fn select_de_matrix<'py>(
     }
 }
 
-/// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
-///
-/// Mirrors the single capability-detection point (`as_column_source`): a valid
-/// CSC route needs a sidecar present, no active row-deletion vector, and — for a
 /// Refuse an explicit `prefer_format="csc"` on a **subset** backed handle.
 ///
 /// The gene-major sidecar is written against the full axis and has no

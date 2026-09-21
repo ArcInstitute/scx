@@ -114,14 +114,13 @@ impl ScxLazyTransformedDataset {
     /// Returns `Some` iff:
     /// - `backed_csc` is set (file has a CSC sidecar AND was opened
     ///   with CSC capability), AND
-    /// - every transform in the chain returns
-    ///   [`Transform::is_csc_applicable`] — today that is every variant,
-    ///   including the row-indexed `NormalizeTotal` / `RowScale`, which read
-    ///   their per-row vector at the global row `ScxCsc::indices` already
-    ///   carries, AND
     /// - `kept_to_global` is `None` (row deletions renumber the live rows
     ///   while CSC `indices` stay global, so a row-indexed transform would
     ///   read the wrong entry).
+    ///
+    /// The transform chain is not a condition: every `Transform` has a
+    /// column-major form, the row-indexed `NormalizeTotal` / `RowScale`
+    /// included, read at the global row `ScxCsc::indices` already carries.
     ///
     /// Callers consume the `LazyShardSource` via the
     /// `ColumnShardSource` trait impl on `LazyShardSource`. Crate-private

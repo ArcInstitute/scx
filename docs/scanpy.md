@@ -2033,14 +2033,24 @@ raises `RuntimeError` with a message naming the missing capability:
    `pyscx.accel.filter_cells()` or `pyscx.accel.subset_obs()`, the
    dataset has `kept_to_global` set; CSC dispatch then raises until
    you `materialize()` or rebuild the file.
-3. No active column projection **on a backed handle**. After
-   `pyscx.accel.filter_genes()`, `pyscx.accel.subset_var()`,
-   `highly_variable_genes(subset=True)` or `adata[:, mask]`, the sidecar
-   (written against the *full* gene axis) no longer describes the visible
-   one, so CSC dispatch on a backed `X` raises. A *lazy* `X` — anything
-   carrying a transform chain — honours the projection instead: its CSC
-   reader remaps each shard's columns, so a projected lazy handle routes
-   CSC normally. The CSR path streams the projected window either way.
+3. For **DE and HVG only**, no active column projection on a *backed*
+   handle. After `pyscx.accel.filter_genes()`, `pyscx.accel.subset_var()`,
+   `highly_variable_genes(subset=True)` or `adata[:, mask]`, the sidecar is
+   written against the *full* gene axis and those two kernels read it
+   full-axis, so they raise. The other CSC consumers **honour a projection**
+   and need no workaround:
+
+   | On a projected handle | backed `X` | lazy `X` |
+   |---|---|---|
+   | `rank_genes_groups`, `pdex_ref` | raises (`reject_csc_on_subset`); `"auto"` falls back to CSR | honoured |
+   | `highly_variable_genes` | raises | honoured |
+   | `col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | honoured | honoured |
+   | `calculate_qc_metrics` (gene axis) | honoured | honoured |
+   | `pseudobulk_dex` | honoured — a projection *is* how you supply the required gene subset | honoured |
+
+   A lazy `X` — anything carrying a transform chain — honours the projection
+   on every op: its CSC reader remaps each shard's columns. The CSR path
+   streams the projected window in all cases.
 
 **The transform chain is not a condition.** It used to be: the gate
 required every transform to be *column-local* (output depending only on

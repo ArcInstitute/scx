@@ -193,10 +193,30 @@ def test_a_row_deletion_vector_still_disqualifies_csc(small_adata, tmp_path):
     # refusal below is the row filter's doing and not a missing sidecar.
     assert a.n_obs == small_adata.n_obs - 2
     pyscx.accel.normalize_total(a, target_sum=1e4)
-    # The shared message lists both remaining causes and cannot say which
-    # fired, so match its stem; the premise above is what pins the cause.
-    with pytest.raises(RuntimeError, match="CSC requested but unavailable"):
+    # The message must name *this* cause. `build_csc` is the wrong repair
+    # here — the file already has a sidecar — so the error must not offer it.
+    with pytest.raises(RuntimeError, match="row deletion vector is active") as e:
         pyscx.accel.col_sums(a.X, prefer_format="csc")
+    assert "build_csc" not in str(e.value), (
+        "a sidecar-carrying file filtered by rows must not be told to build one"
+    )
+
+
+def test_a_missing_sidecar_names_the_other_cause(small_adata, tmp_path):
+    """The complement: the same helper, the other branch.
+
+    Without this, `csc_unavailable` could return the deletion-vector string
+    unconditionally and the test above would still pass.
+    """
+    import pyscx
+
+    path = tmp_path / "no_csc.scx"
+    pyscx.from_anndata(small_adata, str(path))
+    a = pyscx.open(str(path)).to_anndata(backed=True)
+    pyscx.accel.normalize_total(a, target_sum=1e4)
+    with pytest.raises(RuntimeError, match="no CSC sidecar") as e:
+        pyscx.accel.col_sums(a.X, prefer_format="csc")
+    assert "deletion vector" not in str(e.value)
 
 
 # ---------------------------------------------------------------------------

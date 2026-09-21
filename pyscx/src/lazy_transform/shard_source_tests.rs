@@ -522,6 +522,13 @@ use scx_sparse::{ScxCsc, ScxCsr};
 /// - **Row 2** is structurally empty and **row 3** is stored zeros: two
 ///   distinct spellings of the zero-sum row whose normalisation CSR skips.
 /// - **Row 4** holds 16,777,219, past f32's 2²⁴ exact-integer range.
+/// - **Rows 6 and 7** are signed, and they are the rows this fixture was
+///   missing. `from_anndata` accepts them, and they are the only way to reach
+///   the `sum > 0.0` guard's *false* branch with something other than zeros:
+///   row 6 cancels to a sum of exactly 0 and row 7 sums to −1. Without them
+///   the guard is only ever taken on all-zero rows, where every candidate
+///   behaviour agrees and the branch is untestable — which is how the fused
+///   CSR path came to skip `ln_1p` there while every other route applied it.
 fn parity_matrix() -> (ScxCsr, ScxCsc, Vec<f64>) {
     // row -> [(col, value)]
     let rows: Vec<Vec<(usize, f32)>> = vec![
@@ -531,6 +538,8 @@ fn parity_matrix() -> (ScxCsr, ScxCsc, Vec<f64>) {
         vec![(0, 0.0), (1, 0.0)],                    // stored zeros -> zero-sum row
         vec![(0, 1.0), (1, 2.0), (2, 16_777_219.0)], // past f32's 2^24
         vec![(2, 7.0)],                              // sum 7
+        vec![(0, 0.5), (1, -0.5)],                   // cancels: sum exactly 0
+        vec![(0, -2.0), (1, 1.0)],                   // negative sum (-1)
     ];
     let n_rows = rows.len();
     let n_cols = 3;
@@ -656,7 +665,7 @@ fn the_standard_normalize_then_log1p_chain_is_bit_identical() {
 fn row_scale_is_bit_identical_across_layouts() {
     // Not 0.5 / 0.75 / 1.0: those are f32-exact, so `factors[row] as f32`
     // and an f64 multiply agree and the test cannot see the difference.
-    let factors: Vec<f64> = vec![1.0 / 3.0, 0.1, 1.0 / 7.0, 1.1, 0.7, 1.0 / 3.0];
+    let factors: Vec<f64> = vec![1.0 / 3.0, 0.1, 1.0 / 7.0, 1.1, 0.7, 1.0 / 3.0, -0.25, 3.5];
     assert_bit_identical(
         &[Transform::RowScale {
             factors: Arc::new(factors),
@@ -668,7 +677,7 @@ fn row_scale_is_bit_identical_across_layouts() {
 #[test]
 fn a_mixed_chain_is_bit_identical_across_layouts() {
     let (_, _, sums) = parity_matrix();
-    let factors: Vec<f64> = vec![1.0 / 3.0, 0.1, 1.0 / 7.0, 1.1, 0.7, 1.0 / 3.0];
+    let factors: Vec<f64> = vec![1.0 / 3.0, 0.1, 1.0 / 7.0, 1.1, 0.7, 1.0 / 3.0, -0.25, 3.5];
     assert_bit_identical(
         &[
             normalize(&sums),
@@ -684,13 +693,17 @@ fn a_mixed_chain_is_bit_identical_across_layouts() {
 
 #[test]
 fn a_zero_sum_row_is_left_alone_on_both_paths() {
-    // Premise assertion for the three tests above: without a zero-sum row in
+    // Premise assertion for the tests above: without a non-positive-sum row in
     // the fixture, `sum > 0.0` is never false and the branch that skips
     // normalisation is never taken, so the parity tests would pass without
-    // exercising it. Row 3 is stored zeros; row 2 is structurally empty.
+    // exercising it. Row 2 is structurally empty, row 3 stored zeros, and rows
+    // 6 and 7 reach the same branch carrying **non-zero** values, which the
+    // all-zero rows cannot do.
     let (_, _, sums) = parity_matrix();
     assert_eq!(sums[2], 0.0, "row 2 should be structurally empty");
     assert_eq!(sums[3], 0.0, "row 3 should be a stored-zero row");
+    assert_eq!(sums[6], 0.0, "row 6 should cancel to exactly zero");
+    assert!(sums[7] < 0.0, "row 7 should have a negative total");
 
     let (mut csr, mut csc, _) = parity_matrix();
     let chain = [normalize(&sums)];
@@ -709,27 +722,90 @@ fn a_zero_sum_row_is_left_alone_on_both_paths() {
 }
 
 #[test]
-fn every_transform_variant_is_csc_applicable_and_the_gate_admits_the_chain() {
-    // One instance of every `Transform` variant. Two of them (`NormalizeTotal`,
-    // `RowScale`) are *not* column-local — that was the old predicate, and its
-    // answer is what this change stopped asking. What matters now is that each
-    // is applicable column-major, and that `supports_csc`'s transform clause
-    // therefore admits a chain containing them.
-    //
-    // This is a list, so it cannot notice a variant nobody added here. The
-    // compile-time half of the guard is the exhaustive `match` in
-    // `Transform::is_csc_applicable`, which a new variant breaks.
+fn the_fused_csr_prefix_agrees_with_the_unfused_one_on_a_non_positive_row() {
+    // `apply_transforms_to_csr` special-cases a leading `NormalizeTotal →
+    // Log1p` pair. On a row whose total is not positive, `NormalizeTotal` is
+    // skipped but `Log1p` must still apply — the fused branch used to do
+    // neither, so it silently disagreed with its own general path (and with
+    // `dataset_index.rs`, `apply_transforms_to_csc` and scanpy) on any signed
+    // row. Interposing an identity `Scale` defeats the fusion, which is what
+    // makes the two paths comparable on identical input.
     let (_, _, sums) = parity_matrix();
-    let all = [
-        Transform::Log1p,
-        Transform::Scale { factor: 2.0 },
-        normalize(&sums),
-        Transform::RowScale {
-            factors: Arc::new(vec![1.0; 6]),
-        },
-    ];
-    assert!(all.iter().all(Transform::is_csc_applicable));
-    // The chain the old gate refused, through the predicate the gate calls.
-    let standard = [normalize(&sums), Transform::Log1p];
-    assert!(standard.iter().all(Transform::is_csc_applicable));
+    let (mut fused, _, _) = parity_matrix();
+    let (mut unfused, _, _) = parity_matrix();
+
+    super::super::transforms::apply_transforms_to_csr(
+        &[normalize(&sums), Transform::Log1p],
+        &mut fused,
+        0,
+    );
+    super::super::transforms::apply_transforms_to_csr(
+        &[
+            normalize(&sums),
+            Transform::Scale { factor: 1.0 },
+            Transform::Log1p,
+        ],
+        &mut unfused,
+        0,
+    );
+
+    let (a, b) = (csr_cells(&fused), csr_cells(&unfused));
+    assert_eq!(a.len(), b.len());
+    for ((rc_a, va), (rc_b, vb)) in a.iter().zip(b.iter()) {
+        assert_eq!(rc_a, rc_b);
+        assert_eq!(
+            va.to_bits(),
+            vb.to_bits(),
+            "cell {rc_a:?}: fused {va} vs unfused {vb}",
+        );
+    }
+    // Premise: the signed rows really did take the non-positive branch, so the
+    // equality above is not trivially true of a fixture that never reaches it.
+    let row7: Vec<f32> = csr_cells(&fused)
+        .into_iter()
+        .filter(|&((r, _), _)| r == 7)
+        .map(|(_, v)| v)
+        .collect();
+    assert!(
+        row7.iter().any(|v| v.is_nan()),
+        "row 7 holds -2.0, whose ln_1p is NaN; got {row7:?} — the branch was not taken",
+    );
+}
+
+#[test]
+fn the_csc_gate_refuses_without_a_sidecar_whatever_the_chain() {
+    // `supports_csc` makes two decisions, and a transform chain is no longer
+    // one of them: every variant is served column-major, so the chain the old
+    // gate refused (`normalize_total → log1p`) cannot be the reason a source
+    // is rejected. The exhaustive `match` in `apply_transforms_to_csc` is what
+    // forces a future variant to be considered rather than admitted silently.
+    //
+    // Only the no-sidecar half is reachable here — `new_with_csc` needs a real
+    // `BackedCscReader`, which these fixtures do not write. The sidecar-present
+    // and row-filter halves are covered end to end from Python
+    // (`test_csc_dispatch_lazy.py`), where a real CSC file exists.
+    let dir = TempDir::new().unwrap();
+    let reader = multishard_reader(&dir, 0);
+    let (_, _, sums) = parity_matrix();
+
+    for chain in [
+        vec![],
+        vec![Transform::Log1p],
+        vec![normalize(&sums), Transform::Log1p],
+    ] {
+        let src = LazyShardSource::new_with_csc(
+            Arc::clone(&reader),
+            None,
+            chain.clone(),
+            None,
+            None,
+            N_OBS,
+            N_VARS,
+        );
+        assert!(
+            !src.supports_csc(),
+            "no sidecar must refuse, chain len {}",
+            chain.len()
+        );
+    }
 }

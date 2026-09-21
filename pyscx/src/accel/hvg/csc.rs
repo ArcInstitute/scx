@@ -259,9 +259,12 @@ pub(crate) fn hvg_seurat_v3_csc(
     //    not `Sync`, and GPU CSC reduce is a raw-counts / backed feature). ──
     if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let lazy_ref = lazy.borrow();
-        let lazy_src = lazy_ref
-            .as_column_source()
-            .ok_or_else(crate::accel::csc_unavailable)?;
+        let lazy_src = lazy_ref.as_column_source().ok_or_else(|| {
+            crate::accel::csc_unavailable(
+                lazy_ref.backed_csc.is_some(),
+                lazy_ref.kept_to_global.is_some(),
+            )
+        })?;
         let n_obs = lazy_src.n_obs();
         let n_vars = lazy_src.n_vars();
         let stats = scx_accel::streaming_mean_var_csc(&lazy_src)
