@@ -263,7 +263,14 @@ pub(super) fn aggregate_pseudobulk(
             x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
         {
             match lazy.col_projection() {
-                Some(cols) => cols.to_vec(),
+                // Identity positions, NOT the global ids the projection holds:
+                // both the lazy CSC source and `gene_names` (taken from the
+                // already-subset `adata.var`) are on the projected axis, so a
+                // global id would read the wrong column *and* label it with
+                // the wrong name — or fall off the end of the visible
+                // `gene_names` and be rejected as out of range. See the note
+                // in `accel::col_aggs`.
+                Some(cols) => (0..cols.len() as u32).collect(),
                 None => {
                     return Err(PyRuntimeError::new_err(
                         "prefer_format='csc' requires a gene subset; pass \

@@ -727,9 +727,14 @@ fn the_fused_csr_prefix_agrees_with_the_unfused_one_on_a_non_positive_row() {
     // Log1p` pair. On a row whose total is not positive, `NormalizeTotal` is
     // skipped but `Log1p` must still apply — the fused branch used to do
     // neither, so it silently disagreed with its own general path (and with
-    // `dataset_index.rs`, `apply_transforms_to_csc` and scanpy) on any signed
-    // row. Interposing an identity `Scale` defeats the fusion, which is what
-    // makes the two paths comparable on identical input.
+    // `apply_transforms_to_csc` and scanpy) on any signed row. Interposing an
+    // identity `Scale` defeats the fusion, which is what makes the two paths
+    // comparable on identical input.
+    //
+    // This covers only the `transforms.rs` copy of the fusion. The second
+    // copy, `dataset_index.rs::apply_transforms_per_row`, is reached through
+    // `__getitem__` rather than a shard source, so it is pinned end to end
+    // instead, by `test_a_signed_row_reads_the_same_through_a_slice_and_a_fancy_index`.
     let (_, _, sums) = parity_matrix();
     let (mut fused, _, _) = parity_matrix();
     let (mut unfused, _, _) = parity_matrix();

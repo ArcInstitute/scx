@@ -106,7 +106,8 @@ def test_lazy_log1p_csc_col_var_matches_materialized(small_adata, tmp_path):
 # column? For `NormalizeTotal` it does not. But that is the wrong question
 # for a CSC reader, which knows each nonzero's global row because
 # `ScxCsc::indices` *is* that row, and `NormalizeTotal` carries its
-# `row_sums` vector with it. The gate now tests `is_csc_applicable()`.
+# `row_sums` vector with it. So the gate stopped asking about the chain at
+# all: it now checks only for a sidecar and the absence of a row filter.
 # ---------------------------------------------------------------------------
 
 
@@ -385,3 +386,142 @@ def test_de_without_a_sidecar_still_routes_csr(tmp_path):
     pyscx.from_anndata(adata, str(path), csc="off")
     route, _ = _de_on(path, adata, "auto")
     assert route == "cpu_csr"
+
+
+# ---------------------------------------------------------------------------
+# Round-2 regressions.
+#
+# Both were found by review of the round-1 fix commit, and both are cases the
+# non-negative fixtures above structurally cannot reach.
+# ---------------------------------------------------------------------------
+
+
+def _signed_adata():
+    import anndata as ad
+
+    # Row 0 cancels to a total of exactly 0, row 1 to -1. Every other row is
+    # ordinary positive data, so only these two take the `sum > 0.0` false
+    # branch — which on non-negative input is reachable only with all-zero
+    # rows, where every candidate behaviour agrees.
+    dense = np.array(
+        [
+            [0.5, -0.5, 0.0, 0.0],
+            [-2.0, 1.0, 0.0, 0.0],
+            [1.0, 2.0, 3.0, 4.0],
+            [4.0, 3.0, 2.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    a = ad.AnnData(X=sp.csr_matrix(dense))
+    a.obs["cell_id"] = [f"c{i}" for i in range(dense.shape[0])]
+    a.var["gene_id"] = [f"g{i}" for i in range(dense.shape[1])]
+    return a
+
+
+def test_a_signed_row_reads_the_same_through_a_slice_and_a_fancy_index(tmp_path):
+    """`X[:]` and `X[[...]]` are different code paths, and both fuse.
+
+    `apply_transforms_to_csr` and `apply_transforms_per_row` each special-case
+    a leading `normalize_total → log1p`. The round-1 fix repaired the first and
+    left the second, so a row whose total is not positive came back with raw
+    values through a fancy index and `ln_1p`-ed values through a slice — the
+    same matrix answering differently depending on how it was addressed.
+    """
+    import pyscx
+
+    adata = _signed_adata()
+    path = tmp_path / "signed.scx"
+    pyscx.from_anndata(adata, str(path))
+
+    h = pyscx.open(str(path)).to_anndata(backed=True)
+    pyscx.accel.normalize_total(h, target_sum=1e4)
+    pyscx.accel.log1p(h)
+
+    rows = [0, 1, 2, 3]
+    sliced = h.X[:]
+    fancy = h.X[rows]
+    sliced = sliced.toarray() if sp.issparse(sliced) else np.asarray(sliced)
+    fancy = fancy.toarray() if sp.issparse(fancy) else np.asarray(fancy)
+
+    # Premise: the signed rows really did reach the non-positive branch. A
+    # value of -2.0 has no real ln_1p, so a NaN here is the branch's signature.
+    assert np.isnan(sliced[1]).any(), (
+        "row 1 sums to -1 and holds -2.0; the slice path should have applied "
+        f"ln_1p and produced a NaN. Got {sliced[1]}"
+    )
+    np.testing.assert_array_equal(
+        np.isnan(sliced), np.isnan(fancy),
+        err_msg="slice and fancy-index disagree on which cells are NaN",
+    )
+    np.testing.assert_array_equal(
+        np.nan_to_num(sliced, nan=0.0), np.nan_to_num(fancy, nan=0.0),
+        err_msg="slice and fancy-index disagree on a signed row's values",
+    )
+
+
+def test_a_projected_lazy_handle_addresses_the_projected_axis(tmp_path):
+    """A lazy CSC source is already on the projected axis.
+
+    The projected-axis consumers used to hand it back the *global* column ids,
+    applying the projection twice: wrong genes when the ids stayed in range,
+    and a panic in `walk_csc_runs` when they did not. Reachable before this PR
+    with a `log1p`-only chain, so both chains are checked.
+    """
+    import pyscx
+
+    rng = np.random.default_rng(5)
+    mat = sp.random(60, 20, density=0.5, format="csr", dtype=np.float32, random_state=rng)
+    mat.data = (mat.data * 50).astype(np.float32).round() + 1.0
+    import anndata as ad
+
+    adata = ad.AnnData(X=mat)
+    adata.obs["cell_id"] = [f"c{i}" for i in range(60)]
+    adata.var["gene_id"] = [f"g{i}" for i in range(20)]
+    path = tmp_path / "proj.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=5)
+
+    # Non-identity: keep the second half, so a global id is never a valid
+    # position in the projected axis and the two addressings cannot coincide.
+    keep = np.arange(20) >= 10
+
+    for chain in ("log1p", "normalize_then_log1p"):
+        h = pyscx.open(str(path)).to_anndata(backed=True)[:, keep]
+        if chain == "normalize_then_log1p":
+            pyscx.accel.normalize_total(h, target_sum=1e4)
+        pyscx.accel.log1p(h)
+
+        csc_sums = np.asarray(pyscx.accel.col_sums(h.X, prefer_format="csc"))
+        materialised = h.X[:]
+        dense = (
+            materialised.toarray() if sp.issparse(materialised) else np.asarray(materialised)
+        )
+        assert csc_sums.shape == (int(keep.sum()),), f"{chain}: wrong width"
+        np.testing.assert_allclose(
+            csc_sums, dense.sum(axis=0).astype(np.float64), rtol=1e-6,
+            err_msg=f"{chain}: projected lazy CSC col_sums disagree with the matrix",
+        )
+
+
+def test_projected_lazy_qc_gene_axis_matches_the_csr_route(tmp_path):
+    """The same double-projection, through `calculate_qc_metrics`."""
+    import pyscx
+    import anndata as ad
+
+    rng = np.random.default_rng(6)
+    mat = sp.random(50, 16, density=0.6, format="csr", dtype=np.float32, random_state=rng)
+    mat.data = (mat.data * 30).astype(np.float32).round() + 1.0
+    adata = ad.AnnData(X=mat)
+    adata.obs["cell_id"] = [f"c{i}" for i in range(50)]
+    adata.var["gene_id"] = [f"g{i}" for i in range(16)]
+    path = tmp_path / "qc_proj.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=4)
+    keep = np.arange(16) >= 8
+
+    out = {}
+    for prefer in ("csr", "csc"):
+        h = pyscx.open(str(path)).to_anndata(backed=True)[:, keep]
+        pyscx.accel.normalize_total(h, target_sum=1e4)
+        pyscx.accel.calculate_qc_metrics(h, prefer_format=prefer, inplace=True)
+        out[prefer] = np.asarray(h.var["total_counts"], dtype=np.float64)
+
+    np.testing.assert_allclose(out["csc"], out["csr"], rtol=1e-6)

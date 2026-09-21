@@ -145,7 +145,8 @@ impl ScxLazyTransformedDataset {
     /// Threads `backed_csc` through, so consumers that route via
     /// `ColumnShardSource` (Phase F) get the CSC plumbing for free.
     /// Whether CSC is actually serviceable is gated separately by
-    /// `LazyShardSource::supports_csc()` (transform-chain check).
+    /// `LazyShardSource::supports_csc()` — a sidecar must be present and no
+    /// row deletion vector active. The transform chain is not a condition.
     pub(crate) fn as_shard_source(&self) -> LazyShardSource {
         LazyShardSource::new_with_csc(
             Arc::clone(&self.backed),

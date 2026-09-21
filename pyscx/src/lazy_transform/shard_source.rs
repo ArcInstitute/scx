@@ -338,13 +338,14 @@ impl scx_format_io::ShardSource for LazyShardSource {
 /// index the same vector the same way. The gate keeps a row-deletion vector
 /// out precisely because it would renumber those rows.
 ///
-/// One corner where the two routes are *not* identical, and it is CSR's own:
-/// for a `NormalizeTotal → Log1p` pair, CSR takes a **fused** path
-/// (`transforms.rs`) that skips a zero-sum row entirely, so such a row is never
-/// passed through `ln_1p`. CSR's own general path and this one both apply it.
-/// The two agree because a zero-sum row's stored values are all zero and
-/// `ln_1p(0) == 0` — an invariant `apply_transforms_to_csr` already asserts in
-/// debug builds rather than one this function assumes.
+/// A `NormalizeTotal → Log1p` pair is **fused** on the CSR side, in both
+/// `transforms.rs` (slices and shard reads) and `dataset_index.rs` (fancy
+/// indexing). On a row whose total is not positive those fused paths skip the
+/// normalisation — scanpy's rule — but still apply `ln_1p`, which is what this
+/// function does by running the two in sequence. They used to skip `ln_1p`
+/// too, which made them disagree with this path on any signed row; that is
+/// fixed, and `shard_source_tests.rs` pins the agreement on a cancelling row
+/// and a negative-total row.
 ///
 /// Infallible by construction: every `Transform` has a column-major form, so
 /// there is no arm left to refuse. The `match` below is exhaustive with no

@@ -2835,7 +2835,7 @@ when the dataset is large enough to benefit — `n_obs ≥ 50000` **and**
 | Op | `supports_csc` | Default `prefer_format` | GPU-fast with CSC | Notes |
 |----|:--:|:--:|:--:|-------|
 | `pdex_ref` | ✅ | **`auto`** | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. |
-| `rank_genes_groups` (Wilcoxon rank-sum) | ✅ | **`auto`** | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. On CPU the `auto` default takes the CSC kernel whenever the file has a sidecar and no row deletion vector is active — including under a `normalize_total → log1p` chain. |
+| `rank_genes_groups` (Wilcoxon rank-sum) | ✅ | **`auto`** | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. On CPU the `auto` default takes the CSC kernel when the file has a sidecar, no row deletion vector is active, and — on a *backed* handle — no column projection; a lazy transform chain no longer disqualifies, so an ordinary `normalize_total → log1p` now routes CSC. |
 | `rank_genes_groups_df` | ✅ | **`auto`** | ✅ (`gpu_csc_v3`) | Same Wilcoxon rank-sum engine as above. |
 | `pseudobulk_dex` | ✅ (gene subset) | CSR | N/A (CPU + pydeseq2) | CSC requires a gene subset (`gene_indices` or `col_projection`); full-gene CSC has no win. |
 | `highly_variable_genes` (seurat_v3) | ✅ (single-batch) | CSR | ❌ | CSC routes single-batch seurat_v3; multi-batch / GPU / other flavors raise on CSC. |

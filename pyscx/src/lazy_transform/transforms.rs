@@ -48,13 +48,19 @@ pub(crate) fn apply_transforms_to_csr(
                     //
                     // The premise does not hold for signed data, which
                     // `from_anndata` accepts: a row `[0.5, -0.5]` sums to 0 and
-                    // a row `[-2.0, 1.0]` to -1. On those the fused path left
-                    // the values untouched while **every** other route applied
-                    // `ln_1p` — the unfused path below, the row-gather path in
-                    // `dataset_index.rs`, `apply_transforms_to_csc`, and
-                    // `sc.pp.normalize_total` + `sc.pp.log1p` itself. So the
-                    // fused prefix was the outlier, not the rule, and the
-                    // assertion fired on input the public API does not reject.
+                    // a row `[-2.0, 1.0]` to -1. On those this branch left the
+                    // values untouched while the unfused path below,
+                    // `apply_transforms_to_csc`, and `sc.pp.normalize_total` +
+                    // `sc.pp.log1p` all applied `ln_1p`, so the fusion was the
+                    // outlier and the assertion fired on input the public API
+                    // does not reject.
+                    //
+                    // `dataset_index.rs::apply_transforms_per_row` carries a
+                    // second copy of this fusion, for fancy indexing and for
+                    // any read once a deletion vector is set. It had the same
+                    // bug and carries the same repair — the two must stay in
+                    // step, or one matrix answers differently depending on how
+                    // it is addressed.
                     //
                     // Applying `ln_1p` here makes all four agree. Counts data
                     // is unaffected: a sum of non-negative f32 values is 0 only

@@ -1874,10 +1874,10 @@ fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<u32>)>
         let lazy_src = lazy.as_column_source().ok_or_else(|| {
             crate::accel::csc_unavailable(lazy.backed_csc.is_some(), lazy.kept_to_global.is_some())
         })?;
-        let cols_owned: Vec<u32> = match lazy.col_projection() {
-            Some(c) => c.to_vec(),
-            None => (0..lazy.shape_val.1 as u32).collect(),
-        };
+        // Identity positions — see the note in `accel::col_aggs`: a
+        // `LazyShardSource` is already on the projected axis.
+        let cols_owned: Vec<u32> =
+            (0..scx_format_io::ShardSource::n_vars(&lazy_src) as u32).collect();
         return projected_agg::col_sums_and_nnz_projected_csc(&lazy_src, &cols_owned)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()));
     }
