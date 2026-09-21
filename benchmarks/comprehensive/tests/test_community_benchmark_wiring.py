@@ -181,7 +181,7 @@ def test_pipeline_budget_is_declared_consistently_in_all_three_places():
     """The 16 / 32 GB ceiling is spelled three times — the format key's suffix,
     `MEMORY_BUDGET_GB`, and `FormatVariant.params["budget_gb"]` — and
     `estimate_memory_gb` reads only the second. If they drift, the SLURM
-    allocation stops matching the arm's label and `pipeline_completed_bool`
+    allocation stops matching the arm's label and `pipeline_completed_int`
     becomes a claim about a ceiling that was never applied."""
     from benchmarks.comprehensive.benchmarks.pipeline_ooc_constrained import (
         MEMORY_BUDGET_GB,

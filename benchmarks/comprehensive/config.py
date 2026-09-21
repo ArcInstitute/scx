@@ -755,25 +755,41 @@ DATASETS: dict[str, DatasetConfig] = {
     # floors are in exactly that state. Add to TIERS in Phase 4.2, with the
     # fixtures, not before.
     #
-    # `available=False` is documentation only — `DatasetConfig.available` is
-    # read nowhere in the tree. What actually keeps these two out of an
-    # unscoped run is `run_parallel`'s default dataset resolution, which keeps
-    # a dataset only if `cfg.h5ad_path.exists()`, plus their absence from
-    # TIERS. Do not rely on the flag.
+    # `available` is documentation only — `DatasetConfig.available` is read
+    # nowhere in the tree. What actually keeps these two out of an *unscoped*
+    # run is `run_parallel`'s default dataset resolution, which keeps a
+    # dataset only if `cfg.h5ad_path.exists()` and neither has an `.h5ad` at
+    # all. `capture_baseline` reaches them by passing `--datasets` from its
+    # tier list, which is why the TIERS entry is what actually schedules them.
+    # Do not rely on the flag.
     #
-    # `approx_h5ad_mb` is derived from the declared geometry at the ~8 B/nnz
+    # `synthetic=False` even though these are generated: the flag means
+    # "materialised in-process from `synth_params`" everywhere it is read
+    # (`run_all.py`, `accel_de_nb_glm.py`, `grouped_sort.py`, ...), their
+    # `synth_params` is empty, and they are staged to disk by
+    # `build_multimodal_atlas.py` like any downloaded fixture. Left at True it
+    # also redirects `h5ad_path` into a `synthetic/` subtree that nothing
+    # writes, and makes `run_all.discover_available_datasets` report them
+    # available with no file present.
+    #
+    # `approx_h5ad_mb` was derived from the declared geometry at the ~8 B/nnz
     # uncompressed CSR rate the other entries use (pbmc10k checks out at 196 vs
-    # its recorded 194), NOT guessed — it feeds `estimate_memory_gb`'s
-    # `base_mb = h5ad_mb * 2`. The numbers are a real staging cost worth seeing
-    # before Phase 4.1 is written: multiome is 1.8 B nnz / ~13.6 GB (700 M RNA
-    # + 1.125 B ATAC) and CITE-seq 1.15 B nnz / ~8.6 GB. If that is too much to
-    # stage, the lever is the density, and this is the place to revisit it.
+    # its recorded 194) and feeds `estimate_memory_gb`'s `base_mb = h5ad_mb*2`.
+    # Both estimates held once the fixtures were staged, so they are left as
+    # they are: multiome predicted 13,924 MiB and measured 13,862
+    # (1,802,852,332 nnz over 686 M RNA + 1,117 M ATAC); CITE-seq predicted
+    # 8,774 MiB and measured 8,841 (1,136,629,765 nnz over 887 M RNA + 250 M
+    # dense ADT). Realised densities run ~2 % under the nominal ones because
+    # the generator draws column positions with replacement and deduplicates.
+    #
+    # `.scx` compresses those to 3.25 GB and 1.34 GB respectively, so the eager
+    # MuData arms read 4.5x and 6.9x more bytes than the SCX arms do.
     "multiome_atlas_500k": DatasetConfig(
         id="K3", name="multiome_atlas_500k",
         n_obs=500_000, n_vars=35_000 + 150_000,
         protocol="synthetic 10x Multiome (RNA 4% + ATAC 1.5%)",
         source="benchmarks/scripts/build_multimodal_atlas.py",
-        approx_h5ad_mb=13_924, available=False, synthetic=True,
+        approx_h5ad_mb=13_924, available=True, synthetic=False,
         multimodal=True, modality_names=("rna", "atac"),
     ),
     "citeseq_atlas_1m": DatasetConfig(
@@ -781,7 +797,7 @@ DATASETS: dict[str, DatasetConfig] = {
         n_obs=1_000_000, n_vars=30_000 + 250,
         protocol="synthetic CITE-seq (RNA 3% + dense ADT panel)",
         source="benchmarks/scripts/build_multimodal_atlas.py",
-        approx_h5ad_mb=8_774, available=False, synthetic=True,
+        approx_h5ad_mb=8_774, available=True, synthetic=False,
         multimodal=True, modality_names=("rna", "adt"),
     ),
     # Tiny synthetic h5ad used by the streaming-conversion smoke job.
@@ -1903,7 +1919,7 @@ def estimate_time_minutes(
         # `accel_pipeline`'s 210-min base for three of these stages — 300/M
         # puts census_1m at ~540 min, which is the arm this benchmark exists
         # to show completing. Re-derive from the first real capture; a timeout
-        # here loses the `pipeline_completed_bool` evidence entirely, which is
+        # here loses the `pipeline_completed_int` evidence entirely, which is
         # the one number the benchmark is for.
         slope_minutes_per_million = 300
     elif benchmark == "multimodal_atlas_streaming":

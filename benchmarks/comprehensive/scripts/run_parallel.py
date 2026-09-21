@@ -1107,7 +1107,7 @@ def _per_job_slurm_params(
     #
     # `pipeline_ooc_constrained` is exempt from both, because for it the SLURM
     # cgroup ceiling IS the experiment: the arm is named for the 16 or 32 GB
-    # budget it must run under, and `pipeline_completed_bool` means nothing if
+    # budget it must run under, and `pipeline_completed_int` means nothing if
     # the allocation is not the one the label claims. Both adjustments below
     # would silently raise it — `--scale-factor 1.3`, which this script's own
     # `--help` recommends for noisy clusters, turns a 16 GB arm into 21 GB, and

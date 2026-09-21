@@ -113,6 +113,19 @@ TIERS = {
             "pbmc3k", "pbmc10k", "smartseq2", "tabula_sapiens_100k",
             "census_500k", "census_1m",
             "cite_seq_pbmc", "multiome_pbmc",
+            # The atlas-scale synthetic multimodal fixtures, added here only
+            # now that `benchmarks/scripts/build_multimodal_atlas.py` has
+            # staged them. A dataset outside every tier is never scheduled and
+            # `check_absolute_floors` skips an unrun triple *silently*, so a
+            # floor declared against one of these before the fixture existed
+            # would have read as coverage and provided none — the state 53
+            # floors are in today.
+            #
+            # `full` and not `small`: at 500K and 1M cells with an eager f32
+            # MuData control arm these are the most expensive cells in the
+            # suite, and `small` is what the default `gate_candidate.py` run
+            # uses. `xl` has never carried a multimodal entry.
+            "multiome_atlas_500k", "citeseq_atlas_1m",
         ],
         "partition": DEFAULT_PARTITION,
         "mem_gb": 8,
