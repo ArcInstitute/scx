@@ -1,0 +1,77 @@
+{
+ "schema_version": 2,
+ "benchmark": "multimodal_atlas_streaming",
+ "format": "multimodal_atlas_streaming__mudata_h5mu",
+ "dataset": "cite_seq_pbmc_5k",
+ "timestamp": "2026-09-20T18:21:17",
+ "system": {
+  "hostname": "fixture",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python_version": "3.13",
+  "cpu": "fixture",
+  "cpu_cores_physical": 8,
+  "ram_gb": 64,
+  "library_versions": {
+   "pyscx": "0.18.0"
+  },
+  "provenance": {
+   "git_sha": "0000000000000000000000000000000000000000",
+   "git_dirty": false
+  }
+ },
+ "runs": [
+  {
+   "wall_s": 1.5667116842232645,
+   "user_s": 0.0,
+   "sys_s": 0.0,
+   "peak_rss_mb": 479.20703125,
+   "extra": {
+    "cache_policy": "warm",
+    "mudata_eager_peak_rss_mb": 479.20703125,
+    "modality_sums_match_int": 1.0
+   }
+  }
+ ],
+ "median_wall_s": 1.608975169248879,
+ "wall_s_iqr": 0.16041335626505315,
+ "n_runs": 1,
+ "overall_passed": true,
+ "metadata": {
+  "cold_cache": false,
+  "n_warmup": 1,
+  "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/cite_seq_pbmc_5k.h5mu",
+  "chunk_size": 65536,
+  "modality_names": [
+   "rna",
+   "adt"
+  ],
+  "narrow_dtype": "uint16",
+  "reference_available": true,
+  "query_modality": null,
+  "query_filter": null,
+  "query_column": null,
+  "observed_modality_sums": {
+   "rna": 32173181.0,
+   "adt": 16081143.0
+  },
+  "x_dtypes": null
+ },
+ "scenario": {
+  "name": "mudata_eager",
+  "engine": "mudata",
+  "cache_state": "warm",
+  "device": "cpu",
+  "chunk_size": 65536
+ },
+ "comparison": {
+  "subject": {
+   "impl": "multimodal_atlas_streaming__mudata_h5mu"
+  },
+  "baseline": {
+   "impl": "multimodal_atlas_streaming__mudata_h5mu"
+  },
+  "metric": "wall_s",
+  "status": "pending"
+ }
+}

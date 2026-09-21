@@ -1,0 +1,86 @@
+{
+ "schema_version": 2,
+ "benchmark": "accel_qc_filter",
+ "format": "accel_qc_filter__scanpy_cpu",
+ "dataset": "pbmc10k",
+ "timestamp": "2026-09-20T18:21:11",
+ "system": {
+  "hostname": "fixture",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python_version": "3.13",
+  "cpu": "fixture",
+  "cpu_cores_physical": 8,
+  "ram_gb": 64,
+  "library_versions": {
+   "pyscx": "0.18.0"
+  },
+  "provenance": {
+   "git_sha": "0000000000000000000000000000000000000000",
+   "git_dirty": false
+  }
+ },
+ "runs": [
+  {
+   "wall_s": 2.673573076259345,
+   "user_s": 0.0,
+   "sys_s": 0.0,
+   "peak_rss_mb": 1087.203125,
+   "extra": {
+    "qc_wall_s__qc_metrics": 1.0410618879832327,
+    "qc_peak_rss_mb__qc_metrics": 899.0078125,
+    "qc_wall_s__filter_cells": 0.24285130389034748,
+    "qc_peak_rss_mb__filter_cells": 1079.890625,
+    "qc_wall_s__filter_genes": 0.30733271688222885,
+    "qc_peak_rss_mb__filter_genes": 1087.203125,
+    "qc_wall_s": 2.673573076259345,
+    "qc_peak_rss_mb": 1087.203125,
+    "cache_policy": "warm",
+    "x_type": "csr_matrix"
+   }
+  }
+ ],
+ "median_wall_s": 2.5373974638059735,
+ "wall_s_iqr": 0.08697255328297615,
+ "n_runs": 1,
+ "metadata": {
+  "cold_cache": false,
+  "n_warmup": 1,
+  "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc10k.h5ad",
+  "min_genes": 200,
+  "min_cells": 3,
+  "percent_top": [
+   50,
+   100,
+   200,
+   500
+  ],
+  "stages": [
+   "qc_metrics",
+   "filter_cells",
+   "filter_genes"
+  ],
+  "parity_reference": null,
+  "qc_var_counts": {
+   "mt": 13,
+   "ribo": 104
+  }
+ },
+ "scenario": {
+  "name": "qc_metrics_then_filter",
+  "engine": "scanpy",
+  "residency": "in_memory",
+  "cache_state": "warm",
+  "device": "cpu"
+ },
+ "comparison": {
+  "subject": {
+   "impl": "accel_qc_filter__scanpy_cpu"
+  },
+  "baseline": {
+   "impl": "accel_qc_filter__scanpy_cpu"
+  },
+  "metric": "qc_wall_s",
+  "status": "pending"
+ }
+}

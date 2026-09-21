@@ -2938,6 +2938,328 @@ def harmony_validation_table() -> TableBlock:
     )
 
 
+# ---------------------------------------------------------------------------
+# Community analytical workflows
+#
+# Four benchmarks that measure SCX against what a scanpy/MuData user actually
+# runs, rather than against another storage format. Every metric below lives in
+# `runs[].extra` under a suffixed name — `wall_s` / `peak_rss_mb` are reserved
+# `add_run` parameters and never reach `extra`, so each arm owns a distinctly
+# named RSS key (`_rss_key` in `multimodal_atlas_streaming`) and the timing
+# keys carry a `qc_` / `score_` / `total_` prefix.
+# ---------------------------------------------------------------------------
+
+#: Human labels for the arms, keyed by the tail after `<benchmark>__`.
+_COMMUNITY_ARM_LABELS = {
+    # accel_qc_filter
+    "pyscx_cpu": "pyscx (backed)",
+    "pyscx_inmem": "pyscx (in-memory)",
+    "scanpy_cpu": "scanpy",
+    # accel_score_genes
+    "pyscx_cpu_scanpy": "pyscx control (scanpy parity)",
+    "pyscx_cpu_mean": "pyscx mean",
+    "pyscx_cpu_zscore": "pyscx zscore",
+    # pipeline_ooc_constrained
+    "pyscx_16g": "pyscx @ 16 GB",
+    "pyscx_32g": "pyscx @ 32 GB",
+    "scanpy_16g": "scanpy @ 16 GB",
+    "scanpy_32g": "scanpy @ 32 GB",
+    # multimodal_atlas_streaming
+    "scx_stream": "SCX backed stream",
+    "scx_eager_u16": "SCX eager uint16",
+    "scx_eager_f32": "SCX eager f32",
+    "mudata_h5mu": "MuData eager",
+    "mudata_backed": "MuData backed",
+    "scx_query_mod": "SCX modality pushdown",
+}
+
+
+def _community_arm(benchmark: str, format_key: str) -> str:
+    """Strip the `<benchmark>__` prefix and label the arm."""
+    tail = (
+        format_key[len(benchmark) + 2:]
+        if format_key.startswith(benchmark + "__")
+        else format_key
+    )
+    return _COMMUNITY_ARM_LABELS.get(tail, tail)
+
+
+def _community_rows(benchmark: str) -> list:
+    """Measured rows for a community benchmark, dataset axis derived from data.
+
+    Deriving the dataset axis from the rows rather than a literal list is
+    load-bearing: the tier registry keys are `cite_seq_pbmc` / `multiome_pbmc`
+    while the result files carry `DatasetConfig.name` — `cite_seq_pbmc_5k` /
+    `multiome_pbmc_10k`. A hardcoded list renders those two silently empty.
+    """
+    store = get_store()
+    # `r.runs` and not just `r.missing_reason`: `_try_missing_reason` maps an
+    # unrecognised string to `None`, and these modules write typed gaps the
+    # `MissingReason` enum does not carry (`no_selective_obs_column`,
+    # `scanpy_private_api_drift`). A row with no runs has nothing to render
+    # either way, and an all-dash row is what the empty-cell lint exists for.
+    return [
+        r for r in store.by_benchmark(benchmark)
+        if r.missing_reason is None and r.runs
+    ]
+
+
+def _community_src(rows) -> str | None:
+    return next((r.source.path for r in rows if r.source and r.source.path), None)
+
+
+def community_qc_filter_table() -> TableBlock | TextBlock:
+    """`accel_qc_filter` — fused QC metrics + atomic filtering vs scanpy.
+
+    Three arms over the identical call sequence. Only `pyscx (backed)` is
+    native end to end: `accel.filter_cells` / `filter_genes` delegate to
+    `sc.pp.*` for an in-memory scipy `X`, so the in-memory arm is a native QC
+    pass followed by a scanpy filter.
+    """
+    rows_data = _community_rows("accel_qc_filter")
+    if not rows_data:
+        return TextBlock(
+            "_No `accel_qc_filter` results — run it from `run_parallel.py` "
+            "on any CPU host._"
+        )
+
+    headers = [
+        "Dataset", "Arm", "Total", "qc_metrics", "filter_cells",
+        "filter_genes", "Peak RSS", "Max abs diff", "Shapes match",
+    ]
+    rows: list[list[str]] = []
+    for row in sorted(rows_data, key=lambda r: (r.dataset, r.format)):
+        diff = _de_median_extra(row, "qc_metrics_max_abs_diff")
+        match = _de_median_extra(row, "filtered_shape_match_int")
+        rows.append([
+            SHORT_NAMES.get(row.dataset, row.dataset),
+            _community_arm("accel_qc_filter", row.format),
+            _fmt_time(_de_median_extra(row, "qc_wall_s")),
+            _fmt_time(_de_median_extra(row, "qc_wall_s__qc_metrics")),
+            _fmt_time(_de_median_extra(row, "qc_wall_s__filter_cells")),
+            _fmt_time(_de_median_extra(row, "qc_wall_s__filter_genes")),
+            _fmt_mem(_de_median_extra(row, "qc_peak_rss_mb")),
+            "—" if diff is None else f"{diff:.1e}",
+            "—" if match is None else ("yes" if match >= 1.0 else "**no**"),
+        ])
+
+    return TableBlock(
+        headers=headers, rows=rows, wide=True,
+        caption=(
+            "accel_qc_filter — calculate_qc_metrics → filter_cells → "
+            "filter_genes, per arm. Parity columns are measured against an "
+            "untimed scanpy reference in its own process; the scanpy arm is "
+            "that reference and carries none."
+        ),
+        source=SourceRef(
+            kind=SourceKind.raw_json, path=_community_src(rows_data),
+            reason="accel_qc_filter runs[].extra qc_wall_s* / qc_peak_rss_mb*",
+        ),
+    )
+
+
+def community_score_genes_table() -> TableBlock | TextBlock:
+    """`accel_score_genes` — streaming gene-set scoring across three panel sizes.
+
+    The parity arm scores a **backed** `X` that `sc.tl.score_genes` refuses
+    outright, and it passes scanpy's own control set via `ctrl_genes=` so the
+    comparison isolates the numerical kernel from control-sampling variance.
+    """
+    rows_data = _community_rows("accel_score_genes")
+    if not rows_data:
+        return TextBlock(
+            "_No `accel_score_genes` results — run it from `run_parallel.py` "
+            "on any CPU host._"
+        )
+
+    ks = (25, 100, 500)
+    headers = (
+        ["Dataset", "Arm"]
+        + [f"K={k}" for k in ks]
+        + ["Peak RSS", "Cells/s (K=100)", "Spearman vs scanpy", "Max abs diff"]
+    )
+    rows: list[list[str]] = []
+    for row in sorted(rows_data, key=lambda r: (r.dataset, r.format)):
+        rhos = [_de_median_extra(row, f"score_spearman_vs_scanpy__k{k}") for k in ks]
+        diffs = [_de_median_extra(row, f"score_max_abs_diff__k{k}") for k in ks]
+        rhos = [v for v in rhos if v is not None]
+        diffs = [v for v in diffs if v is not None]
+        cps = _de_median_extra(row, "score_cells_per_sec__k100")
+        rows.append(
+            [
+                SHORT_NAMES.get(row.dataset, row.dataset),
+                _community_arm("accel_score_genes", row.format),
+            ]
+            + [_fmt_time(_de_median_extra(row, f"score_wall_s__k{k}")) for k in ks]
+            + [
+                _fmt_mem(_de_median_extra(row, "score_peak_rss_mb")),
+                "—" if cps is None else f"{cps:,.0f}",
+                # Worst across the three panels, not the best.
+                "—" if not rhos else f"{min(rhos):.4f}",
+                "—" if not diffs else f"{max(diffs):.1e}",
+            ]
+        )
+
+    return TableBlock(
+        headers=headers, rows=rows, wide=True,
+        caption=(
+            "accel_score_genes — wall time per signature size. Parity columns "
+            "report the worst of the three panels and exist only on the "
+            "control-method arm; `mean` and `zscore` are different statistics "
+            "with no scanpy counterpart."
+        ),
+        source=SourceRef(
+            kind=SourceKind.raw_json, path=_community_src(rows_data),
+            reason="accel_score_genes runs[].extra score_wall_s__k* / score_spearman_vs_scanpy__k*",
+        ),
+    )
+
+
+def community_pipeline_ooc_table() -> TableBlock | TextBlock:
+    """`pipeline_ooc_constrained` — the laptop test.
+
+    The headline column is **completion under the ceiling**, not wall time. A
+    cell that OOMs is a recorded `pipeline_completed_int = 0.0`, not a missing
+    result, and reports the *budget* as its peak because SIGKILL leaves the
+    sampler no final reading.
+    """
+    rows_data = _community_rows("pipeline_ooc_constrained")
+    if not rows_data:
+        return TextBlock(
+            "_No `pipeline_ooc_constrained` results — run it from "
+            "`run_parallel.py`; the ceiling comes from the SLURM cgroup._"
+        )
+
+    headers = [
+        "Dataset", "Arm", "Budget", "Completed", "Outcome",
+        "Total wall", "Peak RSS", "Clusters",
+    ]
+    rows: list[list[str]] = []
+    for row in sorted(rows_data, key=lambda r: (r.dataset, r.format)):
+        done = _de_median_extra(row, "pipeline_completed_int")
+        budget = row.metadata.get("budget_gb")
+        clusters = _de_median_extra(row, "n_clusters")
+        rows.append([
+            SHORT_NAMES.get(row.dataset, row.dataset),
+            _community_arm("pipeline_ooc_constrained", row.format),
+            "—" if budget is None else f"{budget} GB",
+            "—" if done is None else ("yes" if done >= 1.0 else "**no**"),
+            str(_de_first_extra(row, "outcome_reason") or "—"),
+            _fmt_time(_de_median_extra(row, "total_wall_s")),
+            _fmt_mem(_de_median_extra(row, "pipeline_peak_rss_mb")),
+            # NaN is the module's "not reached" sentinel for a killed run.
+            "—" if clusters is None or clusters != clusters else f"{clusters:.0f}",
+        ])
+
+    return TableBlock(
+        headers=headers, rows=rows, wide=True,
+        caption=(
+            "pipeline_ooc_constrained — nine stages under a fixed memory "
+            "ceiling. `Peak RSS` on a non-completing arm is the budget, not an "
+            "observation."
+        ),
+        source=SourceRef(
+            kind=SourceKind.raw_json, path=_community_src(rows_data),
+            reason="pipeline_ooc_constrained runs[].extra pipeline_completed_int / total_wall_s",
+        ),
+    )
+
+
+def community_pipeline_ooc_stage_table() -> TableBlock | TextBlock:
+    """Per-stage wall time for `pipeline_ooc_constrained`.
+
+    This is where the engines actually differ: the aggregate hides that SCX
+    wins `neighbors` decisively and loses `rank_genes_groups`.
+    """
+    rows_data = _community_rows("pipeline_ooc_constrained")
+    if not rows_data:
+        return TextBlock("_No `pipeline_ooc_constrained` stage records._")
+
+    from benchmarks.comprehensive.benchmarks.pipeline_ooc_constrained import STAGES
+
+    headers = ["Dataset", "Arm"] + [s.replace("_", " ") for s in STAGES]
+    rows: list[list[str]] = []
+    for row in sorted(rows_data, key=lambda r: (r.dataset, r.format)):
+        rows.append(
+            [
+                SHORT_NAMES.get(row.dataset, row.dataset),
+                _community_arm("pipeline_ooc_constrained", row.format),
+            ]
+            + [_fmt_time(_de_median_extra(row, f"stage_wall_s__{s}")) for s in STAGES]
+        )
+
+    return TableBlock(
+        headers=headers, rows=rows, wide=True,
+        caption=(
+            "pipeline_ooc_constrained — per-stage wall time. A killed arm "
+            "shows the stages it completed before the ceiling and `—` after."
+        ),
+        source=SourceRef(
+            kind=SourceKind.raw_json, path=_community_src(rows_data),
+            reason="pipeline_ooc_constrained runs[].extra stage_wall_s__<stage>",
+        ),
+    )
+
+
+def community_multimodal_atlas_table() -> TableBlock | TextBlock:
+    """`multimodal_atlas_streaming` — atlas-scale multiome / CITE-seq reads.
+
+    Each arm owns a distinctly named RSS key, so the peak column is assembled
+    per arm rather than read from one shared metric.
+    """
+    rows_data = _community_rows("multimodal_atlas_streaming")
+    if not rows_data:
+        return TextBlock(
+            "_No `multimodal_atlas_streaming` results — the two atlas fixtures "
+            "are staged by `benchmarks/scripts/build_multimodal_atlas.py`._"
+        )
+
+    from benchmarks.comprehensive.benchmarks.multimodal_atlas_streaming import (
+        _ARMS, _rss_key,
+    )
+
+    headers = [
+        "Dataset", "Arm", "Wall", "Peak RSS", "Cells/s",
+        "f32/u16 peak ratio", "Sums match",
+    ]
+    rows: list[list[str]] = []
+    for row in sorted(rows_data, key=lambda r: (r.dataset, r.format)):
+        # The arm's *mode* is not its format tail — `mudata_h5mu` is the mode
+        # `mudata_eager`, `scx_query_mod` is `scx_query` — and `_rss_key`
+        # raises on anything else, so go through `_ARMS` rather than guessing.
+        arm = _ARMS.get(row.format) or {}
+        rss_key = _rss_key(arm["mode"]) if arm.get("mode") else None
+        rss = _de_median_extra(row, rss_key) if rss_key else None
+        if rss is None:
+            rss = _de_peak_rss_mb(row)
+        cps = _de_median_extra(row, "stream_cells_per_sec")
+        ratio = _de_median_extra(row, "eager_peak_rss_ratio_f32_over_u16")
+        match = _de_median_extra(row, "modality_sums_match_int")
+        rows.append([
+            row.dataset,
+            _community_arm("multimodal_atlas_streaming", row.format),
+            _fmt_time(row.median_wall_s),
+            _fmt_mem(rss),
+            "—" if cps is None else f"{cps:,.0f}",
+            "—" if ratio is None else f"{ratio:.3f}x",
+            "—" if match is None else ("yes" if match >= 1.0 else "**no**"),
+        ])
+
+    return TableBlock(
+        headers=headers, rows=rows, wide=True,
+        caption=(
+            "multimodal_atlas_streaming — six arms over the same file. The "
+            "f32/u16 ratio is measured on the narrowing arm, which runs its "
+            "own f32 control in a second process; `Sums match` compares every "
+            "modality's float64-accumulated total across arms."
+        ),
+        source=SourceRef(
+            kind=SourceKind.raw_json, path=_community_src(rows_data),
+            reason="multimodal_atlas_streaming runs[].extra per-arm *_peak_rss_mb",
+        ),
+    )
+
+
 def generate_all_tables() -> dict[str, Block | list[Block]]:
     """Generate all summary tables, returning a dict of table_name -> block(s).
 
@@ -2947,6 +3269,11 @@ def generate_all_tables() -> dict[str, Block | list[Block]]:
     """
     return {
         "system_info": system_info_table(),
+        "community_qc_filter": community_qc_filter_table(),
+        "community_score_genes": community_score_genes_table(),
+        "community_pipeline_ooc": community_pipeline_ooc_table(),
+        "community_pipeline_ooc_stages": community_pipeline_ooc_stage_table(),
+        "community_multimodal_atlas": community_multimodal_atlas_table(),
         "datasets": datasets_table(),
         "compression": compression_table(),
         "compression_ratio": compression_ratio_table(),

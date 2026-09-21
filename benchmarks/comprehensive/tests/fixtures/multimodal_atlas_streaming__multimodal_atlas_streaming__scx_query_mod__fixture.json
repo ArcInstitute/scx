@@ -1,0 +1,31 @@
+{
+ "schema_version": 2,
+ "benchmark": "multimodal_atlas_streaming",
+ "format": "multimodal_atlas_streaming__scx_query_mod",
+ "dataset": "cite_seq_pbmc_5k",
+ "timestamp": "2026-09-20T18:21:25",
+ "system": {
+  "hostname": "fixture",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python_version": "3.13",
+  "cpu": "fixture",
+  "cpu_cores_physical": 8,
+  "ram_gb": 64,
+  "library_versions": {
+   "pyscx": "0.18.0"
+  },
+  "provenance": {
+   "git_sha": "0000000000000000000000000000000000000000",
+   "git_dirty": false
+  }
+ },
+ "runs": [],
+ "median_wall_s": null,
+ "wall_s_iqr": null,
+ "n_runs": 0,
+ "metadata": {
+  "notes": "no categorical obs column with >= 2 levels to push down"
+ },
+ "missing_reason": "no_selective_obs_column"
+}
