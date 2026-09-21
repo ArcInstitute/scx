@@ -248,6 +248,76 @@ def test_parity_never_reports_a_nan_fold_as_agreement(tmp_path):
     assert qcf.parity_metrics(a, b)["qc_metrics_max_abs_diff"] == float("inf")
 
 
+def test_the_parity_bar_scales_with_the_columns_own_magnitude():
+    """A flat tolerance on an unbounded integer column is the wrong bar.
+
+    scanpy reduces `X` in the array's dtype, and every fixture stores float32.
+    Above 2**24 a float32 cannot represent consecutive integers, so a
+    `total_counts` of ~3.4e7 quantises to a multiple of 4 while SCX's f64
+    accumulator stays exact.
+    """
+    small = np.array([1.0e4, 5.0e3], dtype=np.float64)
+    huge = np.array([3.4e7, 2.0e7], dtype=np.float64)
+
+    assert qcf.float32_sum_tolerance(np.array([], dtype=np.float64)) == 0.0
+    assert qcf.float32_sum_tolerance(huge) > qcf.float32_sum_tolerance(small)
+    # The measured smartseq2 disagreement is 9 counts at ~3.4e7.
+    assert qcf.float32_sum_tolerance(huge) >= 9.0
+    # And a one-count disagreement on an ordinary fixture is still caught.
+    assert qcf.float32_sum_tolerance(small) < 1.0
+
+
+def _parity_npz(tmp_path, name, total, n_genes, shape=(3, 4)):
+    path = tmp_path / name
+    np.savez(
+        path,
+        shape_after=np.asarray(shape),
+        total_counts=np.asarray(total, dtype=np.float64),
+        n_genes_by_counts=np.asarray(n_genes, dtype=np.float64),
+        pct_counts_mt=np.zeros(len(total)),
+        pct_counts_ribo=np.zeros(len(total)),
+    )
+    return path.with_suffix(".npz") if path.suffix != ".npz" else path
+
+
+def test_a_float32_rounding_disagreement_is_inside_the_bar(tmp_path):
+    """The smartseq2 shape: SCX exact, scanpy off by a few counts at 3.4e7."""
+    ref = _parity_npz(tmp_path, "ref.npz", [3.4e7, 2.0e7, 1.0e4], [500, 400, 300])
+    arm = _parity_npz(tmp_path, "arm.npz", [3.4e7 + 9, 2.0e7, 1.0e4], [500, 400, 300])
+
+    out = qcf.parity_metrics(arm, ref)
+    assert out["qc_metrics_max_abs_diff"] == 9.0
+    assert out["qc_parity_worst_bar_ratio"] <= 1.0
+    assert out["qc_parity_within_tolerance_int"] == 1.0
+
+
+def test_a_real_count_error_is_outside_the_bar(tmp_path):
+    """Premise: the widened bar has not disarmed the check.
+
+    One extra gene on a 500-gene cell is a defect, not a rounding error, and
+    `n_genes_by_counts`' own magnitude keeps its bar far below 1 — even on a
+    fixture whose `total_counts` bar is 16.
+    """
+    ref = _parity_npz(tmp_path, "ref.npz", [3.4e7, 2.0e7, 1.0e4], [500, 400, 300])
+    arm = _parity_npz(tmp_path, "arm.npz", [3.4e7, 2.0e7, 1.0e4], [501, 400, 300])
+
+    out = qcf.parity_metrics(arm, ref)
+    assert out["qc_metrics_max_abs_diff"] == 1.0
+    assert out["qc_parity_within_tolerance_int"] == 0.0, (
+        "a one-gene count error was absorbed by the float32 tolerance"
+    )
+
+
+def test_the_tolerance_never_drops_below_the_float_column_floor(tmp_path):
+    """`pct_counts_*` is a ratio in [0, 100]; its bar is the absolute one."""
+    ref = _parity_npz(tmp_path, "ref.npz", [1.0, 2.0, 3.0], [1, 2, 3])
+    arm = _parity_npz(tmp_path, "arm.npz", [1.0, 2.0, 3.0], [1, 2, 3])
+
+    out = qcf.parity_metrics(arm, ref)
+    assert out["qc_parity_worst_bar_ratio"] == 0.0
+    assert out["qc_parity_within_tolerance_int"] == 1.0
+
+
 def test_parity_reports_a_shape_mismatch_rather_than_crashing(tmp_path):
     a = _write_npz(
         tmp_path, "a.npz",

@@ -178,6 +178,10 @@ def percent_top_for(n_vars: int) -> tuple[int, ...]:
 
 #: Columns the parity check compares. Integers must agree exactly; the float
 #: fraction is compared at 1e-5.
+#: Absolute floor on the parity bar, for columns whose float32 error is
+#: negligible (`pct_counts_*`, a ratio in [0, 100]).
+PARITY_ABS_TOL = 1e-5
+
 PARITY_INT_COLS = ("total_counts", "n_genes_by_counts")
 PARITY_FLOAT_COLS = ("pct_counts_mt", "pct_counts_ribo")
 
@@ -393,6 +397,33 @@ def ensure_reference(dataset: DatasetConfig) -> Path | None:
     return out
 
 
+def float32_sum_tolerance(reference: np.ndarray) -> float:
+    """The largest absolute error scanpy's own accumulator can produce here.
+
+    `sc.pp.calculate_qc_metrics` reduces `X` in the array's dtype, and every
+    fixture in the suite stores `X` as float32. Above 2**24 a float32 can no
+    longer represent consecutive integers, so a per-cell `total_counts` of
+    ~3.4e7 is quantised to a multiple of 4 — while SCX accumulates in f64 and
+    is exact.
+
+    Measured on `smartseq2` (50K Smart-seq2 cells, totals 2-3e7): 37 of 50,000
+    cells disagree, by up to 9 counts, and the exact integer sum matches
+    **SCX** every time. Holding SCX to scanpy's value there would be holding it
+    to a rounding error.
+
+    So the bar is a few ULPs of the column's own magnitude rather than one
+    absolute number for every column and every fixture. Four, not one: scanpy
+    sums pairwise, so the error accumulates over log2(nnz) levels rather than
+    landing within a single rounding.
+    """
+    if reference.size == 0:
+        return 0.0
+    peak = float(np.max(np.abs(np.asarray(reference, dtype=np.float64))))
+    if not np.isfinite(peak) or peak == 0.0:
+        return 0.0
+    return 4.0 * float(np.spacing(np.float32(peak)))
+
+
 def parity_metrics(arm_npz: Path, ref_npz: Path) -> dict[str, float]:
     """Compare one arm's QC columns and final shape against the scanpy reference.
 
@@ -413,6 +444,13 @@ def parity_metrics(arm_npz: Path, ref_npz: Path) -> dict[str, float]:
     out: dict[str, float] = {}
 
     diffs: list[float] = [0.0]
+    # `(diff, bar)` per column, judged per column and never folded into one
+    # pair. A single global bar would take the widest column's tolerance —
+    # 16 counts, from `total_counts` at 3.4e7 — and apply it to
+    # `n_genes_by_counts`, where a one-gene error is a defect and would sail
+    # through. The raw `qc_metrics_max_abs_diff` stays the global worst,
+    # because that is what the gate's floors name.
+    judged: list[tuple[str, float, float]] = []
     for col in PARITY_INT_COLS:
         if col not in ours or col not in ref:
             continue
@@ -421,7 +459,9 @@ def parity_metrics(arm_npz: Path, ref_npz: Path) -> dict[str, float]:
             return {"qc_metrics_max_abs_diff": float("inf"),
                     "filtered_shape_match_int": 0.0}
         if a.size:
-            diffs.append(float(np.max(np.abs(a - b))))
+            d = float(np.max(np.abs(a - b)))
+            diffs.append(d)
+            judged.append((col, d, max(PARITY_ABS_TOL, float32_sum_tolerance(b))))
     for col in PARITY_FLOAT_COLS:
         if col not in ours or col not in ref:
             continue
@@ -431,7 +471,11 @@ def parity_metrics(arm_npz: Path, ref_npz: Path) -> dict[str, float]:
                     "filtered_shape_match_int": 0.0}
         both = np.isfinite(a) & np.isfinite(b)
         if both.any():
-            diffs.append(float(np.max(np.abs(a[both] - b[both]))))
+            d = float(np.max(np.abs(a[both] - b[both])))
+            diffs.append(d)
+            # A `pct_counts_*` value is a ratio in [0, 100]; its float32 error
+            # is already inside the absolute bar, so it gets no scaled term.
+            judged.append((col, d, PARITY_ABS_TOL))
     worst = float(np.max(diffs))
     if not np.isfinite(worst):
         logger.warning(
@@ -440,6 +484,20 @@ def parity_metrics(arm_npz: Path, ref_npz: Path) -> dict[str, float]:
         )
         worst = float("inf")
     out["qc_metrics_max_abs_diff"] = worst
+
+    # Emitted, not just applied: a reader who sees a diff of 9.0 needs the bar
+    # it was judged against in the same record. The ratio is the worst
+    # column's `diff / bar`, so <= 1.0 means every column cleared its own bar
+    # and the number says by how much — a single global tolerance could not.
+    ratios = [0.0] + [
+        (d / bar if bar > 0 else (0.0 if d == 0.0 else float("inf")))
+        for _, d, bar in judged
+    ]
+    ratio = float(np.max(ratios))
+    if not np.isfinite(ratio):
+        ratio = float("inf")
+    out["qc_parity_worst_bar_ratio"] = ratio
+    out["qc_parity_within_tolerance_int"] = 1.0 if ratio <= 1.0 else 0.0
 
     shape_ok = bool(np.array_equal(ours["shape_after"], ref["shape_after"]))
     out["filtered_shape_match_int"] = 1.0 if shape_ok else 0.0
@@ -592,8 +650,21 @@ def run(
     parity = [p for p in parity if p is not None]
     if parity:
         result.metadata["qc_metrics_max_abs_diff"] = float(np.median(parity))
+        # Against the per-column bar, not a flat 1e-5: on a deep-sequencing
+        # fixture scanpy's own float32 row sums are off by up to 9 counts and
+        # SCX is the exact side, so a flat tolerance fails the arm for being
+        # right. `float32_sum_tolerance` has the measurement.
+        ratios = [r.extra.get("qc_parity_worst_bar_ratio") for r in result.runs]
+        ratios = [x for x in ratios if isinstance(x, (int, float))]
+        result.metadata["qc_parity_worst_bar_ratio"] = (
+            float(np.max(ratios)) if ratios else None
+        )
+        within = all(
+            r.extra.get("qc_parity_within_tolerance_int") == 1.0
+            for r in result.runs
+        )
         result.overall_passed = bool(
-            result.metadata["qc_metrics_max_abs_diff"] <= 1e-5
+            within
             and all(r.extra.get("filtered_shape_match_int") == 1.0 for r in result.runs)
         )
 
