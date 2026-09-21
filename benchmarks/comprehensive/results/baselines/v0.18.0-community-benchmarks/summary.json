@@ -1,0 +1,675 @@
+{
+  "schema_version": 2,
+  "snapshot_name": "candidate_community_20260920",
+  "tier": "full",
+  "datasets": [
+    "pbmc3k",
+    "pbmc10k",
+    "smartseq2",
+    "tabula_sapiens_100k",
+    "census_500k",
+    "census_1m",
+    "cite_seq_pbmc",
+    "multiome_pbmc",
+    "multiome_atlas_500k",
+    "citeseq_atlas_1m"
+  ],
+  "rows": {
+    "accel_qc_filter__accel_qc_filter__pyscx_cpu__census_1m": {
+      "median_wall_s": 23.161333732306957,
+      "wall_s_iqr": 0.4020989602431655,
+      "n_runs": 3,
+      "peak_rss_mb_median": 2195.8203125,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_cpu__census_1m.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_cpu__census_500k": {
+      "median_wall_s": 13.535782647319138,
+      "wall_s_iqr": 0.11962654860690236,
+      "n_runs": 3,
+      "peak_rss_mb_median": 1870.91796875,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_cpu__census_500k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_cpu__pbmc10k": {
+      "median_wall_s": 1.4847907470539212,
+      "wall_s_iqr": 0.01844406221061945,
+      "n_runs": 5,
+      "peak_rss_mb_median": 553.8046875,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_cpu__pbmc10k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_cpu__pbmc3k": {
+      "median_wall_s": 0.12650177301838994,
+      "wall_s_iqr": 0.0020832568407058716,
+      "n_runs": 5,
+      "peak_rss_mb_median": 341.06640625,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_cpu__pbmc3k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_cpu__smartseq2": {
+      "median_wall_s": 4.0045151500962675,
+      "wall_s_iqr": 0.19014092744328082,
+      "n_runs": 5,
+      "peak_rss_mb_median": 1510.3046875,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_cpu__smartseq2.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 3.8237069500610232,
+      "wall_s_iqr": 0.12822941644117236,
+      "n_runs": 3,
+      "peak_rss_mb_median": 1524.62890625,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_inmem__census_1m": {
+      "median_wall_s": 44.54340155282989,
+      "wall_s_iqr": 0.6891664019785821,
+      "n_runs": 3,
+      "peak_rss_mb_median": 33311.25,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_inmem__census_1m.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_inmem__census_500k": {
+      "median_wall_s": 24.501959182787687,
+      "wall_s_iqr": 0.3672608374617994,
+      "n_runs": 3,
+      "peak_rss_mb_median": 17915.66015625,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_inmem__census_500k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_inmem__pbmc10k": {
+      "median_wall_s": 2.229023435153067,
+      "wall_s_iqr": 0.14789881417527795,
+      "n_runs": 5,
+      "peak_rss_mb_median": 1045.19140625,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_inmem__pbmc10k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_inmem__pbmc3k": {
+      "median_wall_s": 1.088909522164613,
+      "wall_s_iqr": 0.14340564119629562,
+      "n_runs": 5,
+      "peak_rss_mb_median": 513.671875,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_inmem__pbmc3k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_inmem__smartseq2": {
+      "median_wall_s": 12.881938978098333,
+      "wall_s_iqr": 1.270463341847062,
+      "n_runs": 5,
+      "peak_rss_mb_median": 3521.43359375,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_inmem__smartseq2.json"
+    },
+    "accel_qc_filter__accel_qc_filter__pyscx_inmem__tabula_sapiens_100k": {
+      "median_wall_s": 16.439753635320812,
+      "wall_s_iqr": 9.929530231282115,
+      "n_runs": 3,
+      "peak_rss_mb_median": 5019.26171875,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__pyscx_inmem__tabula_sapiens_100k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__scanpy_cpu__census_1m": {
+      "median_wall_s": 52.47140370728448,
+      "wall_s_iqr": 0.7598047950305045,
+      "n_runs": 3,
+      "peak_rss_mb_median": 33366.37109375,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__scanpy_cpu__census_1m.json"
+    },
+    "accel_qc_filter__accel_qc_filter__scanpy_cpu__census_500k": {
+      "median_wall_s": 31.043423877097666,
+      "wall_s_iqr": 12.405891567934304,
+      "n_runs": 3,
+      "peak_rss_mb_median": 17958.8828125,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__scanpy_cpu__census_500k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__scanpy_cpu__pbmc10k": {
+      "median_wall_s": 2.546890637371689,
+      "wall_s_iqr": 0.08487931895069778,
+      "n_runs": 5,
+      "peak_rss_mb_median": 1081.7578125,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__scanpy_cpu__pbmc10k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__scanpy_cpu__pbmc3k": {
+      "median_wall_s": 1.2147210650146008,
+      "wall_s_iqr": 0.15279538393951952,
+      "n_runs": 5,
+      "peak_rss_mb_median": 549.671875,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__scanpy_cpu__pbmc3k.json"
+    },
+    "accel_qc_filter__accel_qc_filter__scanpy_cpu__smartseq2": {
+      "median_wall_s": 14.469339441042393,
+      "wall_s_iqr": 1.1897538071498275,
+      "n_runs": 5,
+      "peak_rss_mb_median": 3553.30859375,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__scanpy_cpu__smartseq2.json"
+    },
+    "accel_qc_filter__accel_qc_filter__scanpy_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 15.518854951951653,
+      "wall_s_iqr": 9.85242514172569,
+      "n_runs": 3,
+      "peak_rss_mb_median": 5046.53515625,
+      "file_size_bytes": null,
+      "source_file": "accel_qc_filter__accel_qc_filter__scanpy_cpu__tabula_sapiens_100k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_mean__census_1m": {
+      "median_wall_s": 18.34002265194431,
+      "wall_s_iqr": 0.36072662798687816,
+      "n_runs": 3,
+      "peak_rss_mb_median": 821.1640625,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_mean__census_1m.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_mean__census_500k": {
+      "median_wall_s": 10.061808530706912,
+      "wall_s_iqr": 0.23122108401730657,
+      "n_runs": 3,
+      "peak_rss_mb_median": 622.625,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_mean__census_500k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_mean__pbmc10k": {
+      "median_wall_s": 1.2156381951645017,
+      "wall_s_iqr": 0.036078586243093014,
+      "n_runs": 5,
+      "peak_rss_mb_median": 327.15234375,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_mean__pbmc10k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_mean__pbmc3k": {
+      "median_wall_s": 0.10955989686772227,
+      "wall_s_iqr": 0.0024400565307587385,
+      "n_runs": 5,
+      "peak_rss_mb_median": 324.2265625,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_mean__pbmc3k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_mean__smartseq2": {
+      "median_wall_s": 3.104599712882191,
+      "wall_s_iqr": 0.03671177010983229,
+      "n_runs": 5,
+      "peak_rss_mb_median": 439.08203125,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_mean__smartseq2.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_mean__tabula_sapiens_100k": {
+      "median_wall_s": 3.1037977589294314,
+      "wall_s_iqr": 0.04428193811327219,
+      "n_runs": 3,
+      "peak_rss_mb_median": 481.515625,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_mean__tabula_sapiens_100k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__census_1m": {
+      "median_wall_s": 18.761489558033645,
+      "wall_s_iqr": 0.2229399299249053,
+      "n_runs": 3,
+      "peak_rss_mb_median": 821.23046875,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__census_1m.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__census_500k": {
+      "median_wall_s": 10.551415937952697,
+      "wall_s_iqr": 0.12667893804609776,
+      "n_runs": 3,
+      "peak_rss_mb_median": 674.84375,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__census_500k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__pbmc10k": {
+      "median_wall_s": 1.2829880639910698,
+      "wall_s_iqr": 0.020920301554724574,
+      "n_runs": 5,
+      "peak_rss_mb_median": 327.03515625,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__pbmc10k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__pbmc3k": {
+      "median_wall_s": 0.11081903334707022,
+      "wall_s_iqr": 0.0016664196737110615,
+      "n_runs": 5,
+      "peak_rss_mb_median": 322.89453125,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__pbmc3k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__smartseq2": {
+      "median_wall_s": 3.0536159370094538,
+      "wall_s_iqr": 0.08623591647483408,
+      "n_runs": 5,
+      "peak_rss_mb_median": 453.3828125,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__smartseq2.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__tabula_sapiens_100k": {
+      "median_wall_s": 3.2140137529931962,
+      "wall_s_iqr": 0.020961096044629812,
+      "n_runs": 3,
+      "peak_rss_mb_median": 486.7578125,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_scanpy__tabula_sapiens_100k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__census_1m": {
+      "median_wall_s": 34.20868396386504,
+      "wall_s_iqr": 0.31893633399158716,
+      "n_runs": 3,
+      "peak_rss_mb_median": 819.5546875,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__census_1m.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__census_500k": {
+      "median_wall_s": 19.19684353005141,
+      "wall_s_iqr": 0.28664996288716793,
+      "n_runs": 3,
+      "peak_rss_mb_median": 702.83984375,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__census_500k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__pbmc10k": {
+      "median_wall_s": 2.6613227128982544,
+      "wall_s_iqr": 0.03458238020539284,
+      "n_runs": 5,
+      "peak_rss_mb_median": 329.15234375,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__pbmc10k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__pbmc3k": {
+      "median_wall_s": 0.19983325200155377,
+      "wall_s_iqr": 0.0067290004808455706,
+      "n_runs": 5,
+      "peak_rss_mb_median": 322.24609375,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__pbmc3k.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__smartseq2": {
+      "median_wall_s": 5.936004436109215,
+      "wall_s_iqr": 0.09477110975421965,
+      "n_runs": 5,
+      "peak_rss_mb_median": 452.5625,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__smartseq2.json"
+    },
+    "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__tabula_sapiens_100k": {
+      "median_wall_s": 6.9823256358504295,
+      "wall_s_iqr": 1.3468543468043208,
+      "n_runs": 3,
+      "peak_rss_mb_median": 496.2421875,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__pyscx_cpu_zscore__tabula_sapiens_100k.json"
+    },
+    "accel_score_genes__accel_score_genes__scanpy_cpu__census_1m": {
+      "median_wall_s": 55.75503993406892,
+      "wall_s_iqr": 0.8250362952239811,
+      "n_runs": 3,
+      "peak_rss_mb_median": 23530.859375,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__scanpy_cpu__census_1m.json"
+    },
+    "accel_score_genes__accel_score_genes__scanpy_cpu__census_500k": {
+      "median_wall_s": 29.047830084804446,
+      "wall_s_iqr": 0.07173306308686733,
+      "n_runs": 3,
+      "peak_rss_mb_median": 12732.26171875,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__scanpy_cpu__census_500k.json"
+    },
+    "accel_score_genes__accel_score_genes__scanpy_cpu__pbmc10k": {
+      "median_wall_s": 0.9428841439657845,
+      "wall_s_iqr": 0.008325748494826257,
+      "n_runs": 5,
+      "peak_rss_mb_median": 848.05078125,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__scanpy_cpu__pbmc10k.json"
+    },
+    "accel_score_genes__accel_score_genes__scanpy_cpu__pbmc3k": {
+      "median_wall_s": 0.13490324234589934,
+      "wall_s_iqr": 0.005132689839228988,
+      "n_runs": 5,
+      "peak_rss_mb_median": 484.125,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__scanpy_cpu__pbmc3k.json"
+    },
+    "accel_score_genes__accel_score_genes__scanpy_cpu__smartseq2": {
+      "median_wall_s": 4.961313402745873,
+      "wall_s_iqr": 0.039369786623865366,
+      "n_runs": 5,
+      "peak_rss_mb_median": 2602.25390625,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__scanpy_cpu__smartseq2.json"
+    },
+    "accel_score_genes__accel_score_genes__scanpy_cpu__tabula_sapiens_100k": {
+      "median_wall_s": 22.090522890910506,
+      "wall_s_iqr": 6.591825750656426,
+      "n_runs": 3,
+      "peak_rss_mb_median": 3665.9296875,
+      "file_size_bytes": null,
+      "source_file": "accel_score_genes__accel_score_genes__scanpy_cpu__tabula_sapiens_100k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_backed__cite_seq_pbmc_5k": {
+      "median_wall_s": 1.6247419700957835,
+      "wall_s_iqr": 0.11054348410107195,
+      "n_runs": 5,
+      "peak_rss_mb_median": 484.87890625,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_backed__cite_seq_pbmc_5k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_backed__citeseq_atlas_1m": {
+      "median_wall_s": 11.89800631115213,
+      "wall_s_iqr": 0.35135551588609815,
+      "n_runs": 3,
+      "peak_rss_mb_median": 1426.95703125,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_backed__citeseq_atlas_1m.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_backed__multiome_atlas_500k": {
+      "median_wall_s": 19.86063949391246,
+      "wall_s_iqr": 8.407663743011653,
+      "n_runs": 3,
+      "peak_rss_mb_median": 2722.19921875,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_backed__multiome_atlas_500k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_backed__multiome_pbmc_10k": {
+      "median_wall_s": 3.050248851068318,
+      "wall_s_iqr": 0.10284323082305491,
+      "n_runs": 5,
+      "peak_rss_mb_median": 2015.16015625,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_backed__multiome_pbmc_10k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_h5mu__cite_seq_pbmc_5k": {
+      "median_wall_s": 1.598566371947527,
+      "wall_s_iqr": 0.04145643929950893,
+      "n_runs": 5,
+      "peak_rss_mb_median": 479.76953125,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_h5mu__cite_seq_pbmc_5k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_h5mu__citeseq_atlas_1m": {
+      "median_wall_s": 11.59429804701358,
+      "wall_s_iqr": 0.19802760565653443,
+      "n_runs": 3,
+      "peak_rss_mb_median": 15998.703125,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_h5mu__citeseq_atlas_1m.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_h5mu__multiome_atlas_500k": {
+      "median_wall_s": 26.353261958342046,
+      "wall_s_iqr": 1.601786457002163,
+      "n_runs": 3,
+      "peak_rss_mb_median": 22764.16015625,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_h5mu__multiome_atlas_500k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_h5mu__multiome_pbmc_10k": {
+      "median_wall_s": 3.036350779235363,
+      "wall_s_iqr": 0.09568354953080416,
+      "n_runs": 5,
+      "peak_rss_mb_median": 2196.18359375,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__mudata_h5mu__multiome_pbmc_10k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_f32__cite_seq_pbmc_5k": {
+      "median_wall_s": 1.5995528027415276,
+      "wall_s_iqr": 0.04170575947500765,
+      "n_runs": 5,
+      "peak_rss_mb_median": 500.328125,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_f32__cite_seq_pbmc_5k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_f32__citeseq_atlas_1m": {
+      "median_wall_s": 7.344921595416963,
+      "wall_s_iqr": 4.34828164614737,
+      "n_runs": 3,
+      "peak_rss_mb_median": 17395.97265625,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_f32__citeseq_atlas_1m.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_f32__multiome_atlas_500k": {
+      "median_wall_s": 12.679330745246261,
+      "wall_s_iqr": 5.944672090467066,
+      "n_runs": 3,
+      "peak_rss_mb_median": 26267.8203125,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_f32__multiome_atlas_500k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_f32__multiome_pbmc_10k": {
+      "median_wall_s": 4.211903817951679,
+      "wall_s_iqr": 0.30618604691699147,
+      "n_runs": 5,
+      "peak_rss_mb_median": 2445.80859375,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_f32__multiome_pbmc_10k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_u16__cite_seq_pbmc_5k": {
+      "median_wall_s": 1.5885259360074997,
+      "wall_s_iqr": 0.029533537570387125,
+      "n_runs": 5,
+      "peak_rss_mb_median": 483.0859375,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_u16__cite_seq_pbmc_5k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_u16__citeseq_atlas_1m": {
+      "median_wall_s": 24.195760225877166,
+      "wall_s_iqr": 5.8677107989788055,
+      "n_runs": 3,
+      "peak_rss_mb_median": 15178.4453125,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_u16__citeseq_atlas_1m.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_u16__multiome_atlas_500k": {
+      "median_wall_s": 32.46029041474685,
+      "wall_s_iqr": 1.0430662077851593,
+      "n_runs": 3,
+      "peak_rss_mb_median": 22451.109375,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_u16__multiome_atlas_500k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_u16__multiome_pbmc_10k": {
+      "median_wall_s": 3.9992488329298794,
+      "wall_s_iqr": 0.11655655479989946,
+      "n_runs": 5,
+      "peak_rss_mb_median": 2203.15625,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_eager_u16__multiome_pbmc_10k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_query_mod__cite_seq_pbmc_5k": {
+      "median_wall_s": null,
+      "wall_s_iqr": null,
+      "n_runs": 0,
+      "peak_rss_mb_median": null,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_query_mod__cite_seq_pbmc_5k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_query_mod__citeseq_atlas_1m": {
+      "median_wall_s": 0.021768120117485523,
+      "wall_s_iqr": 0.011762895155698061,
+      "n_runs": 3,
+      "peak_rss_mb_median": 50.11328125,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_query_mod__citeseq_atlas_1m.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_query_mod__multiome_atlas_500k": {
+      "median_wall_s": 0.01648762309923768,
+      "wall_s_iqr": 0.0002765716053545475,
+      "n_runs": 3,
+      "peak_rss_mb_median": 49.72265625,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_query_mod__multiome_atlas_500k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_query_mod__multiome_pbmc_10k": {
+      "median_wall_s": null,
+      "wall_s_iqr": null,
+      "n_runs": 0,
+      "peak_rss_mb_median": null,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_query_mod__multiome_pbmc_10k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_stream__cite_seq_pbmc_5k": {
+      "median_wall_s": 1.5777652319520712,
+      "wall_s_iqr": 0.03779896744526923,
+      "n_runs": 5,
+      "peak_rss_mb_median": 567.84375,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_stream__cite_seq_pbmc_5k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_stream__citeseq_atlas_1m": {
+      "median_wall_s": 15.425164999905974,
+      "wall_s_iqr": 0.3779790224507451,
+      "n_runs": 3,
+      "peak_rss_mb_median": 3402.9921875,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_stream__citeseq_atlas_1m.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_stream__multiome_atlas_500k": {
+      "median_wall_s": 22.416405262891203,
+      "wall_s_iqr": 1.0749778230674565,
+      "n_runs": 3,
+      "peak_rss_mb_median": 6645.6015625,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_stream__multiome_atlas_500k.json"
+    },
+    "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_stream__multiome_pbmc_10k": {
+      "median_wall_s": 4.158982855733484,
+      "wall_s_iqr": 0.036419159499928355,
+      "n_runs": 5,
+      "peak_rss_mb_median": 3227.2734375,
+      "file_size_bytes": null,
+      "source_file": "multimodal_atlas_streaming__multimodal_atlas_streaming__scx_stream__multiome_pbmc_10k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_16g__census_1m": {
+      "median_wall_s": 3186.218912323937,
+      "wall_s_iqr": 873.0253934673965,
+      "n_runs": 3,
+      "peak_rss_mb_median": 8819.28125,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_16g__census_1m.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_16g__census_500k": {
+      "median_wall_s": 1494.133620367851,
+      "wall_s_iqr": 61.21101238206029,
+      "n_runs": 3,
+      "peak_rss_mb_median": 6335.63671875,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_16g__census_500k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_16g__pbmc10k": {
+      "median_wall_s": 61.19982159975916,
+      "wall_s_iqr": 0.5149045903235674,
+      "n_runs": 5,
+      "peak_rss_mb_median": 1083.38671875,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_16g__pbmc10k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_16g__tabula_sapiens_100k": {
+      "median_wall_s": 266.8495186222717,
+      "wall_s_iqr": 4.319848560262471,
+      "n_runs": 3,
+      "peak_rss_mb_median": 4259.3125,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_16g__tabula_sapiens_100k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_32g__census_1m": {
+      "median_wall_s": 3373.13978084689,
+      "wall_s_iqr": 396.2217995827086,
+      "n_runs": 3,
+      "peak_rss_mb_median": 8897.77734375,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_32g__census_1m.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_32g__census_500k": {
+      "median_wall_s": 1506.4199795937166,
+      "wall_s_iqr": 68.41370714176446,
+      "n_runs": 3,
+      "peak_rss_mb_median": 6424.60546875,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_32g__census_500k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_32g__pbmc10k": {
+      "median_wall_s": 61.464730937965214,
+      "wall_s_iqr": 0.26123929605819285,
+      "n_runs": 5,
+      "peak_rss_mb_median": 1082.79296875,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_32g__pbmc10k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_32g__tabula_sapiens_100k": {
+      "median_wall_s": 267.0826298012398,
+      "wall_s_iqr": 1.8055913699790835,
+      "n_runs": 3,
+      "peak_rss_mb_median": 4177.45703125,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__pyscx_32g__tabula_sapiens_100k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_16g__census_1m": {
+      "median_wall_s": 32.620833055116236,
+      "wall_s_iqr": 44.78134716069326,
+      "n_runs": 3,
+      "peak_rss_mb_median": 16384.0,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_16g__census_1m.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_16g__census_500k": {
+      "median_wall_s": 22.28413339704275,
+      "wall_s_iqr": 1.5339074470102787,
+      "n_runs": 3,
+      "peak_rss_mb_median": 16384.0,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_16g__census_500k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_16g__pbmc10k": {
+      "median_wall_s": 51.62915260484442,
+      "wall_s_iqr": 0.6909108052495867,
+      "n_runs": 5,
+      "peak_rss_mb_median": 1335.6875,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_16g__pbmc10k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_16g__tabula_sapiens_100k": {
+      "median_wall_s": 289.8379757781513,
+      "wall_s_iqr": 42.63869746401906,
+      "n_runs": 3,
+      "peak_rss_mb_median": 5006.25,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_16g__tabula_sapiens_100k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_32g__census_1m": {
+      "median_wall_s": 42.153121672105044,
+      "wall_s_iqr": 44.793759604450315,
+      "n_runs": 3,
+      "peak_rss_mb_median": 32768.0,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_32g__census_1m.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_32g__census_500k": {
+      "median_wall_s": 2574.335113561712,
+      "wall_s_iqr": 174.8013860550709,
+      "n_runs": 3,
+      "peak_rss_mb_median": 17825.4765625,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_32g__census_500k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_32g__pbmc10k": {
+      "median_wall_s": 53.05431569181383,
+      "wall_s_iqr": 8.042982078390196,
+      "n_runs": 5,
+      "peak_rss_mb_median": 1339.09375,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_32g__pbmc10k.json"
+    },
+    "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_32g__tabula_sapiens_100k": {
+      "median_wall_s": 249.61580367502756,
+      "wall_s_iqr": 1.1380482210079208,
+      "n_runs": 3,
+      "peak_rss_mb_median": 5006.8984375,
+      "file_size_bytes": null,
+      "source_file": "pipeline_ooc_constrained__pipeline_ooc_constrained__scanpy_32g__tabula_sapiens_100k.json"
+    }
+  }
+}
