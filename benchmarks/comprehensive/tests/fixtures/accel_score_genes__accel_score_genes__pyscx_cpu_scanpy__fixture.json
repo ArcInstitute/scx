@@ -1,0 +1,101 @@
+{
+ "schema_version": 2,
+ "benchmark": "accel_score_genes",
+ "format": "accel_score_genes__pyscx_cpu_scanpy",
+ "dataset": "pbmc10k",
+ "timestamp": "2026-09-20T18:21:19",
+ "system": {
+  "hostname": "fixture",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python_version": "3.13",
+  "cpu": "fixture",
+  "cpu_cores_physical": 8,
+  "ram_gb": 64,
+  "library_versions": {
+   "pyscx": "0.18.0"
+  },
+  "provenance": {
+   "git_sha": "0000000000000000000000000000000000000000",
+   "git_dirty": false
+  }
+ },
+ "runs": [
+  {
+   "wall_s": 1.2223717770539224,
+   "user_s": 0.0,
+   "sys_s": 0.0,
+   "peak_rss_mb": 327.00390625,
+   "extra": {
+    "score_wall_s__k25": 0.38828961504623294,
+    "score_peak_rss_mb__k25": 326.01953125,
+    "score_cells_per_sec__k25": 30309.850029336187,
+    "score_wall_s__k100": 0.39875223441049457,
+    "score_peak_rss_mb__k100": 326.3203125,
+    "score_cells_per_sec__k100": 29514.568156336474,
+    "score_wall_s__k500": 0.4337794650346041,
+    "score_peak_rss_mb__k500": 327.0,
+    "score_cells_per_sec__k500": 27131.298156451798,
+    "score_wall_s": 1.2223717770539224,
+    "score_peak_rss_mb": 327.00390625,
+    "cache_policy": "warm",
+    "x_type": "ScxBackedSparseDataset",
+    "score_spearman_vs_scanpy__k25": 0.9999999964904353,
+    "score_max_abs_diff__k25": 5.684341886080802e-14,
+    "score_spearman_vs_scanpy__k100": 0.9999999964407456,
+    "score_max_abs_diff__k100": 1.7763568394002505e-14,
+    "score_spearman_vs_scanpy__k500": 0.9999999997349882,
+    "score_max_abs_diff__k500": 6.750155989720952e-14
+   }
+  }
+ ],
+ "median_wall_s": 1.228928699158132,
+ "wall_s_iqr": 0.019121049903333187,
+ "n_runs": 1,
+ "overall_passed": true,
+ "metadata": {
+  "cold_cache": false,
+  "n_warmup": 1,
+  "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc10k_auto.scx",
+  "panel_sizes": [
+   25,
+   100,
+   500
+  ],
+  "panel_pool": 2000,
+  "ctrl_size": 50,
+  "n_bins": 25,
+  "panels": {
+   "25": "<25 genes elided for fixture size>",
+   "100": "<100 genes elided for fixture size>",
+   "500": "<500 genes elided for fixture size>"
+  },
+  "n_control_genes": {
+   "25": 109,
+   "100": 106,
+   "500": 91
+  },
+  "normalization": "none (raw stored values on every arm)",
+  "score_spearman_vs_scanpy__k25": 1.0,
+  "score_spearman_vs_scanpy__k100": 1.0,
+  "score_spearman_vs_scanpy__k500": 1.0
+ },
+ "scenario": {
+  "name": "score_genes",
+  "engine": "pyscx",
+  "method": "control",
+  "residency": "backed",
+  "cache_state": "warm",
+  "device": "cpu"
+ },
+ "comparison": {
+  "subject": {
+   "impl": "accel_score_genes__pyscx_cpu_scanpy"
+  },
+  "baseline": {
+   "impl": "accel_score_genes__scanpy_cpu"
+  },
+  "metric": "score_wall_s",
+  "status": "pending"
+ }
+}

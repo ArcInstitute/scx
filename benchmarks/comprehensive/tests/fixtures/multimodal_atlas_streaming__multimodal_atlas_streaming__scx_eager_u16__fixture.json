@@ -1,0 +1,84 @@
+{
+ "schema_version": 2,
+ "benchmark": "multimodal_atlas_streaming",
+ "format": "multimodal_atlas_streaming__scx_eager_u16",
+ "dataset": "cite_seq_pbmc_5k",
+ "timestamp": "2026-09-20T18:21:16",
+ "system": {
+  "hostname": "fixture",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python_version": "3.13",
+  "cpu": "fixture",
+  "cpu_cores_physical": 8,
+  "ram_gb": 64,
+  "library_versions": {
+   "pyscx": "0.18.0"
+  },
+  "provenance": {
+   "git_sha": "0000000000000000000000000000000000000000",
+   "git_dirty": false
+  }
+ },
+ "runs": [
+  {
+   "wall_s": 1.4647687310352921,
+   "user_s": 0.0,
+   "sys_s": 0.0,
+   "peak_rss_mb": 480.7734375,
+   "extra": {
+    "cache_policy": "warm",
+    "eager_u16_peak_rss_mb": 480.7734375,
+    "modality_sums_match_int": 1.0,
+    "eager_f32_peak_rss_mb": 499.8203125,
+    "eager_peak_rss_ratio_f32_over_u16": 1.0396171533499081
+   }
+  }
+ ],
+ "median_wall_s": 1.6541050500236452,
+ "wall_s_iqr": 0.22008233796805143,
+ "n_runs": 1,
+ "overall_passed": true,
+ "metadata": {
+  "cold_cache": false,
+  "n_warmup": 1,
+  "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/cite_seq_pbmc_5k_multimodal.scx",
+  "chunk_size": 65536,
+  "modality_names": [
+   "rna",
+   "adt"
+  ],
+  "narrow_dtype": "uint16",
+  "reference_available": true,
+  "query_modality": null,
+  "query_filter": null,
+  "query_column": null,
+  "x_data_bytes__f32": 37623980,
+  "x_data_bytes__u16": 18811990,
+  "observed_modality_sums": {
+   "rna": 32173181.0,
+   "adt": 16081143.0
+  },
+  "x_dtypes": {
+   "rna": "uint16",
+   "adt": "uint16"
+  }
+ },
+ "scenario": {
+  "name": "scx_eager_u16",
+  "engine": "pyscx",
+  "cache_state": "warm",
+  "device": "cpu",
+  "chunk_size": 65536
+ },
+ "comparison": {
+  "subject": {
+   "impl": "multimodal_atlas_streaming__scx_eager_u16"
+  },
+  "baseline": {
+   "impl": "multimodal_atlas_streaming__mudata_h5mu"
+  },
+  "metric": "wall_s",
+  "status": "pending"
+ }
+}

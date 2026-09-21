@@ -141,6 +141,19 @@ ALL_BENCHMARKS: list[str] = [
     "accel_harmony",
     "accel_preprocess",
     "accel_hvg",
+    # Community analytical workflows.
+    # Both are accel-shaped: variants live in the module as
+    # `<bench>_variants()` and are picked up by `config.accel_formats()`, so
+    # `run_parallel` pairs each only with its own `<bench>__*` keys.
+    #
+    # accel_qc_filter: the fused one-row-pass + one-column-pass QC kernel and
+    # atomic filter_cells / filter_genes vs scanpy's seven separate passes.
+    # Profiled in Phase 4.1, never gated against scanpy until now.
+    "accel_qc_filter",
+    # accel_score_genes: streaming gene-set scoring over the decode-prefetch
+    # engine, on a backed `X` where `sc.tl.score_genes` raises outright. Three
+    # method arms (scanpy parity / mean / zscore) plus the scanpy comparator.
+    "accel_score_genes",
     # V3 task 2.7 — end-to-end PCA→kNN→UMAP residency benchmark: the fused
     # device-resident path vs the host-boundary path vs a CPU reference vs the
     # rapids-singlecell GPU competitor. Variants live in
@@ -180,6 +193,20 @@ ALL_BENCHMARKS: list[str] = [
     # CSC dispatch sweep (Phase L.3): qc_metrics / HVG / DE /
     # pseudobulk × {csr, csc} on a CSC-equipped fixture.
     "bench_csc_dispatch",
+    # The "laptop test": the full 9-stage
+    # scverse pipeline (open → QC → filter → normalize → log1p → HVG → PCA →
+    # kNN → UMAP + Leiden → Wilcoxon DE) run end to end under a fixed 16 / 32 GB
+    # ceiling, pyscx backed-streaming vs scanpy in-memory. Every component is
+    # benchmarked in isolation already; the composite claim is not.
+    #
+    # Structurally an accel benchmark — self-contained, never touching the
+    # `runners/*_runner.py` contract surface — but without the `accel_` prefix,
+    # exactly like `bench_csc_dispatch`. Both are named in
+    # `run_parallel._ARM_SHAPED_BENCHMARKS`, which drives the format pairing,
+    # the format-pool trigger and the smoke-gate exclusion from one place.
+    # Miss that and it either pairs with every format in the tier or schedules
+    # zero cells.
+    "pipeline_ooc_constrained",
     # Phase K — multimodal benchmarks. Both gated on
     # `dataset.multimodal == True` inside the modules; non-multimodal
     # datasets surface a clear "use compression / ml_loader instead"
@@ -190,6 +217,17 @@ ALL_BENCHMARKS: list[str] = [
     # Gated on `dataset.multimodal == True` AND
     # `format_variant.key in scx_multimodal_*` inside the module.
     "multimodal_read_streaming_vs_inmemory",
+    # Atlas-scale multimodal streaming + in-decode dtype narrowing
+    # The existing multimodal benchmarks run
+    # on 5.2K / 11.9K-cell fixtures; `to_mudata(data_dtype=...)`'s 2-4x cut in
+    # value-buffer bytes has never been shown at the >=500K scale where
+    # MuData's all-f32 buffers are the actual problem.
+    #
+    # In `_MULTIMODAL_BENCHMARKS`, and its key prefix is in
+    # `_MULTIMODAL_FORMAT_PREFIXES`, so `_triple_compatible`'s three-way XOR
+    # holds. Its 500K / 1M fixtures are built in Phase 4.1; until then it runs
+    # only on cite_seq_pbmc / multiome_pbmc.
+    "multimodal_atlas_streaming",
 ]
 
 

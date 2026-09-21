@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "hostname": "GPUCACE",
+    "os": "Linux 5.15.0-190-generic",
+    "python_version": "3.13.13",
+    "numpy_version": "2.4.3",
+    "git_sha": "b43eebf6ce03f33f40735c87a13b3fb6df2b3112",
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "rayon_num_threads": "1",
+    "pinned_seed": 42,
+    "pinned_threads": 1,
+    "blake3_available": true,
+    "pyscx_version": "0.18.0",
+    "scanpy_version": "1.12",
+    "anndata_version": "0.12.10",
+    "scipy_version": "1.17.1",
+    "rapids_singlecell_version": "not installed",
+    "cuml_version": "not installed",
+    "dataset_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc3k.h5ad"
+  },
+  "timings_seconds": {
+    "pca": 0.45324510615319014,
+    "neighbors": 0.3986121560446918,
+    "umap": 1.2288877880200744,
+    "leiden": 0.04908443707972765,
+    "harmony": 0.443227918818593,
+    "lisi": 0.1898437961935997
+  },
+  "fingerprints": {
+    "pca": {
+      "hash": "3b9d48bd9b4bd0b4e2484ec57ac4b0ec31b8f9d4af2fa8d944245e4bf4b56e0b",
+      "shape": [
+        2700,
+        20
+      ],
+      "dtype": "float32",
+      "nbytes": 216000
+    },
+    "pca_variance_ratio": {
+      "hash": "c4f18530895691027f0293a1079fc04cc776a3cd93691cdd99123528318734aa",
+      "shape": [
+        20
+      ],
+      "dtype": "float64",
+      "nbytes": 160
+    },
+    "neighbors_distances": {
+      "hash": "a197ec8956827fa15256c1b6ddf15d1bbf4638924d8bee2460e9f43dfde69280",
+      "shape": [
+        2700,
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 58320000
+    },
+    "neighbors_connectivities": {
+      "hash": "0e7ec2209ea04f59214cdc671bc380818c307982d9fa891f6551a67811421e98",
+      "shape": [
+        2700,
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 58320000
+    },
+    "umap": {
+      "hash": "71d3036bfa954b959b9a683deb50c9ef779a1d4cbd61bdc265e09cef1e22df40",
+      "shape": [
+        2700,
+        2
+      ],
+      "dtype": "float32",
+      "nbytes": 21600
+    },
+    "leiden": {
+      "hash": "9773b46ff83e0dee6339c2dbf39fd090f7082fccec0081aa5867ae7991a869c8",
+      "shape": [
+        2700
+      ],
+      "dtype": "int32",
+      "nbytes": 10800
+    },
+    "harmony": {
+      "hash": "b9940fd2931c9e18190e0d55d046bdf800ca3ec1ae3caa11f74f88403c9196ee",
+      "shape": [
+        2700,
+        20
+      ],
+      "dtype": "float32",
+      "nbytes": 216000
+    },
+    "lisi": {
+      "hash": "56c8cc21a1ce1685d242515b813cdce063802f76b15cd6a8d461ad298c8a55a4",
+      "shape": [
+        2700
+      ],
+      "dtype": "float64",
+      "nbytes": 21600
+    }
+  }
+}

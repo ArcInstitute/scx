@@ -219,6 +219,65 @@ def build(store: ResultStore) -> Chapter:
         ],
     ))
 
+    # ── Fused QC + filtering vs scanpy ───────────────────────────────
+    c.sections.append(Section(
+        title="Fused QC Metrics + Filtering vs scanpy (accel_qc_filter)",
+        blocks=[
+            TextBlock(
+                "`calculate_qc_metrics` → `filter_cells` → `filter_genes`, the "
+                "opening of essentially every scanpy workflow, run three ways "
+                "over identical inputs. `percent_top` is passed **explicitly "
+                "on both sides** (clamped to the gene axis): pyscx defaults it "
+                "to `None` and scanpy to `(50, 100, 200, 500)`, so left alone "
+                "the scanpy arm would do four extra order statistics the SCX "
+                "arm skips. Each arm runs in its own process and samples its "
+                "own peak RSS — a shared interpreter would carry one arm's "
+                "retained heap into the next arm's high-water mark."
+            ),
+            tables.community_qc_filter_table(),
+            TextBlock(
+                "Only **pyscx (backed)** is native end to end. "
+                "`accel.filter_cells` / `accel.filter_genes` delegate to "
+                "`sc.pp.*` when `X` is an in-memory scipy matrix, so the "
+                "in-memory arm is a native QC pass followed by a scanpy "
+                "filter — read it as the cost of the QC kernel alone, not as "
+                "a native-vs-scanpy result. Parity is computed against an "
+                "untimed scanpy reference run in a separate process and cached "
+                "per (dataset, qc_vars, percent_top), because each triple is a "
+                "separate SLURM job and cannot rely on whichever arm ran first."
+            ),
+        ],
+    ))
+
+    # ── Gene-set scoring vs scanpy ───────────────────────────────────
+    c.sections.append(Section(
+        title="Streaming Gene-Set Scoring vs scanpy (accel_score_genes)",
+        blocks=[
+            TextBlock(
+                "Per-cell signature scoring at three panel sizes. Panels are "
+                "derived deterministically from each fixture — rank `var_names` "
+                "by total counts, keep the top 2,000, then take each K by a "
+                "**stride** through that pool, so a K=500 panel spans the "
+                "expression range instead of landing entirely in one bin of "
+                "the expression-matched control sampler."
+            ),
+            tables.community_score_genes_table(),
+            TextBlock(
+                "The parity arm scores a **backed** `X`, which "
+                "`sc.tl.score_genes` refuses outright — that asymmetry is the "
+                "benchmark's claim, not a flaw in it. It passes scanpy's own "
+                "control genes via `ctrl_genes=`, reconstructed through "
+                "scanpy's private binning helpers because scanpy 1.12 keeps "
+                "`control_genes` as a function local and writes nothing to "
+                "`uns`. That route is load-bearing: measured on pbmc3k, SCX's "
+                "own control sampler scores Spearman 0.92 / 0.73 / 0.81 at "
+                "K = 25 / 100 / 500 against the explicit set's 1.0, so a "
+                "silent fallback would leave the parity column comparing two "
+                "different control sets and reporting agreement."
+            ),
+        ],
+    ))
+
     # ── GPU accelerator performance ──────────────────────────────────
     gpu_table = _build_gpu_table(store)
     c.sections.append(Section(

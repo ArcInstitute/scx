@@ -1,0 +1,211 @@
+{
+  "schema_version": 2,
+  "benchmark": "pipeline_ooc_constrained",
+  "format": "pipeline_ooc_constrained__pyscx_32g",
+  "dataset": "census_500k",
+  "timestamp": "2026-09-20T19:30:34",
+  "system": {
+    "hostname": "CPUDFE410",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2016,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": false
+    },
+    "gpu": {
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M30WRS18H3PG0TSCSWAGCZEQ",
+      "git_sha": "ba3a2bbc9b395d7930a0db924b7e1a8ce8b80869",
+      "git_branch": "bench-community-benchmarks",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.19.0-14-gba3a2bbc",
+      "rayon_threads": "",
+      "omp_threads": "",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 1480.9966727150604,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 6379.8359375,
+      "extra": {
+        "stage_wall_s__load": 2.4481364847160876,
+        "stage_peak_rss_mb__load": 952.35546875,
+        "stage_wall_s__qc_metrics": 5.2715536979958415,
+        "stage_peak_rss_mb__qc_metrics": 1706.58203125,
+        "stage_wall_s__filter": 6.175512961111963,
+        "stage_peak_rss_mb__filter": 1749.890625,
+        "stage_wall_s__hvg": 19.51782095991075,
+        "stage_peak_rss_mb__hvg": 3258.16796875,
+        "stage_wall_s__normalize_log1p": 19.84991383412853,
+        "stage_peak_rss_mb__normalize_log1p": 2232.16015625,
+        "stage_wall_s__pca": 26.207938217092305,
+        "stage_peak_rss_mb__pca": 3506.4609375,
+        "stage_wall_s__neighbors": 119.1675705621019,
+        "stage_peak_rss_mb__neighbors": 2409.12890625,
+        "stage_wall_s__umap_leiden": 303.16917481506243,
+        "stage_peak_rss_mb__umap_leiden": 2605.12109375,
+        "stage_wall_s__rank_genes_groups": 977.9956780443899,
+        "stage_peak_rss_mb__rank_genes_groups": 6379.8359375,
+        "pipeline_completed_int": 1.0,
+        "total_wall_s": 1480.9966727150604,
+        "pipeline_peak_rss_mb": 6379.8359375,
+        "n_clusters": 47.0,
+        "n_obs_final": 488523.0,
+        "n_vars_final": 36348.0,
+        "outcome_reason": "completed",
+        "failed_stage": ""
+      }
+    },
+    {
+      "wall_s": 1549.4103798568249,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 6424.60546875,
+      "extra": {
+        "stage_wall_s__load": 2.4483393877744675,
+        "stage_peak_rss_mb__load": 953.98046875,
+        "stage_wall_s__qc_metrics": 5.601794114802033,
+        "stage_peak_rss_mb__qc_metrics": 1688.640625,
+        "stage_wall_s__filter": 6.351173733826727,
+        "stage_peak_rss_mb__filter": 1713.56640625,
+        "stage_wall_s__hvg": 19.82218138407916,
+        "stage_peak_rss_mb__hvg": 3305.14453125,
+        "stage_wall_s__normalize_log1p": 20.402091229800135,
+        "stage_peak_rss_mb__normalize_log1p": 2234.5546875,
+        "stage_wall_s__pca": 26.509003425017,
+        "stage_peak_rss_mb__pca": 3493.98046875,
+        "stage_wall_s__neighbors": 121.73644331516698,
+        "stage_peak_rss_mb__neighbors": 2364.2890625,
+        "stage_wall_s__umap_leiden": 336.2394162379205,
+        "stage_peak_rss_mb__umap_leiden": 2567.8984375,
+        "stage_wall_s__rank_genes_groups": 1009.0878478586674,
+        "stage_peak_rss_mb__rank_genes_groups": 6424.60546875,
+        "pipeline_completed_int": 1.0,
+        "total_wall_s": 1549.4103798568249,
+        "pipeline_peak_rss_mb": 6424.60546875,
+        "n_clusters": 46.0,
+        "n_obs_final": 488523.0,
+        "n_vars_final": 36348.0,
+        "outcome_reason": "completed",
+        "failed_stage": ""
+      }
+    },
+    {
+      "wall_s": 1506.4199795937166,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 6525.609375,
+      "extra": {
+        "stage_wall_s__load": 2.455202718731016,
+        "stage_peak_rss_mb__load": 964.6484375,
+        "stage_wall_s__qc_metrics": 5.753884655889124,
+        "stage_peak_rss_mb__qc_metrics": 1698.90625,
+        "stage_wall_s__filter": 6.625368691980839,
+        "stage_peak_rss_mb__filter": 1748.05859375,
+        "stage_wall_s__hvg": 20.287605809047818,
+        "stage_peak_rss_mb__hvg": 3444.0859375,
+        "stage_wall_s__normalize_log1p": 20.536261876113713,
+        "stage_peak_rss_mb__normalize_log1p": 2351.859375,
+        "stage_wall_s__pca": 27.426301709376276,
+        "stage_peak_rss_mb__pca": 3889.3671875,
+        "stage_wall_s__neighbors": 121.06742742890492,
+        "stage_peak_rss_mb__neighbors": 2684.33203125,
+        "stage_wall_s__umap_leiden": 307.7299279058352,
+        "stage_peak_rss_mb__umap_leiden": 2877.48828125,
+        "stage_wall_s__rank_genes_groups": 992.916828581132,
+        "stage_peak_rss_mb__rank_genes_groups": 6525.609375,
+        "pipeline_completed_int": 1.0,
+        "total_wall_s": 1506.4199795937166,
+        "pipeline_peak_rss_mb": 6525.609375,
+        "n_clusters": 47.0,
+        "n_obs_final": 488523.0,
+        "n_vars_final": 36348.0,
+        "outcome_reason": "completed",
+        "failed_stage": ""
+      }
+    }
+  ],
+  "median_wall_s": 1506.4199795937166,
+  "wall_s_iqr": 68.41370714176446,
+  "n_runs": 3,
+  "overall_passed": true,
+  "metadata": {
+    "cold_cache": false,
+    "n_warmup": 0,
+    "budget_gb": 32,
+    "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/census_500k_auto.scx",
+    "stages": [
+      "load",
+      "qc_metrics",
+      "filter",
+      "hvg",
+      "normalize_log1p",
+      "pca",
+      "neighbors",
+      "umap_leiden",
+      "rank_genes_groups"
+    ],
+    "n_comps": 50,
+    "n_neighbors": 15,
+    "leiden_resolution": 1.0,
+    "n_hvg_requested": 2000,
+    "random_seed": 42,
+    "worker_timeout_s": 7600,
+    "stage_order_note": "seurat_v3 HVG runs on raw counts before normalisation and marks var['highly_variable'] without subsetting; PCA takes the mask. Both arms run this identical order.",
+    "pipeline_completed_int": 1.0,
+    "outcome_reasons": [
+      "completed"
+    ]
+  },
+  "scenario": {
+    "name": "end_to_end_pipeline",
+    "engine": "pyscx",
+    "budget_gb": 32,
+    "residency": "backed",
+    "cache_state": "warm",
+    "device": "cpu"
+  },
+  "comparison": {
+    "subject": {
+      "impl": "pipeline_ooc_constrained__pyscx_32g"
+    },
+    "baseline": {
+      "impl": "pipeline_ooc_constrained__scanpy_32g"
+    },
+    "metric": "pipeline_completed_int",
+    "status": "pending"
+  }
+}

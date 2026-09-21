@@ -1,0 +1,92 @@
+{
+ "schema_version": 2,
+ "benchmark": "accel_qc_filter",
+ "format": "accel_qc_filter__pyscx_cpu",
+ "dataset": "pbmc10k",
+ "timestamp": "2026-09-20T18:21:17",
+ "system": {
+  "hostname": "fixture",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python_version": "3.13",
+  "cpu": "fixture",
+  "cpu_cores_physical": 8,
+  "ram_gb": 64,
+  "library_versions": {
+   "pyscx": "0.18.0"
+  },
+  "provenance": {
+   "git_sha": "0000000000000000000000000000000000000000",
+   "git_dirty": false
+  }
+ },
+ "runs": [
+  {
+   "wall_s": 1.4810725757852197,
+   "user_s": 0.0,
+   "sys_s": 0.0,
+   "peak_rss_mb": 552.33984375,
+   "extra": {
+    "qc_wall_s__qc_metrics": 0.8006801372393966,
+    "qc_peak_rss_mb__qc_metrics": 541.609375,
+    "qc_wall_s__filter_cells": 0.313975865021348,
+    "qc_peak_rss_mb__filter_cells": 546.1953125,
+    "qc_wall_s__filter_genes": 0.36528607783839107,
+    "qc_peak_rss_mb__filter_genes": 548.4140625,
+    "qc_wall_s": 1.4810725757852197,
+    "qc_peak_rss_mb": 552.33984375,
+    "cache_policy": "warm",
+    "x_type": "ScxBackedSparseDataset",
+    "qc_metrics_max_abs_diff": 6.184516365692616e-06,
+    "filtered_shape_match_int": 1.0,
+    "n_obs_after": 11537.0,
+    "n_vars_after": 20292.0
+   }
+  }
+ ],
+ "median_wall_s": 1.4756546560674906,
+ "wall_s_iqr": 0.030565367778763175,
+ "n_runs": 1,
+ "overall_passed": true,
+ "metadata": {
+  "cold_cache": false,
+  "n_warmup": 1,
+  "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc10k_auto.scx",
+  "min_genes": 200,
+  "min_cells": 3,
+  "percent_top": [
+   50,
+   100,
+   200,
+   500
+  ],
+  "stages": [
+   "qc_metrics",
+   "filter_cells",
+   "filter_genes"
+  ],
+  "parity_reference": "/large_storage/arcinfra/projects/scx/scx_bench_qc_reference/pbmc10k.582a89556bc18785.npz",
+  "qc_var_counts": {
+   "mt": 13,
+   "ribo": 104
+  },
+  "qc_metrics_max_abs_diff": 6.184516365692616e-06
+ },
+ "scenario": {
+  "name": "qc_metrics_then_filter",
+  "engine": "pyscx",
+  "residency": "backed",
+  "cache_state": "warm",
+  "device": "cpu"
+ },
+ "comparison": {
+  "subject": {
+   "impl": "accel_qc_filter__pyscx_cpu"
+  },
+  "baseline": {
+   "impl": "accel_qc_filter__scanpy_cpu"
+  },
+  "metric": "qc_wall_s",
+  "status": "pending"
+ }
+}

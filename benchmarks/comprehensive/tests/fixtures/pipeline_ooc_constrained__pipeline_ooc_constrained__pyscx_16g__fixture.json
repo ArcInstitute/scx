@@ -1,0 +1,109 @@
+{
+ "schema_version": 2,
+ "benchmark": "pipeline_ooc_constrained",
+ "format": "pipeline_ooc_constrained__pyscx_16g",
+ "dataset": "pbmc10k",
+ "timestamp": "2026-09-20T18:21:15",
+ "system": {
+  "hostname": "fixture",
+  "os": "Linux",
+  "arch": "x86_64",
+  "python_version": "3.13",
+  "cpu": "fixture",
+  "cpu_cores_physical": 8,
+  "ram_gb": 64,
+  "library_versions": {
+   "pyscx": "0.18.0"
+  },
+  "provenance": {
+   "git_sha": "0000000000000000000000000000000000000000",
+   "git_dirty": false
+  }
+ },
+ "runs": [
+  {
+   "wall_s": 63.04447779385373,
+   "user_s": 0.0,
+   "sys_s": 0.0,
+   "peak_rss_mb": 1082.859375,
+   "extra": {
+    "stage_wall_s__load": 0.037160634994506836,
+    "stage_peak_rss_mb__load": 325.03515625,
+    "stage_wall_s__qc_metrics": 0.7542138248682022,
+    "stage_peak_rss_mb__qc_metrics": 542.97265625,
+    "stage_wall_s__filter": 0.6907155839726329,
+    "stage_peak_rss_mb__filter": 550.55078125,
+    "stage_wall_s__hvg": 2.1567551558837295,
+    "stage_peak_rss_mb__hvg": 895.43359375,
+    "stage_wall_s__normalize_log1p": 0.8702911902219057,
+    "stage_peak_rss_mb__normalize_log1p": 712.515625,
+    "stage_wall_s__pca": 3.752882321830839,
+    "stage_peak_rss_mb__pca": 814.6328125,
+    "stage_wall_s__neighbors": 1.6429406283423305,
+    "stage_peak_rss_mb__neighbors": 387.85546875,
+    "stage_wall_s__umap_leiden": 5.074202726595104,
+    "stage_peak_rss_mb__umap_leiden": 391.06640625,
+    "stage_wall_s__rank_genes_groups": 46.86238030111417,
+    "stage_peak_rss_mb__rank_genes_groups": 1082.859375,
+    "pipeline_completed_int": 1.0,
+    "total_wall_s": 63.04447779385373,
+    "pipeline_peak_rss_mb": 1082.859375,
+    "n_clusters": 20.0,
+    "n_obs_final": 11537.0,
+    "n_vars_final": 20292.0,
+    "outcome_reason": "completed",
+    "failed_stage": ""
+   }
+  }
+ ],
+ "median_wall_s": 62.7819312508218,
+ "wall_s_iqr": 1.4149728529155254,
+ "n_runs": 1,
+ "overall_passed": true,
+ "metadata": {
+  "cold_cache": false,
+  "n_warmup": 0,
+  "budget_gb": 16,
+  "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc10k_auto.scx",
+  "stages": [
+   "load",
+   "qc_metrics",
+   "filter",
+   "hvg",
+   "normalize_log1p",
+   "pca",
+   "neighbors",
+   "umap_leiden",
+   "rank_genes_groups"
+  ],
+  "n_comps": 50,
+  "n_neighbors": 15,
+  "leiden_resolution": 1.0,
+  "n_hvg_requested": 2000,
+  "random_seed": 42,
+  "worker_timeout_s": 15600,
+  "stage_order_note": "seurat_v3 HVG runs on raw counts before normalisation and marks var['highly_variable'] without subsetting; PCA takes the mask. Both arms run this identical order.",
+  "pipeline_completed_int": 1.0,
+  "outcome_reasons": [
+   "completed"
+  ]
+ },
+ "scenario": {
+  "name": "end_to_end_pipeline",
+  "engine": "pyscx",
+  "budget_gb": 16,
+  "residency": "backed",
+  "cache_state": "warm",
+  "device": "cpu"
+ },
+ "comparison": {
+  "subject": {
+   "impl": "pipeline_ooc_constrained__pyscx_16g"
+  },
+  "baseline": {
+   "impl": "pipeline_ooc_constrained__scanpy_16g"
+  },
+  "metric": "pipeline_completed_int",
+  "status": "pending"
+ }
+}

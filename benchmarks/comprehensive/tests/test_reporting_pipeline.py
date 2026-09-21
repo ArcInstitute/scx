@@ -804,3 +804,169 @@ class TestSetStore:
         finally:
             # Restore original to avoid polluting other tests
             set_store(original)
+
+
+# ===================================================================
+# 25. Community analytical workflows — the four Phase-5 benchmarks
+# ===================================================================
+class TestCommunityBenchmarkTables:
+    """`accel_qc_filter` / `accel_score_genes` / `pipeline_ooc_constrained` /
+    `multimodal_atlas_streaming` render from real result shapes.
+
+    The fixtures are trimmed copies of real captures, so a change to an
+    emitted metric name breaks these rather than silently rendering a column
+    of em-dashes.
+    """
+
+    BUILDERS = (
+        "community_qc_filter_table",
+        "community_score_genes_table",
+        "community_pipeline_ooc_table",
+        "community_pipeline_ooc_stage_table",
+        "community_multimodal_atlas_table",
+    )
+
+    @staticmethod
+    def _with_fixture_store():
+        from benchmarks.comprehensive.reporting.result_store import (
+            ResultStore, set_store, get_store,
+        )
+        store = ResultStore()
+        store.load_raw_dir(FIXTURES)
+        previous = get_store()
+        set_store(store)
+        return previous
+
+    @staticmethod
+    def _restore(previous):
+        from benchmarks.comprehensive.reporting.result_store import set_store
+        set_store(previous)
+
+    @pytest.mark.parametrize("builder", BUILDERS)
+    def test_builder_renders_a_table_with_a_source(self, builder):
+        from benchmarks.comprehensive.reporting import tables
+
+        previous = self._with_fixture_store()
+        try:
+            block = getattr(tables, builder)()
+        finally:
+            self._restore(previous)
+
+        assert isinstance(block, TableBlock), (
+            f"{builder} fell back to its no-data TextBlock — the fixtures no "
+            f"longer match what the module emits"
+        )
+        # Every TableBlock needs a SourceRef or report lint flags it.
+        assert block.source is not None
+        assert block.rows, f"{builder} rendered a header with no rows"
+
+    @pytest.mark.parametrize("builder", BUILDERS)
+    def test_no_rendered_row_is_entirely_placeholders(self, builder):
+        """A row of em-dashes is the shape the empty-cell lint exists to catch.
+
+        It is also how a renamed metric key presents: the row is found, every
+        lookup misses, and the table reads as "measured, all blank".
+        """
+        from benchmarks.comprehensive.reporting import tables
+
+        previous = self._with_fixture_store()
+        try:
+            block = getattr(tables, builder)()
+        finally:
+            self._restore(previous)
+
+        for row in block.rows:
+            # First two are Dataset / Arm labels; a trailing `Notes` column is
+            # an explanation, not a measurement, so it does not count either.
+            data_cells = row[2:-1] if block.headers[-1] == "Notes" else row[2:]
+            assert any(c != "—" for c in data_cells), (
+                f"{builder}: {row[0]} / {row[1]} rendered no values at all"
+            )
+
+    def test_a_runs_empty_arm_is_dropped_rather_than_rendered_blank(self):
+        """The pushdown arm writes a typed gap the `MissingReason` enum lacks.
+
+        `_try_missing_reason` maps `no_selective_obs_column` to `None`, so
+        filtering on `missing_reason` alone lets a runs-empty row through as a
+        full line of em-dashes. Filtering on `runs` is what actually holds.
+        """
+        from benchmarks.comprehensive.reporting import tables
+
+        previous = self._with_fixture_store()
+        try:
+            rows = tables._community_rows("multimodal_atlas_streaming")
+            block = tables.community_multimodal_atlas_table()
+        finally:
+            self._restore(previous)
+
+        # The fixture pair is one measured arm plus one runs-empty arm.
+        assert all(r.runs for r in rows)
+        assert not any("pushdown" in r[1] for r in block.rows)
+
+    def test_the_arm_labels_cover_every_declared_variant(self):
+        """A new arm must not render as its raw format-key tail."""
+        from benchmarks.comprehensive.reporting.tables import (
+            _COMMUNITY_ARM_LABELS, _community_arm,
+        )
+        from benchmarks.comprehensive.benchmarks import (
+            accel_qc_filter, accel_score_genes,
+            pipeline_ooc_constrained, multimodal_atlas_streaming,
+        )
+
+        for module, bench in (
+            (accel_qc_filter, "accel_qc_filter"),
+            (accel_score_genes, "accel_score_genes"),
+            (pipeline_ooc_constrained, "pipeline_ooc_constrained"),
+            (multimodal_atlas_streaming, "multimodal_atlas_streaming"),
+        ):
+            for key in module.SUPPORTED_FORMATS:
+                tail = key[len(bench) + 2:]
+                assert tail in _COMMUNITY_ARM_LABELS, (
+                    f"{bench} arm {tail!r} has no display label"
+                )
+                assert _community_arm(bench, key) != tail
+
+    def test_the_multimodal_rss_column_resolves_every_arms_own_key(self):
+        """Each arm owns a distinct RSS metric, and the *mode* is not the tail.
+
+        `mudata_h5mu` is the mode `mudata_eager` and `scx_query_mod` is
+        `scx_query`; `_rss_key` raises on anything else, so the table has to
+        go through `_ARMS` rather than slicing the format key.
+        """
+        from benchmarks.comprehensive.benchmarks.multimodal_atlas_streaming import (
+            _ARMS, SUPPORTED_FORMATS, _rss_key,
+        )
+
+        keys = set()
+        for fmt in SUPPORTED_FORMATS:
+            assert fmt in _ARMS, f"{fmt} is not in _ARMS"
+            keys.add(_rss_key(_ARMS[fmt]["mode"]))
+        assert len(keys) == len(SUPPORTED_FORMATS), "two arms share an RSS key"
+        assert "peak_rss_mb" not in keys, "reserved add_run parameter"
+
+    def test_the_four_sections_are_in_the_report_model(self):
+        """The report is a fixed chapter list; a new section must be wired in."""
+        from benchmarks.comprehensive.reporting.sections import (
+            accelerators, specialized,
+        )
+        from benchmarks.comprehensive.reporting.result_store import (
+            ResultStore, get_store, set_store,
+        )
+
+        store = ResultStore()
+        store.load_raw_dir(FIXTURES)
+        previous = get_store()
+        set_store(store)
+        try:
+            titles = [s.title for s in accelerators.build(store).sections]
+            titles += [s.title for s in specialized.build(store).sections]
+        finally:
+            set_store(previous)
+
+        for needle in (
+            "accel_qc_filter", "accel_score_genes",
+            "pipeline_ooc_constrained", "multimodal_atlas_streaming",
+        ):
+            assert any(needle in t for t in titles), (
+                f"no section renders {needle}"
+            )

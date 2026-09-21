@@ -1980,6 +1980,18 @@ kernel yet — it needs exact-rank parity that f32 gemm can't guarantee, and is
 already fast on the small `[P×G]` effect matrix; `device` is accepted for
 symmetry but always runs CPU.
 
+**`calculate_qc_metrics` head-to-head.** Since 0.18 one native kernel handles
+every kind of `X`, and on the standard opening sequence —
+`calculate_qc_metrics(qc_vars=["mt","ribo"])` → `filter_cells` →
+`filter_genes`, with `percent_top` passed explicitly on both sides — a backed
+SCX handle runs it in **23.2 s / 2.2 GB on 1M cells against scanpy's 52.5 s /
+33.4 GB**, 2.3× faster on 15× less resident memory. The two engines agree to
+0.0 on every fixture whose per-cell totals stay inside float32's exact-integer
+range; past it SCX is the accurate side, because scanpy reduces `X` in the
+array's own dtype and SCX accumulates in f64. Tables, smaller fixtures and
+provenance:
+[docs/performance.md § Fused QC + filtering vs scanpy](performance.md#fused-qc--filtering-vs-scanpy-accel_qc_filter).
+
 ### `prefer_format="auto"|"csr"|"csc"`: column-major dispatch
 
 A subset of accelerators take a `prefer_format` kwarg that selects
@@ -2926,6 +2938,25 @@ pyscx.accel.score_genes(
 > `ctrl_genes` after resolution raises. Use `layer=` to score a named layer
 > instead of `X`. CPU-only — `device` is accepted for API symmetry but there is
 > no GPU kernel.
+
+**What `ctrl_genes=` on a backed `X` is worth.** Scoring K = 25 / 100 / 500
+panels, `pyscx.accel.score_genes(method="control", ctrl_genes=...)` on a
+backed `X` against `sc.tl.score_genes` on an eager one — which is the only
+comparison available, since scanpy refuses the backed input:
+
+| Dataset | pyscx (backed) | scanpy (eager) | speedup | peak RSS |
+|---|---:|---:|---:|---|
+| pbmc10k (11.5K) | 1.28 s | 0.94 s | **0.7×** | 327 MB vs 848 MB |
+| tabula_sapiens_100k | 3.21 s | 22.09 s | 6.9× | 487 MB vs 3,666 MB |
+| census_1m | 18.76 s | 55.76 s | 3.0× | **821 MB vs 23,531 MB** |
+
+Scores are **bit-identical** — Spearman 1.0, maximum absolute difference 0.0
+at all three panel sizes on every fixture except `smartseq2`, where scanpy's
+float32 accumulator puts it at 0.017–0.038 (Spearman still 1.0). SCX is
+slower below ~10K cells, where the matrix fits in cache and the streaming
+decode is overhead the eager path does not pay. The memory ratio never
+crosses, and at 1M cells it is 29×. Full tables and provenance:
+[docs/performance.md § Gene-set scoring vs scanpy](performance.md#gene-set-scoring-vs-scanpy-accel_score_genes).
 
 ### PFlog normalization (`pyscx.accel.pflog`)
 

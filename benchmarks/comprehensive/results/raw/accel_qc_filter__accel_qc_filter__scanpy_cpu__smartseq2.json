@@ -1,0 +1,192 @@
+{
+  "schema_version": 2,
+  "benchmark": "accel_qc_filter",
+  "format": "accel_qc_filter__scanpy_cpu",
+  "dataset": "smartseq2",
+  "timestamp": "2026-09-20T19:29:56",
+  "system": {
+    "hostname": "CPUDFDC84",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2016,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": false
+    },
+    "gpu": {
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M30WRS18H3PG0TSCSWAGCZEQ",
+      "git_sha": "ba3a2bbc9b395d7930a0db924b7e1a8ce8b80869",
+      "git_branch": "bench-community-benchmarks",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.19.0-14-gba3a2bbc",
+      "rayon_threads": "",
+      "omp_threads": "",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 14.938477750867605,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 3556.18359375,
+      "extra": {
+        "qc_wall_s__qc_metrics": 3.240497161168605,
+        "qc_peak_rss_mb__qc_metrics": 2651.7265625,
+        "qc_wall_s__filter_cells": 5.95359917730093,
+        "qc_peak_rss_mb__filter_cells": 3537.87890625,
+        "qc_wall_s__filter_genes": 4.798700229264796,
+        "qc_peak_rss_mb__filter_genes": 3556.18359375,
+        "qc_wall_s": 14.938477750867605,
+        "qc_peak_rss_mb": 3556.18359375,
+        "cache_policy": "warm",
+        "x_type": "csr_matrix"
+      }
+    },
+    {
+      "wall_s": 14.469339441042393,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 3553.30859375,
+      "extra": {
+        "qc_wall_s__qc_metrics": 3.3826351216994226,
+        "qc_peak_rss_mb__qc_metrics": 2648.828125,
+        "qc_wall_s__filter_cells": 5.176118586678058,
+        "qc_peak_rss_mb__filter_cells": 3534.9375,
+        "qc_wall_s__filter_genes": 4.9195010252296925,
+        "qc_peak_rss_mb__filter_genes": 3553.30859375,
+        "qc_wall_s": 14.469339441042393,
+        "qc_peak_rss_mb": 3553.30859375,
+        "cache_policy": "warm",
+        "x_type": "csr_matrix"
+      }
+    },
+    {
+      "wall_s": 15.039214577991515,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 3551.89453125,
+      "extra": {
+        "qc_wall_s__qc_metrics": 3.4000469646416605,
+        "qc_peak_rss_mb__qc_metrics": 2649.5859375,
+        "qc_wall_s__filter_cells": 5.200631596148014,
+        "qc_peak_rss_mb__filter_cells": 3538.828125,
+        "qc_wall_s__filter_genes": 5.516738629899919,
+        "qc_peak_rss_mb__filter_genes": 3551.89453125,
+        "qc_wall_s": 15.039214577991515,
+        "qc_peak_rss_mb": 3551.89453125,
+        "cache_policy": "warm",
+        "x_type": "csr_matrix"
+      }
+    },
+    {
+      "wall_s": 14.20705111976713,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 3552.05078125,
+      "extra": {
+        "qc_wall_s__qc_metrics": 3.3755394420586526,
+        "qc_peak_rss_mb__qc_metrics": 2649.69921875,
+        "qc_wall_s__filter_cells": 4.964139208197594,
+        "qc_peak_rss_mb__filter_cells": 3535.62890625,
+        "qc_wall_s__filter_genes": 4.881148009095341,
+        "qc_peak_rss_mb__filter_genes": 3554.05078125,
+        "qc_wall_s": 14.20705111976713,
+        "qc_peak_rss_mb": 3552.05078125,
+        "cache_policy": "warm",
+        "x_type": "csr_matrix"
+      }
+    },
+    {
+      "wall_s": 13.391133594792336,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 3554.54296875,
+      "extra": {
+        "qc_wall_s__qc_metrics": 2.5653303959406912,
+        "qc_peak_rss_mb__qc_metrics": 2649.95703125,
+        "qc_wall_s__filter_cells": 4.659134613815695,
+        "qc_peak_rss_mb__filter_cells": 3526.05859375,
+        "qc_wall_s__filter_genes": 5.150933934375644,
+        "qc_peak_rss_mb__filter_genes": 3554.54296875,
+        "qc_wall_s": 13.391133594792336,
+        "qc_peak_rss_mb": 3554.54296875,
+        "cache_policy": "warm",
+        "x_type": "csr_matrix"
+      }
+    }
+  ],
+  "median_wall_s": 14.469339441042393,
+  "wall_s_iqr": 1.1897538071498275,
+  "n_runs": 5,
+  "metadata": {
+    "cold_cache": false,
+    "n_warmup": 1,
+    "source_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/smartseq2.h5ad",
+    "min_genes": 200,
+    "min_cells": 3,
+    "percent_top": [
+      50,
+      100,
+      200,
+      500
+    ],
+    "stages": [
+      "qc_metrics",
+      "filter_cells",
+      "filter_genes"
+    ],
+    "parity_reference": null,
+    "qc_var_counts": {
+      "mt": 0,
+      "ribo": 0
+    }
+  },
+  "scenario": {
+    "name": "qc_metrics_then_filter",
+    "engine": "scanpy",
+    "residency": "in_memory",
+    "cache_state": "warm",
+    "device": "cpu"
+  },
+  "comparison": {
+    "subject": {
+      "impl": "accel_qc_filter__scanpy_cpu"
+    },
+    "baseline": {
+      "impl": "accel_qc_filter__scanpy_cpu"
+    },
+    "metric": "qc_wall_s",
+    "status": "pending"
+  }
+}

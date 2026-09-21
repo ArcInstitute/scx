@@ -125,17 +125,63 @@ _MULTIMODAL_BENCHMARKS = {
     "multimodal_compression",
     "multimodal_training",
     "multimodal_read_streaming_vs_inmemory",
+    "multimodal_atlas_streaming",
 }
 
 # Format keys that consume `.h5mu` (or write the multimodal SCX layout).
 # Non-multimodal benchmarks can't read these; multimodal benchmarks can't
 # read non-multimodal formats. Defined inline (not imported from config)
 # so this list stays a single source of truth for the orchestrator.
-_MULTIMODAL_FORMAT_PREFIXES = ("h5mu_", "zarr_mudata_", "scx_multimodal_")
+_MULTIMODAL_FORMAT_PREFIXES = (
+    "h5mu_", "zarr_mudata_", "scx_multimodal_",
+    # `multimodal_atlas_streaming`'s variants are implementation arms rather
+    # than storage formats (they name a read strategy: backed-streaming, eager
+    # at uint16, eager at f32, MuData, CLI pushdown), so they register through
+    # `config.accel_formats()` like every other arm-shaped variant. They still
+    # have to read as multimodal *here*, because `_triple_compatible` gates on
+    # the three-way XOR of dataset / benchmark / format multimodality — without
+    # this prefix the benchmark would be multimodal and its own formats would
+    # not, and it would pair with nothing.
+    "multimodal_atlas_streaming__",
+)
 
 
 def _is_multimodal_format(format_key: str) -> bool:
     return any(format_key.startswith(p) for p in _MULTIMODAL_FORMAT_PREFIXES)
+
+
+# Benchmarks whose `FormatVariant`s are *implementation arms* rather than
+# storage formats — one variant per engine / device / strategy, all reading the
+# same source file. Every `accel_*` benchmark is one by its prefix; these three
+# are the same shape under a name that does not carry it, so they have to be
+# named. The pairing rule is symmetric (see `_bench_format_compatible`): an
+# arm-shaped benchmark takes only its own `<bench>__*` keys, and a benchmark
+# that is not arm-shaped takes none of them.
+#
+# Getting only half of this right is the recurring failure. Register the
+# benchmark and not the format side, and every *other* benchmark with no
+# `SUPPORTED_FORMATS` picks up the new keys — which is not hypothetical: none
+# of `multimodal_compression` / `multimodal_training` /
+# `multimodal_read_streaming_vs_inmemory` declares one, and all three sit on
+# the same side of `_triple_compatible`'s multimodal XOR as
+# `multimodal_atlas_streaming`, so nothing else would have stopped the pairing.
+_ARM_SHAPED_BENCHMARKS = frozenset({
+    "bench_csc_dispatch",
+    "pipeline_ooc_constrained",
+    "multimodal_atlas_streaming",
+})
+
+_ARM_SHAPED_FORMAT_PREFIXES = ("accel_", "bench_csc__") + tuple(
+    f"{b}__" for b in sorted(_ARM_SHAPED_BENCHMARKS) if b != "bench_csc_dispatch"
+)
+
+
+def _is_arm_shaped_benchmark(bench_name: str) -> bool:
+    return bench_name.startswith("accel_") or bench_name in _ARM_SHAPED_BENCHMARKS
+
+
+def _is_arm_shaped_format(format_key: str) -> bool:
+    return any(format_key.startswith(p) for p in _ARM_SHAPED_FORMAT_PREFIXES)
 
 
 # Submission failures that are worth retrying: slurmctld was momentarily busy
@@ -585,10 +631,11 @@ def _bench_format_compatible(bench_name: str, format_key: str) -> bool:
     """Check benchmark–format pairing beyond multimodal compatibility.
 
     Three layered checks:
-    1. Accel benchmarks (accel_*) only pair with their own format variants
-       (e.g. accel_pca pairs with accel_pca__scx_auto). Similarly,
-       bench_csc_dispatch only pairs with bench_csc__* formats. Non-accel
-       benchmarks skip accel_* and bench_csc__* format keys.
+    1. Arm-shaped benchmarks only pair with their own format variants (e.g.
+       accel_pca pairs with accel_pca__scx_auto). Every `accel_*` benchmark is
+       arm-shaped by its prefix; `_ARM_SHAPED_BENCHMARKS` names the three that
+       are arm-shaped without carrying it. The rule is symmetric: a benchmark
+       that is not arm-shaped skips arm-shaped format keys entirely.
     2. Static-guarded benches (e.g. ``cloud_push``, ``correctness``)
        expose a module-level ``SUPPORTED_FORMATS`` frozenset and only
        accept format keys in that set.
@@ -600,14 +647,15 @@ def _bench_format_compatible(bench_name: str, format_key: str) -> bool:
     path in each bench from producing phantom ``missing_result`` entries
     in ``watch.py``.
     """
-    is_accel = bench_name.startswith("accel_") or bench_name == "bench_csc_dispatch"
-    fmt_is_accel = format_key.startswith("accel_") or format_key.startswith("bench_csc__")
+    is_arm_shaped = _is_arm_shaped_benchmark(bench_name)
+    fmt_is_arm_shaped = _is_arm_shaped_format(format_key)
 
-    if is_accel:
+    if is_arm_shaped:
+        # `bench_csc_dispatch` is the one whose keys don't repeat its name.
         if bench_name == "bench_csc_dispatch":
             return format_key.startswith("bench_csc__")
         return format_key.startswith(f"{bench_name}__")
-    elif fmt_is_accel:
+    elif fmt_is_arm_shaped:
         return False
 
     allowed = _bench_supported_formats(bench_name)
@@ -1056,8 +1104,21 @@ def _per_job_slurm_params(
         time_bench = benchmark
 
     # Apply the scale factor (memory + time), then clamp.
-    mem = min(int(round(mem * scale)), MEM_CEILING_GB)
-    mem = max(mem, args.mem_gb)  # CLI floor
+    #
+    # `pipeline_ooc_constrained` is exempt from both, because for it the SLURM
+    # cgroup ceiling IS the experiment: the arm is named for the 16 or 32 GB
+    # budget it must run under, and `pipeline_completed_int` means nothing if
+    # the allocation is not the one the label claims. Both adjustments below
+    # would silently raise it — `--scale-factor 1.3`, which this script's own
+    # `--help` recommends for noisy clusters, turns a 16 GB arm into 21 GB, and
+    # `capture_baseline.py` always passes `--mem-gb`, whose floor would raise it
+    # to whatever the tier asked for (80 GB under SLURM_DEFAULTS). The default
+    # gate path happens to be safe today; that is luck, not a guarantee.
+    if benchmark == "pipeline_ooc_constrained":
+        mem = min(mem, MEM_CEILING_GB)
+    else:
+        mem = min(int(round(mem * scale)), MEM_CEILING_GB)
+        mem = max(mem, args.mem_gb)  # CLI floor
 
     est_time = estimate_time_minutes(cfg, format_key, time_bench)
     est_time = int(round(est_time * scale))
@@ -1215,13 +1276,15 @@ def main() -> None:
     from benchmarks.comprehensive.config import accel_formats
     need_accel = (
         args.include_accel
-        or any((fk or "").startswith("accel_") for fk in (args.formats or []))
-        or any((b or "").startswith("accel_") for b in (args.benchmarks or []))
-        # `bench_csc_dispatch` exposes its variants through
-        # `accel_formats()` even though the benchmark name doesn't carry
-        # the `accel_` prefix. Treat its presence the same way.
-        or any(b == "bench_csc_dispatch" for b in (args.benchmarks or []))
-        or any((fk or "").startswith("bench_csc__") for fk in (args.formats or []))
+        or any(_is_arm_shaped_format(fk or "") for fk in (args.formats or []))
+        # Every arm-shaped benchmark exposes its variants through
+        # `accel_formats()`, including the three whose names don't carry the
+        # `accel_` prefix (`bench_csc_dispatch`, `pipeline_ooc_constrained`,
+        # `multimodal_atlas_streaming`). Naming one of them has to pull that
+        # pool in, or it resolves to zero cells and is scheduled silently
+        # never — which reads exactly like a benchmark that ran and found
+        # nothing to do.
+        or any(_is_arm_shaped_benchmark(b or "") for b in (args.benchmarks or []))
     )
     # Multimodal benchmarks (Phase K) live outside PRIMARY_FORMATS —
     # auto-include the multimodal format set whenever a multimodal
@@ -1282,13 +1345,12 @@ def main() -> None:
     # touch the `runners/*_runner.py` contract surface — they go through
     # `accel_*.py` modules in `comprehensive/benchmarks/`, which the smoke
     # gate doesn't validate).
-    # `bench_csc_dispatch` is structurally an accel benchmark (self-
-    # contained, doesn't go through the runner contract surface) even
-    # though its name doesn't carry the `accel_` prefix. Treat it the
-    # same way for smoke-test gating.
+    # `_ARM_SHAPED_BENCHMARKS` covers the three that are structurally accel
+    # benchmarks (self-contained, never touching the runner contract surface)
+    # under names that don't carry the `accel_` prefix. Treat them the same
+    # way for smoke-test gating.
     non_accel_benchmarks = [
-        b for b in benchmarks
-        if not b.startswith("accel_") and b != "bench_csc_dispatch"
+        b for b in benchmarks if not _is_arm_shaped_benchmark(b)
     ]
     needs_smoke = (
         not getattr(args, "skip_smoke", False)
@@ -1764,9 +1826,20 @@ def main() -> None:
         _persist_bench_manifest()
 
     if args.dry_run:
+        # Mirror Phase A's own skip (`cfg.multimodal != _is_multimodal_format`,
+        # in the convert loop above) rather than counting the raw cross
+        # product. Without it this line counted every pool format against every
+        # dataset, so a multimodal run reported conversions for the whole
+        # single-modality pool that Phase A never submits. It read as harmless
+        # while the accel pool and the multimodal datasets were never in the
+        # pool together; `multimodal_atlas_streaming` is the first benchmark
+        # that is both arm-shaped and multimodal, and it made the summary
+        # report 91 conversions where the loop submits none.
         n_conv = sum(
             1 for ds in datasets for fmt in formats
-            if not DATASETS[ds].path_for_format(fmt.key).exists() or args.overwrite
+            if DATASETS[ds].multimodal == _is_multimodal_format(fmt.key)
+            and (not DATASETS[ds].path_for_format(fmt.key).exists()
+                 or args.overwrite)
         )
         n_bench = sum(len(v) for v in cohorts.values())
         n_dep = sum(
