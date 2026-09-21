@@ -327,3 +327,204 @@ def _attribute_names(mod) -> set[str]:
         for node in ast.walk(_module_ast(mod))
         if isinstance(node, ast.Attribute)
     }
+
+
+# ---------------------------------------------------------------------------
+# accel_score_genes
+# ---------------------------------------------------------------------------
+
+from benchmarks.comprehensive.benchmarks import accel_score_genes as sg  # noqa: E402
+
+
+def _totals(n: int) -> np.ndarray:
+    """Strictly decreasing totals, so rank order is unambiguous."""
+    return np.arange(n, 0, -1, dtype=np.float64)
+
+
+def test_gene_panels_have_the_requested_sizes():
+    names = [f"g{i}" for i in range(5000)]
+    panels = sg.gene_panels(names, _totals(5000))
+    assert {k: len(v) for k, v in panels.items()} == {25: 25, 100: 100, 500: 500}
+    for genes in panels.values():
+        assert len(set(genes)) == len(genes), "a panel must not repeat a gene"
+
+
+def test_gene_panels_are_deterministic():
+    names = [f"g{i}" for i in range(5000)]
+    totals = _totals(5000)
+    assert sg.gene_panels(names, totals) == sg.gene_panels(names, totals)
+
+
+def test_gene_panels_span_the_pool_rather_than_taking_its_head():
+    """A head would put every gene of a K=500 panel in one expression bin.
+
+    The control sampling both engines run is expression-matched, so a panel
+    concentrated at the top of the range exercises one bin and the benchmark
+    would report the cost of a degenerate case.
+    """
+    names = [f"g{i}" for i in range(5000)]
+    panels = sg.gene_panels(names, _totals(5000))
+    ranks = [int(g[1:]) for g in panels[500]]
+    # The pool is the top PANEL_POOL genes; a strided draw reaches its far end.
+    assert max(ranks) > sg.PANEL_POOL * 0.9, f"panel stops at rank {max(ranks)}"
+    assert min(ranks) < sg.PANEL_POOL * 0.1
+
+
+def test_gene_panels_break_ties_by_position_not_by_input_order():
+    names = [f"g{i}" for i in range(100)]
+    flat = np.ones(100)
+    assert sg.gene_panels(names, flat, sizes=(10,))[10] == \
+        sg.gene_panels(names, flat, sizes=(10,))[10]
+
+
+def test_gene_panels_reject_a_length_mismatch():
+    with pytest.raises(ValueError):
+        sg.gene_panels([f"g{i}" for i in range(10)], _totals(11))
+
+
+def test_gene_panels_clamp_to_a_small_gene_axis():
+    panels = sg.gene_panels([f"g{i}" for i in range(30)], _totals(30))
+    assert len(panels[500]) == 30
+    assert len(panels[25]) == 25
+
+
+def test_spearman_is_nan_not_zero_for_a_constant_vector():
+    """A constant vector has no rank correlation; 0.0 would read as a failure.
+
+    `min: 0.999` on a NaN is a missing metric, which the gate calls a violation
+    on a result that exists — loud, and honestly labelled. `0.0` would be a
+    loud claim that the two engines disagree completely, which is not what
+    happened.
+    """
+    a = np.ones(50)
+    b = np.arange(50, dtype=float)
+    assert np.isnan(sg.spearman(a, b))
+    assert np.isnan(sg.spearman(np.arange(3, dtype=float), np.arange(4, dtype=float)))
+
+
+def test_score_parity_reports_a_shape_mismatch(tmp_path):
+    a = _write_npz(tmp_path, "a.npz", k25=np.arange(5, dtype=float))
+    b = _write_npz(tmp_path, "b.npz", k25=np.arange(6, dtype=float))
+    out = sg.parity_metrics(a, b)
+    assert out["score_spearman_vs_scanpy__k25"] == 0.0
+    assert out["score_max_abs_diff__k25"] == float("inf")
+
+
+def test_score_reference_tag_changes_with_the_sampling_settings(monkeypatch):
+    from benchmarks.comprehensive.config import DATASETS
+
+    ds = DATASETS["pbmc3k"]
+    base = sg._reference_tag(ds)
+    for attr, value in (("CTRL_SIZE", 10), ("N_BINS", 5), ("PANEL_POOL", 500),
+                        ("SCORE_RANDOM_STATE", 7)):
+        monkeypatch.setattr(sg, attr, value)
+        assert sg._reference_tag(ds) != base, f"{attr} does not change the tag"
+        monkeypatch.undo()
+
+
+def test_exactly_one_scoring_arm_carries_parity():
+    assert set(sg._ARMS) == set(sg.SUPPORTED_FORMATS)
+    assert {v.key for v in sg.accel_score_genes_variants()} == set(sg.SUPPORTED_FORMATS)
+    parity = [k for k, v in sg._ARMS.items() if v["parity"]]
+    assert parity == ["accel_score_genes__pyscx_cpu_scanpy"]
+    # `mean` and `zscore` are different statistics with no scanpy counterpart;
+    # comparing either to sc.tl.score_genes would be a floor on a mismatch.
+    assert all(v["method"] in ("control", "mean", "zscore") for v in sg._ARMS.values())
+
+
+def test_there_is_no_method_named_scanpy():
+    """The spec calls it `method="scanpy"`; the binding rejects that.
+
+    Accepted values are "control" (which *is* scanpy's algorithm, and the
+    default), "mean" and "zscore".
+    """
+    assert all(v["method"] != "scanpy" for v in sg._ARMS.values())
+
+
+def test_the_parity_arm_passes_ctrl_genes_under_a_method_guard():
+    """`ctrl_genes=` is the only thing that makes a 0.999 Spearman floor mean
+    anything.
+
+    Measured on pbmc3k: SCX's own sampler scores 0.92 / 0.73 / 0.81 against the
+    scanpy reference at K = 25 / 100 / 500 with a max absolute difference of
+    ~5.9 on a score of range 16.4, while `ctrl_genes=` scores 0.9999999 at
+    ~1e-14. A silent fallback to the sampler would leave the floor comparing a
+    run against a different control set and reporting it as agreement.
+
+    The guard matters too: the binding rejects `ctrl_genes=` for the `mean` and
+    `zscore` methods, so setting it unconditionally would raise on two arms.
+    """
+    assigns = _subscript_assign_guards(sg, "ctrl_genes")
+    assert assigns, "ctrl_genes is never assigned into the score_genes kwargs"
+    assert all(g == repr("control") for g in assigns), (
+        f"ctrl_genes must be set only under a method == 'control' guard; "
+        f"found guards {assigns}"
+    )
+
+
+def test_the_prime_call_runs_before_the_timed_region():
+    """The first score_genes call in a process pays a fixed cost the rest do not.
+
+    Measured on pbmc3k with scanpy: 1.04 s for the first panel against 0.044 s
+    for the next two. Panels are scored smallest-first, so without a discarded
+    prime the K=25 column is that fixed cost plus the work and the three sizes
+    are not comparable to one another.
+    """
+    fn = _function_def(sg, "run_arm_once")
+    prime = [
+        n.lineno for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_prime"
+    ]
+    withs = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.With)]
+    assert prime, "run_arm_once must prime before timing"
+    assert withs, "expected a PeakRssSampler `with` block"
+    assert max(prime) < max(withs), "the prime must precede the timed region"
+
+
+# ---------------------------------------------------------------------------
+# AST helpers
+# ---------------------------------------------------------------------------
+
+def _function_def(mod, name: str) -> ast.FunctionDef:
+    return next(
+        n for n in ast.walk(_module_ast(mod))
+        if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+
+
+def _subscript_assign_guards(mod, subscript_key: str) -> list[str]:
+    """For each `x["<key>"] = ...`, the literal its enclosing `if` compares to.
+
+    Returns one entry per assignment. An assignment with no enclosing `if`
+    yields `None`, which is what makes "set unconditionally" visible rather
+    than simply absent from the result.
+    """
+    tree = _module_ast(mod)
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    guards: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        hit = any(
+            isinstance(t, ast.Subscript)
+            and isinstance(t.slice, ast.Constant)
+            and t.slice.value == subscript_key
+            for t in node.targets
+        )
+        if not hit:
+            continue
+        cur: ast.AST | None = node
+        found = None
+        while cur is not None:
+            cur = parents.get(cur)
+            if isinstance(cur, ast.If) and isinstance(cur.test, ast.Compare):
+                found = ast.unparse(cur.test.comparators[0])
+                break
+            if isinstance(cur, (ast.FunctionDef, ast.Module)):
+                break
+        guards.append(found)
+    return guards

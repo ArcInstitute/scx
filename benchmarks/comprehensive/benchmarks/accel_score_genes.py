@@ -16,8 +16,12 @@ is the default.
 
 Parity requires handing SCX scanpy's own control genes. SCX's sampler is
 deterministic but is not numpy's, so it draws a different control set and the
-scores differ by ~10 % of their range at the defaults; a Spearman floor over two
-different control sets measures nothing in particular. The wrinkle is that
+scores genuinely diverge. Measured on pbmc3k, SCX's own sampler against the
+scanpy reference gives Spearman 0.92 / 0.73 / 0.81 at K = 25 / 100 / 500 and a
+max absolute difference of ~5.9 on a score whose range is 16.4; passing
+scanpy's controls through `ctrl_genes=` gives 0.9999999 and ~1e-14. So the
+planned `min: 0.999` floor is reachable only by way of `ctrl_genes=`, and is
+not something the arm would pass by accident. The wrinkle is that
 **scanpy does not expose the set it drew** — `sc.tl.score_genes` only logs how
 many, and writes nothing to `uns` (verified against scanpy 1.12: `uns` is empty
 afterwards). So the reference child reaches into two private helpers,
@@ -331,6 +335,43 @@ def reference_failure_reason(outcome_stderr: str) -> str:
 # The measured work
 # ---------------------------------------------------------------------------
 
+def _prime(adata: Any, engine: str, method: str, meta: dict[str, Any]) -> None:
+    """Score a throwaway panel so the timed loop measures steady state.
+
+    Uses the smallest panel and the same code path the arm will take, then
+    deletes the column. Failures are swallowed: a prime that cannot run is not
+    a reason to fail the arm, and the arm itself will raise on the same call a
+    moment later with a better diagnostic.
+    """
+    smallest = min((int(k) for k in meta["panels"]), default=None)
+    if smallest is None:
+        return
+    genes = meta["panels"][str(smallest)]
+    if not genes:
+        return
+    try:
+        if engine == "pyscx":
+            import pyscx
+
+            kwargs: dict[str, Any] = {
+                "score_name": "_prime", "method": method, "device": "cpu",
+            }
+            if method == "control":
+                kwargs["ctrl_genes"] = meta["controls"][str(smallest)]
+            pyscx.accel.score_genes(adata, genes, **kwargs)
+        else:
+            import scanpy as sc
+
+            sc.tl.score_genes(
+                adata, genes, ctrl_size=CTRL_SIZE, n_bins=N_BINS,
+                random_state=SCORE_RANDOM_STATE, score_name="_prime",
+                use_raw=False,
+            )
+        adata.obs.drop(columns=["_prime"], inplace=True, errors="ignore")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("accel_score_genes: prime call failed (%s); continuing", exc)
+
+
 def run_arm_once(
     engine: str,
     method: str,
@@ -358,6 +399,14 @@ def run_arm_once(
         "n_obs": int(adata.n_obs), "n_vars": int(adata.n_vars),
     }
     scores: dict[str, np.ndarray] = {}
+
+    # Prime once, untimed, and throw the result away. The first
+    # `sc.tl.score_genes` call in a process pays a fixed cost the later ones do
+    # not — measured on pbmc3k at 1.04 s for the first panel against 0.044 s
+    # for the next two. The panels are scored smallest-first, so without this
+    # the K=25 column would be that fixed cost plus the work, on every arm, and
+    # the three sizes would not be comparable to each other.
+    _prime(adata, engine, method, meta)
 
     with PeakRssSampler() as outer:
         t_all = time.perf_counter()
