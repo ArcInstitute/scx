@@ -14,7 +14,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use scx_sparse::{
-    streaming_csr_to_csc_iter_with_cap, CscBuilder, CscBuilderConfig, MemSpillStore, ScxCsr,
+    compute_chunk_cols_with_cap, CscBuilder, CscBuilderConfig, MemSpillStore, ScxCsr,
 };
 
 /// OLD: collect (local_col, row, value) tuples then stable-sort by (col, row).
@@ -197,17 +197,21 @@ fn bench_full_build(c: &mut Criterion) {
 
         group.bench_function("chunked_transpose", |b| {
             b.iter(|| {
-                let mut it = streaming_csr_to_csc_iter_with_cap(
-                    black_box(&shards),
-                    n_rows,
-                    n_cols,
-                    usize::MAX,
-                    cols_per_shard,
-                )
-                .unwrap();
+                // The retired `streaming_csr_to_csc_iter_with_cap` loop,
+                // inline — the same convention `transpose_chunk_sort` above
+                // follows, and for the same reason: a baseline arm has to
+                // survive the deletion of the code it is a baseline for, or
+                // the comparison quietly stops being one.
+                let chunk_cols =
+                    compute_chunk_cols_with_cap(n_rows, usize::MAX, cols_per_shard).unwrap();
                 let mut total = 0usize;
-                for chunk in &mut it {
-                    total += chunk.unwrap().indices.len();
+                let mut col_start = 0usize;
+                while col_start < n_cols {
+                    let col_end = (col_start + chunk_cols).min(n_cols);
+                    let (_, indices, _) =
+                        transpose_chunk_scatter(black_box(&shards), col_start, col_end);
+                    total += indices.len();
+                    col_start = col_end;
                 }
                 total
             });

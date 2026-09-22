@@ -15,7 +15,8 @@
 
 use proptest::prelude::*;
 
-use scx_sparse::transpose::{csr_to_csc, streaming_csr_to_csc_iter_with_cap, CscArrays};
+use scx_sparse::transpose::{csr_to_csc, CscArrays};
+use scx_sparse::{CscBuilder, CscBuilderConfig, MemSpillStore};
 use scx_sparse::{ScxCsc, ScxCsr};
 
 // ---------------------------------------------------------------------------
@@ -133,49 +134,82 @@ proptest! {
         prop_assert_eq!(csr_dense, csc_dense);
     }
 
-    /// The streaming-with-cap transpose produces the same column-axis
-    /// arrays as the in-memory `csr_to_csc(...)`. We chain the
-    /// emitted shards back together (concatenating indices / data and
-    /// shifting indptr by the running nnz offset) and compare.
+    /// The chunked CSC build produces the same column-axis arrays as the
+    /// in-memory `csr_to_csc(...)`, across chunk widths and spill settings.
+    ///
+    /// Rewritten from the streaming transpose this crate used to export, whose
+    /// public API `CscBuilder` replaced. Two things changed with it, and both
+    /// were gaps: the source is now **split across several shards** rather
+    /// than fed as a single-shard slice (the old version said so — "the test
+    /// isn't about multi-shard reassembly" — which left the running row
+    /// offset, the thing most likely to be wrong, untested at this level), and
+    /// the spill threshold is swept so the concatenation is checked with the
+    /// records in RAM, on disk, and split across both.
+    ///
+    /// It stays an *integration* test, over the public surface only, which is
+    /// what distinguishes it from `csc_builder`'s own unit proptests: those
+    /// compare against the retained `transpose_column_chunk` oracle, and this
+    /// one against a whole-matrix transpose that shares no code with either.
     #[test]
-    fn streaming_chunked_matches_in_memory(
+    fn chunked_build_matches_in_memory(
         csr in arb_csr(20, 20, 8),
-        memory_cap_kb in 1u64..16,
+        n_shards in 1usize..=4,
         max_cols in 1usize..32,
+        spill_after in 0usize..512,
     ) {
         let in_memory = csr_to_csc(&csr);
-        let memory_cap = (memory_cap_kb * 1024) as usize;
         let n_rows = csr.shape.0;
         let n_cols = csr.shape.1;
 
-        // The iterator takes a `&[ScxCsr]` (treats each as a shard).
-        // We feed it as a single-shard slice; the test isn't about
-        // multi-shard reassembly (that's covered by Phase A tests).
-        let shards = vec![csr];
-        let it = streaming_csr_to_csc_iter_with_cap(
-            &shards,
-            n_rows,
-            n_cols,
-            memory_cap,
-            max_cols,
-        ).unwrap();
+        // Split the rows into `n_shards` parts, allowing empty ones: a part
+        // with no rows must advance the row cursor by zero, and a part with
+        // one row is the sharpest detector of an offset advanced wrongly.
+        let per = n_rows.div_ceil(n_shards);
+        let mut shards: Vec<scx_sparse::ScxCsr> = Vec::new();
+        let mut lo = 0usize;
+        while lo < n_rows || shards.is_empty() {
+            let hi = (lo + per).min(n_rows);
+            let (a, z) = (csr.indptr[lo] as usize, csr.indptr[hi] as usize);
+            let indptr: Vec<i64> = csr.indptr[lo..=hi].iter().map(|v| v - csr.indptr[lo]).collect();
+            shards.push(scx_sparse::ScxCsr::new_unchecked(
+                (hi - lo, n_cols),
+                indptr,
+                csr.indices[a..z].to_vec(),
+                csr.data[a..z].to_vec(),
+            ));
+            lo = hi;
+            if lo >= n_rows { break; }
+        }
+
+        let cfg = CscBuilderConfig {
+            cols_per_shard: max_cols,
+            memory_bytes: n_rows * 12 * 8,
+            spill_after_bytes: spill_after,
+            block_bytes: 8,
+            ..CscBuilderConfig::default()
+        };
+        let mut builder =
+            CscBuilder::new(n_rows, n_cols, cfg, Box::new(MemSpillStore::new())).unwrap();
+        let mut row_start = 0u64;
+        for shard in &shards {
+            builder.push_shard(row_start, shard).unwrap();
+            row_start += shard.n_rows() as u64;
+        }
+        let mut emitter = builder.finish().unwrap();
 
         let mut concat_indptr: Vec<i64> = vec![0];
         let mut concat_indices: Vec<i32> = Vec::new();
         let mut concat_data: Vec<f32> = Vec::new();
         let mut total_cols_emitted: usize = 0;
-        for chunk_res in it {
-            let chunk = chunk_res.unwrap();
-            // chunk.shape == (n_rows, chunk_n_cols)
-            prop_assert_eq!(chunk.shape.0, n_rows);
-            let chunk_cols = chunk.shape.1;
+        let (mut ip, mut ix, mut dt) = (Vec::new(), Vec::new(), Vec::new());
+        while emitter.next_shard_into(&mut ip, &mut ix, &mut dt).unwrap().is_some() {
             let base_nnz = *concat_indptr.last().unwrap();
-            for &p in &chunk.indptr[1..] {
-                concat_indptr.push(p + base_nnz);
+            for &pos in &ip[1..] {
+                concat_indptr.push(pos as i64 + base_nnz);
             }
-            concat_indices.extend_from_slice(&chunk.indices);
-            concat_data.extend_from_slice(&chunk.data);
-            total_cols_emitted += chunk_cols;
+            concat_indices.extend(ix.iter().map(|&v| v as i32));
+            concat_data.extend_from_slice(&dt);
+            total_cols_emitted += ip.len() - 1;
         }
         prop_assert_eq!(total_cols_emitted, n_cols);
 

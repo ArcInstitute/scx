@@ -13,7 +13,7 @@
 //! `validate_csc` can see it.
 
 use super::*;
-use crate::transpose::{csr_to_csc, streaming_csr_to_csc_iter_with_cap, CscArrays};
+use crate::transpose::{csr_to_csc, reference_chunks, CscArrays};
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -76,8 +76,13 @@ fn run(
     run_with(shards, n_rows, n_cols, c, Box::new(MemSpillStore::new())).map(|(o, _)| o)
 }
 
-/// The predecessor, driven exactly as production drives it: `current_col_start`
-/// read *before* `next`, chunk by chunk.
+/// The predecessor's per-chunk transpose, driven over the same column
+/// boundaries production uses.
+///
+/// `transpose::reference_chunks` is `transpose_column_chunk` plus the
+/// `compute_chunk_cols_with_cap` walk that used to wrap it — kept as
+/// `#[cfg(test)]` when the public streaming API was deleted, precisely so it
+/// can go on being the oracle here.
 fn reference(
     shards: &[ScxCsr],
     n_rows: usize,
@@ -85,18 +90,11 @@ fn reference(
     memory_bytes: usize,
     cols_per_shard: usize,
 ) -> Vec<(u64, CscArrays)> {
-    let mut it =
-        streaming_csr_to_csc_iter_with_cap(shards, n_rows, n_cols, memory_bytes, cols_per_shard)
-            .expect("reference iterator");
-    let mut out = Vec::new();
-    loop {
-        let col_start = it.current_col_start() as u64;
-        match it.next() {
-            Some(chunk) => out.push((col_start, chunk.expect("reference chunk"))),
-            None => break,
-        }
-    }
-    out
+    reference_chunks(shards, n_rows, n_cols, memory_bytes, cols_per_shard)
+        .expect("reference chunks")
+        .into_iter()
+        .map(|(col_start, chunk)| (col_start as u64, chunk))
+        .collect()
 }
 
 fn assert_same(got: &[(u64, CscArrays)], want: &[(u64, CscArrays)]) {
@@ -667,4 +665,84 @@ fn zero_and_usize_max_cols_per_shard_both_mean_no_cap() {
         assert_eq!(got.len(), 1, "cols_per_shard={cps}");
         assert_same(&got, &reference(&shards, 3, 6, 1 << 30, cps));
     }
+}
+
+// ---------------------------------------------------------------------------
+// At a shape where the spill actually engages
+// ---------------------------------------------------------------------------
+
+/// The proptest above runs at 18 x 14. This runs at a shape where the spill is
+/// doing real work — thousands of row blocks across dozens of buckets, several
+/// sealed blocks per bucket, and a budget that forces most of them out — and
+/// still demands element-for-element equality with the reference.
+///
+/// It is the one test that would notice a divergence which only appears once
+/// there is more than a handful of blocks per bucket: a sealed-block ordering
+/// bug, a bucket whose disk prefix and RAM tail are stitched the wrong way
+/// round at depth, or a `u32` row that only overflows past 65k. None of those
+/// can arise at proptest scale.
+///
+/// 3,000 x 600 at ~4 % density is ~72k nonzeros: large enough for all of that,
+/// small enough to stay a unit test.
+#[test]
+fn a_spilling_build_at_scale_matches_the_reference() {
+    const N_ROWS: usize = 3_000;
+    const N_COLS: usize = 600;
+
+    // Deterministic, and deliberately *skewed*: column `c` is hit roughly in
+    // proportion to `600 - c`, so the buckets are far from equal and the
+    // "spill the largest bucket" rule is actually exercised rather than
+    // draining a uniform set.
+    let mut shards = Vec::new();
+    let mut row = 0usize;
+    for rows in [777usize, 1, 1_222, 1_000] {
+        let mut indptr = vec![0i64];
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for r in row..row + rows {
+            let mut cols: Vec<usize> = (0..24)
+                .map(|k| (r * 31 + k * k * 7) % N_COLS)
+                .filter(|c| (r + c) % 3 != 0)
+                .collect();
+            cols.sort_unstable();
+            cols.dedup();
+            for c in &cols {
+                indices.push(*c as i32);
+                data.push((r * N_COLS + c + 1) as f32);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        shards.push(ScxCsr::new_unchecked((rows, N_COLS), indptr, indices, data));
+        row += rows;
+    }
+    assert_eq!(row, N_ROWS);
+    let nnz: usize = shards.iter().map(|s| s.nnz()).sum();
+    assert!(nnz > 40_000, "premise: {nnz} nonzeros is too few to spill");
+
+    let memory_bytes = N_ROWS * 12 * 40; // 40-column shards -> 15 of them
+    let cfg = CscBuilderConfig {
+        cols_per_shard: 64,
+        memory_bytes,
+        // A tenth of the payload, so most buckets spill and the ones that do
+        // not leave a RAM tail for a column's scatter to cross.
+        spill_after_bytes: nnz * SPILL_BYTES_PER_NNZ / 10,
+        target_buckets: DEFAULT_TARGET_BUCKETS,
+        block_bytes: 4096,
+    };
+
+    let (got, stats) =
+        run_with(&shards, N_ROWS, N_COLS, cfg, Box::new(MemSpillStore::new())).expect("builder");
+
+    // Premises, so a green run cannot mean "it never spilled": most of the
+    // payload left RAM, and it left in many blocks rather than one.
+    assert!(
+        stats.spilled_bytes > (nnz * SPILL_BYTES_PER_NNZ / 2) as u64,
+        "only {} of ~{} payload bytes spilled",
+        stats.spilled_bytes,
+        nnz * SPILL_BYTES_PER_NNZ
+    );
+    assert!(stats.n_buckets > 4, "{} buckets", stats.n_buckets);
+    assert!(got.len() > 8, "{} emitted shards", got.len());
+
+    assert_same(&got, &reference(&shards, N_ROWS, N_COLS, memory_bytes, 64));
 }

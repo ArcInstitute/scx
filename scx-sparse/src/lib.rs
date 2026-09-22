@@ -28,10 +28,7 @@ pub use moments::{
     first_non_finite_column, residual_lost_to_cancellation, ClosedFormVarianceHealth,
     ColumnMoments, CLOSED_FORM_VAR_REL_EPS,
 };
-pub use transpose::{
-    compute_chunk_cols_with_cap, streaming_csr_to_csc_iter_with_cap, CscArrays, CscShardIterator,
-    TransposeError,
-};
+pub use transpose::{compute_chunk_cols_with_cap, CscArrays, TransposeError};
 pub use umap_math::{compute_epochs_per_sample, find_ab_params, random_init_f32, random_init_f64};
 pub use validate::{
     canonicalize_csr, coalesce_sorted_coo, drop_explicit_zeros_inplace, is_canonical_csr,
