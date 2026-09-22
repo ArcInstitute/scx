@@ -589,3 +589,59 @@ fn streaming_tenx_keeps_the_eager_paths_input_gates() {
     assert!(msg.contains("CellBender"), "{msg}");
     assert!(msg.contains("cellbender-import"), "{msg}");
 }
+
+/// 10x streaming builds its sidecar in the same pass as X, byte-identical to
+/// the second pass (`rebuild_csc_inplace`) it replaced, with one catalog
+/// generation.
+#[test]
+fn streaming_tenx_csc_is_built_in_the_same_pass_as_x() {
+    let dir = tempfile::tempdir().unwrap();
+    let tenx = dir.path().join("in.h5");
+    write_tenx(&tenx, 16, 12, ShapeForm::Dataset, 3, |c, g| {
+        ((c * g) % 6 + 1) as f32
+    });
+    let opts = |csc| IngestOptions {
+        csc,
+        csc_cols_per_shard: 5,
+        ..IngestOptions::default()
+    };
+    let same = dir.path().join("same.scx");
+    tenx_to_scx_streaming(
+        &tenx,
+        &same,
+        &opts(crate::pipeline::CscPolicy::Always),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    let two = dir.path().join("two.scx");
+    let off = opts(crate::pipeline::CscPolicy::Off);
+    tenx_to_scx_streaming(&tenx, &two, &off, &mut WarningSink::log()).unwrap();
+    scx_ops::rebuild_csc_inplace(
+        &two,
+        off.csc_cols_per_shard,
+        &crate::budget::csc_sidecar_bytes(off.memory_budget).to_string(),
+        off.framing_preserving_codec(),
+        None,
+    )
+    .unwrap();
+
+    let csc = |p: &Path| -> Vec<(String, u64, [u8; 32])> {
+        ScxReader::open(p)
+            .unwrap()
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .map(|e| (e.name.clone(), e.length, e.checksum))
+            .collect()
+    };
+    assert!(csc(&same).len() > 1);
+    assert_eq!(csc(&same), csc(&two));
+    assert_eq!(
+        ScxReader::open(&same)
+            .unwrap()
+            .catalog()
+            .prev_catalog_offset,
+        0
+    );
+}

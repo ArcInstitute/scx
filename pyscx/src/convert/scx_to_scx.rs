@@ -375,6 +375,14 @@ pub(crate) fn route_scx_backed_to_scx(
         None => None,
     };
 
+    // The sidecar, when the policy asks for one, is built in the same pass
+    // as X — from the copied bytes on the passthrough branch, from the
+    // encoded shards otherwise — and emitted before the layers.
+    if csc_build {
+        writer
+            .enable_csc_sidecar(csc_build_options(csc_cols_per_shard))
+            .map_err(to_pyerr)?;
+    }
     if passthrough_ok {
         // Byte-passthrough. Iterate source CSR shards in row order;
         // copy each verbatim. `modality_id == None` is already
@@ -417,6 +425,7 @@ pub(crate) fn route_scx_backed_to_scx(
                 .map_err(to_pyerr)?;
         }
     }
+    py.detach(|| writer.emit_csc_sidecar()).map_err(to_pyerr)?;
 
     // Layers (decode-encode, never passthrough — keeps the byte
     // path bounded to X). `adata.layers` from a backed AnnData
@@ -470,26 +479,6 @@ pub(crate) fn route_scx_backed_to_scx(
         .map_err(to_pyerr)?;
 
     writer.finish().map_err(to_pyerr)?;
-
-    // Optional CSC sidecar rebuild over the just-written file.
-    if csc_build {
-        // The admissible framing for the sidecar (`Some` iff the output is
-        // v4). See `scx_ops::framing_for_csc_rebuild`.
-        let csc_framing = scx_ops::framing_for_csc_rebuild(std::path::Path::new(out_path));
-        py.detach(|| {
-            scx_ops::rebuild_csc_inplace(
-                std::path::Path::new(out_path),
-                csc_cols_per_shard,
-                "4G",
-                csc_framing,
-                // No `temp_dir` on this path; the spill root defaults to the
-                // output's own directory, which is where this write already is.
-                None,
-            )
-            .map_err(|e| e.to_string())
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
-    }
     Ok(())
 }
 
@@ -588,6 +577,11 @@ pub(crate) fn route_scx_lazy_to_scx(
     // `codec=` or per-shard adaptive, never the source's file header.
     let bounds = compute_wrapper_boundaries_lazy(lazy, shard_target_rows);
     let adata_x = adata.getattr("X")?;
+    if csc_build {
+        writer
+            .enable_csc_sidecar(csc_build_options(csc_cols_per_shard))
+            .map_err(to_pyerr)?;
+    }
     for (i, (start, end)) in bounds.iter().enumerate() {
         let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
         let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
@@ -606,6 +600,7 @@ pub(crate) fn route_scx_lazy_to_scx(
         py.detach(|| writer.write_preencoded_shard(pre))
             .map_err(to_pyerr)?;
     }
+    py.detach(|| writer.emit_csc_sidecar()).map_err(to_pyerr)?;
 
     // Layers — never transformed by the lazy X chain, so we just
     // stream them through the same decode-encode pipeline as X. The lazy path
@@ -683,25 +678,6 @@ pub(crate) fn route_scx_lazy_to_scx(
         .map_err(to_pyerr)?;
 
     writer.finish().map_err(to_pyerr)?;
-
-    if csc_build {
-        // The admissible framing for the sidecar (`Some` iff the output is
-        // v4). See `scx_ops::framing_for_csc_rebuild`.
-        let csc_framing = scx_ops::framing_for_csc_rebuild(std::path::Path::new(out_path));
-        py.detach(|| {
-            scx_ops::rebuild_csc_inplace(
-                std::path::Path::new(out_path),
-                csc_cols_per_shard,
-                "4G",
-                csc_framing,
-                // No `temp_dir` on this path; the spill root defaults to the
-                // output's own directory, which is where this write already is.
-                None,
-            )
-            .map_err(|e| e.to_string())
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
-    }
     Ok(())
 }
 
@@ -1027,4 +1003,15 @@ pub(crate) fn write_mapping_overrides(
         )?;
     }
     Ok(())
+}
+
+/// The same-pass sidecar's build options on the `from_anndata` SCX -> SCX
+/// paths: `build_csc`'s defaults (4 GiB, the output's directory for spill,
+/// framed iff the output is v4) at the caller's shard width — what the second
+/// pass these paths used to run over the finished file built.
+fn csc_build_options(cols_per_shard: usize) -> scx_format_io::CscBuildOptions {
+    scx_format_io::CscBuildOptions {
+        cols_per_shard,
+        ..Default::default()
+    }
 }

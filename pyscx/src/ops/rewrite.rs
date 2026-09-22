@@ -308,6 +308,7 @@ pub(crate) fn csc_carry_options(
         cols_per_shard: csc_cols_per_shard,
         memory_limit: csc_memory_limit.to_string(),
         temp_dir,
+        framing: None,
     })
 }
 
@@ -402,7 +403,7 @@ fn sort_csc_mode(py: Python<'_>, csc: &str, rebuild_csc: Option<bool>) -> PyResu
 #[pyo3(signature = (
     input, output, by, reverse=false, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    memory_budget=None, temp_dir=None, bitmap="off".to_string(), csc="carry".to_string(),
+    memory_budget=None, temp_dir=None, bitmap="off".to_string(), csc="carry",
     rebuild_csc=None, csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
     group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None,
     group_write_block_bytes=None,
@@ -423,7 +424,7 @@ pub fn sort(
     memory_budget: Option<String>,
     temp_dir: Option<String>,
     bitmap: String,
-    csc: String,
+    csc: &str,
     rebuild_csc: Option<bool>,
     csc_cols_per_shard: usize,
     csc_memory_limit: String,
@@ -462,7 +463,7 @@ pub fn sort(
     let temp_dir = temp_dir.map(PathBuf::from);
     // The sidecar builder spills where the sort's external partitions do.
     let csc = csc_carry_options(
-        &sort_csc_mode(py, &csc, rebuild_csc)?,
+        &sort_csc_mode(py, csc, rebuild_csc)?,
         csc_cols_per_shard,
         &csc_memory_limit,
         temp_dir.clone(),
@@ -546,7 +547,7 @@ pub fn sort(
 #[pyo3(signature = (
     input, output, seed=42, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    memory_budget=None, temp_dir=None, bitmap="off".to_string(), csc="carry".to_string(),
+    memory_budget=None, temp_dir=None, bitmap="off".to_string(), csc="carry",
     rebuild_csc=None, csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -564,7 +565,7 @@ pub fn shuffle(
     memory_budget: Option<String>,
     temp_dir: Option<String>,
     bitmap: String,
-    csc: String,
+    csc: &str,
     rebuild_csc: Option<bool>,
     csc_cols_per_shard: usize,
     csc_memory_limit: String,
@@ -579,7 +580,7 @@ pub fn shuffle(
     let shard_target_rows = validate_shard_size(shard_size)?.get();
     let temp_dir = temp_dir.map(PathBuf::from);
     let csc = csc_carry_options(
-        &sort_csc_mode(py, &csc, rebuild_csc)?,
+        &sort_csc_mode(py, csc, rebuild_csc)?,
         csc_cols_per_shard,
         &csc_memory_limit,
         temp_dir.clone(),

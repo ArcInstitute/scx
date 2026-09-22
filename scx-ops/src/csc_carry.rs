@@ -43,6 +43,10 @@ pub struct CscCarryOptions {
     pub memory_limit: String,
     /// Where the builder spills; `None` is the output's own directory.
     pub temp_dir: Option<PathBuf>,
+    /// Row-group framing for a sidecar on a v4 output; `None` is the default
+    /// config (see `CscBuildOptions::framing`). Only `scx convert` sets it, to
+    /// frame the sidecar at its `--row-group-rows`.
+    pub framing: Option<scx_format_io::FramingConfig>,
 }
 
 impl Default for CscCarryOptions {
@@ -52,6 +56,7 @@ impl Default for CscCarryOptions {
             cols_per_shard: 5000,
             memory_limit: "4G".to_string(),
             temp_dir: None,
+            framing: None,
         }
     }
 }
@@ -113,6 +118,7 @@ impl CscCarryOptions {
                 ))
             })?,
             spill_root: self.temp_dir.clone(),
+            framing: self.framing,
             ..Default::default()
         }))
     }

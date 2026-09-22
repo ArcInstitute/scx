@@ -283,10 +283,11 @@ pyscx.from_h5ad("very_large.h5ad", "very_large.scx",
                 codec="auto", csc="always")
 ```
 
-`csc="always"` performs a two-pass write: the streaming path emits CSR
-shards, then `scx_ops::rebuild_csc_inplace` appends the CSC sidecar to the
-just-written file in place — one extra read pass over the CSR, and no second
-copy of the file on disk.
+`csc="always"` builds the sidecar in the same pass as X: the writer pushes
+each streamed CSR shard into a `CscBuilder` and emits the CSC shards right
+after X — no extra read of the output and no second copy on disk. Under
+`memory_budget=`, the builder's buckets get a quarter of the budget (capped at
+what the builder would stage alone) and ingest sizes itself against the rest.
 
 Limitations:
 

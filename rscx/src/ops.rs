@@ -379,6 +379,9 @@ fn scx_merge_impl(
         shard_target_rows: None,
         sort_by: sort_by.iter().map(|s| s.to_string()).collect(),
         sort_reverse: reverse,
+        // Carry a CSC sidecar iff an input had one, built in the same pass;
+        // `scx_merge()` exposes no `csc` argument yet.
+        csc: Default::default(),
     };
 
     scx_ops::merge_with_options(&input_refs, Path::new(output), &options)

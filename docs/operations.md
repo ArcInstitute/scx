@@ -36,16 +36,16 @@ rollback`. Copy out first if you want a way back.
 
 | Operation | Writes | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes | Deletion vectors |
 |-----------|--------|---------------|--------------|--------------|-------------|-------------------|-------------------|
-| **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows | **Preserved** (deleted rows keep their global indices; appended rows are live) |
+| **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) unless `--rebuild-csc`, which runs an in-place rebuild after the append | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows | **Preserved** (deleted rows keep their global indices; appended rows are live) |
 | **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged | **Written** (this is the op that creates them) |
 | **modify_metadata** / **set_uns** / **update_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied — `n_obs_physical` rows as handed in, or the live `n_obs` rows scattered onto the physical axis (deleted rows `null`, barcode kept); a supplied `obsm` (always physical-length) sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
-| **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deleted rows are dropped and no vector is emitted. This is the op that materializes deletions |
-| **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), and the per-shard column stats are **carried from the input** (rows are 1:1, so the input's stats are exactly right for the output's shards), so **Level-1** pruning survives. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
-| **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able; **refuses multimodal input** | Decoded, **canonicalized** and re-emitted **unframed** (per-shard codec preserved; canonicalizing can change `nnz`); a file already newer than the target (v4) is **declined**. `varm`, `obsp`, `varp`, `.raw` and the group index are **carried**; detection bitmaps are carried too unless canonicalizing actually rewrote X, in which case they are dropped with a warning — see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** when canonicalizing left the matrix unchanged (every file a current writer produces) — the one op that carries the sidecar through rather than dropping it. **Dropped with a warning** when canonicalizing actually rewrote X, since the sidecar is then a view of a different matrix | Sections **copied verbatim** by `copy_auxiliary_sections_canonicalizing`, and the per-shard catalog column stats are **carried from the input** (a 1:1 re-emit), so **Level-1** shard pruning survives (`build-csc` never touches them at all). See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
-| **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata; an `obsm` key some inputs lack is a **hard error** naming the input | Writes merged; `varm` / `varp` come from input 0 | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Carried**, with each input's rows offset into the merged row space (a sorted merge follows the merge permutation). Physical rows are all retained — run `compact` to reclaim them |
-| **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — a subset builds a new row space, so deleted cells are excluded (whether or not `--filter` is given, and intersected with it when it is) |
-| **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Always rebuilt** — the `--by` key(s) are force-added to the index regardless of `--index-*` flags (there is no way to opt out); `--index-obs` / `--index-var` / `--index-preset` add further columns on top | **Applied** — deletions are materialized away by the reorder |
-| **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them | **Applied** — as for `sort` |
+| **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Carried** — rebuilt from the output's X in the same pass iff the input had one (`--csc carry`, the default); `--csc always` builds one regardless, `--csc off` drops it; a multimodal input's sidecars are dropped with a warning | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deleted rows are dropped and no vector is emitted. This is the op that materializes deletions |
+| **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Carried** as for `compact` (rebuilt from the re-canonicalized X, so a changed `nnz` cannot leave it stale) | Sections **preserved** (rows + shard boundaries unchanged), and the per-shard column stats are **carried from the input** (rows are 1:1, so the input's stats are exactly right for the output's shards), so **Level-1** pruning survives. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
+| **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able; **refuses multimodal input** | Decoded, **canonicalized** and re-emitted **unframed** (per-shard codec preserved; canonicalizing can change `nnz`); a file already newer than the target (v4) is **declined**. `varm`, `obsp`, `varp`, `.raw` and the group index are **carried**; detection bitmaps are carried too unless canonicalizing actually rewrote X, in which case they are dropped with a warning — see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** when canonicalizing left the matrix unchanged (every file a current writer produces) — the one rewrite op that carries the input's sidecar through verbatim rather than rebuilding it (the other rewrite ops build a fresh one in the same pass) or dropping it. **Dropped with a warning** when canonicalizing actually rewrote X, since the sidecar is then a view of a different matrix | Sections **copied verbatim** by `copy_auxiliary_sections_canonicalizing`, and the per-shard catalog column stats are **carried from the input** (a 1:1 re-emit), so **Level-1** shard pruning survives (`build-csc` never touches them at all). See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
+| **merge** | New file (`<OUTPUT>` required) | Writes new output combining all inputs | Writes merged metadata; an `obsm` key some inputs lack is a **hard error** naming the input | Writes merged; `varm` / `varp` come from input 0 | **Carried** as for `compact`, iff **any** input had one | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Carried**, with each input's rows offset into the merged row space (a sorted merge follows the merge permutation). Physical rows are all retained — run `compact` to reclaim them |
+| **subset** | New file (`<OUTPUT>` required, optional with `--dry-run`) | Writes new output with matching rows | Writes subset metadata | Writes subset | **Carried** as for `compact`; with `--modality NAME` (a single-modality output) it follows that modality's own sidecar, and `--csc always` works | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — a subset builds a new row space, so deleted cells are excluded (whether or not `--filter` is given, and intersected with it when it is) |
+| **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Carried** as for `compact` | **Always rebuilt** — the `--by` key(s) are force-added to the index regardless of `--index-*` flags (there is no way to opt out); `--index-obs` / `--index-var` / `--index-preset` add further columns on top | **Applied** — deletions are materialized away by the reorder |
+| **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Carried** as for `compact` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them | **Applied** — as for `sort` |
 | **build-csc** | In place (an append — rollback-able), or with `<OUTPUT>` a copy of the input plus the same append | **Untouched** — no CSR shard is rewritten, so framing, codecs and per-shard stats are exactly the input's | **Untouched** | **Untouched** | **Built** (this is the op that creates it); an existing sidecar is replaced, its bytes left for `compact` to reclaim | **Untouched**, and so are the per-shard column stats Level-1 pruning reads | **Untouched** (the CSC sidecar is built over the physical rows, which the vector still indexes correctly) |
 | **obs-import** / **doublet-import** / **attach_obs_columns** | In place (`<FILE> <SOURCE>` / `pyscx.attach_obs_columns(path, df)`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides). The per-shard catalog column stats are cleared **per rewritten column** — see the note below | **Preserved** (X untouched) |
 | **var-import** / **attach_var_columns** | In place (`<FILE> <SOURCE>` / `pyscx.attach_var_columns(path, df)`) | **Unchanged** (never read or rewritten) | **Preserved** (never read or rewritten) | Replaced (same `n_vars`, plus the new columns); a sharded var keeps its shard boundaries, a single section stays one section | **Preserved** (X untouched) | The **obs** index and the per-shard obs column stats are untouched — this op writes no obs column. The **var** index survives a pure column *add* and is **rebuilt** (not dropped) when `overwrite` rewrites a column it covers; there are no per-shard var column stats to clear | **Preserved** (X untouched) |
@@ -194,8 +194,8 @@ Two consequences worth knowing:
   excluding deleted rows would mean decoding the matrix — so on a file with
   deletions it exceeds the nnz of what a read returns.
 - `build-csc` carries deletions rather than applying them, so that
-  `mark_deleted` → `build-csc` — the documented way to restore a sidecar a
-  mutating op dropped — cannot un-delete anything. (It is also rollback-able
+  `mark_deleted` → `build-csc` — the documented way to restore a sidecar an
+  `append` dropped — cannot un-delete anything. (It is also rollback-able
   now, being an append; it was not while it rewrote the file.)
 
 `rscx`'s backed and lazy handles (`scx_backed_sparse()`, `scx_lazy_transform()`)
@@ -308,15 +308,52 @@ Detection bitmaps are a separate case, because what invalidates them is not the
 allowlist but the canonicalization: see the note above. When canonicalizing
 actually rewrites X, the sidecar is dropped with its own warning.
 
-### Restoring CSC after a mutating operation
+### CSC survives mutating operations
 
-When a mutating operation drops the CSC sidecar, it emits a warning:
+The copy-out rewrite ops — `compact`, `merge` (concat, raw-copy fast path and
+`--sort-by`), `optimize`, `sort` (including `--shuffle`, every strategy) and
+`subset` — **carry** the CSC sidecar by default. The input's sidecar is never
+copied: its row indices are stale once rows move, drop or re-canonicalize.
+Instead the writer pushes every X CSR shard it writes into a `CscBuilder`
+(`ScxWriter::enable_csc_sidecar`) and emits the sidecar right after X, before
+layers and `obsm`. There is no second read of the output and no staged copy,
+and the sidecar is byte-identical to the one `scx build-csc` would append to
+the finished output at the same `--csc-cols-per-shard` / `--csc-memory-limit`.
+`adata.raw` and layers are not pushed, and a layer's CSC sidecar is still
+dropped.
+
+`--csc carry|always|off` (pyscx `csc=`) chooses:
+
+- `carry` (default) — the output gets a sidecar iff the input had one (for
+  `merge`, iff **any** input had one).
+- `always` — build one whether or not an input had one.
+- `off` — build none.
+
+`--csc-cols-per-shard` (default 5000) and `--csc-memory-limit` (default `4G`)
+are `scx build-csc`'s parameters for that build. The builder's column buckets
+(bounded by half of `--csc-memory-limit`) are live during the op's X pass
+rather than after it, and are released when the sidecar is emitted, before the
+rest of the output is written. A sidecar built this way is fresh
+(`csc_build_generation == data_generation`) and leaves no `build-csc`
+provenance entry or extra catalog generation. `--rebuild-csc` (pyscx
+`rebuild_csc=True` on `sort` / `shuffle`) is kept as a deprecated alias for
+`--csc always`; combining it with `--csc` is a usage error.
+
+**Multimodal inputs** are not covered yet: the builder is single-modality. Under
+`carry` a multimodal input's per-modality sidecars are dropped with a warning,
+and `--csc always` is refused before the output is created. `subset --modality
+NAME` is the exception — its output is single-modality, so `carry` follows the
+extracted modality's own sidecar and `always` works.
+
+**`append` still drops the sidecar**, because it extends the file in place and
+carrying one would be a full rebuild per append. It warns:
 
 ```
 log::warn!("append dropped 1 CSC shards from experiment.scx: rerun `scx build-csc` (or pass --rebuild-csc) to restore the column-major sidecar")
 ```
 
-To restore:
+To restore after an `append` (or to add a sidecar to a file that never had
+one):
 
 ```bash
 # Standalone build, in place — omit <OUTPUT>. Appends the sidecar and repoints
@@ -327,17 +364,20 @@ scx build-csc experiment.scx
 # Or write a copy, leaving the input alone
 scx build-csc experiment.scx experiment_with_csc.scx
 
-# Or pass --rebuild-csc to the mutating operation
-scx compact experiment.scx compacted.scx --rebuild-csc
+# Or rebuild in place as part of the append
+scx append experiment.scx more_cells.scx --rebuild-csc
+
+# Or have a rewrite op build one in its own pass
+scx compact experiment.scx compacted.scx --csc always
 ```
 
 The Python API exposes `pyscx.build_csc(input, output=None, memory_limit="4G", force=False, csc_cols_per_shard=5000)`
 for standalone builds — `output=None` (the default) appends the sidecar in
 place, and a path writes a copy. Alternatively, set `csc="always"` at conversion time
 via `pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
-initial write, or pass `rebuild_csc=True` to mutating operations like `pyscx.sort(..., rebuild_csc=True)`.
+initial write, or pass `csc="always"` to a rewrite op such as `pyscx.sort(..., csc="always")`.
 
-Neither form can change the input's row-group framing, because neither writes a
+Neither `build-csc` form can change the input's row-group framing, because neither writes a
 CSR shard: the sidecar is framed iff the file is v4, and asking to frame one on
 an unframed (≤ v3) file is refused, pointing at `scx optimize` — unless the
 matrix is empty and carries no sidecar, which is a no-op before any check. Callers derive
@@ -555,7 +595,7 @@ existing values, drop or retype columns, or respec the index.
 | **`var`** | O(n_vars) | Single `VarMetadata` section. Must match `n_vars`. |
 | **`obsm` / `varm`** | O(replaced matrices) | Only the named matrices are rewritten; other keys pass through. |
 | **`obsp` / `varp`** | O(1) | Not replaceable here — existing sections (`ObspEmbedding` / `VarpEmbedding` and their shards) pass through unchanged. |
-| **CSC sidecar** | **Preserved** | `data_generation` / `csc_build_generation` are left unchanged, so a pre-existing CSC sidecar stays valid — no `--rebuild-csc` needed. |
+| **CSC sidecar** | **Preserved** | `data_generation` / `csc_build_generation` are left unchanged, so a pre-existing CSC sidecar stays valid — no rebuild needed. |
 | **Predicate indexes** | O(n_obs)/O(n_vars) when the axis is replaced and indexed | The old section describes values that are gone, so it is rebuilt over the columns the file already indexed — the replaced axis keeps its pushdown rather than silently losing it. `--index-obs` / `--index-var` / `--index-preset` name a different set instead. Untouched (O(1)) when only `uns`/`obsm`/`varm` change, or when the axis had no index. |
 
 **Invariants (validated, never changed)**: `n_obs`, `n_vars`, `nnz`,
@@ -620,9 +660,9 @@ the mutating ops treat it consistently:
 - **build-csc** on an empty matrix (0 rows or 0 columns) writes no sidecar but
   still produces the requested output — a verbatim copy, or, for a file that
   carries a stale sidecar from an older writer, an in-place commit that drops
-  it (undoable with `scx rollback`) — so
-  `--rebuild-csc` / `rebuild_csc=True` on a rewrite that yielded zero rows
-  succeeds. `input` and `output` naming the same file through different
+  it (undoable with `scx rollback`) — so running it on a rewrite's 0-row
+  output succeeds. Likewise a rewrite op under `--csc always` that yields zero
+  rows succeeds and writes no sidecar. `input` and `output` naming the same file through different
   spellings is refused (omit `<OUTPUT>` for the in-place form). `CscPolicy` never builds a sidecar
   on an empty matrix, whatever `csc=` says, and nothing warns about it.
 - **predicate indexes** are never built over a 0-row obs (or a 0-row var):
@@ -653,8 +693,11 @@ Unlike `compact`, `optimize` is a faithful 1:1 upgrade:
 - It **does** re-canonicalize every shard (sorting indices, summing duplicate
   coordinates, dropping explicit zeros), so nnz may legitimately drop.
 
-The CSC sidecar is dropped (re-canonicalizing can change nnz and would leave the
-column-major sidecar referencing stale offsets) — rerun `scx build-csc`.
+The input's CSC sidecar is not copied (re-canonicalizing can change nnz and
+would leave it referencing stale offsets); under `--csc carry` (the default) a
+new one is built from the re-canonicalized X in the same pass, `--csc always`
+builds one regardless, and `--csc off` drops it — see
+[CSC survives mutating operations](#csc-survives-mutating-operations).
 Multimodal inputs are rejected with a message pointing at `scx compact`. An
 in-place invocation (`--output` == input) is safe: the writer stages a sibling
 tempfile and atomically renames over the target. Verify the result with

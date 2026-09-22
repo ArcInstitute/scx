@@ -81,7 +81,7 @@ pub(crate) fn to_pyerr(e: ScxError) -> PyErr {
     }
     match e.class() {
         // Bad input / inconsistent data (incl. the stale-sidecar error, whose
-        // message already names the fix `scx build-csc` / `--rebuild-csc`).
+        // message already names the fix, `scx build-csc`).
         ScxErrorClass::Validation => PyValueError::new_err(msg),
         // File looks corrupt or was written by an incompatible/newer SCX.
         // ValueError (not RuntimeError) so callers can distinguish a bad

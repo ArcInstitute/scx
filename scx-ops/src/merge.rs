@@ -1110,8 +1110,8 @@ fn merge_multimodal(
         ..Default::default()
     };
 
-    // As with single-modality merge: new CSR shards, CSC dropped — bump
-    // past the max input generation.
+    // As with single-modality merge: new CSR shards — bump past the max
+    // input generation. (No sidecar is built here; see the doc above.)
     let merged_data_generation = readers
         .iter()
         .map(|r| r.catalog().data_generation)

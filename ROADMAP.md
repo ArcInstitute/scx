@@ -279,7 +279,7 @@ scGPT train end-to-end on atlas-scale SCX data.
 - [x] GPU sparse-to-dense (CSR→dense) scatter kernel — serves the **analysis** paths (GPU DE gene-major scatter, `to_gpu_anndata` device handoff). **Not** wired into the CPU training loader, whose decode + dense-scatter stay on host (`scx-loader` `io_stage`/`decode_stage`). Loader-side device decode (Phase D) was profiled (D0, 2026-07-09) and **deferred**: post-SIMD ShufDeltaZstd CPU decode is only ~9% over Scx1, loader back-pressure ≈ 0, and GPU util ≈ 0% — host-bounce is not the measured training ceiling. A `gpu`-gated `scx-loader → scx-gpu` feature edge (D1) exists as scaffolding.
 
 ### 3.2 scx-cli (extended) — COMPLETE
-- [x] `scx build-csc input.scx [output.scx]` — one-pass streaming transpose, appended to the file in place (rollback-able; copy-out with `output`). **Fully integrated** end-to-end: write-time CSC at `scx convert --csc=always` / `pyscx.from_anndata(csc="always")` / 10x / MTX import; multi-shard CSC (`--csc-cols-per-shard`, default 5000); column-major streaming via `BackedCscReader` + `ColumnShardSource` trait; consumer dispatch via `prefer_format="csc"` on HVG / DE / pseudobulk / QC / col_aggs; `scx info` per-shard layout; `scx validate` BLAKE3 coverage; mutating ops drop CSC by default with `--rebuild-csc` opt-in. See [docs/sharding.md § CSC sharding](docs/sharding.md#csc-sharding) and [docs/scanpy.md § prefer_format](docs/scanpy.md#prefer_formatautocsrcsc-column-major-dispatch).
+- [x] `scx build-csc input.scx [output.scx]` — one-pass streaming transpose, appended to the file in place (rollback-able; copy-out with `output`). **Fully integrated** end-to-end: write-time CSC at `scx convert --csc=always` / `pyscx.from_anndata(csc="always")` / 10x / MTX import; multi-shard CSC (`--csc-cols-per-shard`, default 5000); column-major streaming via `BackedCscReader` + `ColumnShardSource` trait; consumer dispatch via `prefer_format="csc"` on HVG / DE / pseudobulk / QC / col_aggs; `scx info` per-shard layout; `scx validate` BLAKE3 coverage; rewrite ops (`compact` / `merge` / `optimize` / `sort` / `subset`) carry CSC by default, rebuilt in the same pass as X (`--csc carry|always|off`); `append` drops it (`--rebuild-csc` rebuilds in place). See [docs/sharding.md § CSC sharding](docs/sharding.md#csc-sharding) and [docs/scanpy.md § prefer_format](docs/scanpy.md#prefer_formatautocsrcsc-column-major-dispatch).
 - [x] `scx benchmark experiment.scx` — I/O + pipeline benchmarks
 - [x] `scx subset` — extract cell/gene subsets to new file
 - [x] `scx upgrade input.scx output.scx` — rewrite to latest format version (docs/format.md (Versioning))
@@ -368,7 +368,8 @@ are not exposed in R and are tracked here rather than implemented:
   input. `scx-ops::compact_multimodal` applies the deletion-vector
   keep mask across every modality's CSR shards and per-modality
   layers; the modality table and per-modality var/obsm/uns are
-  preserved; CSC sidecars are dropped (rebuild via `--rebuild-csc`).
+  preserved; CSC sidecars are dropped with a warning (the same-pass
+  sidecar build is single-modality, so `--csc always` is refused).
 - [x] Per-modality CSC sidecar preservation on `scx append`.
   `scx append --modality M` invalidates `HAS_CSC` only on the target
   modality; other modalities' CSC sections are preserved verbatim.

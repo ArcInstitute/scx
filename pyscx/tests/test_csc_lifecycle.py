@@ -4,8 +4,9 @@ Walks the user-visible end-to-end CSC story:
 
 1. Convert AnnData → SCX with `csc="always"` and inspect via the
    on-disk file (CSC catalog entries present, has_csc flag set).
-2. Mutating ops (append/compact via the underlying scx-ops API)
-   drop the CSC sidecar by default.
+2. The rewrite ops (compact, merge, optimize, sort, shuffle) carry the
+   sidecar by default — rebuilt from their output in the same pass —
+   and `csc="off"` drops it; `append` still drops it.
 3. Round-tripping through `pyscx.open` + `to_anndata(backed=True)`
    preserves CSC.
 
@@ -377,3 +378,88 @@ def test_build_csc_rejects_bad_memory_limit(small_adata, tmp_path):
     # Decimal "GB" is rejected as ambiguous by the size parser -> ValueError.
     with pytest.raises(ValueError):
         pyscx.build_csc(str(src), str(out), memory_limit="4GB")
+
+
+# ---------------------------------------------------------------------------
+# The rewrite ops carry the sidecar: `csc="carry"` (default), "always", "off".
+# ---------------------------------------------------------------------------
+
+
+def _col_sums_agree(path):
+    """The sidecar serves the same column sums as the CSR it mirrors."""
+    import pyscx
+
+    adata = pyscx.open(str(path)).to_anndata(backed=True)
+    csr_sums = pyscx.accel.col_sums(adata.X, prefer_format="csr")
+    csc_sums = pyscx.accel.col_sums(adata.X, prefer_format="csc")
+    np.testing.assert_allclose(csr_sums, csc_sums, atol=1e-9)
+
+
+def _rewrites(pyscx, src, out, **kw):
+    """Each rewrite op, as a callable writing `out` from `src`."""
+    return {
+        "compact": lambda: pyscx.compact(src, out, **kw),
+        "sort": lambda: pyscx.sort(src, out, by=["cell_id"], **kw),
+        "shuffle": lambda: pyscx.shuffle(src, out, seed=1, **kw),
+        "optimize": lambda: pyscx.optimize(src, out, **kw),
+        "merge": lambda: pyscx.merge([src, src], out, **kw),
+    }
+
+
+@pytest.mark.parametrize("op", ["compact", "sort", "shuffle", "optimize", "merge"])
+def test_rewrite_ops_carry_the_sidecar_by_default(small_adata, tmp_path, op):
+    import pyscx
+
+    src = str(tmp_path / "src.scx")
+    pyscx.from_anndata(small_adata, src, csc="always", csc_cols_per_shard=5)
+
+    out = str(tmp_path / f"{op}_carry.scx")
+    _rewrites(pyscx, src, out)[op]()
+    assert pyscx.open(out).has_csc, f"{op} must carry the sidecar"
+    _col_sums_agree(out)
+
+    off = str(tmp_path / f"{op}_off.scx")
+    _rewrites(pyscx, src, off, csc="off")[op]()
+    assert not pyscx.open(off).has_csc, f'{op}: csc="off" must drop it'
+
+
+@pytest.mark.parametrize("op", ["compact", "sort", "shuffle", "optimize", "merge"])
+def test_rewrite_ops_build_a_sidecar_only_when_asked(small_adata, tmp_path, op):
+    import pyscx
+
+    src = str(tmp_path / "src.scx")
+    pyscx.from_anndata(small_adata, src)
+
+    out = str(tmp_path / f"{op}_plain.scx")
+    _rewrites(pyscx, src, out)[op]()
+    assert not pyscx.open(out).has_csc, f"{op}: carry must not invent one"
+
+    always = str(tmp_path / f"{op}_always.scx")
+    _rewrites(pyscx, src, always, csc="always")[op]()
+    assert pyscx.open(always).has_csc
+    _col_sums_agree(always)
+
+
+def test_rewrite_csc_rejects_an_unknown_mode(small_adata, tmp_path):
+    import pyscx
+
+    src = str(tmp_path / "src.scx")
+    pyscx.from_anndata(small_adata, src)
+    with pytest.raises(ValueError, match="carry"):
+        pyscx.compact(src, str(tmp_path / "out.scx"), csc="yes")
+
+
+def test_sort_rebuild_csc_is_deprecated(small_adata, tmp_path):
+    """`rebuild_csc=True` still builds one (as `csc="always"`), with a
+    DeprecationWarning; passing it beside `csc=` is an error."""
+    import pyscx
+
+    src = str(tmp_path / "src.scx")
+    pyscx.from_anndata(small_adata, src)
+    out = str(tmp_path / "sorted.scx")
+    with pytest.warns(DeprecationWarning, match="rebuild_csc"):
+        pyscx.sort(src, out, by=["cell_id"], rebuild_csc=True)
+    assert pyscx.open(out).has_csc
+
+    with pytest.raises(ValueError, match="not both"):
+        pyscx.sort(src, str(tmp_path / "x.scx"), by=["cell_id"], rebuild_csc=True, csc="off")

@@ -9,8 +9,9 @@
 //! * the CSC entries to agree on `(name, length, checksum)`, i.e. the same
 //!   bytes, so the same-pass sidecar is not merely *a* transpose but the one
 //!   users already had;
-//! * every other entry to agree between the two op runs, so building the
-//!   sidecar changes nothing else in the output;
+//! * every other entry but provenance (a wall-clock timestamp) to agree
+//!   between the two op runs, so building the sidecar changes nothing else in
+//!   the output;
 //! * the sidecar to be the output's own transpose, and fresh.
 //!
 //! Each X write path the writer feeds is reached by at least one op: compact,
@@ -20,7 +21,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use common::fixture_all_families;
 use scx_format_io::section::SectionType;
@@ -46,6 +47,9 @@ fn entries(path: &Path, want_csc: bool) -> Vec<Entry> {
         .entries
         .iter()
         .filter(|e| (e.section_type == SectionType::CscShard) == want_csc)
+        // Provenance carries a wall-clock timestamp, so two runs of one op
+        // can differ in it across a second boundary.
+        .filter(|e| e.section_type != SectionType::Provenance)
         .map(|e| (e.name.clone(), e.section_type, e.length, e.checksum))
         .collect();
     v.sort_by(|a, b| a.0.cmp(&b.0));
@@ -76,20 +80,6 @@ fn assert_csc_is_the_transpose(path: &Path) {
         "{}: a same-pass sidecar is fresh",
         path.display()
     );
-}
-
-/// Give `path` a sidecar the way a user would, so the ops see one to carry.
-fn with_sidecar(path: PathBuf) -> PathBuf {
-    scx_ops::rebuild_csc_inplace(
-        &path,
-        COLS,
-        "4G",
-        scx_ops::framing_for_csc_rebuild(&path),
-        None,
-    )
-    .unwrap();
-    assert!(ScxReader::open(&path).unwrap().header().has_csc());
-    path
 }
 
 /// Run `op` with `--csc always` and with `--csc off` + a second pass, and
@@ -258,7 +248,7 @@ fn carry_is_the_default_and_follows_the_input() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let plain = fixture_all_families(d, "plain.scx");
-    let carried = with_sidecar(fixture_all_families(d, "carried.scx"));
+    let carried = common::fixture_all_families_with_csc(d, "carried.scx", COLS);
 
     for (src, want) in [(&plain, false), (&carried, true)] {
         let out = d.join("compact_default.scx");

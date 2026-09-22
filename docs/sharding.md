@@ -78,8 +78,10 @@ the pushdown instead.
 Sorting is **stable** (equal keys keep their original order) and **deterministic**
 (same input + flags ⇒ byte-identical output, modulo the provenance timestamp).
 Deletions are materialized away first (the output is dense and deletion-free).
-The CSC sidecar and detection bitmap are dropped by default; pass `--rebuild-csc`
-/ `--bitmap auto|always` to re-emit them on the sorted output.
+The CSC sidecar is carried by default — rebuilt from the sorted X in the same
+pass iff the input had one (`--csc carry|always|off`). The detection bitmap is
+dropped by default; pass `--bitmap auto|always` to re-emit it on the sorted
+output.
 
 **Output size is not guaranteed neutral.** A sort is a row permutation, not a
 recompression pass: `scx1`-coded X is size-neutral (each row's gene indices are
@@ -114,7 +116,7 @@ scx sort --by cell_type --index-obs cell_type input.scx sorted.scx
 scx sort --by cell_type,donor_id input.scx out.scx
 scx sort --by n_genes --reverse input.scx out.scx
 scx sort --by cell_type --memory-budget 8G --temp-dir /scratch in.scx out.scx
-scx sort --by cell_type --rebuild-csc --bitmap auto in.scx out.scx
+scx sort --by cell_type --csc always --bitmap auto in.scx out.scx
 ```
 
 ```python
@@ -244,8 +246,8 @@ batch composition. Pass `--shard-size <input's value>` to reorder only; the
 command warns when the two differ.
 
 Everything else behaves exactly as a key sort: deletions are materialized away,
-the CSC sidecar and detection bitmap are dropped unless `--rebuild-csc` /
-`--bitmap` is passed, `adata.raw` is not preserved, obsm/obsp/layers are
+the CSC sidecar is carried (rebuilt in the same pass; `--csc off` drops it),
+the detection bitmap is dropped unless `--bitmap` is passed, `adata.raw` is not preserved, obsm/obsp/layers are
 remapped, and multimodal inputs reorder every modality in lockstep.
 
 ## CLI commands
@@ -767,8 +769,8 @@ grouped archives stay readable.
 > on-disk size, so tools assign groups to shards
 > differently while agreeing on order, roles, and per-label ranges.
 
-CSC sidecars are dropped by the reorder as usual — pass
-`--group-by … --rebuild-csc`. Grouping is single-modality only in v1.
+CSC sidecars are carried through the reorder as for any sort (rebuilt in the
+same pass; `--csc off` drops them). Grouping is single-modality only in v1.
 
 Convert-time grouping (`scx convert --group-by`) picks a one-pass or two-pass
 route: `--group-pass auto` (default) streams CSR X in one pass and routes dense
@@ -1109,7 +1111,7 @@ CSC shards (8 total):  │ 0..5K│5..10K│10..15│15..20│20..25│25..30│
 
 `scx build-csc --csc-cols-per-shard N` and the matching kwargs on
 `pyscx.from_anndata`, `scx convert --csc-cols-per-shard`, and the
-`--rebuild-csc` flag on mutating ops all default to **5000 columns
+`--csc-cols-per-shard` flag on the rewrite ops all default to **5000 columns
 per shard**. Pass `0` for no cap (single CSC shard, memory permitting
 — the streaming transpose will still chunk internally to respect the
 `--memory-limit` budget).
@@ -1192,14 +1194,20 @@ per-shard `cols a..b ({n} cols), nnz N` block when there are multiple
 CSC shards. The JSON output (`scx info --json`) gains a `csc_layout`
 array with `name`, `col_start`, `col_end`, `nnz` per shard.
 
-### Mutating ops drop CSC by default
+### Rewrite ops carry CSC by default
 
-`scx append`, `scx compact`, `scx merge`, and `scx subset` change the
-row layout (or the column index space, in subset's case), so the
-existing CSC `indices` arrays would silently reference stale rows /
-columns. Each op therefore drops the CSC sidecar by default and emits
-a `log::warn!` message. Pass `--rebuild-csc` to append a fresh sidecar to
-the post-op output in place, as `scx build-csc` does.
+`scx compact`, `scx merge`, `scx optimize`, `scx sort` and `scx subset`
+change the row layout (or the column index space, in subset's case, or
+`nnz`, in optimize's), so the input's CSC `indices` arrays would silently
+reference stale rows / columns and are never copied. Instead each op builds a
+fresh sidecar from the output's own X shards in the same pass that writes
+them — no second read of the output — iff an input had one (`--csc carry`, the
+default); `--csc always` builds one regardless and `--csc off` drops it. A
+multimodal input's sidecars are dropped with a warning under `carry`, and
+`--csc always` on one is refused before the output is created. `scx append`
+still drops the sidecar with a `log::warn!` message; `append --rebuild-csc`
+rebuilds it in place afterwards, as `scx build-csc` does. See
+[operations.md § CSC survives mutating operations](operations.md#csc-survives-mutating-operations).
 
 ### CSC lifecycle
 
@@ -1220,16 +1228,23 @@ The sidecar moves through four stages over a file's life:
    in-memory CSR: there bucketing would be a *second* copy of it, so that
    path scatters straight out of the resident CSR (one counting pass, then
    one range-filtered scatter per shard) and its peak is the caller's.
+   Streaming conversion (and the rewrite ops) instead enable the same
+   `CscBuilder` on the writer (`ScxWriter::enable_csc_sidecar`), which is
+   fed each X shard as it is written and emits the sidecar right after X —
+   the same bytes, with no second read of the output.
 2. **Consumption.** Column algorithms opt into the sidecar with
    `prefer_format="csc"` (CPU) or, for GPU `pdex_ref` / `rank_genes_groups`,
    the `gpu_csc_v3` route (the default GPU DE route when a CSC sidecar is
    present). `BackedCscReader` serves column-range
    reads with shard-level pushdown. See
    [scanpy.md § GPU-supported vs GPU-fast](scanpy.md#gpu-supported-vs-gpu-fast).
-3. **Mutation drop.** Any row/column-layout-changing op (`append`,
-   `compact`, `merge`, `subset`) drops the sidecar with a warning, because
-   its `indices` would otherwise reference stale rows/columns.
-4. **Rebuild.** Re-emit with `--rebuild-csc` on the mutating op, or run
+3. **Mutation.** The rewrite ops (`compact`, `merge`, `optimize`, `sort`,
+   `subset`) never copy the input's sidecar, because its `indices` would
+   reference stale rows/columns; they rebuild it in the same pass iff an
+   input had one (`--csc carry`, the default; `--csc off` drops it, and a
+   multimodal input's sidecars are dropped with a warning). `append` drops
+   it with a warning.
+4. **Rebuild.** After an `append`, re-emit with `append --rebuild-csc`, or run
    `scx build-csc` against the post-op file. The rebuild reads the current
    CSR shards, transposes, and appends a fresh CSC sidecar plus an updated
    catalog to the file itself; the previous catalog stays in the file, so

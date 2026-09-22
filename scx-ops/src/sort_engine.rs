@@ -46,9 +46,9 @@
 //! ## Scope
 //!
 //! Local input only (cloud input deferred). obsm and layers are gathered
-//! in-memory (the bounded-memory guarantee is for X). The CSC sidecar is
-//! dropped; the CLI re-emits it post-write via `rebuild_csc_inplace` on
-//! `--rebuild-csc`.
+//! in-memory (the bounded-memory guarantee is for X). The input's CSC sidecar
+//! is never copied; `SortOptions::csc` decides whether a new one is built from
+//! the sorted X in the same pass (by default, iff the input had one).
 //!
 //! **Output size is not guaranteed neutral.** The reorder re-encodes every X
 //! shard with `--codec` (default `auto`). `scx1`-coded shards are size-neutral

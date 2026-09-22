@@ -10,8 +10,9 @@
 //! does not change CSR shard boundaries, and canonicalizes each shard so the
 //! output is a real v3 file with sidecars. The one optional layout change is
 //! obs-metadata: `ObsShardPolicy` may migrate a legacy single-section obs to the
-//! sharded layout (row order/content preserved exactly). The CSC sidecar is
-//! dropped (rerun `scx build-csc` / `--rebuild-csc`); a `decode/*` sidecar is
+//! sharded layout (row order/content preserved exactly). A CSC sidecar is
+//! rebuilt from the re-encoded X in the same pass when the input had one
+//! (`CscCarryOptions`, see `optimize_with_csc`); a `decode/*` sidecar is
 //! emitted for every Scx1 integer shard automatically by the encoder.
 
 use std::path::Path;

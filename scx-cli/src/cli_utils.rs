@@ -68,6 +68,7 @@ impl CscArgs {
             cols_per_shard: self.csc_cols_per_shard,
             memory_limit: self.csc_memory_limit.clone(),
             temp_dir,
+            framing: None,
         }
     }
 }

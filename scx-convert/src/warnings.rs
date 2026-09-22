@@ -121,8 +121,8 @@ pub enum ConvertWarning {
     /// `csc='auto'` resolved to "build" for one or more modalities, but
     /// the streaming h5mu path cannot emit per-modality CSC sidecars (only
     /// the non-streaming `h5mu_to_scx` can, having each modality's full CSR
-    /// in memory; `rebuild_csc_inplace` is unimodal-only and would corrupt
-    /// a multimodal file). The sidecar was skipped — re-run with
+    /// in memory; the same-pass builder, `ScxWriter::enable_csc_sidecar`, is
+    /// single-modality). The sidecar was skipped — re-run with
     /// `stream=False` to build it. Explicit `csc='always'` is rejected with
     /// an error instead of being downgraded to this warning.
     CscSkippedStreamingMultimodal { modalities: Vec<String> },

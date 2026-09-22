@@ -138,8 +138,8 @@ pub struct ScxWriter {
     /// [`Self::with_data_generation`] so a later read can detect a CSC
     /// sidecar built against an earlier generation.
     data_generation: u64,
-    /// The `data_generation` a CSC sidecar was built against, set by
-    /// `finish()` when it auto-emits CSC (and left `None` otherwise so
+    /// The `data_generation` a CSC sidecar was built against, set whenever a
+    /// CSC shard is written through `write_shard_inner` (and left `None` otherwise so
     /// the catalog records `0`). Stamped into
     /// `FullCatalog::csc_build_generation`.
     csc_build_generation: Option<u64>,

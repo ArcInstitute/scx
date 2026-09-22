@@ -521,7 +521,7 @@ pub struct FullCatalog {
     pub entries: Vec<FullCatalogEntry>,
     /// Monotonic identity of the CSR X data (v4+). Bumped by every
     /// in-place CSR-content-mutating writer (`append`/`compact`/`merge`);
-    /// **not** bumped by CSC-only rewrites (`build-csc`/`--rebuild-csc`).
+    /// **not** bumped by CSC-only rewrites (`build-csc`, `append --rebuild-csc`).
     /// `subset` writes a brand-new file at the default generation (1)
     /// rather than bumping a source. `0` on v1–v3 catalogs (the field was
     /// absent).

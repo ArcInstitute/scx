@@ -1098,8 +1098,9 @@ pub(crate) fn write_obs_shards_streaming(
 /// Phase 6: compact a multimodal SCX file. Applies the global keep
 /// mask to every modality's CSR shards (and per-modality layers) while
 /// preserving the ModalityTable and per-modality var / obsm / uns.
-/// Per-modality CSC sidecars are dropped (rebuild via
-/// `--rebuild-csc`).
+/// Per-modality CSC sidecars are dropped: the same-pass builder is
+/// single-modality, and `CscCarryOptions::resolve` has already warned (or
+/// refused `--csc always`).
 fn compact_multimodal(
     reader: ScxReader,
     in_header: FileHeader,
@@ -1145,8 +1146,8 @@ fn compact_multimodal(
     };
 
     // Carry input flags except has_deletion_vectors (applied) and
-    // has_csc (per-modality CSC sidecars are dropped on compact;
-    // caller rebuilds via --rebuild-csc).
+    // has_csc (per-modality CSC sidecars are dropped on a multimodal
+    // compact; see `CscCarryOptions::resolve`).
     let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
     let table = reader
         .modality_table()

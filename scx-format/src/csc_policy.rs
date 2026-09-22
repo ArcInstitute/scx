@@ -59,8 +59,8 @@ impl CscPolicy {
     /// An **empty matrix** — either axis zero — never gets a sidecar, whatever
     /// the policy: a 0-row file has no CSR shards to transpose and a 0-column
     /// file has no CSC columns to emit, so `Always` would only add a section
-    /// that indexes nothing (and every `--rebuild-csc` caller would then
-    /// have to special-case it). Silent by design; there is nothing to warn
+    /// that indexes nothing (and every sidecar builder would then have to
+    /// special-case it). Silent by design; there is nothing to warn
     /// about.
     pub fn should_build_csc(self, n_obs: u64, n_vars: u64) -> bool {
         if n_obs == 0 || n_vars == 0 {

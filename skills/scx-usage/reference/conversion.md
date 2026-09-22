@@ -135,8 +135,9 @@ keep raw. The warning carries a per-call-site remedy for exactly this reason.
   comparison table.
 - **`csc`**: `None` (default; resolved to `"off"` normally, or `"auto"` when an
   `index_preset` is set), `"off"`, `"auto"`, or `"always"`. `"always"`/`"auto"`
-  write a column-major sidecar via a two-pass write (streaming CSR → in-place
-  rebuild); transient disk briefly reaches ~2× the output size. `"auto"` builds
+  write a column-major sidecar, built in the same pass as X (each streamed CSR
+  shard is pushed into the builder; no extra read, no second copy on disk;
+  under `memory_budget` the builder takes a quarter of it). `"auto"` builds
   it only when the dataset clears the size thresholds (`n_obs ≥ 50000` **and**
   `n_vars ≥ 5000`, env-tunable via `SCX_CSC_AUTO_OBS_THRESHOLD` /
   `SCX_CSC_AUTO_VARS_THRESHOLD` — set either to `0` to force a build). Required
@@ -266,7 +267,7 @@ scx convert <input> <output> [--force] [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad
   SCX ingest carries values as f32 and could only store it rounded.
   `--allow-lossy` accepts the rounding.
 - On ingest, `--csc always` (or `--csc auto` over a dataset above the size
-  thresholds) does the two-pass CSR-then-rebuild write.
+  thresholds) builds the sidecar in the same pass as X.
 - For multimodal SCX → h5ad, combine `--to h5ad --modality NAME`; `--to mtx
   --modality NAME` does the same and is **required** on a multimodal input, since
   an MTX directory holds one matrix over one feature space.
@@ -274,13 +275,13 @@ scx convert <input> <output> [--force] [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad
 Other commands:
 - `scx info <source> [--json] [--history]` — metadata; `<source>` accepts a file, `.scxd/` dir, or cloud URL. Multimodal shows a per-modality table with a `has_csc` column.
 - `scx validate <file> [--verbose] [--deep]` — verifies BLAKE3 checksums section-by-section. `--deep` also decodes sparse shards and validates the canonical CSR invariant.
-- `scx subset <input> [output] [--force] [--filter EXPR] [--genes PATH] [--modality NAME] [--dry-run] [--shard-size N] [--codec ...] [--memory-budget SIZE] [--rebuild-csc]` (`output` optional with `--dry-run`).
+- `scx subset <input> [output] [--force] [--filter EXPR] [--genes PATH] [--modality NAME] [--dry-run] [--shard-size N] [--codec ...] [--memory-budget SIZE] [--csc carry|always|off] [--csc-cols-per-shard N] [--csc-memory-limit SIZE]` (`output` optional with `--dry-run`).
 - `scx append <target> <source> [--codec ...] [--shard-size N] [--index-* ...] [--modality NAME] [--rebuild-csc]`.
 - `scx delete <file> --filter <expr> [--dry-run]`.
-- `scx compact <input> <output> [--force] [--index-* ...] [--codec ...] [--memory-budget SIZE] [--rebuild-csc] [--reshape-obs]`.
-- `scx optimize <input> <output> [--force] [--codec auto|scx1] [--shard-obs off|auto|always]` — in-place upgrade (single-modality): re-encode + canonicalize + row-group-frame CSR shards and stamp `format_version=4` (preserves rows/obs/var/obsm/uns/indexes/deletion-vectors; drops CSC — rerun `scx build-csc`); no decode sidecar is written. Use to make an older file row-group random-access + GPU-device-decode-fast without a full reconvert. `--shard-obs` (default `auto`) also migrates a **legacy single-section** obs to the sharded `ObsMetadataShard` layout when `n_obs > shard_target_rows` (`always` = unconditional, `off` = keep single section); already-sharded obs is preserved as-is. Python: `pyscx.optimize(input, output, codec="auto", shard_obs="auto")`.
-- `scx merge <f1> <f2> [...] --output <path> [--force] [--index-* ...] [--assume-identical-var] [--uns-policy first|require-equal|namespace|summary] [--sort-by CSV] [--sort-reverse] [--codec ...] [--memory-budget SIZE] [--rebuild-csc]`.
-- `scx sort <input> <output> --by CSV [--reverse] [--force] [--shard-size N] [--codec ...] [--index-* ...] [--memory-budget SIZE] [--temp-dir DIR] [--bitmap off|auto|always] [--rebuild-csc]` — globally reorder cells by obs columns for query locality.
+- `scx compact <input> <output> [--force] [--index-* ...] [--codec ...] [--memory-budget SIZE] [--csc carry|always|off] [--csc-cols-per-shard N] [--csc-memory-limit SIZE] [--reshape-obs]`. `--csc carry` (the default on `compact`/`merge`/`optimize`/`sort`/`subset`) rebuilds the output's CSC sidecar in the same pass iff the input had one (merge: any input); `always` builds one regardless, `off` none. A multimodal input's sidecars are dropped (`always` refused). `--rebuild-csc` there is a deprecated alias for `--csc always`; on `append` it still means an in-place rebuild after the append (append otherwise drops the sidecar).
+- `scx optimize <input> <output> [--force] [--codec auto|scx1] [--shard-obs off|auto|always] [--csc carry|always|off] [--csc-cols-per-shard N] [--csc-memory-limit SIZE]` — in-place upgrade (single-modality): re-encode + canonicalize + row-group-frame CSR shards and stamp `format_version=4` (preserves rows/obs/var/obsm/uns/indexes/deletion-vectors; carries CSC, rebuilt from the re-canonicalized X in the same pass); no decode sidecar is written. Use to make an older file row-group random-access + GPU-device-decode-fast without a full reconvert. `--shard-obs` (default `auto`) also migrates a **legacy single-section** obs to the sharded `ObsMetadataShard` layout when `n_obs > shard_target_rows` (`always` = unconditional, `off` = keep single section); already-sharded obs is preserved as-is. Python: `pyscx.optimize(input, output, codec="auto", shard_obs="auto")`.
+- `scx merge <f1> <f2> [...] --output <path> [--force] [--index-* ...] [--assume-identical-var] [--uns-policy first|require-equal|namespace|summary] [--sort-by CSV] [--sort-reverse] [--codec ...] [--memory-budget SIZE] [--csc carry|always|off] [--csc-cols-per-shard N] [--csc-memory-limit SIZE]`.
+- `scx sort <input> <output> --by CSV [--reverse] [--force] [--shard-size N] [--codec ...] [--index-* ...] [--memory-budget SIZE] [--temp-dir DIR] [--bitmap off|auto|always] [--csc carry|always|off] [--csc-cols-per-shard N] [--csc-memory-limit SIZE]` — globally reorder cells by obs columns for query locality.
 - `scx sort <input> <output> --shuffle [--seed N] [--codec ...]` — the training counterpart: reorder cells by a seeded random permutation so a loader gets i.i.d. batches at any `shard_group_size`. Mutually exclusive with `--by` / `--group-by` / `--reverse`; the seed (default 42) is recorded in provenance. Pass `--codec` to hold the input's encoding — left at `auto` the adaptive codec re-selects and the file can grow substantially. Python: `pyscx.shuffle(input, output, seed=42)`.
 - `scx set-uns <file> --uns JSON_FILE [--merge]` — replace the `uns` block in place (no X re-encode); `--merge` shallow-merges the JSON object's top-level keys into the existing block instead (`pyscx.update_uns`).
 - `scx modify-metadata <file> [--uns JSON] [--obs PARQUET] [--var PARQUET] [--obsm NAME=PATH.npy ...] [--varm NAME=PATH.npy ...] [--index-* ...] [--modality NAME]` — replace metadata sections in place.

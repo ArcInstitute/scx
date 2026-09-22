@@ -1,11 +1,12 @@
 // The framing rule for a CSC sidecar build. The build itself —
 // `rebuild_csc_inplace`, used by `scx build-csc` with no `<OUTPUT>` and by
-// `--rebuild-csc` on the mutating ops — lives in `build_csc.rs`.
+// `scx append --rebuild-csc` — lives in `build_csc.rs`.
 //
-// The mutating ops (`append`, `compact`, `merge`, `subset`, `sort`, and the
-// streaming convert) drop CSC sidecars by default because their row layout no
-// longer matches the pre-op CSC `indices` arrays. When the caller passes
-// `--rebuild-csc`, the sidecar is appended to the post-op output in place.
+// The rewrite ops (`compact`, `merge`, `optimize`, `sort`, `subset`) and
+// streaming convert no longer use it: they build the output's sidecar in the
+// same pass as its X shards (`ScxWriter::enable_csc_sidecar`, see
+// `csc_carry.rs`). `append` still drops the sidecar, since it appends rows in
+// place, and rebuilds it in place when asked.
 
 use std::path::Path;
 

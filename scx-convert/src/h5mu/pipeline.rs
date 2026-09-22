@@ -497,9 +497,9 @@ pub fn h5mu_to_scx_streaming(
 
     // CSC sidecar policy on the streaming multimodal path. The streaming
     // writer cannot build per-modality CSC: the non-streaming `h5mu_to_scx`
-    // does so (it holds each modality's full CSR in memory), and
-    // `rebuild_csc_inplace` is unimodal-only — running it over a multimodal
-    // file would collapse every modality into one CSC transpose. So:
+    // does so (it holds each modality's full CSR in memory), and the
+    // same-pass builder (`ScxWriter::enable_csc_sidecar`) is single-modality.
+    // So:
     //   - `Always` → reject; the user explicitly demanded CSC we can't honor.
     //   - `Auto`   → warn for each modality that would have cleared the size
     //                threshold, then proceed CSR-only (best-effort).
