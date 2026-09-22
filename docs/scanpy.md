@@ -2011,11 +2011,10 @@ Entries that accept it:
 other `prefer_format`-taking function defaults to `"csr"`.**
 `"auto"` (a **compatibility change** in the CPU-accelerator Phase-2
 work — DE previously defaulted to `"csr"`) resolves at call time
-against the *selected* matrix: on CPU it takes the CSC-direct route
-when a valid sidecar is available (sidecar present ∧ no active row
-deletion vector ∧, on a *backed* handle, no column projection) and CSR
-otherwise; on GPU it stays CSR so the planner routes `gpu_csc_v3` when a
-sidecar is present. The route and
+against the *selected* matrix: on CPU it takes the CSC-direct route when the
+file has a sidecar **and** the handle's row window still spans at least half
+the CSR shards, and CSR otherwise; on GPU it stays CSR so the planner routes
+`gpu_csc_v3` under the same condition. The route and
 `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`
 (`cpu_csc` vs `cpu_csr`; `cpu_csc_nnz` when the 1-vs-rest exact-nnz Wilcoxon
 kernel is opted into with `SCX_ACCEL_WILCOXON_NNZ=1`). Pass `prefer_format="csr"` explicitly to pin
@@ -2023,52 +2022,60 @@ the pre-change behaviour. The non-DE functions keep `"csr"` — the
 runtime does not yet auto-route them. No thread-local default; no
 env-var override; each call sets the choice locally.
 
-`prefer_format="csc"` requires *all* of the following; otherwise it
-raises `RuntimeError` with a message naming the missing capability:
+`prefer_format="csc"` requires **one** thing, and raises `RuntimeError`
+naming it otherwise: the file has a CSC sidecar
+(`pyscx.from_anndata(csc="always"|"auto")`, `scx convert --csc=always|auto`,
+`scx build-csc`, or the standalone `pyscx.build_csc(path)` to add one to an
+existing file in place — pass an `output` to write a copy instead).
 
-1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always"|"auto")`,
-   `scx convert --csc=always|auto`, `scx build-csc`, or the standalone
-   `pyscx.build_csc(path)` to add one to an existing file in place, or pass an `output` to write a copy).
-2. No active row deletion vector. After
-   `pyscx.accel.filter_cells()` or `pyscx.accel.subset_obs()`, the
-   dataset has `kept_to_global` set; CSC dispatch then raises until
-   you `materialize()` or rebuild the file.
-3. For **DE and HVG only**, no active column projection on a *backed*
-   handle. After `pyscx.accel.filter_genes()`, `pyscx.accel.subset_var()`,
-   `highly_variable_genes(subset=True)` or `adata[:, mask]`, the sidecar is
-   written against the *full* gene axis and those two kernels read it
-   full-axis, so they raise. The other CSC consumers **honour a projection**
-   and need no workaround:
+Neither the transform chain, nor a row filter, nor a column projection is a
+condition, and all three used to be. Each was a real barrier as written, and
+each was removed by making the read path present the handle's own view rather
+than the file:
 
-   | On a projected handle | backed `X` | lazy `X` |
-   |---|---|---|
-   | `rank_genes_groups`, `pdex_ref` | raises (`reject_csc_on_subset`); `"auto"` falls back to CSR | honoured |
-   | `highly_variable_genes` | raises | honoured |
-   | `col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | honoured | honoured |
-   | `calculate_qc_metrics` (gene axis) | honoured | honoured |
-   | `pseudobulk_dex` | honoured — a projection *is* how you supply the required gene subset | honoured |
+- **The transform chain.** The gate required every transform to be
+  *column-local* (output depending only on the element's own column), which
+  `Log1p` and `Scale` satisfy and `NormalizeTotal` and `RowScale` do not — so
+  the standard `normalize_total → log1p` chain was refused. That was the wrong
+  question for a CSC reader, which always knows a nonzero's row because
+  `ScxCsc::indices` *is* the global row, and both row-indexed transforms carry
+  their per-row vector (`row_sums`, `factors`) with them. They are applied
+  column-major by lookup, bit-identically to the CSR path — element-wise maps
+  with no accumulation, so exact agreement is achievable and is asserted, not
+  approximated.
+- **A row filter** (`filter_cells`, `subset_obs`, `adata[mask]`, or a
+  `mark_deleted` deletion vector) renumbers the live rows while the sidecar's
+  `indices` keep addressing the file's, so a slab handed over unchanged would
+  have scattered into the wrong output rows. The read path now renumbers it —
+  one pass over the slab, after the transforms and before the projection — so
+  what a kernel receives is addressed in live row space, which is what it
+  already assumed.
+- **A column projection on a backed handle** (`filter_genes`, `subset_var`,
+  `highly_variable_genes(subset=True)`, `adata[:, mask]`) used to reach the
+  kernel as a full-axis sidecar under a visible-width gene axis, and DE and HVG
+  refused rather than risk it. A backed handle now serves its CSC reads through
+  the same view a lazy one does, which remaps each shard's columns into the
+  projected axis — so every CSC consumer honours a projection on either handle
+  kind.
 
-   A lazy `X` — anything carrying a transform chain — honours the projection
-   on every op: its CSC reader remaps each shard's columns. The CSR path
-   streams the projected window in all cases.
+One consequence worth stating plainly: because `"auto"` is DE's default, an
+ordinary `filter_cells → filter_genes → normalize_total → log1p →
+rank_genes_groups` pipeline now records `cpu_csc` where it recorded `cpu_csr`.
+The output is the same (pinned bit-for-bit against the CSR route); the wall
+time and the recorded route are not.
 
-**The transform chain is not a condition.** It used to be: the gate
-required every transform to be *column-local* (output depending only on
-the element's own column), which `Log1p` and `Scale` satisfy and
-`NormalizeTotal` and `RowScale` do not — so the standard
-`normalize_total → log1p` chain was refused. That was the wrong question
-for a CSC reader, which always knows a nonzero's row because
-`ScxCsc::indices` *is* the global row, and both row-indexed transforms
-carry their per-row vector (`row_sums`, `factors`) with them. They are
-now applied column-major by lookup, bit-identically to the CSR path —
-element-wise maps with no accumulation, so exact agreement is achievable
-and is asserted, not approximated.
-
-The row deletion vector is the one that stays, and it is a correctness
-barrier rather than caution: it renumbers the live rows while CSC
-`indices` stay global. It is a refusal, not a silent fallback — the CSR
-default handles a filtered handle fine, so reach for
-`prefer_format="csc"` before you filter cells, not after.
+**`"auto"` asks a second question that an explicit `"csc"` does not.** Being
+*able* to serve a window is not a reason to prefer it: a CSC column shard spans
+the whole row axis, so a narrow row window (`adata[:10_000]` of a million
+cells) decodes every physical cell of the columns it asks for and discards most
+of them, where the CSR path skips the shards the window empties outright. So
+`auto` takes CSC only while the kept rows still span **at least half** the CSR
+shards — true for the ordinary `filter_cells` that keeps ~99 % of cells, where
+every shard retains survivors and nothing is skippable, and false for a slice
+confined to a few shards. That cut is coarse and deliberately so: it is chosen
+to be right at both ends rather than tuned, and where exactly it belongs in
+between is not something the measurements here establish. `prefer_format="csc"`
+bypasses it and is served on any window the reader can compact.
 
 Unknown values (e.g. `"CSC"`, `"bogus"`) raise `ValueError`. `"auto"`
 is accepted by `rank_genes_groups` / `pdex_ref` (and is their default);
@@ -2094,9 +2101,15 @@ pyscx.accel.normalize_total(adata, target_sum=1e4)
 pyscx.accel.log1p(adata)
 pyscx.accel.col_sums(adata.X, prefer_format="csc")  # works
 
-# A row filter does not — CSC `indices` are global and this renumbers them.
+# A row filter keeps it too: the slab's rows are renumbered onto the live
+# row space on the way out, so the answer is the visible matrix's.
 pyscx.accel.filter_cells(adata, min_genes=200)
-pyscx.accel.col_sums(adata.X, prefer_format="csc")  # raises RuntimeError
+pyscx.accel.col_sums(adata.X, prefer_format="csc")  # works
+
+# And so does a gene filter, on a backed handle as well as a lazy one.
+pyscx.accel.filter_genes(adata, min_cells=3)
+pyscx.accel.rank_genes_groups(adata, "perturbation", reference="control")
+adata.uns["scx_accel"]["rank_genes_groups"]["route"]  # 'cpu_csc' under the "auto" default
 ```
 
 For the on-disk format and sharding granularity, see
@@ -2118,7 +2131,11 @@ bullet; the only direct measurement points the other way.
   intermediate and skips non-overlapping CSC shards via a column-range
   pre-filter. Without a sidecar — e.g. an in-memory scipy CSR — the same call
   falls back to `gpu_csr_v3` (`fallback_reason == "no_csc_sidecar"`), which is
-  *GPU-supported but not GPU-fast*.
+  *GPU-supported but not GPU-fast*. A **windowed or transformed** handle
+  reaches the CSC-direct route too — while its row window still spans at least
+  half the CSR shards — where it used to be downgraded to `gpu_csr_v3`
+  unconditionally, because the only CSC source it could offer was the full-axis
+  sidecar reader; it now passes its own view instead.
 - **Wilcoxon rank-sum (`rank_genes_groups`) takes the same v3 *routes* as `pdex_ref` — but
   not, on the one shape measured, the same *timing*.** With a CSC sidecar it runs CSC-direct
   (`gpu_csc_v3`); without one it runs CSR-direct (`gpu_csr_v3`,
@@ -2169,9 +2186,13 @@ bullet; the only direct measurement points the other way.
 >
 > - **GPU-fast DE:** pass `device="gpu"` (or `"auto"`) with `prefer_format`
 >   left at its `"auto"` default (or set to `"csr"`) — both keep GPU on the
->   planner-driven path. When the backed file has a CSC sidecar the planner
->   routes to `gpu_csc_v3` automatically; without one it uses `gpu_csr_v3`. This
->   is the intended GPU-fast entry point.
+>   planner-driven path. When the backed file has a CSC sidecar **and** the
+>   handle's row window still spans at least half the CSR shards, the planner
+>   routes to `gpu_csc_v3` automatically; without a sidecar, or on a window
+>   narrower than that, it uses `gpu_csr_v3` (see § `prefer_format` for why the
+>   window matters, and note that a route declined by that policy still records
+>   `csc_available=true`, with `fallback_reason=perf_policy`). This is the
+>   intended GPU-fast entry point.
 > - `prefer_format="csc"` selects the **CPU** column-major streaming path
 >   (`cpu_csc`) — there is no GPU kernel behind that knob. With `device="auto"`
 >   it runs on CPU; combining it with an explicit `device="gpu"` raises a
@@ -3097,7 +3118,8 @@ SCX offers several DE functions covering different experimental designs:
 | `pdex_nb_glm` | Perturbation NB-GLM with replicate-forming stratification | Rust-native negative-binomial GLM |
 
 All Wilcoxon rank-sum-based functions support GPU via `device="gpu"` (CSC-direct
-`gpu_csc_v3` when a sidecar is present, CSR-direct `gpu_csr_v3` otherwise).
+`gpu_csc_v3` when a sidecar is present **and** the handle's row window still
+spans at least half the CSR shards, CSR-direct `gpu_csr_v3` otherwise).
 The NB-GLM functions are CPU-only.
 
 #### `pyscx.accel.rank_genes_groups`
@@ -3146,8 +3168,8 @@ df = pyscx.accel.rank_genes_groups_df(adata, group="0")  # + pct_nz_group, pct_n
 | `rankby_abs` | `False` | Sort genes by absolute z-score instead of signed score. `False` (default) matches scanpy's default: highest positive z-score first. `True` ranks by significance regardless of direction. |
 | `tie_correct` | `False` | Apply the `Σ(t³−t)` tie correction to the Wilcoxon rank-sum variance estimate. The default `False` matches **scanpy's default** (`scanpy.tl.rank_genes_groups` takes the same parameter, also defaulting to `False`); `True` matches **scipy**, which always corrects. These are two different answers, not two precisions — see [Numerical parity](#numerical-parity-against-scanpy-and-scipy) below. |
 | `gene_chunk_size` | `None` | Process genes in chunks of this size to limit memory. `None` processes all genes at once. |
-| `prefer_format` | `"auto"` | `"auto"` (default; CPU routes CSC-direct when a valid sidecar is present, else CSR), `"csr"`, or `"csc"`. |
-| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present, or CSR-direct (`gpu_csr_v3`) otherwise. |
+| `prefer_format` | `"auto"` | `"auto"` (default; CPU routes CSC-direct when a valid sidecar is present **and** the row window spans at least half the CSR shards, else CSR), `"csr"`, or `"csc"` — the explicit `"csc"` skips that policy. |
+| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present and the row window spans at least half the CSR shards, or CSR-direct (`gpu_csr_v3`) otherwise. |
 
 **A group with fewer than two cells is refused, whichever way you ask.** Any
 **participating** group raises scanpy's `Could not calculate statistics for
@@ -3296,7 +3318,7 @@ df = pyscx.accel.pdex_ref(adata, "perturbation", groups=["KO_1", "KO_7"])
 | `cpm_filter` | `None` | Optional CPM floor `T`: keep a gene iff `target_cpm > T` or `ref_cpm > T` (pooled arithmetic CPM, mode-independent); drops other rows, FDR recomputed over survivors. |
 | `gene_chunk_size` | `None` | Process genes in chunks to limit memory |
 | `prefer_format` | `"auto"` | `"auto"` (default), `"csr"`, or `"csc"` |
-| `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present. |
+| `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present and the row window spans at least half the CSR shards. |
 | `output` | `"pandas"` | `"pandas"` (needs no extra) or `"polars"` (needs the `eval` extra; what `cell_eval` consumes) |
 
 ### Pseudobulk Differential Expression (`pyscx.accel.pseudobulk_dex`)

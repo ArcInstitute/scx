@@ -68,13 +68,23 @@ impl scx_format_io::ShardSource for InMemoryCsrSource<'_> {
     }
 }
 
-/// Whether `x` is a backed SCX dataset that exposes a usable CSC sidecar
-/// (the same capability gate as `ScxBackedSparseDataset::as_column_source`:
-/// a CSC sidecar is present and no row deletion vector is active). Used to
-/// auto-route single-batch seurat_v3 GPU HVG to the column-major reduce.
+/// Whether `x` is a backed SCX dataset this op should **auto-route** to the
+/// column-major GPU reduce: a CSC sidecar is present *and* no row filter is
+/// active.
+///
+/// The row-filter clause is a policy choice, not a capability one — the reader
+/// serves a filtered handle's CSC reads perfectly well, and an explicit
+/// `prefer_format="csc"` still gets them. But HVG is the one CSC consumer
+/// whose column-major walk is *slower* than the row-major sweep it replaces
+/// (see the `highly_variable_genes` row in `docs/api.md`), so this auto-route
+/// exists only for the case where the sidecar is otherwise free. A row filter
+/// adds a compaction pass over every column shard on top of a walk that was
+/// already losing, and nobody asked for CSC: `filter_cells` →
+/// `highly_variable_genes(device="gpu")` would silently record `gpu_csc_v3`.
 fn backed_x_has_csc_sidecar(x: &Bound<'_, PyAny>) -> bool {
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        backed.borrow().as_column_source().is_some()
+        let b = backed.borrow();
+        b.kept_to_global.is_none() && b.as_column_source().is_some()
     } else {
         false
     }
@@ -130,7 +140,12 @@ fn backed_x_has_csc_sidecar(x: &Bound<'_, PyAny>) -> bool {
 ///         on CPU it runs the CSC reduce (route `cpu_csc`). Note: even
 ///         under the default `prefer_format="csr"`, a single-batch
 ///         seurat_v3 GPU run on a backed dataset that has a CSC sidecar
-///         auto-routes to `gpu_csc_v3` (mirrors GPU DE).
+///         auto-routes to `gpu_csc_v3` — but **only when no row filter is
+///         active**. The column-major walk is slower than the row-major
+///         sweep here, so that auto-route exists for the case where the
+///         sidecar costs nothing; a filtered handle would add a row
+///         compaction on top and is left on `gpu_csr`. An explicit
+///         `prefer_format="csc"` is still honoured on any window.
 ///     layer: Read counts from `adata.layers[layer]` instead of
 ///         `adata.X`. Mirrors `scanpy.pp.highly_variable_genes(layer=)`
 ///         and is the canonical way to compute `flavor="seurat_v3"`
@@ -373,8 +388,10 @@ pub fn highly_variable_genes<'py>(
     // prefer_format="csr". Restricted to `layer is None` (the sidecar lives
     // on adata.X, not on arbitrary layers) and to a GPU run
     // (`effective_gpu_id.is_some()`) — we do not silently switch the CPU
-    // default from CSR to CSC. `backed_x_has_csc_sidecar` mirrors the
-    // `as_column_source` capability gate.
+    // default from CSR to CSC. `backed_x_has_csc_sidecar` is the
+    // `as_column_source` capability gate **plus** "no row filter" — it is a
+    // policy predicate, not a mirror of the capability one, because this op's
+    // CSC walk is the slower of the two.
     if effective_gpu_id.is_some()
         && single_batch
         && seurat_v3_family
@@ -416,7 +433,24 @@ pub fn highly_variable_genes<'py>(
     // orthogonal to whether the op finished. `RouteStamp` covers the latter —
     // the stamp is rolled back if any branch below raises, so a present entry
     // means the route ran *and* completed.
-    let info = super::route::hvg_exec_info(device, seurat_v3_family, false);
+    // Plan with `false`, then correct only the capability field.
+    //
+    // `hvg_exec_info`'s third argument is a **route** input, not a metadata
+    // one: `plan_hvg_route` picks `CpuCsc` / `GpuCscV3` from it, and derives
+    // `reduction` from the route it picked. This stamp belongs to the CSR
+    // fall-through — the branch reached *after* the CSC auto-route has been
+    // declined — so passing the real capability here named a CSC kernel over a
+    // CSR one: `cpu_csc` for any sidecar file on CPU, and `gpu_csc_v3` with
+    // `reduction="deterministic"` for a row-filtered GPU run whose reduce is
+    // the atomic CSR one. That is the shape DE avoids by planning the CSR
+    // layout and overwriting the field afterwards, and it is what this now
+    // does.
+    //
+    // Capability comes from `x`, the matrix this op will actually read, not
+    // from `adata.X`: under `layer=` those differ, the sidecar lives on `X`,
+    // and the layer's own is not usable here.
+    let mut info = super::route::hvg_exec_info(device, seurat_v3_family, false);
+    info.csc_available = Some(crate::accel::csc_source_for(&x).is_some());
     super::route::announce_route(py, "highly_variable_genes", device, &info);
     // Rolled back if any branch below raises (a loess singularity across every
     // batch, a missing `batch_key`, …) — see RouteStamp.

@@ -79,8 +79,11 @@ impl<'a> BackedGpuMatrixSource<'a> {
     /// the CSR reduces two functions above went through the unified surface
     /// (review §8.20: *the same file using both conventions*).
     ///
-    /// `shape()` comes from the CSC source, so `n_obs` is the file-wide cell
-    /// count the sidecar's global row indices are numbered against.
+    /// `shape()` comes from the CSC source, so `n_obs` is whatever row space
+    /// *that* source numbers its slabs in — the file-wide cell count for a
+    /// `BackedCscReader`, the visible count for a view over a row-filtered
+    /// handle. The pairing is self-consistent either way, which is the point:
+    /// both halves come from one source.
     pub fn csc_only(
         dev: &'a GpuDevice,
         csc_source: &'a (dyn ColumnShardSource + Sync),

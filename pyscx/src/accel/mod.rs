@@ -113,46 +113,66 @@ pub(crate) fn reject_presentation_ordered_source(x: &Bound<'_, PyAny>, op: &str)
     Ok(())
 }
 
-/// The error for `as_column_source()` returning `None`, naming which of the two
-/// causes actually fired.
+/// Whether `x` is one of the two SCX matrix handles (backed or lazy).
 ///
-/// A lazy transform chain is **not** among them: every `Transform` has a
-/// column-major form in `lazy_transform::shard_source::apply_transforms_to_csc`,
-/// because a CSC reader knows each nonzero's global row and the two row-indexed
-/// transforms carry their per-row vector with them. What
-/// remains is a missing sidecar and an active row deletion vector — two causes
-/// the backed and lazy paths share, which is why one helper serves both and
-/// this text lives in one place instead of the nine copies it replaced.
+/// Distinguishes "this is an SCX handle with no sidecar" — which must raise
+/// [`csc_unavailable`] — from "this is a scipy/dense matrix", which several
+/// ops materialise instead. [`csc_source_for`] returns `None` for both, so a
+/// caller that needs to tell them apart asks this first.
+pub(crate) fn is_scx_matrix_handle(x: &Bound<'_, PyAny>) -> bool {
+    backed_dataset_ref(x).is_some()
+        || x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
+            .is_ok()
+}
+
+/// This handle's CSC column source, whichever kind of handle it is.
 ///
-/// It takes the two facts rather than returning one vague string because the
-/// remedies are opposite: `build_csc` fixes a missing sidecar and is exactly
-/// the wrong advice after `filter_cells` on a file that already has one.
-/// Callers have both booleans in hand at the `ok_or_else`.
-pub(crate) fn csc_unavailable(has_sidecar: bool, has_row_filter: bool) -> PyErr {
-    let cause = match (has_sidecar, has_row_filter) {
-        (false, false) => {
-            "the file has no CSC sidecar — add one with `pyscx.build_csc(path)` \
-             or `scx build-csc`, or re-import with `csc=\"always\"`"
-        }
-        (true, true) => {
-            "a row deletion vector is active (e.g. after `filter_cells`), and CSC \
-             `indices` are global row ids that a row filter renumbers — \
-             `materialize()` or rebuild the file"
-        }
-        // Both wrong at once: lead with the sidecar, since rebuilding the file
-        // is the step that resolves both.
-        (false, true) => {
-            "the file has no CSC sidecar and a row deletion vector is active — \
-             rebuild the file with `csc=\"always\"`"
-        }
-        // Unreachable via `as_column_source()`, which only returns `None` for
-        // the two causes above. Answer honestly rather than assert.
-        (true, false) => "the dataset cannot serve CSC reads",
-    };
-    pyo3::exceptions::PyRuntimeError::new_err(format!(
-        "CSC requested but unavailable: {cause}. Pass `prefer_format='csr'` to \
-         use the row-major path."
-    ))
+/// One ladder, in one place. It used to be six copies, and it had to be: the
+/// backed arm handed back a borrowed full-axis `BackedCscReader` while the lazy
+/// arm handed back an owned view, so the two arms differed in type, in lifetime
+/// and in the column space their caller then had to address. Both now return
+/// the same owned [`LazyShardSource`], which left six identical ladders behind.
+///
+/// `None` means the file brought no CSC sidecar — see [`csc_unavailable`] for
+/// the error every caller pairs this with. A non-SCX `X` (numpy/scipy, e.g.
+/// from `use_raw`/`layer`) is also `None`, and callers that want to say so
+/// specifically check the handle types themselves.
+pub(crate) fn csc_source_for(
+    x: &Bound<'_, PyAny>,
+) -> Option<crate::lazy_transform::LazyShardSource> {
+    if let Some(handle) = backed_dataset_ref(x) {
+        return handle.get().as_column_source();
+    }
+    if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+        return lazy.as_column_source();
+    }
+    None
+}
+
+/// The error for `as_column_source()` returning `None`.
+///
+/// There is exactly one cause left, which is why this takes no arguments. It
+/// used to name two, and before that three:
+///
+/// * a lazy transform chain — retired when every `Transform` gained a
+///   column-major form in `lazy_transform::shard_source::apply_transforms_to_csc`,
+///   a CSC reader knowing each nonzero's global row and the two row-indexed
+///   transforms carrying their per-row vector with them;
+/// * an active row deletion vector — retired when the CSC read path started
+///   renumbering a slab's rows onto the live row space
+///   (`scx_engine::projection::compact_csc_rows_in_place`), so a filtered
+///   handle is served rather than refused.
+///
+/// What remains is a file that brought no sidecar, and the remedy is to build
+/// one. Keep it that way: if a future condition closes the gate again, it wants
+/// its own message here rather than a vaguer shared one, because the remedies
+/// differ and `build_csc` is exactly the wrong advice for anything else.
+pub(crate) fn csc_unavailable() -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(
+        "CSC requested but unavailable: the file has no CSC sidecar — add one \
+         with `pyscx.build_csc(path)` or `scx build-csc`, or re-import with \
+         `csc=\"always\"`. Pass `prefer_format='csr'` to use the row-major path.",
+    )
 }
 
 /// A borrow of the backed dataset behind `adata.X` **or** a backed layer handle.

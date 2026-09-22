@@ -97,30 +97,24 @@ impl ScxLazyTransformedDataset {
 
     /// Builder method: attach a CSC sidecar reader. Mirrors
     /// `ScxBackedSparseDataset::with_csc_reader`. After this call,
-    /// `as_column_source()` returns `Some` unless a row deletion vector
-    /// is active.
+    /// `as_column_source()` returns `Some`.
     pub fn with_csc_reader(mut self, backed_csc: Option<Arc<BackedCscReader>>) -> Self {
         self.backed_csc = backed_csc;
         self
     }
 
-    /// Capability gate: returns `Some(LazyShardSource)` iff this
-    /// lazy dataset can serve CSC reads. Mirrors
-    /// `ScxBackedSparseDataset::as_column_source` but returns an
-    /// owned `LazyShardSource` (rather than a borrowed `&dyn`) because
-    /// the underlying `LazyShardSource` is materialized fresh per call;
-    /// it's cheap (clones `Arc` handles only).
+    /// Capability gate: returns `Some(LazyShardSource)` iff this lazy
+    /// dataset can serve CSC reads — i.e. iff `backed_csc` is set. It is now
+    /// the *same* function as `ScxBackedSparseDataset::as_column_source`,
+    /// which used to return a borrowed full-axis `&dyn ColumnShardSource`
+    /// and had to refuse a window; both return this owned view, which is
+    /// materialized fresh per call and cheap (clones `Arc` handles only).
     ///
-    /// Returns `Some` iff:
-    /// - `backed_csc` is set (file has a CSC sidecar AND was opened
-    ///   with CSC capability), AND
-    /// - `kept_to_global` is `None` (row deletions renumber the live rows
-    ///   while CSC `indices` stay global, so a row-indexed transform would
-    ///   read the wrong entry).
-    ///
-    /// The transform chain is not a condition: every `Transform` has a
-    /// column-major form, the row-indexed `NormalizeTotal` / `RowScale`
-    /// included, read at the global row `ScxCsc::indices` already carries.
+    /// Neither the transform chain nor a row filter is a condition. Every
+    /// `Transform` has a column-major form, the row-indexed `NormalizeTotal`
+    /// / `RowScale` included, read at the global row `ScxCsc::indices`
+    /// already carries; and the row filter is applied by renumbering the
+    /// slab onto the live row space after those transforms have run.
     ///
     /// Callers consume the `LazyShardSource` via the
     /// `ColumnShardSource` trait impl on `LazyShardSource`. Crate-private
@@ -145,8 +139,8 @@ impl ScxLazyTransformedDataset {
     /// Threads `backed_csc` through, so consumers that route via
     /// `ColumnShardSource` (Phase F) get the CSC plumbing for free.
     /// Whether CSC is actually serviceable is gated separately by
-    /// `LazyShardSource::supports_csc()` — a sidecar must be present and no
-    /// row deletion vector active. The transform chain is not a condition.
+    /// `LazyShardSource::supports_csc()` — a sidecar must be present, and
+    /// that is the whole condition.
     pub(crate) fn as_shard_source(&self) -> LazyShardSource {
         LazyShardSource::new_with_csc(
             Arc::clone(&self.backed),

@@ -421,7 +421,8 @@ fn dispatch_rank_genes_kernels(
     let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
 
     // Resolve the `"auto"` policy (§5.2) against the *selected* matrix: CSC-direct
-    // on CPU when a valid sidecar is present, else CSR; CSR on GPU (the planner
+    // on CPU when a valid sidecar is present and the row window still spans at
+    // least half the CSR shards, else CSR; CSR on GPU (the planner
     // routes gpu_csc_v3 from there). Explicit "csr"/"csc" pass through.
     let prefer_format = resolve_de_format(prefer_format, gpu_device_id, x);
 
@@ -437,82 +438,47 @@ fn dispatch_rank_genes_kernels(
             ));
         }
         // CSC dispatch: works on both backed and lazy datasets via
-        // `as_column_source`. The kernel reads each gene chunk as a
-        // CSC slab once, scatters into a row-major dense buffer, and
-        // hands it to the existing `wilcoxon_rank_sum` kernel.
+        // `as_column_source`, which hands back the same type for either — a
+        // view that renumbers rows onto the live space and remaps columns into
+        // the projected one. That is what lets a filtered or gene-subset
+        // handle take this path; it used to be refused here outright. The
+        // kernel reads each gene chunk as a CSC
+        // slab once, scatters into a row-major dense buffer, and hands it to
+        // the existing `wilcoxon_rank_sum` kernel.
         let chunk_size = gene_chunk_size.unwrap_or(500);
 
-        if let Some(handle) = crate::accel::backed_dataset_ref(x) {
-            let backed = handle.get();
-            // Validate CSC availability under the GIL, then clone the Arc so
-            // the Rust kernel can run without holding the GIL.
-            reject_csc_on_subset(backed)?;
-            let csc_reader = backed
-                .backed_csc
-                .as_ref()
-                .ok_or_else(|| {
-                    PyRuntimeError::new_err(
-                        "CSC requested but unavailable: file has no CSC sidecar",
-                    )
-                })?
-                .clone();
-            drop(handle);
-            // Pass the concrete `BackedCscReader` (not `&dyn`) so the
-            // closure is `Send` — `dyn ColumnShardSource` is not `Send`.
-            let result = py
-                .detach(|| {
-                    scx_accel::wilcoxon_rank_sum_streaming_csc(
-                        csc_reader.as_ref(),
-                        gene_names,
-                        groups,
-                        unique_groups,
-                        ref_idx,
-                        chunk_size,
-                        log_transformed,
-                        rankby_abs,
-                        tie_correct,
-                    )
-                })
-                .map(|mut r| {
-                    r.exec_info = csc_exec_info(device, ref_idx, rankby_abs, chunk_size);
-                    r
-                })
-                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            return Ok(result);
+        // Resolve the source under the GIL; it is owned, so the kernel runs
+        // detached. (`LazyShardSource` is `Send`, where a `&dyn
+        // ColumnShardSource` was not — which is why the two arms used to
+        // differ.)
+        if !crate::accel::is_scx_matrix_handle(x) {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
+                 dataset; got a regular scipy/dense matrix",
+            ));
         }
-        if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
-            let lazy_src = lazy.as_column_source().ok_or_else(|| {
-                crate::accel::csc_unavailable(
-                    lazy.backed_csc.is_some(),
-                    lazy.kept_to_global.is_some(),
+        let source = crate::accel::csc_source_for(x).ok_or_else(crate::accel::csc_unavailable)?;
+
+        let result = py
+            .detach(|| {
+                scx_accel::wilcoxon_rank_sum_streaming_csc(
+                    &source,
+                    gene_names,
+                    groups,
+                    unique_groups,
+                    ref_idx,
+                    chunk_size,
+                    log_transformed,
+                    rankby_abs,
+                    tie_correct,
                 )
-            })?;
-            drop(lazy);
-            let result = py
-                .detach(|| {
-                    scx_accel::wilcoxon_rank_sum_streaming_csc(
-                        &lazy_src,
-                        gene_names,
-                        groups,
-                        unique_groups,
-                        ref_idx,
-                        chunk_size,
-                        log_transformed,
-                        rankby_abs,
-                        tie_correct,
-                    )
-                })
-                .map(|mut r| {
-                    r.exec_info = csc_exec_info(device, ref_idx, rankby_abs, chunk_size);
-                    r
-                })
-                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            return Ok(result);
-        }
-        return Err(PyRuntimeError::new_err(
-            "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
-             dataset; got a regular scipy/dense matrix",
-        ));
+            })
+            .map(|mut r| {
+                r.exec_info = csc_exec_info(device, ref_idx, rankby_abs, chunk_size);
+                r
+            })
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+        return Ok(result);
     }
 
     let result = if let Some(handle) = crate::accel::backed_dataset_ref(x) {
@@ -530,6 +496,15 @@ fn dispatch_rank_genes_kernels(
         // CSC-direct `Backed` input); the CPU arm runs entirely off `source`.
         #[cfg(feature = "gpu")]
         let reader = std::sync::Arc::clone(&backed.backed);
+        // The *capability*, recorded independently of the route the policy
+        // picked. `AccelExecutionInfo::csc_available` is documented as whether
+        // a sidecar was available at dispatch time, and the benchmark route
+        // gates read it to tell a silent CSC->CSR fallback from a file that
+        // never had a sidecar. Deriving it from the input the policy chose
+        // reported `csc_available=false` on a sidecar-carrying file whenever
+        // `csc_preferred_for_auto` declined — the two questions have to stay
+        // separate here as well as in the routing.
+        let csc_capable = source.supports_csc();
         #[cfg(feature = "gpu")]
         let has_view = backed.has_axis_view();
         // If a CSC sidecar reader exists on the dataset, hand it to the GPU
@@ -544,27 +519,43 @@ fn dispatch_rank_genes_kernels(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    // Load-bearing, not bookkeeping. Neither of the CSC
-                    // gates elsewhere protects this path: the `csc` below
-                    // comes straight off `backed.backed_csc`, bypassing
-                    // `as_column_source()`'s deletion check, and
-                    // `csc_route_available` is never consulted on GPU
+                    // Which CSC source to hand over, not whether to hand
+                    // one over. Neither CSC gate elsewhere protects this
+                    // path: `csc_reader` comes straight off
+                    // `backed.backed_csc`, bypassing `as_column_source()`,
+                    // and `csc_route_available` is never consulted on GPU
                     // (`resolve_de_format` short-circuits to "csr" whenever
-                    // `gpu_device_id.is_some()`). So a subset handle with a
-                    // sidecar would otherwise reach the CSC-direct kernel and
-                    // read *on-disk* columns under visible-width
-                    // `gene_names` — a silent wrong answer, since
-                    // `Backed::shape()` takes `n_vars` from `gene_names.len()`
-                    // and the widths agree. Route it to the generic `Lazy`
-                    // input; only an unsubset handle keeps `Backed` and with
-                    // it the CSC-direct `gpu_csc_v3` route.
-                    let input = if has_view {
-                        scx_accel::GpuDeShardInput::Lazy(&source)
-                    } else {
+                    // `gpu_device_id.is_some()`). That reader is the *file* —
+                    // full row axis, full column axis — so under a subset
+                    // handle's visible-width `gene_names` it would read the
+                    // wrong columns, and silently, since `Backed::shape()`
+                    // takes `n_vars` from `gene_names.len()` and the widths
+                    // agree. This used to be handled by giving the route up
+                    // and passing the CSR-shaped `Lazy` input. It no longer
+                    // has to be: `source` is the window on both axes — rows
+                    // renumbered onto the live space, columns remapped into
+                    // the projected one — and serves as both the CSR and the
+                    // CSC side, so a filtered or gene-subset handle keeps
+                    // `gpu_csc_v3`. `Lazy` remains for the case with no
+                    // sidecar to offer — and for a window so narrow that CSC's
+                    // full-height column reads would lose to the shard
+                    // skipping the CSR path can do
+                    // (`csc_preferred_for_auto`), since on GPU the route is
+                    // chosen by the planner rather than requested.
+                    let input = if !has_view {
                         scx_accel::GpuDeShardInput::Backed {
-                            csr: &reader,
-                            csc: csc_reader.as_deref(),
+                            csr: reader.as_ref(),
+                            csc: csc_reader
+                                .as_deref()
+                                .map(|c| c as &(dyn scx_format_io::ColumnShardSource + Sync)),
                         }
+                    } else if source.csc_preferred_for_auto() {
+                        scx_accel::GpuDeShardInput::Backed {
+                            csr: &source,
+                            csc: Some(&source),
+                        }
+                    } else {
+                        scx_accel::GpuDeShardInput::Lazy(&source)
                     };
                     scx_accel::wilcoxon_rank_sum_gpu(
                         device_id,
@@ -578,6 +569,21 @@ fn dispatch_rank_genes_kernels(
                         rankby_abs,
                         tie_correct,
                     )
+                })
+                .map(|mut r| {
+                    // The policy declined an available sidecar, so the planner
+                    // — which derives capability from the input it was handed —
+                    // stamped `csc_available=false` / `no_csc_sidecar`. Both are
+                    // false about the file. Restore the capability and name the
+                    // actual reason, which `FallbackReason::PerfPolicy` already
+                    // exists for.
+                    if csc_capable && r.exec_info.csc_available != Some(true) {
+                        r.exec_info.csc_available = Some(true);
+                        if r.exec_info.fallback_reason == scx_accel::FallbackReason::NoCscSidecar {
+                            r.exec_info.fallback_reason = scx_accel::FallbackReason::PerfPolicy;
+                        }
+                    }
+                    r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?,
             #[cfg(not(feature = "gpu"))]
@@ -601,7 +607,7 @@ fn dispatch_rank_genes_kernels(
                         device,
                         scx_accel::InputLayout::BackedCsr,
                         true,
-                        false,
+                        csc_capable,
                         Some(chunk_size),
                     );
                     r
@@ -609,10 +615,17 @@ fn dispatch_rank_genes_kernels(
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?,
         }
     } else {
-        // ScxLazyTransformedDataset (non-CSC GPU path) — route
-        // through `wilcoxon_rank_sum_gpu` with `GpuDeShardInput::Lazy`
-        // (device-resident shard
-        // pipeline) before falling through to the CPU lazy streamer.
+        // ScxLazyTransformedDataset — route through `wilcoxon_rank_sum_gpu`
+        // (device-resident shard pipeline) before falling through to the CPU
+        // lazy streamer.
+        //
+        // `Backed` when the chain carries a sidecar, `Lazy` when it does not.
+        // This arm was CSR-only for as long as `Backed` named the concrete
+        // full-axis readers, which is the shape a transformed handle can never
+        // present — so `normalize_total → log1p` on GPU gave up `gpu_csc_v3`
+        // even on a file with a sidecar, which is every real pipeline. The
+        // source renumbers rows, remaps columns and applies the chain
+        // column-major, so it can serve both sides.
         #[cfg(feature = "gpu")]
         {
             if let Some(device_id) = gpu_device_id {
@@ -622,11 +635,19 @@ fn dispatch_rank_genes_kernels(
                     let chunk_size = gene_chunk_size.unwrap_or(500);
                     let lazy_src = lazy.as_shard_source();
                     drop(lazy);
+                    let input = if lazy_src.csc_preferred_for_auto() {
+                        scx_accel::GpuDeShardInput::Backed {
+                            csr: &lazy_src,
+                            csc: Some(&lazy_src),
+                        }
+                    } else {
+                        scx_accel::GpuDeShardInput::Lazy(&lazy_src)
+                    };
                     let result = py
                         .detach(|| {
                             scx_accel::wilcoxon_rank_sum_gpu(
                                 device_id,
-                                scx_accel::GpuDeShardInput::Lazy(&lazy_src),
+                                input,
                                 gene_names,
                                 groups,
                                 unique_groups,
@@ -636,6 +657,20 @@ fn dispatch_rank_genes_kernels(
                                 rankby_abs,
                                 tie_correct,
                             )
+                        })
+                        .map(|mut r| {
+                            // Same as the backed arm: a declined-but-present
+                            // sidecar must not read as a missing one.
+                            if lazy_src.supports_csc() && r.exec_info.csc_available != Some(true) {
+                                r.exec_info.csc_available = Some(true);
+                                if r.exec_info.fallback_reason
+                                    == scx_accel::FallbackReason::NoCscSidecar
+                                {
+                                    r.exec_info.fallback_reason =
+                                        scx_accel::FallbackReason::PerfPolicy;
+                                }
+                            }
+                            r
                         })
                         .map_err(|e: scx_accel::AccelError| {
                             PyRuntimeError::new_err(e.to_string())
@@ -655,6 +690,8 @@ fn dispatch_rank_genes_kernels(
         if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
             let chunk_size = gene_chunk_size.unwrap_or(500);
             let lazy_src = lazy.as_shard_source().with_cached_reads();
+            // Capability, not route — see the backed arm above.
+            let csc_capable = lazy_src.supports_csc();
             drop(lazy);
             let result = py
                 .detach(|| {
@@ -675,7 +712,7 @@ fn dispatch_rank_genes_kernels(
                         device,
                         scx_accel::InputLayout::LazyCsr,
                         true,
-                        false,
+                        csc_capable,
                         Some(chunk_size),
                     );
                     r
@@ -1036,7 +1073,8 @@ pub fn rank_genes_groups(
     };
     // `prefer_format="csc"` selects the CPU column-major path (it is a CPU-only
     // knob — the GPU CSC-direct route `gpu_csc_v3` is reached via the *default*
-    // prefer_format="csr", chosen by the planner when a CSC sidecar is present).
+    // prefer_format="csr", chosen by the planner when a CSC sidecar is present and
+    // the row window spans at least half the CSR shards).
     // Reject when the user explicitly asked for GPU; for device="auto" fall back
     // to CPU, but nudge on a GPU host so the silent CPU pin is not surprising.
     let gpu_device_id = if prefer_format == "csc" {
@@ -1058,7 +1096,8 @@ pub fn rank_genes_groups(
                      CPU: prefer_format=\"csc\" pins the CPU column-major path even on a GPU \
                      host. For GPU CSC-direct DE (route gpu_csc_v3), drop prefer_format \
                      (pass \"csr\" explicitly) with device=\"auto\"/\"gpu\" — the planner \
-                     routes to gpu_csc_v3 automatically when a CSC sidecar is present.",
+                     routes to gpu_csc_v3 automatically when a CSC sidecar is present \
+                     and the row window spans at least half the CSR shards.",
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),
             )?;

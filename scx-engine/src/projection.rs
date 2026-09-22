@@ -379,6 +379,93 @@ pub fn project_csc(csc: &ScxCsc, gene_indices: &[u32]) -> ScxCsc {
     ScxCsc::new_unchecked((n_rows, n_cols_out), new_indptr, new_indices, new_data)
 }
 
+/// Compact a CSC slab's rows onto a filtered (live) row space, in place.
+///
+/// A CSC sidecar stores each nonzero's **global physical** row, and a row
+/// filter — `filter_cells`, a subset, or a deletion vector — renumbers the rows
+/// the caller can see. Every CSC consumer reads its row space off the source
+/// (`ColumnShardSource::n_obs`) and then indexes a *visible-length* per-row
+/// array by the slab's stored row: a group label, a `cell_to_group` entry, a
+/// dense `[n_obs x chunk]` scatter slot. So a filtered handle needs the slab's
+/// rows translated before it leaves the reader, which is what this does.
+///
+/// `global_to_live[g]` is the live index of global row `g`, or a negative value
+/// when `g` is filtered out. Nonzeros on dropped rows are removed; survivors
+/// keep their value and take their live row. `indptr` is rewritten, `indices`
+/// and `data` are truncated, and `shape.0` becomes `n_live`.
+///
+/// Two invariants carry over rather than needing re-establishing, because a
+/// filter is monotone: row order **within** a column is preserved (which
+/// `scx_accel::csc::pseudobulk` relies on in practice), and no column gains a
+/// duplicate row, since distinct global rows have distinct live indices.
+///
+/// A row outside `global_to_live` is treated as dropped, matching the `row >=
+/// n_obs` skip every CSC kernel already performs — a reader must not panic on a
+/// malformed slab. Debug builds assert instead, so a real bug is loud in tests.
+///
+/// `O(nnz)`, one pass, and in place — there is never a second logical slab. It
+/// is not allocation-*free*: a compaction that leaves the buffers more than
+/// half empty releases the dead tail, which may reallocate and copy once (see
+/// the `shrink_to_fit` below and why its threshold exists).
+pub fn compact_csc_rows_in_place(csc: &mut ScxCsc, global_to_live: &[i32], n_live: usize) {
+    debug_assert!(
+        csc.indices
+            .iter()
+            .all(|&r| r >= 0 && (r as usize) < global_to_live.len()),
+        "compact_csc_rows_in_place: a slab row index is outside global_to_live ({}); \
+         a CSC shard's indices must be global physical rows",
+        global_to_live.len(),
+    );
+
+    let n_cols = csc.n_cols();
+    // Write cursor into `indices`/`data`, always <= the read position, so the
+    // compaction is a single in-place pass rather than a copy into new buffers.
+    let mut w = 0usize;
+    // The read cursor has to be carried rather than re-read from
+    // `indptr[col]`: the previous iteration has already overwritten that entry
+    // with its *write* position, so reading it here would restart each column
+    // at the compacted offset and duplicate entries.
+    let mut read_start = csc.indptr.first().copied().unwrap_or(0) as usize;
+    for col in 0..n_cols {
+        let read_end = csc.indptr[col + 1] as usize;
+        for r in read_start..read_end {
+            // `usize::try_from` rather than `as usize`: a negative row index
+            // in a malformed slab would otherwise wrap to `usize::MAX` and be
+            // dropped by `get`, which is the right *behaviour* reached by an
+            // implicit two's-complement cast. Say it instead.
+            let live = usize::try_from(csc.indices[r])
+                .ok()
+                .and_then(|row| global_to_live.get(row).copied())
+                .unwrap_or(-1);
+            if live >= 0 {
+                csc.indices[w] = live;
+                csc.data[w] = csc.data[r];
+                w += 1;
+            }
+        }
+        // Rewrite this column's end, having consumed its old value above.
+        csc.indptr[col + 1] = w as i64;
+        read_start = read_end;
+    }
+    csc.indices.truncate(w);
+    csc.data.truncate(w);
+    // `truncate` frees no capacity, so a compacted slab would keep the whole
+    // pre-compaction allocation while `LazyShardSource::csc_shard_size_hint`
+    // prices it at the compacted *length* — and the GPU staging budget is
+    // computed from that hint. Release the dead tail only when it is worth a
+    // copy: a light filter (the ordinary `filter_cells`) drops almost nothing
+    // and should not pay a realloc, while a sparse window can be holding most
+    // of a shard for no one.
+    if csc.indices.capacity() > 2 * w {
+        csc.indices.shrink_to_fit();
+        csc.data.shrink_to_fit();
+    }
+    csc.shape.0 = n_live;
+
+    debug_assert_eq!(csc.shape.0, n_live);
+    debug_assert_eq!(csc.indices.len(), w);
+    debug_assert_eq!(csc.indptr.last().copied(), Some(w as i64));
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,5 +1033,188 @@ mod tests {
         assert!(data.is_empty());
         // All indptr values should be 0 (no nnz per row)
         assert!(indptr.iter().all(|&v| v == 0));
+    }
+    // -----------------------------------------------------------------------
+    // compact_csc_rows_in_place
+    //
+    // Every case is checked against a dense oracle rather than against
+    // hand-written indptr/indices, because the failure this function exists to
+    // prevent is *silent*: a CSC kernel skips a row it cannot place
+    // (`row >= n_obs`) and mislabels the rest, so a structural assertion can
+    // pass while the values are wrong.
+    // -----------------------------------------------------------------------
+
+    /// Build a CSC from a row-major dense matrix, storing every nonzero with
+    /// rows ascending within each column.
+    fn csc_from_dense(n_rows: usize, n_cols: usize, dense: &[f32]) -> ScxCsc {
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for c in 0..n_cols {
+            for r in 0..n_rows {
+                let v = dense[r * n_cols + c];
+                if v != 0.0 {
+                    indices.push(r as i32);
+                    data.push(v);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsc::new((n_rows, n_cols), indptr, indices, data).expect("fixture is canonical")
+    }
+
+    /// Read a CSC back as a row-major dense matrix.
+    fn dense_from_csc(csc: &ScxCsc) -> Vec<f32> {
+        let (n_rows, n_cols) = csc.shape;
+        let mut dense = vec![0.0f32; n_rows * n_cols];
+        for c in 0..n_cols {
+            let (idx, vals) = project_csc_column(&csc.indptr, &csc.indices, &csc.data, c);
+            for (&r, &v) in idx.iter().zip(vals.iter()) {
+                dense[r as usize * n_cols + c] = v;
+            }
+        }
+        dense
+    }
+
+    /// `global_to_live` for a sorted list of kept global rows.
+    fn live_map(n_physical: usize, kept: &[usize]) -> Vec<i32> {
+        let mut map = vec![-1i32; n_physical];
+        for (live, &g) in kept.iter().enumerate() {
+            map[g] = live as i32;
+        }
+        map
+    }
+
+    /// The oracle: the dense matrix restricted to `kept`, rows in kept order.
+    fn dense_rows(n_cols: usize, dense: &[f32], kept: &[usize]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(kept.len() * n_cols);
+        for &g in kept {
+            out.extend_from_slice(&dense[g * n_cols..(g + 1) * n_cols]);
+        }
+        out
+    }
+
+    /// 6x4, deliberately ragged: column 1 lives only on rows the tests drop,
+    /// column 3 only on rows they keep, row 2 is structurally empty, and
+    /// there is a stored value on every other row.
+    fn compaction_fixture() -> (usize, usize, Vec<f32>) {
+        let (n_rows, n_cols) = (6usize, 4usize);
+        #[rustfmt::skip]
+        let dense: Vec<f32> = vec![
+            1.0, 0.0, 0.0, 4.0,   // row 0
+            0.0, 2.5, 3.0, 0.0,   // row 1
+            0.0, 0.0, 0.0, 0.0,   // row 2 — structurally empty
+            7.0, 0.0, 0.0, 8.0,   // row 3
+            0.0, 9.5, 0.0, 0.0,   // row 4
+            5.0, 0.0, 6.0, 1.5,   // row 5
+        ];
+        (n_rows, n_cols, dense)
+    }
+
+    /// Compacting against the identity map is a no-op on every array.
+    #[test]
+    fn compacting_with_an_identity_map_changes_nothing() {
+        let (n_rows, n_cols, dense) = compaction_fixture();
+        let original = csc_from_dense(n_rows, n_cols, &dense);
+        let mut csc = original.clone();
+        let kept: Vec<usize> = (0..n_rows).collect();
+        compact_csc_rows_in_place(&mut csc, &live_map(n_rows, &kept), n_rows);
+        assert_eq!(csc.shape, original.shape);
+        assert_eq!(csc.indptr, original.indptr);
+        assert_eq!(csc.indices, original.indices);
+        assert_eq!(csc.data, original.data);
+    }
+
+    /// The interleaved case, against the dense oracle. This is the one that
+    /// matters: rows 1 and 4 are dropped from the middle, so every surviving
+    /// row above them shifts down by a different amount.
+    #[test]
+    fn compacting_renumbers_the_live_rows_and_drops_the_rest() {
+        let (n_rows, n_cols, dense) = compaction_fixture();
+        let mut csc = csc_from_dense(n_rows, n_cols, &dense);
+        let kept = [0usize, 2, 3, 5];
+        compact_csc_rows_in_place(&mut csc, &live_map(n_rows, &kept), kept.len());
+        assert_eq!(csc.shape, (kept.len(), n_cols));
+        assert_eq!(dense_from_csc(&csc), dense_rows(n_cols, &dense, &kept));
+        // And the slab is still canonical in its new row space.
+        ScxCsc::new(
+            csc.shape,
+            csc.indptr.clone(),
+            csc.indices.clone(),
+            csc.data.clone(),
+        )
+        .expect("compaction output must pass full validation");
+    }
+
+    /// Dropping the extremes is the boundary case for the write cursor.
+    #[test]
+    fn dropping_the_first_and_last_rows_keeps_the_middle_intact() {
+        let (n_rows, n_cols, dense) = compaction_fixture();
+        let mut csc = csc_from_dense(n_rows, n_cols, &dense);
+        let kept = [1usize, 2, 3, 4];
+        compact_csc_rows_in_place(&mut csc, &live_map(n_rows, &kept), kept.len());
+        assert_eq!(dense_from_csc(&csc), dense_rows(n_cols, &dense, &kept));
+    }
+
+    /// A column all of whose rows are dropped comes back empty rather than
+    /// carrying a stale `indptr` span. Column 1 lives only on rows 1 and 4.
+    #[test]
+    fn a_column_whose_rows_are_all_dropped_becomes_empty() {
+        let (n_rows, n_cols, dense) = compaction_fixture();
+        let mut csc = csc_from_dense(n_rows, n_cols, &dense);
+        let kept = [0usize, 3, 5];
+        compact_csc_rows_in_place(&mut csc, &live_map(n_rows, &kept), kept.len());
+        assert_eq!(
+            csc.indptr[2] - csc.indptr[1],
+            0,
+            "column 1's only rows were dropped"
+        );
+        assert_eq!(dense_from_csc(&csc), dense_rows(n_cols, &dense, &kept));
+    }
+
+    /// Keeping nothing empties the slab but leaves it structurally valid —
+    /// `indptr` still has `n_cols + 1` entries, all zero.
+    #[test]
+    fn compacting_to_no_rows_leaves_a_valid_empty_slab() {
+        let (n_rows, n_cols, dense) = compaction_fixture();
+        let mut csc = csc_from_dense(n_rows, n_cols, &dense);
+        compact_csc_rows_in_place(&mut csc, &live_map(n_rows, &[]), 0);
+        assert_eq!(csc.shape, (0, n_cols));
+        assert_eq!(csc.nnz(), 0);
+        assert_eq!(csc.indptr.len(), n_cols + 1);
+        assert!(csc.indptr.iter().all(|&v| v == 0));
+        ScxCsc::new(
+            csc.shape,
+            csc.indptr.clone(),
+            csc.indices.clone(),
+            csc.data.clone(),
+        )
+        .expect("an empty slab is still a valid one");
+    }
+
+    /// `shape.0` is the slab's own account of its row space. Nothing on the DE
+    /// path reads it — the kernels take `n_obs` from the source and the GPU
+    /// validator from `source.shape()` — so this test is the only thing that
+    /// catches a compaction that forgets to update it.
+    #[test]
+    fn compaction_reports_the_live_row_count_as_its_shape() {
+        let (n_rows, n_cols, dense) = compaction_fixture();
+        let mut csc = csc_from_dense(n_rows, n_cols, &dense);
+        let kept = [2usize, 4];
+        compact_csc_rows_in_place(&mut csc, &live_map(n_rows, &kept), kept.len());
+        assert_eq!(csc.shape.0, 2);
+        assert!(csc.indices.iter().all(|&r| (r as usize) < 2));
+    }
+
+    /// A row index the map cannot describe is a malformed slab. Debug builds
+    /// say so; release builds drop the entry, which is what every CSC kernel
+    /// already does with an out-of-range row (`row >= n_obs { continue }`),
+    /// because a reader must not panic on bad input.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "outside global_to_live")]
+    fn a_row_index_outside_the_map_is_a_debug_assertion() {
+        let mut csc = ScxCsc::new_unchecked((9, 1), vec![0, 1], vec![8], vec![1.0]);
+        compact_csc_rows_in_place(&mut csc, &live_map(4, &[0, 1]), 2);
     }
 }

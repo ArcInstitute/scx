@@ -1213,7 +1213,9 @@ one worth reaching for on performance grounds. Both halves are **output-neutral*
   `PyRef` cannot cross `py.detach(...)`, so each entry now snapshots what the scan needs
   into an owned handle (`Arc` clones + owned index vectors; no matrix data copied), runs
   the kernel detached, and re-acquires only to build the array. The CSC dispatchers needed
-  a new owned accessor (`as_column_source_owned`) under the identical deletion-vector gate.
+  an owned accessor for the same reason; `as_column_source()` is now that accessor on both
+  handle kinds — it returns an owned view rather than a borrow, so the separate
+  `as_column_source_owned` it once needed is gone.
 
   `pyscx/tests/test_col_aggs_gil.py` measures the property directly rather than as a
   throughput ratio, which would be flaky on a loaded host: a monitor thread stamps
@@ -1844,11 +1846,21 @@ The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell f
 
 **CPU DE routing (Phase-2 §5.2/§5.3).** `rank_genes_groups` and `pdex_ref` now
 default to `prefer_format="auto"`: on CPU they take the CSC-direct kernel when the
-file has a valid CSC sidecar, no active row deletion vector and — on a backed
-handle — no column projection, else the CSR
-streamer (a lazy transform chain is not a disqualifier — the row-indexed
-`normalize_total` / row-scale transforms are served column-major by looking up
-their per-row factor at the global row CSC `indices` carries, bit-identically); on GPU they stay CSR so the planner can route `gpu_csc_v3`.
+file has a CSC sidecar **and** the handle's row window still spans at least half the
+CSR shards, else the CSR streamer. Neither a lazy transform chain, nor a row filter,
+nor a column projection is a *disqualifier* any more — the
+row-indexed `normalize_total` / row-scale transforms are served column-major by
+looking up their per-row factor at the global row CSC `indices` carries
+(bit-identically), and a filtered or gene-subset handle has its slab's rows
+renumbered onto the live row space and its columns remapped into the projected
+one on the way out of the reader. What a window does still decide is the *policy*:
+a CSC column shard spans the whole row axis, so a slice confined to a few shards
+would read every physical cell of the columns it asks for where the CSR path skips
+the shards the slice empties — hence the half-of-the-shards cut, which an explicit
+`prefer_format="csc"` bypasses. On GPU they stay CSR so the planner can route
+`gpu_csc_v3`, which a windowed or transformed handle now also reaches under the same
+condition. A route declined by that policy records `csc_available=true` with
+`fallback_reason=perf_policy`, not `no_csc_sidecar` — the sidecar was there.
 The route + `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`.
 This is a compatibility change (DE previously defaulted to `"csr"`); pin
 `prefer_format="csr"` for the old behaviour. An **exact sparse-nnz Wilcoxon**

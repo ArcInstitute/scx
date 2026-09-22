@@ -1856,32 +1856,17 @@ impl RowQcOutputs {
 }
 
 fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<u32>)> {
-    if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-        let source = backed.as_column_source().ok_or_else(|| {
-            crate::accel::csc_unavailable(
-                backed.backed_csc.is_some(),
-                backed.kept_to_global.is_some(),
-            )
-        })?;
-        let cols_owned: Vec<u32> = match backed.col_projection() {
-            Some(c) => c.to_vec(),
-            None => (0..backed.shape_val.1 as u32).collect(),
-        };
-        return projected_agg::col_sums_and_nnz_projected_csc(source, &cols_owned)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+    if !crate::accel::is_scx_matrix_handle(x) {
+        return Err(PyRuntimeError::new_err(
+            "prefer_format='csc' requires backed or lazy SCX dataset",
+        ));
     }
-    if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
-        let lazy_src = lazy.as_column_source().ok_or_else(|| {
-            crate::accel::csc_unavailable(lazy.backed_csc.is_some(), lazy.kept_to_global.is_some())
-        })?;
-        // Identity positions — see the note in `accel::col_aggs`: a
-        // `LazyShardSource` is already on the projected axis.
-        let cols_owned: Vec<u32> =
-            (0..scx_format_io::ShardSource::n_vars(&lazy_src) as u32).collect();
-        return projected_agg::col_sums_and_nnz_projected_csc(&lazy_src, &cols_owned)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()));
-    }
-    Err(PyRuntimeError::new_err(
-        "prefer_format='csc' requires backed or lazy SCX dataset",
-    ))
+    // One source for both handle kinds, presenting its own visible axes.
+    let source = crate::accel::csc_source_for(x).ok_or_else(crate::accel::csc_unavailable)?;
+    // Identity positions — see the note in `accel::col_aggs`: the source is
+    // already on the projected axis, so passing `col_projection()` back in
+    // would apply it twice.
+    let cols_owned: Vec<u32> = (0..scx_format_io::ShardSource::n_vars(&source) as u32).collect();
+    projected_agg::col_sums_and_nnz_projected_csc(&source, &cols_owned)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }

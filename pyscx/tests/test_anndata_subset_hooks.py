@@ -462,14 +462,23 @@ def test_unsorted_and_duplicated_columns_are_honoured(scx_path, source):
 
 
 def test_a_full_index_through_subset_does_not_install_a_deletion_vector(source, tmp_dir):
-    """`adata[np.arange(n_obs)]` must not cost the CSC sidecar.
+    """`adata[np.arange(n_obs)]` must not change what the CSC route answers.
 
-    The mutating ops guard this with an all-kept early return, but `_subset` is
-    now reachable directly. *Any* `kept_to_global` — even the identity — closes
-    the CSC capability gate (`as_column_source` returns `None`), so a full-index
-    view would permanently downgrade the `gpu_csc_v3` CSC-direct DE route on a
-    file nobody actually subset. Asserted through the gate itself rather than
-    the private field.
+    The mutating ops guard the all-kept case with an early return, but
+    `_subset` is reachable directly, and *any* `kept_to_global` — even the
+    identity — used to close the CSC capability gate, permanently downgrading
+    the `gpu_csc_v3` CSC-direct DE route on a file nobody actually subset.
+
+    **Read what this still proves, and what it no longer does.** A row filter
+    no longer closes that gate, so the mechanism this test used as its
+    detector — the gate raising — is gone: an identity `kept_to_global` now
+    makes the CSC path run a row compaction that cannot drop anything, and the
+    sums come out the same either way. There is no Python-visible signal left
+    to distinguish the two, so what survives here is the answer, not the
+    elision. The elision itself is pinned on the Rust side
+    (`shard_source_tests.rs::an_identity_row_filter_is_indistinguishable_from_no_filter`,
+    bit-for-bit) and by `pyscx/src/backed/sparse_dataset.rs::subset_clone`'s
+    own guard.
     """
     import anndata
     import pandas as pd
@@ -489,8 +498,9 @@ def test_a_full_index_through_subset_does_not_install_a_deletion_vector(source, 
 
     view = pyscx.open(path).to_anndata(backed=True)[np.arange(N_OBS)]
     assert view.X.shape == (N_OBS, N_VARS)
-    # Raises "CSC requested but unavailable ... deletion vector is active" if an
-    # identity `kept_to_global` was installed.
+    # `rtol=0`: an identity view must be bit-for-bit the unsubset answer, which
+    # is the strongest statement still available here (see the docstring — this
+    # used to raise if an identity `kept_to_global` had been installed).
     assert_allclose(pyscx.accel.col_sums(view.X, prefer_format="csc"), expected, rtol=0)
 
 

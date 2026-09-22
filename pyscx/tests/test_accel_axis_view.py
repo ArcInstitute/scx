@@ -407,42 +407,71 @@ def test_sorted_projection_is_not_refused(scx_path, counts, obs_cols, var_names)
 
 
 # ---------------------------------------------------------------------------
-# prefer_format="csc" — still refused on a subset, but now says why
+# prefer_format="csc" on a subset — served, where it used to be refused
 # ---------------------------------------------------------------------------
+#
+# Both of these asserted a `RuntimeError` naming its cause, and both causes
+# were real while the backed handle's column source was the full-axis
+# `BackedCscReader`: a row subset renumbers the live rows that the sidecar's
+# `indices` do not know about, and a column subset left the kernel comparing
+# `gene_names length 15 != source.n_vars() 30` (which is what the named
+# refusal was introduced to replace). The handle now hands back a view that
+# renumbers rows and remaps columns, so both are served — and the assertion
+# that carries the weight is no longer the message but the answer.
 
 
-def test_csc_on_row_subset_names_the_cause(csc_path):
+def test_csc_on_row_subset_matches_the_reference(csc_path, counts, obs_cols, var_names):
     adata = _backed(csc_path)
     pyscx.accel.subset_obs(adata, ROW_KEEP)
-    with pytest.raises(RuntimeError, match="row deletion vector"):
-        pyscx.accel.rank_genes_groups(
-            adata, groupby="pert", method="wilcoxon", prefer_format="csc", device="cpu"
-        )
+    _assert_de_equal(
+        _rgg(adata, prefer_format="csc"),
+        _rgg(_reference(counts, obs_cols, var_names, rows=ROW_KEEP)),
+    )
+    assert _de_route(adata) == "cpu_csc"
 
 
-def test_csc_on_var_subset_names_the_cause(csc_path):
-    """Used to surface as a bare `gene_names length 15 != source.n_vars() 30`."""
+def test_csc_on_var_subset_matches_the_reference(csc_path, counts, obs_cols, var_names):
     adata = _backed(csc_path)
     pyscx.accel.subset_var(adata, COL_KEEP)
-    with pytest.raises(RuntimeError, match="column projection is active"):
-        pyscx.accel.rank_genes_groups(
-            adata, groupby="pert", method="wilcoxon", prefer_format="csc", device="cpu"
-        )
+    _assert_de_equal(
+        _rgg(adata, prefer_format="csc"),
+        _rgg(_reference(counts, obs_cols, var_names, cols=COL_KEEP)),
+    )
+    assert _de_route(adata) == "cpu_csc"
+
+
+def test_csc_on_both_axes_matches_the_reference(csc_path, counts, obs_cols, var_names):
+    """Both windows at once, which is the shape a QC-then-filter workflow
+    leaves behind and the one neither refusal above could reach."""
+    adata = _backed(csc_path)
+    pyscx.accel.subset_obs(adata, ROW_KEEP)
+    pyscx.accel.subset_var(adata, COL_KEEP)
+    _assert_de_equal(
+        _rgg(adata, prefer_format="csc"),
+        _rgg(_reference(counts, obs_cols, var_names, rows=ROW_KEEP, cols=COL_KEEP)),
+    )
+    assert _de_route(adata) == "cpu_csc"
 
 
 # ---------------------------------------------------------------------------
 # GPU DE route: the `has_axis_view()` switch
 # ---------------------------------------------------------------------------
 #
-# The riskiest edit in this change. `GpuDeShardInput::Lazy` cannot carry a CSC
-# sidecar, so an unsubset handle must keep going through `Backed { csr, csc }`
-# to preserve the CSC-direct `gpu_csc_v3` route — `CLAUDE.md` treats a silent
-# CSC→CSR downgrade as a hard gate failure. A subset handle must take `Lazy`:
-# neither of the other CSC gates protects this path (`Backed`'s `csc` is read
-# straight off `backed_csc`, bypassing `as_column_source()`, and
-# `resolve_de_format` short-circuits to "csr" on GPU without consulting
-# `csc_route_available`), so without the switch it would run the CSC-direct
-# kernel against on-disk columns.
+# `has_axis_view()` decides **which** CSC source to hand over, and used to
+# decide whether to hand one over at all. `GpuDeShardInput::Lazy` carries no
+# CSC sidecar, so an unsubset handle goes through `Backed { csr, csc }` with
+# the concrete readers to keep the CSC-direct `gpu_csc_v3` route —
+# `CLAUDE.md` treats a silent CSC→CSR downgrade as a hard gate failure.
+#
+# A subset handle used to be forced onto `Lazy`, giving the route up, because
+# `Backed`'s `csc` was read straight off `backed_csc` — the *file*, full row
+# axis and full column axis — and neither of the other CSC gates protects this
+# path (`as_column_source()` is bypassed, and `resolve_de_format`
+# short-circuits to "csr" on GPU without consulting `csc_route_available`), so
+# it would have run the CSC-direct kernel against on-disk columns under
+# visible-width `gene_names`. `Backed` now takes trait objects, so a subset
+# handle passes its own view on both sides — rows renumbered onto the live
+# space, columns remapped into the projected one — and keeps the route.
 
 
 def _gpu_available():
@@ -479,21 +508,32 @@ def test_gpu_de_keeps_csc_direct_when_unsubset(csc_path):
         pytest.param(lambda a: pyscx.accel.subset_var(a, COL_KEEP), id="cols"),
     ],
 )
-def test_gpu_de_downgrades_to_csr_when_subset(csc_path, subset):
+def test_gpu_de_keeps_csc_direct_when_subset(csc_path, subset):
+    """This asserted `gpu_csr_v3` until `GpuDeShardInput::Backed` took trait
+    objects. It was right then: the only CSC source a subset handle could
+    offer was the full-axis reader. It now offers its own view, so the route
+    survives the subset — and `test_gpu_de_subset_matches_cpu` below is what
+    says the answer survives with it."""
     adata = _backed(csc_path)
     subset(adata)
     pyscx.accel.rank_genes_groups(
         adata, groupby="pert", method="wilcoxon", device="gpu"
     )
-    assert _de_route(adata) == "gpu_csr_v3", (
-        f"a subset handle must not reach the full-axis CSC kernel, "
-        f"got {_de_route(adata)!r}"
+    assert _de_route(adata) == "gpu_csc_v3", (
+        f"a subset handle presents its own CSC view, so the CSC-direct route "
+        f"must survive, got {_de_route(adata)!r}"
     )
 
 
 @gpu_only
 def test_gpu_de_subset_matches_cpu(csc_path, counts, obs_cols, var_names):
-    """The downgrade must also produce the right answer, not just the route."""
+    """The route must also produce the right answer, not just be recorded.
+
+    Load-bearing in a way it was not before: the CSC-direct GPU kernels index
+    `cell_to_group[row_indices[e]]`, a per-row table the driver sizes from the
+    caller's `groups`. On a subset handle that table is visible-length while
+    the sidecar's rows are global, so this is the test that says the
+    renumbering reached the device."""
     adata = _backed(csc_path)
     pyscx.accel.subset_obs(adata, ROW_KEEP)
     pyscx.accel.subset_var(adata, COL_KEEP)
@@ -508,6 +548,53 @@ def test_gpu_de_subset_matches_cpu(csc_path, counts, obs_cols, var_names):
     np.testing.assert_allclose(
         got["scores"].to_numpy().astype(np.float64),
         ref["scores"].to_numpy().astype(np.float64),
+        atol=1e-4,
+    )
+
+
+@gpu_only
+def test_gpu_de_keeps_csc_direct_on_a_transformed_handle(csc_path):
+    """The shape an actual pipeline presents on GPU.
+
+    `normalize_total` turns `X` into an `ScxLazyTransformedDataset`, a
+    different pyclass that never reaches `has_axis_view()` — it took the
+    CSR-shaped `Lazy` input unconditionally, so `gpu_csc_v3` was unreachable
+    for any transformed handle however many sidecars the file had. Compared
+    against the CPU CSC route on the same window and chain, at the tolerance
+    the other GPU DE tests in this file use.
+    """
+    def run(device):
+        adata = _backed(csc_path)
+        pyscx.accel.subset_obs(adata, ROW_KEEP)
+        # `device="cpu"` on the transforms, deliberately. Left at the default
+        # `"auto"` they route through rapids-singlecell on a GPU host, which
+        # **materialises** `X` — so the handle reaching DE is an in-memory
+        # scipy matrix, not a lazy SCX one, `GpuDeShardInput::Csr` is what the
+        # dispatch picks, and the route comes back `gpu_csr_v3` without the
+        # lazy arm this test exists for ever being reached. That is how the
+        # first version of this test failed: it asserted the right thing about
+        # a shape it never built.
+        pyscx.accel.normalize_total(adata, target_sum=1e4, device="cpu")
+        pyscx.accel.log1p(adata, device="cpu")
+        assert type(adata.X).__name__ == "ScxLazyTransformedDataset", (
+            f"premise: the chain must leave X lazy, got {type(adata.X).__name__}"
+        )
+        pyscx.accel.rank_genes_groups(
+            adata, groupby="pert", method="wilcoxon", device=device
+        )
+        return _de_route(adata), pyscx.accel.rank_genes_groups_df(adata, group="drug")
+
+    gpu_route, gpu_df = run("gpu")
+    cpu_route, cpu_df = run("cpu")
+    assert gpu_route == "gpu_csc_v3", (
+        f"a transformed handle with a sidecar must reach the CSC-direct GPU "
+        f"route, got {gpu_route!r}"
+    )
+    assert cpu_route == "cpu_csc", f"premise: the CPU side takes CSC too, got {cpu_route!r}"
+    assert list(gpu_df["names"]) == list(cpu_df["names"])
+    np.testing.assert_allclose(
+        gpu_df["scores"].to_numpy().astype(np.float64),
+        cpu_df["scores"].to_numpy().astype(np.float64),
         atol=1e-4,
     )
 

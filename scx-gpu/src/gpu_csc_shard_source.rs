@@ -45,9 +45,18 @@ use crate::staging_driver::{
 /// Borrowed CSC view backed by a device-resident CSC shard slot.
 ///
 /// Column-major: `col_indptr` indexes into `row_indices` / `data` per
-/// column. `row_indices` stores **global** row (cell) ids — the cell
-/// numbering is consistent across all shards in the file. This matches the
-/// on-disk encoding documented in `docs/format.md` § 5 (`shard_type = 1`).
+/// column. `row_indices` stores row (cell) ids **in the source's own row
+/// space**, and `n_obs` is that space's extent — the two always agree because
+/// both come from the same [`ColumnShardSource`].
+///
+/// For a `BackedCscReader` that space is the file's: global cell ids,
+/// consistent across every shard, exactly the on-disk encoding documented in
+/// `docs/format.md` § 5 (`shard_type = 1`). For a *view* source — pyscx's
+/// `LazyShardSource` over a row-filtered handle — it is the **visible** row
+/// space, because the reader renumbers each slab onto it before handing it
+/// over. Do not pair one source's slabs with another's per-cell table:
+/// `ensure_cell_table_covers` only rejects a table that is too *short*, never
+/// one in a different row space.
 ///
 /// All fields are exact-sized: `col_indptr.len() == n_cols_in_shard + 1`,
 /// `row_indices.len() == data.len() == nnz`. Callers can pass `&col_indptr`,
@@ -55,7 +64,7 @@ use crate::staging_driver::{
 pub struct GpuCscShardView<'a> {
     /// `[n_cols_in_shard + 1]` cumulative offsets (CSC-style).
     pub col_indptr: CudaView<'a, i64>,
-    /// `[nnz]` global row (cell) indices.
+    /// `[nnz]` row (cell) indices, in the source's row space (see above).
     pub row_indices: CudaView<'a, i32>,
     /// `[nnz]` values.
     pub data: CudaView<'a, f32>,
@@ -64,7 +73,8 @@ pub struct GpuCscShardView<'a> {
     /// One-past-last global column id (exclusive); `col_end - col_start` is
     /// the shard's column count.
     pub col_end: usize,
-    /// Cell count (n_obs) — same across all shards in a file.
+    /// Cell count (n_obs) in the same row space as `row_indices`; identical
+    /// across all shards of one source.
     pub n_obs: usize,
 }
 

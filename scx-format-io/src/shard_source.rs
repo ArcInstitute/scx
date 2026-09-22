@@ -324,8 +324,15 @@ pub trait ColumnShardSource {
     /// Number of CSC shards.
     fn n_csc_shards(&self) -> usize;
 
-    /// Total number of observations (rows). Must match the underlying
-    /// CSR view; CSC shards span the full row axis.
+    /// Total number of observations (rows) **in this source's row space**,
+    /// which must match the row ids its slabs carry.
+    ///
+    /// A CSC shard spans the source's whole row axis. For a reader over a file
+    /// that axis is the file's, and the slabs' indices are global cell ids. An
+    /// implementor that presents a *window* — pyscx's `LazyShardSource` over a
+    /// row-filtered handle — reports the visible count here and must renumber
+    /// its slabs' rows to match, which is what lets a consumer index a
+    /// visible-length per-cell array by a slab's row id.
     fn n_obs(&self) -> usize;
 
     /// Number of variables (columns).

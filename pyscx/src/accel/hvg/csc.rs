@@ -4,8 +4,6 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::types::PyDict;
 
 use super::*;
-use crate::backed::ScxBackedSparseDataset;
-use crate::lazy_transform::ScxLazyTransformedDataset;
 use crate::optional_deps::{import_optional, EXTRA_HVG};
 
 /// Loess fit on (log10 mean, log10 var) for non-constant genes — the
@@ -180,8 +178,9 @@ fn csc_clip_dispatch<S: scx_format_io::ColumnShardSource + Sync>(
 /// `ColumnShardSource`. With `device_id = Some(gid)` the two reduction
 /// passes run the GPU CSC reduce kernels (one block per gene, no
 /// `atomicAdd`) — route `gpu_csc_v3`; `None` runs the CPU CSC kernels.
-/// GPU CSC reduce is **backed-only** (raw counts): the lazy-transformed
-/// branch always runs CPU since its `&dyn` source is not `Sync`.
+/// Both handle kinds reach either device: the column source is owned and
+/// `Sync`, so the restriction that used to pin the lazy branch to CPU (a
+/// borrowed `&dyn ColumnShardSource` is not `Sync`) is gone.
 pub(crate) fn hvg_seurat_v3_csc(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -196,100 +195,53 @@ pub(crate) fn hvg_seurat_v3_csc(
 
     let x = adata.getattr("X")?;
 
-    // ── Backed dataset: concrete `Arc<BackedCscReader>` (Send + Sync), so
-    //    the GPU CSC reduce path (which decodes on a worker thread) is
-    //    reachable. Mirror the same capability gate as `as_column_source`. ──
-    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        let backed_ref = backed.borrow();
-        if backed_ref.kept_to_global.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "CSC requested but unavailable: a row deletion vector is active. \
-                 Pass `prefer_format='csr'`.",
-            ));
-        }
-        let csc_reader = backed_ref
-            .backed_csc
-            .as_ref()
-            .ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "CSC requested but unavailable: file has no CSC sidecar. \
-                     Re-import with `csc=\"always\"` or pass `prefer_format='csr'`.",
-                )
-            })?
-            .clone();
-        drop(backed_ref);
-
-        let n_obs = csc_reader.n_obs();
-        let n_vars = csc_reader.n_vars();
-
-        #[cfg(feature = "gpu")]
-        let stats = csc_mean_var_dispatch(py, csc_reader.as_ref(), device_id)?;
-        #[cfg(not(feature = "gpu"))]
-        let stats = {
-            let _ = device_id;
-            scx_accel::streaming_mean_var_csc(csc_reader.as_ref())
-                .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}")))?
-        };
-
-        let estimat_var = csc_loess_estimat_var(py, &stats.means, &stats.variances, span)?;
-        let clip_val = csc_clip_val(&stats.means, &estimat_var, n_obs);
-
-        #[cfg(feature = "gpu")]
-        let (bcs, sbcs) = csc_clip_dispatch(py, csc_reader.as_ref(), &clip_val, device_id)?;
-        #[cfg(not(feature = "gpu"))]
-        let (bcs, sbcs) = scx_accel::streaming_clip_square_sum_csc(csc_reader.as_ref(), &clip_val)
-            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_csc: {e}")))?;
-
-        return csc_finish_seurat_v3(
-            py,
-            adata,
-            n_obs,
-            n_vars,
-            stats.means,
-            stats.variances,
-            estimat_var,
-            bcs,
-            sbcs,
-            n_top_genes,
-            subset,
-        );
+    // ── One column source for either handle kind. `as_column_source()` hands
+    //    back an owned `LazyShardSource` (Send + Sync), so the GPU CSC reduce
+    //    path — which decodes on a worker thread and wants
+    //    `S: ColumnShardSource + Sync` — is reachable from both. The lazy arm
+    //    used to be pinned to CPU because it held a borrowed `&dyn
+    //    ColumnShardSource`, which is not `Sync`; that was a property of the
+    //    borrow, not of the data. ──
+    if !crate::accel::is_scx_matrix_handle(&x) {
+        return Err(PyRuntimeError::new_err(
+            "prefer_format='csc' requires adata.X to be ScxBackedSparseDataset \
+             or ScxLazyTransformedDataset (got a regular scipy/dense matrix)",
+        ));
     }
+    let source = crate::accel::csc_source_for(&x).ok_or_else(crate::accel::csc_unavailable)?;
 
-    // ── Lazy-transformed dataset: CPU CSC only (the `&dyn` column source is
-    //    not `Sync`, and GPU CSC reduce is a raw-counts / backed feature). ──
-    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
-        let lazy_ref = lazy.borrow();
-        let lazy_src = lazy_ref.as_column_source().ok_or_else(|| {
-            crate::accel::csc_unavailable(
-                lazy_ref.backed_csc.is_some(),
-                lazy_ref.kept_to_global.is_some(),
-            )
-        })?;
-        let n_obs = lazy_src.n_obs();
-        let n_vars = lazy_src.n_vars();
-        let stats = scx_accel::streaming_mean_var_csc(&lazy_src)
-            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}")))?;
-        let estimat_var = csc_loess_estimat_var(py, &stats.means, &stats.variances, span)?;
-        let clip_val = csc_clip_val(&stats.means, &estimat_var, n_obs);
-        let (bcs, sbcs) = scx_accel::streaming_clip_square_sum_csc(&lazy_src, &clip_val)
-            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_csc: {e}")))?;
-        return csc_finish_seurat_v3(
-            py,
-            adata,
-            n_obs,
-            n_vars,
-            stats.means,
-            stats.variances,
-            estimat_var,
-            bcs,
-            sbcs,
-            n_top_genes,
-            subset,
-        );
-    }
+    let n_obs = ColumnShardSource::n_obs(&source);
+    let n_vars = ColumnShardSource::n_vars(&source);
 
-    Err(PyRuntimeError::new_err(
-        "prefer_format='csc' requires adata.X to be ScxBackedSparseDataset \
-         or ScxLazyTransformedDataset (got a regular scipy/dense matrix)",
-    ))
+    #[cfg(feature = "gpu")]
+    let stats = csc_mean_var_dispatch(py, &source, device_id)?;
+    #[cfg(not(feature = "gpu"))]
+    let stats = {
+        let _ = device_id;
+        scx_accel::streaming_mean_var_csc(&source)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}")))?
+    };
+
+    let estimat_var = csc_loess_estimat_var(py, &stats.means, &stats.variances, span)?;
+    let clip_val = csc_clip_val(&stats.means, &estimat_var, n_obs);
+
+    #[cfg(feature = "gpu")]
+    let (bcs, sbcs) = csc_clip_dispatch(py, &source, &clip_val, device_id)?;
+    #[cfg(not(feature = "gpu"))]
+    let (bcs, sbcs) = scx_accel::streaming_clip_square_sum_csc(&source, &clip_val)
+        .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_csc: {e}")))?;
+
+    csc_finish_seurat_v3(
+        py,
+        adata,
+        n_obs,
+        n_vars,
+        stats.means,
+        stats.variances,
+        estimat_var,
+        bcs,
+        sbcs,
+        n_top_genes,
+        subset,
+    )
 }
