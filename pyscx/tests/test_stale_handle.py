@@ -457,6 +457,7 @@ _EXPERIMENT_CALLS = {
     "codec_id": lambda e: e.codec_id,
     "index_dtype": lambda e: e.index_dtype,
     "has_csc": lambda e: e.has_csc,
+    "n_csc_shards": lambda e: e.n_csc_shards,
     "has_deletions": lambda e: e.has_deletions,
     # shard-header / catalog folds — still through `reader()`, so they refuse too
     "value_encoding": lambda e: e.value_encoding,
