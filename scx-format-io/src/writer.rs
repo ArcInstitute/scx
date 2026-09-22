@@ -1771,8 +1771,9 @@ impl ScxWriter {
     /// Carry obs `column_stats` from a source catalog's CSR entries onto this
     /// writer's, matching by `row_start`. Returns how many shards received them.
     ///
-    /// For `build-csc` / `optimize`, which re-encode every CSR shard while
-    /// preserving the row partition 1:1. See
+    /// For `optimize` / `scx upgrade`, which re-encode every CSR shard while
+    /// preserving the row partition 1:1. (`build-csc` used to be a third; it
+    /// now appends in place and never rewrites a CSR entry.) See
     /// [`carry_csr_shard_column_stats`] for why this copies rather than
     /// re-deriving from the carried index.
     pub fn carry_csr_shard_column_stats_from(&mut self, source: &[FullCatalogEntry]) -> usize {

@@ -2267,6 +2267,9 @@ fn test_query_no_filter_gets_no_category_note() {
 /// `CategoryBitset`. So the section was there and the pruning was gone — a full
 /// scan returning the right rows, which is why nothing caught it.
 ///
+/// (`build-csc` has since become an in-place append that never writes a CSR entry,
+/// so it now keeps both by construction; the test stays as the end-to-end pin.)
+///
 /// That gap was pinned here rather than fixed, with a note saying the fix was to
 /// wire the stats into the re-emit as `merge` does. Phase 5c did that, and found
 /// `optimize` — the only other op declaring `Carry::Verbatim` for this family —
@@ -2409,9 +2412,9 @@ fn build_csc_carries_predicate_index_and_pushdown() {
     let (after_elim, after_matched) = pruned(&copied);
     assert_eq!(
         after_elim, before_elim,
-        "build-csc re-encodes every CSR shard, so it must re-derive the per-shard \
-         column stats Level-1 pruning reads from the index it carried. Carrying \
-         the section bytes alone leaves pruning off."
+        "build-csc must leave the per-shard column stats Level-1 pruning reads \
+         intact. It is an append now and never rewrites a CSR entry; when it \
+         re-encoded every shard, carrying the section bytes alone left pruning off."
     );
     assert_eq!(
         before_matched, after_matched,

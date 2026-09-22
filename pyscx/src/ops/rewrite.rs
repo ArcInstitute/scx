@@ -328,9 +328,8 @@ fn run_sort_engine(
         // Run the heavy CSC rebuild off the GIL too. Its `Box<dyn Error>` is
         // not `Send`, so map it to a `String` inside the closure to cross
         // `py.detach`.
-        // NOT `None`: on a v4 output that would rewrite CSR + CSC unframed and
-        // strip the row-group framing the sort just wrote. See
-        // `scx_ops::framing_for_csc_rebuild`.
+        // The admissible framing for the sidecar (`Some` iff the output is v4).
+        // See `scx_ops::framing_for_csc_rebuild`.
         let csc_framing = scx_ops::framing_for_csc_rebuild(output_path);
         py.detach(|| {
             scx_ops::rebuild_csc_inplace(

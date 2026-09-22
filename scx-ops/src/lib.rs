@@ -40,7 +40,7 @@ pub use append::{
     append, append_from_reader, append_from_reader_with_index_options, append_with_index_options,
     AppendOptions,
 };
-pub use build_csc::{run_build_csc, BuildCscOutcome};
+pub use build_csc::{rebuild_csc_inplace, run_build_csc, BuildCscOutcome};
 pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
 pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};
 // Re-exported from `scx-format-io`, which is where the obs shard-boundary loop
@@ -70,9 +70,9 @@ pub use modify_metadata::{
 };
 pub use optimize::{optimize, optimize_with_budget, optimize_with_framing, OptimizeStats};
 pub use predicate_index::{ObsVarIndexPass, PredicateIndexBuildSummary, StatsSink};
-pub use rebuild_csc::{framing_for_csc_rebuild, rebuild_csc_inplace};
+pub use rebuild_csc::framing_for_csc_rebuild;
 pub use rewrite_helpers::{
-    codec_for_canonicalized, copy_auxiliary_sections, copy_auxiliary_sections_canonicalizing,
+    codec_for_canonicalized, copy_auxiliary_sections_canonicalizing,
     copy_obs_var_preserving_layout, encoding_for_canonicalized, LayerCanonicalization,
 };
 pub use rollback::{rollback, rollback_to};

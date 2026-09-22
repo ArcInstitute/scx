@@ -515,7 +515,7 @@ fn compact(family: SectionFamily) -> Carry {
             warns: true,
         },
         F::LayerCsc => Carry::Dropped {
-            why: "re-sharding invalidates column-major offsets (rebuild: scx build-csc)",
+            why: "re-sharding invalidates column-major offsets (nothing rebuilds a layer sidecar)",
             warns: false,
         },
         // Correct to drop — bitmap row keys are shard-local and compact
@@ -595,7 +595,7 @@ fn merge(family: SectionFamily) -> Carry {
             warns: true,
         },
         F::LayerCsc => Carry::Dropped {
-            why: "output row space differs from every input's (rebuild: scx build-csc)",
+            why: "output row space differs from every input's (nothing rebuilds a layer sidecar)",
             warns: false,
         },
         F::Bitmap => Carry::Dropped {
@@ -656,7 +656,7 @@ fn optimize(family: SectionFamily) -> Carry {
             warns: true,
         },
         F::LayerCsc => Carry::Dropped {
-            why: "re-canonicalisation can change nnz, staleing column offsets (rebuild: scx build-csc)",
+            why: "re-canonicalisation can change nnz, staleing column offsets (nothing rebuilds a layer sidecar)",
             warns: false,
         },
         F::Raw => Carry::Dropped {
@@ -707,7 +707,8 @@ fn sort(family: SectionFamily) -> Carry {
             warns: true,
         },
         F::LayerCsc => Carry::Dropped {
-            why: "permuting rows invalidates column-major offsets (rebuild: scx build-csc)",
+            why:
+                "permuting rows invalidates column-major offsets (nothing rebuilds a layer sidecar)",
             warns: false,
         },
         F::Raw => Carry::Dropped {
@@ -754,14 +755,19 @@ fn build_csc(family: SectionFamily) -> Carry {
         // Shard-local row keys; the CSR shards they key are untouched.
         F::Bitmap => Carry::Verbatim,
         F::GroupIndex => Carry::Verbatim,
-        // A layer's column-major view. Nothing here rebuilds it, and nothing
-        // needs to: `data_generation` is unchanged, so it is as fresh after the
-        // append as before. It was `Dropped` while build-csc rewrote the file.
-        F::LayerCsc => Carry::Verbatim,
-        F::Unwritten => Carry::Dropped {
-            why: "no writer in this workspace produces it",
-            warns: false,
+        // A layer's column-major view. Nothing here rebuilds it, and it shares
+        // the one freshness stamp (`csc_build_generation`) that this op
+        // re-stamps for X's sidecar. So a fresh one is carried untouched, and a
+        // stale one — which the new stamp would otherwise bless — is dropped
+        // with a warning. It was `Dropped` outright while build-csc rewrote the
+        // file.
+        F::LayerCsc => Carry::Conditional {
+            on: "carried when fresh (csc_build_generation == data_generation); a stale one is dropped",
         },
+        // Nothing writes it, but an append carries whatever is there: dropping
+        // it would be the only rewrite this op performs, and declaring it
+        // `Dropped` made `audit_in_place` refuse every file that had one.
+        F::Unwritten => Carry::Verbatim,
     }
 }
 
@@ -819,7 +825,7 @@ fn upgrade(family: SectionFamily) -> Carry {
         // The allowlist has no layer-CSC rebuild path. `build-csc` keeps one
         // only because it never rewrites anything.
         F::LayerCsc => Carry::Dropped {
-            why: "no rebuild path in this op (rebuild: scx build-csc)",
+            why: "no rebuild path in this op (nothing rebuilds a layer sidecar)",
             warns: true,
         },
         F::Unwritten => Carry::Dropped {
@@ -1006,8 +1012,8 @@ pub fn audit_staged(
 ///
 /// An append can promise something no rewrite can: a `Verbatim` family is not
 /// merely present in the output but is the **same catalog entry** — same name,
-/// type, modality, offset, length and checksum — because its bytes were never
-/// moved. So on top of [`audit`]'s presence rules, every input entry whose
+/// type, modality, offset, length, checksum and stats — because its bytes were
+/// never moved. So on top of [`audit`]'s presence rules, every input entry whose
 /// family this op declares `Verbatim` must appear in `new` unchanged. A
 /// rewrite that snuck into an in-place op (a re-encoded shard written to EOF,
 /// say) would keep its family present and pass [`audit`]; it fails here.
@@ -1027,6 +1033,11 @@ pub fn audit_in_place(
             && a.offset == b.offset
             && a.length == b.length
             && a.checksum == b.checksum
+            // Catalog data, outside the section checksum: the per-shard
+            // `column_stats` Level-1 pruning reads live here, so bytes that
+            // survive with their stats cleared are exactly the loss this
+            // table was written down for.
+            && a.stats == b.stats
     };
     for e in &old.entries {
         let scope = if e.modality_id == 0 {

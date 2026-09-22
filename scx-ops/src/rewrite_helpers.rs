@@ -347,27 +347,27 @@ pub fn codec_for_canonicalized(source: CodecId, encoding: ValueEncoding) -> Code
 /// `copy_bitmaps`.
 const DROPPED_SECTION_FAMILIES: &[(SectionType, &str)] = &[(
     SectionType::LayerCscShard,
-    "layer CSC sidecars (rebuild: scx build-csc)",
+    "layer CSC sidecars (nothing rebuilds them)",
 )];
 
 /// Warn, once per family, about input sections this rewrite is about to drop.
 ///
 /// `copy_auxiliary_sections` is an allowlist, so anything it does not name is
-/// dropped — silently, until this existed. Both its callers rename a wholly new
-/// file over the target with no prior catalog, so `scx rollback` cannot recover
-/// what goes missing.
+/// dropped — silently, until this existed. Its caller (`scx upgrade`) can rename
+/// a wholly new file over the target with no prior catalog, so `scx rollback`
+/// cannot recover what goes missing.
 fn warn_dropped_sections(reader: &ScxReader, action: &str) {
     let dropped = dropped_section_labels(reader);
     if !dropped.is_empty() {
         // No rollback clause: this helper does not know whether the caller is
         // writing to a separate output (where the input is untouched) or
-        // renaming over it. Stating the loss and the remedy is true of both;
+        // renaming over it. Stating the loss (and, in its label, whether any
+        // remedy exists) is true of both;
         // claiming irreversibility on the copy-out form would be the same wrong
         // rationale for a right warning that `run_upgrade`'s decline message
         // had. The in-place hazard is documented in docs/operations.md.
         log::warn!(
-            "scx {action}: the output will not carry {} — rebuild them against the \
-             output if you need them.",
+            "scx {action}: the output will not carry {}.",
             dropped.join(", ")
         );
     }
@@ -444,7 +444,7 @@ impl LayerCanonicalization {
 /// provenance entry.
 ///
 /// **Only valid for a rewrite that preserves the global obs row space 1:1** —
-/// its two callers, `build_csc` and `scx upgrade`, both do. That precondition
+/// its caller, `scx upgrade`, does. That precondition
 /// is what licenses nearly everything here: v2 deletion vectors store global obs
 /// row indices, detection bitmaps are keyed to CSR-shard-local rows, and the
 /// group index records global output-row ranges, so all three stay valid exactly
@@ -455,7 +455,7 @@ impl LayerCanonicalization {
 /// graph, `uns`, `adata.raw`, detection bitmaps, the grouped-sort group index,
 /// the predicate-index sections, and the deletion vector.
 ///
-/// Does **not** carry layer CSC sidecars (rebuild with `scx build-csc`), and
+/// Does **not** carry layer CSC sidecars (nothing rebuilds them), and
 /// carries detection bitmaps only when canonicalization left the matrix alone —
 /// see [`LayerCanonicalization`]. [`warn_dropped_sections`] reports whatever is
 /// dropped rather than leaving the user to discover it; see
@@ -467,33 +467,14 @@ impl LayerCanonicalization {
 /// carry was written to fix, and why `scx_ops::carry`'s audit runs over the
 /// output regardless of what this function believes it copied.
 ///
-/// Layers are re-emitted as they are. For the canonicalizing variant — which
-/// `scx upgrade` needs and `build_csc` must not have — see
-/// [`copy_auxiliary_sections_canonicalizing`].
-pub fn copy_auxiliary_sections(
-    reader: &ScxReader,
-    writer: &mut ScxWriter,
-    action: &str,
-    params_json: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    copy_auxiliary_sections_canonicalizing(
-        reader,
-        writer,
-        action,
-        params_json,
-        LayerCanonicalization::Off,
-    )
-}
-
-/// [`copy_auxiliary_sections`] with control over canonicalization.
-///
-/// The fifth parameter was a bare `canonicalize: bool` until Phase 5b, split out
-/// of the four-argument form rather than widening it because only one of the two
-/// callers was making the choice. It is now [`LayerCanonicalization`], because
-/// the caller that *is* making it also has to answer a second question the
-/// bitmap carry depends on — and answering "did canonicalization change the
-/// matrix?" with a separate `bool` would let a caller pass a combination
-/// (`Off` + `changed`) that cannot happen.
+/// Takes a [`LayerCanonicalization`] because its one caller, `scx upgrade`,
+/// has to answer two questions the carry depends on: whether to canonicalise
+/// layers, and whether canonicalising X changed the matrix under the bitmaps.
+/// A four-argument non-canonicalising wrapper existed for `build-csc`, which no
+/// longer rewrites anything and so no longer calls this. The parameter was a
+/// bare `canonicalize: bool` until Phase 5b; answering "did canonicalization
+/// change the matrix?" with a separate `bool` would let a caller pass a
+/// combination (`Off` + `changed`) that cannot happen.
 pub fn copy_auxiliary_sections_canonicalizing(
     reader: &ScxReader,
     writer: &mut ScxWriter,
@@ -818,7 +799,7 @@ fn copy_deletion_vectors(
 ///
 /// `canonicalize` sorts each row's column indices, sums duplicate coordinates
 /// and drops explicit zeros before re-encoding — the v3 canonical-CSR contract.
-/// See [`copy_auxiliary_sections`] for why it is the caller's choice.
+/// See [`copy_auxiliary_sections_canonicalizing`] for why it is the caller's choice.
 fn copy_layers(
     reader: &ScxReader,
     writer: &mut ScxWriter,
@@ -1215,7 +1196,7 @@ mod tests {
         w.finish().unwrap();
         assert_eq!(
             dropped_section_labels(&ScxReader::open(&with_layer_csc).unwrap()),
-            vec!["layer CSC sidecars (rebuild: scx build-csc)"],
+            vec!["layer CSC sidecars (nothing rebuilds them)"],
             "the one family still on the list must still be named when present"
         );
 

@@ -19,28 +19,23 @@ pub fn validate_scx_file(path: &Path) -> CliResult<()> {
     Ok(())
 }
 
-/// Derive the framing config to use when rewriting `path`'s CSC sidecar so the
-/// rebuild preserves the file's existing layout: a framed (v4) file keeps
-/// framing (default `G`), an unframed (≤v3) file stays unframed. Without this,
-/// `rebuild_csc_inplace(..., None)` re-encodes every CSR shard unframed and
-/// silently downgrades a v4 file back to v3 — undoing the framing that
-/// compact/sort/merge/append/subset just preserved. Returns `None` (unframed)
-/// if the file can't be opened; the CSC rebuild surfaces any real error.
+/// The framing argument for a CSC sidecar build on `path`: `Some(default)` on a
+/// framed (v4) file, `None` on an unframed (≤v3) one — exactly the values the
+/// build admits. The build appends the sidecar and never rewrites a CSR shard,
+/// so it frames the sidecar to match the file and refuses `Some` on a ≤ v3 file
+/// rather than re-framing it. Returns `None` if the file can't be opened; the
+/// build surfaces any real error.
 ///
 /// **Deliberately `FramingConfig::default()` — i.e. `decode_target: None`.**
-/// This is the one framing site where the `fast` profile is correct rather than
-/// a bug: a CSC rebuild re-writes each CSR shard at the codec read off the
-/// source shard header, and `decode_target: Some(_)` would authorise the writer
-/// to re-select it (see `FramingConfig`'s contract), silently defeating the
-/// preservation. Do not "make this consistent" with the derived-file ops.
-/// Pinned by `scx-ops/tests/codec_adaptive.rs::build_csc_preserves_per_shard_codec`.
+/// `decode_target: Some(_)` would authorise the encoder to re-pick the
+/// sidecar's codec, which `pick_csc_encoding` has already decided (the build
+/// also clears it defensively). While build-csc still rewrote the CSR, the same
+/// field would have re-selected every CSR shard's codec — `subset` and
+/// `convert --csc` passed the rewrite framing until review caught it.
 ///
-/// **Every `rebuild_csc_inplace` caller must get its framing from here** (or, in
-/// `scx-convert`, from `IngestOptions::framing_preserving_codec`) — never from
-/// the framing used for the surrounding rewrite. `subset` and `convert --csc`
-/// both passed the rewrite framing until this was caught in review: harmless
-/// while `write_shard_inner` ignored `decode_target`, a silent codec override
-/// once it honoured it.
+/// **Every `rebuild_csc_inplace` caller should get its framing from here** (or,
+/// in `scx-convert`, from `IngestOptions::framing_preserving_codec`, which
+/// carries a custom `--row-group-rows` through to the sidecar).
 pub fn framing_for_file(path: &Path) -> Option<scx_format_io::FramingConfig> {
     // Delegates so the CLI, pyscx and convert cannot drift apart on this rule
     // again -- see `scx_ops::framing_for_csc_rebuild`.

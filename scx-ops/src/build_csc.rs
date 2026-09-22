@@ -264,16 +264,19 @@ fn truncate_on_error<T>(
     result
 }
 
-/// Add a CSC sidecar to `path` in place: the CSC shards are appended at EOF
+/// Add a CSC sidecar to `path` in place — `scx build-csc` with no `<OUTPUT>`,
+/// and `--rebuild-csc` on the mutating ops. The CSC shards are appended at EOF
 /// and the catalog repointed with `prepare_in_place` / `commit_in_place`, the
 /// harness `append` and the attach ops use.
 ///
-/// Nothing else in the file moves. Every CSR shard, layer, obs/var section,
-/// index and bitmap keeps its bytes at its offset — [`crate::carry::audit_in_place`]
-/// checks that before committing — so `data_generation` is unchanged, a
-/// pre-existing *layer* sidecar stays fresh, and `scx rollback` undoes the
-/// build. A sidecar already on the file is replaced; its bytes become orphans
-/// that `scx compact --rebuild-csc` reclaims, as with every in-place op.
+/// Nothing else in the file moves. Every CSR shard, obs/var section, index and
+/// bitmap keeps its bytes at its offset — [`crate::carry::audit_in_place`]
+/// checks that before committing — so `data_generation` is unchanged and
+/// `scx rollback` undoes the build. A sidecar already on the file is replaced;
+/// its bytes become orphans that `scx compact --rebuild-csc` reclaims, as with
+/// every in-place op. A *layer* sidecar is kept when it is fresh and dropped
+/// with a warning when it is not, because the generation stamp written here is
+/// the one freshness field every column-major section shares.
 ///
 /// `framing`: `None` or `Some` on a v4 file (the sidecar is framed with it, or
 /// with the default when `None`); must be `None` on a ≤ v3 file, which an
@@ -284,13 +287,13 @@ fn truncate_on_error<T>(
 /// `temp_dir`: root for the CSC builder's column-bucket spill files. `None`
 /// uses the file's own directory — see `TempDirSpillStore` for why that,
 /// rather than the platform temp dir the other spilling ops default to.
-pub(crate) fn build_csc_in_place(
+pub fn rebuild_csc_inplace(
     path: &Path,
-    memory_limit: &str,
     csc_cols_per_shard: usize,
+    memory_limit: &str,
     framing: Option<FramingConfig>,
     temp_dir: Option<&Path>,
-) -> Result<Built, BoxError> {
+) -> Result<BuildCscOutcome, BoxError> {
     if !path.exists() {
         return Err(format!("input file does not exist: {}", path.display()).into());
     }
@@ -308,7 +311,7 @@ pub(crate) fn build_csc_in_place(
                 prep.header.n_obs,
                 prep.header.n_vars
             );
-            return Ok(Built::none());
+            return Ok(BuildCscOutcome::NoSidecar);
         }
         Plan::Empty { has_csc: true } => {
             log::info!(
@@ -406,12 +409,35 @@ pub(crate) fn build_csc_in_place(
                 path.display()
             );
         }
+        // A layer sidecar shares the one freshness stamp with X's, and this op
+        // re-stamps it below. One that was already stale (built before an op
+        // that bumped `data_generation` and did not drop it) would be blessed by
+        // that stamp, so it is dropped instead — nothing here can rebuild it.
+        // A fresh one is carried untouched.
+        let old_fresh = prep.old_catalog.csc_build_generation == prep.old_catalog.data_generation;
+        let stale_layer_csc = !old_fresh
+            && prep
+                .old_catalog
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::LayerCscShard);
+        if stale_layer_csc {
+            log::warn!(
+                "build-csc: dropping the stale layer CSC sidecar on {} (built at generation \
+                 {}, file is at {}); nothing rebuilds a layer sidecar",
+                path.display(),
+                prep.old_catalog.csc_build_generation,
+                prep.old_catalog.data_generation
+            );
+        }
         let mut entries: Vec<FullCatalogEntry> = prep
             .old_catalog
             .entries
             .iter()
             .filter(|e| {
-                e.section_type != SectionType::CscShard && e.section_type != SectionType::Provenance
+                e.section_type != SectionType::CscShard
+                    && e.section_type != SectionType::Provenance
+                    && !(stale_layer_csc && e.section_type == SectionType::LayerCscShard)
             })
             .cloned()
             .collect();
@@ -487,41 +513,13 @@ pub(crate) fn build_csc_in_place(
                 path.display()
             );
         }
-        return Ok(Built::none());
+        return Ok(BuildCscOutcome::NoSidecar);
     }
-    Ok(Built {
-        outcome: BuildCscOutcome::Built,
-        n_rows: prep.header.n_obs,
-        n_cols: prep.header.n_vars,
-        n_csc_shards,
-        nnz: new_catalog
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::CscShard)
-            .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
-            .sum(),
-    })
-}
-
-/// [`build_csc_in_place`]'s answer plus what the copy-out form prints.
-pub(crate) struct Built {
-    pub(crate) outcome: BuildCscOutcome,
-    n_rows: u64,
-    n_cols: u64,
-    n_csc_shards: u32,
-    nnz: u64,
-}
-
-impl Built {
-    fn none() -> Self {
-        Self {
-            outcome: BuildCscOutcome::NoSidecar,
-            n_rows: 0,
-            n_cols: 0,
-            n_csc_shards: 0,
-            nnz: 0,
-        }
-    }
+    log::info!(
+        "build-csc: appended {n_csc_shards} CSC shard(s) to {}",
+        path.display()
+    );
+    Ok(BuildCscOutcome::Built)
 }
 
 /// Decode each CSR shard once, route it into the builder, then emit the CSC
@@ -633,12 +631,12 @@ fn append_csc_shards(
 /// untouched.
 ///
 /// The copy is `input`'s bytes verbatim followed by the in-place append of
-/// [`build_csc_in_place`], staged beside `output` and renamed over it. So the
+/// [`rebuild_csc_inplace`], staged beside `output` and renamed over it. So the
 /// output's previous catalog is the input's, and `scx rollback` on the output
 /// yields the input. Every refusal is checked against `input` first, so a
 /// refused build costs no copy.
 ///
-/// `framing` and `temp_dir` are as for [`build_csc_in_place`]; `temp_dir`
+/// `framing` and `temp_dir` are as for [`rebuild_csc_inplace`]; `temp_dir`
 /// defaults to `output`'s directory.
 pub fn run_build_csc(
     input: &Path,
@@ -674,48 +672,69 @@ pub fn run_build_csc(
     }
 
     // Refuse against the input before copying it.
-    {
+    let empty_without_sidecar = {
         let reader = ScxReader::open(input)?;
-        if let Plan::Empty { has_csc: false } = plan(&reader, input, memory_limit, framing)? {
-            log::info!(
-                "build-csc: {} is an empty matrix; no CSC sidecar to build",
-                input.display()
-            );
-            std::fs::copy(input, output)?;
-            return Ok(BuildCscOutcome::NoSidecar);
-        }
-    }
+        matches!(
+            plan(&reader, input, memory_limit, framing)?,
+            Plan::Empty { has_csc: false }
+        )
+    };
 
     // A sibling temp file, so the rename is atomic and a failure leaves no
-    // partial output (the `TempPath` deletes itself on drop). No `remove_file`
-    // of an existing `output` first: the rename replaces it, and unlinking
-    // would only widen a window in which neither exists.
+    // partial output (the `TempPath` deletes itself on drop) — for the
+    // empty-matrix copy too, which used to write `output` directly and so could
+    // leave half a file, or write through a symlink rather than replacing it.
+    // No `remove_file` of an existing `output` first: the rename replaces it,
+    // and unlinking would only widen a window in which neither exists.
     let (file, staging) = scx_format_io::make_sibling_tempfile(output)?;
     drop(file);
     std::fs::copy(input, &staging)?;
-    // `temp_dir: None` spills beside the staging file, i.e. in `output`'s
-    // directory.
-    let built = build_csc_in_place(
-        &staging,
-        memory_limit,
-        csc_cols_per_shard,
-        framing,
-        temp_dir,
-    )?;
+    let outcome = if empty_without_sidecar {
+        log::info!(
+            "build-csc: {} is an empty matrix; no CSC sidecar to build",
+            input.display()
+        );
+        BuildCscOutcome::NoSidecar
+    } else {
+        // `temp_dir: None` spills beside the staging file, i.e. in `output`'s
+        // directory.
+        rebuild_csc_inplace(
+            &staging,
+            csc_cols_per_shard,
+            memory_limit,
+            framing,
+            temp_dir,
+        )?
+    };
     staging.persist(output)?;
-    if built.outcome == BuildCscOutcome::Built {
+    // `std::fs::copy` carried the input's mode onto the staging file; every
+    // other writer leaves its output at `0o666 & !umask`, so this does too.
+    scx_format_io::chmod_to_umask(output)?;
+
+    if outcome == BuildCscOutcome::Built {
+        let r = ScxReader::open(output)?;
+        let csc: Vec<_> = r
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .collect();
+        let nnz: u64 = csc
+            .iter()
+            .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
+            .sum();
         println!(
             "Built CSC: {} → {} ({} rows × {} cols, {} nnz, {} CSC shard{})",
             input.display(),
             output.display(),
-            built.n_rows,
-            built.n_cols,
-            built.nnz,
-            built.n_csc_shards,
-            if built.n_csc_shards == 1 { "" } else { "s" },
+            r.header().n_obs,
+            r.header().n_vars,
+            nnz,
+            csc.len(),
+            if csc.len() == 1 { "" } else { "s" },
         );
     }
-    Ok(built.outcome)
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -1027,7 +1046,7 @@ mod tests {
             crate::mark_deleted(&input, &[1, 4]).unwrap();
 
             let read_path = if in_place {
-                crate::rebuild_csc::rebuild_csc_inplace(&input, 5000, "4G", None, None).unwrap();
+                crate::rebuild_csc_inplace(&input, 5000, "4G", None, None).unwrap();
                 input.clone()
             } else {
                 let output = dir.path().join("output.scx");
@@ -1392,8 +1411,7 @@ mod tests {
             !output.exists(),
             "nothing may be written for a malformed input"
         );
-        let err =
-            crate::rebuild_csc::rebuild_csc_inplace(&path, 5000, "4G", None, None).unwrap_err();
+        let err = crate::rebuild_csc_inplace(&path, 5000, "4G", None, None).unwrap_err();
         assert!(err.to_string().contains("no CSR shards"), "{err}");
     }
 

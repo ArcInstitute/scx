@@ -107,7 +107,7 @@ fn an_in_place_build_only_appends() {
     drop(before_reader);
     let csr_before = entries_of(&path, SectionType::CsrShard);
 
-    let outcome = crate::rebuild_csc_inplace(&path, 4, "1G", None, None).unwrap();
+    let outcome = rebuild_csc_inplace(&path, 4, "1G", None, None).unwrap();
     assert_eq!(outcome, BuildCscOutcome::Built);
 
     let after = std::fs::read(&path).unwrap();
@@ -159,7 +159,7 @@ fn the_sidecar_follows_the_files_framing() {
     assert_eq!(shard_versions(&v4, SectionType::CsrShard), vec![2, 2]);
     let csr_before = entries_of(&v4, SectionType::CsrShard);
     // `None`, which used to strip the framing off the whole file.
-    crate::rebuild_csc_inplace(&v4, 5, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&v4, 5, "1G", None, None).unwrap();
     let r = ScxReader::open(&v4).unwrap();
     assert_eq!(r.header().format_version, CURRENT_FORMAT_VERSION);
     assert_eq!(entries_of(&v4, SectionType::CsrShard), csr_before);
@@ -171,7 +171,7 @@ fn the_sidecar_follows_the_files_framing() {
     assert_csc_is_the_transpose(&v4);
 
     let v3 = write_input(&dir.path().join("v3.scx"), 60, 11, 2, false);
-    crate::rebuild_csc_inplace(&v3, 5, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&v3, 5, "1G", None, None).unwrap();
     assert_eq!(
         ScxReader::open(&v3).unwrap().header().format_version,
         DEFAULT_WRITE_FORMAT_VERSION
@@ -187,7 +187,7 @@ fn framing_an_unframed_file_is_refused_and_leaves_it_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let v3 = write_input(&dir.path().join("v3.scx"), 20, 6, 2, false);
     let before = std::fs::read(&v3).unwrap();
-    let err = crate::rebuild_csc_inplace(&v3, 5, "1G", Some(FramingConfig::default()), None)
+    let err = rebuild_csc_inplace(&v3, 5, "1G", Some(FramingConfig::default()), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("scx optimize"), "names the way out: {err}");
@@ -201,11 +201,11 @@ fn framing_an_unframed_file_is_refused_and_leaves_it_untouched() {
 fn a_rebuild_replaces_the_sidecar_and_rolls_back_to_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_input(&dir.path().join("in.scx"), 40, 12, 4, false);
-    crate::rebuild_csc_inplace(&path, 6, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&path, 6, "1G", None, None).unwrap();
     let first = entries_of(&path, SectionType::CscShard);
     assert_eq!(first.len(), 2);
 
-    crate::rebuild_csc_inplace(&path, 4, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&path, 4, "1G", None, None).unwrap();
     let second = entries_of(&path, SectionType::CscShard);
     assert_eq!(second.len(), 3);
     let names: std::collections::BTreeSet<_> = second.iter().map(|e| e.0.clone()).collect();
@@ -240,7 +240,7 @@ fn an_empty_matrix_drops_a_stale_sidecar_in_place() {
     writer.finish().unwrap();
     assert!(ScxReader::open(&path).unwrap().header().has_csc());
 
-    let outcome = crate::rebuild_csc_inplace(&path, 5000, "1G", None, None).unwrap();
+    let outcome = rebuild_csc_inplace(&path, 5000, "1G", None, None).unwrap();
     assert_eq!(outcome, BuildCscOutcome::NoSidecar);
     let r = ScxReader::open(&path).unwrap();
     assert!(!r.header().has_csc());
@@ -267,7 +267,7 @@ fn an_empty_matrix_without_a_sidecar_is_not_touched() {
     writer.write_var(&sample_var(3)).unwrap();
     writer.finish().unwrap();
     let before = std::fs::read(&path).unwrap();
-    let outcome = crate::rebuild_csc_inplace(&path, 5000, "1G", None, None).unwrap();
+    let outcome = rebuild_csc_inplace(&path, 5000, "1G", None, None).unwrap();
     assert_eq!(outcome, BuildCscOutcome::NoSidecar);
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
@@ -359,4 +359,140 @@ fn truncate_on_error_restores_the_length_and_keeps_the_error() {
     .unwrap();
     drop(lock);
     assert_eq!(std::fs::read(&path).unwrap().len(), before.len() + 8);
+}
+
+/// Append `bytes` at EOF as a catalog entry of type `t` named `name`, and set
+/// the catalog's generations — by rewriting the catalog at EOF and repointing
+/// the header, since no writer here produces these sections on a
+/// single-modality file (`write_layer_csc_shard_for` refuses modality 0, and no
+/// writer emits `obs_index` at all).
+fn graft_entry(path: &Path, t: SectionType, name: &str, data_gen: u64, csc_gen: u64) {
+    let (mut catalog, mut header) = {
+        let r = ScxReader::open(path).unwrap();
+        (r.catalog().clone(), r.header().clone())
+    };
+    let mut bytes = std::fs::read(path).unwrap();
+    while !bytes.len().is_multiple_of(8) {
+        bytes.push(0);
+    }
+    let payload = vec![0xabu8; 64];
+    catalog.entries.push(FullCatalogEntry {
+        name: name.to_string(),
+        offset: bytes.len() as u64,
+        length: payload.len() as u64,
+        section_type: t,
+        checksum: blake3_hash(&payload),
+        modality_id: 0,
+        stats: None,
+    });
+    bytes.extend_from_slice(&payload);
+    catalog.data_generation = data_gen;
+    catalog.csc_build_generation = csc_gen;
+    let mut catalog_buf = Vec::new();
+    catalog.write_to(&mut catalog_buf).unwrap();
+    header.full_catalog_offset = bytes.len() as u64;
+    header.full_catalog_length = catalog_buf.len() as u64;
+    bytes.extend_from_slice(&catalog_buf);
+    let mut header_buf = Vec::new();
+    header.write_to(&mut header_buf).unwrap();
+    bytes[..header_buf.len()].copy_from_slice(&header_buf);
+    std::fs::write(path, &bytes).unwrap();
+}
+
+fn has(path: &Path, t: SectionType) -> bool {
+    !entries_of(path, t).is_empty()
+}
+
+/// A layer sidecar shares the one freshness stamp this op re-stamps. A fresh
+/// one is carried untouched; a stale one — which the new stamp would bless —
+/// is dropped.
+#[test]
+fn a_layer_sidecar_is_kept_when_fresh_and_dropped_when_stale() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let fresh = write_input(&dir.path().join("fresh.scx"), 20, 6, 2, false);
+    graft_entry(
+        &fresh,
+        SectionType::LayerCscShard,
+        "counts_csc_shard_0",
+        3,
+        3,
+    );
+    let layer_before = entries_of(&fresh, SectionType::LayerCscShard);
+    rebuild_csc_inplace(&fresh, 5, "1G", None, None).unwrap();
+    assert_eq!(entries_of(&fresh, SectionType::LayerCscShard), layer_before);
+    assert_eq!(
+        ScxReader::open(&fresh)
+            .unwrap()
+            .catalog()
+            .csc_build_generation,
+        3
+    );
+
+    let stale = write_input(&dir.path().join("stale.scx"), 20, 6, 2, false);
+    graft_entry(
+        &stale,
+        SectionType::LayerCscShard,
+        "counts_csc_shard_0",
+        3,
+        0,
+    );
+    rebuild_csc_inplace(&stale, 5, "1G", None, None).unwrap();
+    let r = ScxReader::open(&stale).unwrap();
+    assert!(
+        !has(&stale, SectionType::LayerCscShard),
+        "a stale layer sidecar must not survive a stamp that would call it fresh"
+    );
+    assert_eq!(r.catalog().csc_build_generation, 3);
+    assert!(has(&stale, SectionType::CscShard));
+}
+
+/// A legacy `obs_index` section — which no writer here produces, but the format
+/// recognises — is carried by the append rather than refused by its audit.
+#[test]
+fn a_legacy_obs_index_section_is_carried() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_input(&dir.path().join("legacy.scx"), 20, 6, 2, false);
+    graft_entry(&path, SectionType::ObsIndex, "obs_index", 1, 0);
+    let before = entries_of(&path, SectionType::ObsIndex);
+    assert_eq!(before.len(), 1);
+    rebuild_csc_inplace(&path, 5, "1G", None, None).unwrap();
+    assert_eq!(entries_of(&path, SectionType::ObsIndex), before);
+    assert!(has(&path, SectionType::CscShard));
+}
+
+/// With `force`, an existing `output` that is a symlink is *replaced*, never
+/// written through — on the empty-matrix path too, which used to
+/// `std::fs::copy` straight onto `output` and so overwrote the link's target.
+#[cfg(unix)]
+#[test]
+fn copy_out_replaces_a_symlinked_output_rather_than_writing_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty.scx");
+    let mut writer = ScxWriter::new(&empty, sample_header(0, 3)).unwrap();
+    writer.write_obs(&sample_obs(0)).unwrap();
+    writer.write_var(&sample_var(3)).unwrap();
+    writer.finish().unwrap();
+
+    for (name, input) in [
+        ("empty", empty.clone()),
+        (
+            "full",
+            write_input(&dir.path().join("full.scx"), 12, 4, 2, false),
+        ),
+    ] {
+        let victim = dir.path().join(format!("victim_{name}.txt"));
+        std::fs::write(&victim, b"do not touch").unwrap();
+        let link = dir.path().join(format!("out_{name}.scx"));
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        run_build_csc(&input, &link, "1G", true, 5000, None, None).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch", "{name}");
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{name}: the link itself is replaced"
+        );
+    }
 }

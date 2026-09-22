@@ -473,9 +473,8 @@ pub(crate) fn route_scx_backed_to_scx(
 
     // Optional CSC sidecar rebuild over the just-written file.
     if csc_build {
-        // Preserve the just-written layout rather than passing `None`, which
-        // would downgrade a framed output to v3. See
-        // `scx_ops::framing_for_csc_rebuild`.
+        // The admissible framing for the sidecar (`Some` iff the output is
+        // v4). See `scx_ops::framing_for_csc_rebuild`.
         let csc_framing = scx_ops::framing_for_csc_rebuild(std::path::Path::new(out_path));
         py.detach(|| {
             scx_ops::rebuild_csc_inplace(
@@ -686,9 +685,8 @@ pub(crate) fn route_scx_lazy_to_scx(
     writer.finish().map_err(to_pyerr)?;
 
     if csc_build {
-        // Preserve the just-written layout rather than passing `None`, which
-        // would downgrade a framed output to v3. See
-        // `scx_ops::framing_for_csc_rebuild`.
+        // The admissible framing for the sidecar (`Some` iff the output is
+        // v4). See `scx_ops::framing_for_csc_rebuild`.
         let csc_framing = scx_ops::framing_for_csc_rebuild(std::path::Path::new(out_path));
         py.detach(|| {
             scx_ops::rebuild_csc_inplace(

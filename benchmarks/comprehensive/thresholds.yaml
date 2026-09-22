@@ -3925,6 +3925,11 @@ absolute_floors:
 #    estimate. census_1m's ratio fell 3.76x -> 1.74x and its wall 966 s ->
 #    103 s.
 #
+#    In that (builder) capture the two small datasets got slightly *worse*
+#    (0.87 -> 0.92 on tabula). Below the spill threshold every bucket stays
+#    resident, costing about what holding the decoded CSR used to, plus block
+#    slack. That is a real trade for the 2.05x wall, not noise.
+#
 #    What did not: the source shard's re-encode, the writer, and the ~0.4-1.1
 #    GB interpreter baseline the sampler measures within all sit outside that
 #    bound. So the contract figure -- 1.0 -- is still not met at census scale,
@@ -3945,13 +3950,11 @@ absolute_floors:
 #    census_1m, 5512 -> 5547 on census_500k), which is what licenses floors
 #    closer to the measured value than 1.25x: they now sit between the
 #    after and before figures (1.30 against 1.25 / 1.35; 1.60 against 1.44 /
-#    1.76), so a return to the rewrite fails them. Still not 1.0: the decode,
-#    the writer and the interpreter baseline remain outside the bound.
-#
-#    The two small datasets got slightly *worse* (0.87 -> 0.92 on tabula).
-#    Below the spill threshold every bucket stays resident, costing about what
-#    holding the decoded CSR used to, plus block slack. That is a real trade
-#    for the 2.05x wall, not noise, and the floors leave room for it.
+#    1.76), so a return to the rewrite fails them. census_500k's margin is the
+#    thin one, ~4% over its median: the three runs spanned 1.238-1.251 and the
+#    cross-capture movement was ~1%, and it cannot be wider without admitting
+#    the rewrite's 1.35. Still not 1.0: the decode, the writer and the
+#    interpreter baseline remain outside the bound.
 #
 #    The floors are therefore **regression floors on a measured
 #    improvement**, not contract floors. They were first set at ~1.25x the

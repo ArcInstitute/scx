@@ -137,15 +137,18 @@ has no per-modality pairwise reader to round-trip them through.
 
 **`build-csc` carries everything, by never rewriting it.** It appends CSC
 shards and repoints the catalog, so every other section keeps its bytes at its
-offset — the carry audit checks exactly that before committing — including a
-layer's CSC sidecar, which stays fresh because `data_generation` is unchanged.
+offset — the carry audit checks exactly that, stats included, before
+committing. The one conditional is a layer's CSC sidecar: it shares the single
+freshness stamp (`csc_build_generation`) the build re-stamps for X's, so a
+fresh one is carried and a stale one — which the new stamp would otherwise
+bless — is dropped with a warning. Nothing rebuilds a layer sidecar.
 
 **`scx upgrade` carries everything `optimize` does, plus `adata.raw`.** It used
 to copy only layers, `obsm`, `uns`, the predicate-index sections and the
 deletion vector, dropping `varm`, `obsp`, `varp`, `adata.raw`, detection bitmaps
 and the group index — unrecoverably on `--in-place`, which renames a wholly new
 file over the target carrying no prior catalog. The one thing still dropped is a
-layer's CSC sidecar (rerun `scx build-csc`). (`build-csc` shared this carry list
+layer's CSC sidecar, which nothing rebuilds. (`build-csc` shared this carry list
 while it was a rewrite.)
 
 **A detection bitmap does not survive a rewrite that canonicalizes the matrix
@@ -293,13 +296,12 @@ deletion vectors. All of that is sound for one reason: the op preserves the
 global obs row space and the CSR shard boundaries 1:1, so a section keyed to
 either stays valid.
 
-The one section it does not carry is a layer's CSC sidecar; rerun
-`scx build-csc`. On `--in-place` — a rename over the target carrying no prior
+The one section it does not carry is a layer's CSC sidecar, which nothing
+rebuilds. On `--in-place` — a rename over the target carrying no prior
 catalog — a loss cannot be rolled back, so the op warns before writing:
 
 ```
-scx upgrade: the output will not carry layer CSC sidecars (rebuild: scx
-build-csc) — rebuild them against the output if you need them.
+scx upgrade: the output will not carry layer CSC sidecars (nothing rebuilds them).
 ```
 
 Detection bitmaps are a separate case, because what invalidates them is not the

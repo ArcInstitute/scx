@@ -921,7 +921,8 @@ fn uns_only_patch_keeps_the_column_stats() {
 /// An index whose keying a rewrite cannot verify must not have statistics
 /// fabricated for it.
 ///
-/// `build-csc` / `optimize` re-encode every CSR shard and must restore the
+/// `optimize` / `upgrade` re-encode every CSR shard (as `build-csc` did before it
+/// became an in-place append) and must restore the
 /// per-shard `column_stats` Level-1 pruning reads. The first implementation
 /// re-derived them from the carried index bytes, gated on
 /// `max(shard_id) + 1 == n_csr_shards`. **That equality is not proof the index is
