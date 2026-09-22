@@ -8,16 +8,35 @@ this is the only operation in the suite with a *declared* memory budget —
 `build_csc(memory_limit=…)`, default `"4G"` — and nothing measured the gap
 between what a caller asks for and what the op takes.
 
-The figures below are the **pre-fix** measurements, and they are what
-`thresholds.yaml`'s floors were authored against; the after-numbers are in that
-file's comment beside them. At the time they were taken, `run_build_csc`
-collected every decoded CSR shard into a `Vec<ScxCsr>` and held it across both
-the re-encode and the transpose, and the transpose itself rescanned every
-nonzero of every shard twice per column chunk — so the cost was dominated by
-holding the whole CSR and its column-major image at once, and the declared
-budget bounded neither.
+**The budget is now partly honoured, and this module is what said so.** The
+streaming `CscBuilder` replaced a transpose that rescanned every nonzero of
+every shard twice per column chunk while `run_build_csc` held every decoded
+shard in a `Vec<ScxCsr>`. Before/after on one node, median of three:
 
-**The budget cannot be honoured.** Sweeping it over a 128x range on
+    dataset               before MB   after MB   before/bud  after/bud   wall x
+    pbmc10k                     967        990         0.24       0.24     1.40
+    tabula_sapiens_100k        3580       3775         0.87       0.92     2.05
+    census_500k                8998       5512         2.20       1.35     5.66
+    census_1m                 15411       7138         3.76       1.74     9.36
+
+Read that carefully before quoting it. The wall is 9.4x at census scale and the
+peak fell by half, but **1.74x is not 1.0** — the bucket staging is bounded by
+an asserted counter, while the source shard's re-encode, the writer and the
+interpreter baseline are not. And the two small datasets got slightly *worse*:
+below the spill threshold every bucket stays resident. `thresholds.yaml`'s
+floors are set ~1.25x above the measured values for that reason: they are
+regression floors on an improvement, not contract floors.
+
+This module also earned its keep twice over during that change. The first
+capture came back at 1.92x with tabula 10 % worse than the code being replaced,
+which is how a capacity-vs-length accounting bug in the builder's own bound was
+found — the Rust suite was green throughout, because nothing asserted the
+number the change was about.
+
+The pre-fix budget sweep below is kept because it is the evidence for what
+"declared but ignored" meant, and `thresholds.yaml` item 14 cites it.
+
+**The budget could not be honoured at all, before.** Sweeping it over a 128x range on
 tabula_sapiens_100k (194.9M nnz) moves the op's own allocation by 26% and halves
 the wall — so the knob buys throughput for memory rather than doing nothing — but
 even the smallest setting overshoots by 4.4x:
@@ -60,11 +79,12 @@ Per run, into `runs[].extra`:
   — context. The premise (a sidecar was actually built) is enforced by raising,
   not recorded as a metric.
 
-The ratio is deliberately **not** floored in `thresholds.yaml` yet. A
-`<= 1.25` row would pass on tabula (0.73x) and fail on census_500k (1.99x), so
-until the sidecar writer streams a live floor would fail every gate run that
-reaches census scale. The measurements, the crossover, and the activation recipe
-are in that file's "Deferred floors" block, item 14.
+The ratio **is** floored in `thresholds.yaml` now, on both census tiers, at
+~1.25x the measured value rather than at the contract's 1.0 — see item 14 of
+that file's "Deferred floors" block for the capture and for what is still
+outside the bound. `n_csc_shards__build_csc` is pinned there too, from both
+directions: a memory ratio can be met by narrowing shards, which would fix
+nothing.
 
 ## In-place, one copy per run
 
