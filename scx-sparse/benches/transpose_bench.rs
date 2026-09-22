@@ -13,7 +13,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use scx_sparse::ScxCsr;
+use scx_sparse::{
+    streaming_csr_to_csc_iter_with_cap, CscBuilder, CscBuilderConfig, MemSpillStore, ScxCsr,
+};
 
 /// OLD: collect (local_col, row, value) tuples then stable-sort by (col, row).
 fn transpose_chunk_sort(
@@ -168,5 +170,81 @@ fn bench_transpose(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_transpose);
+/// The whole build, both ways, **swept over the chunk count**.
+///
+/// `bench_transpose` above times one column chunk, which is the wrong unit for
+/// the cost that dominates: the chunked transpose rescans every nonzero of
+/// every shard twice *per chunk*, so its total is `2 * nnz * n_chunks` while
+/// the builder's is `2 * nnz` plus one encode/parse of a re-partitioned copy.
+/// A single-chunk benchmark cannot see that and reports the two as near-equal.
+///
+/// One point cannot carry the claim either — any speedup divided by any chunk
+/// count yields some ratio. Sweeping `cols_per_shard` holds nnz fixed and
+/// varies only `n_chunks`, so the chunked arm's wall must rise roughly
+/// linearly in it while the builder's stays flat. That is the falsifiable
+/// form: if the builder's arm also rises, the bucketing is not O(nnz).
+fn bench_full_build(c: &mut Criterion) {
+    let n_rows = 20_000;
+    let n_cols = 8_000;
+    let shards = build_shards(n_rows, n_cols, 20, 8);
+    let nnz: usize = shards.iter().map(|s| s.nnz()).sum();
+
+    for cols_per_shard in [800usize, 200, 50] {
+        let n_chunks = n_cols.div_ceil(cols_per_shard);
+        let mut group = c.benchmark_group(format!("full_csc_build_20k_x_8k/{n_chunks}_chunks"));
+        group.throughput(Throughput::Elements(nnz as u64));
+        group.sample_size(10);
+
+        group.bench_function("chunked_transpose", |b| {
+            b.iter(|| {
+                let mut it = streaming_csr_to_csc_iter_with_cap(
+                    black_box(&shards),
+                    n_rows,
+                    n_cols,
+                    usize::MAX,
+                    cols_per_shard,
+                )
+                .unwrap();
+                let mut total = 0usize;
+                for chunk in &mut it {
+                    total += chunk.unwrap().indices.len();
+                }
+                total
+            });
+        });
+
+        group.bench_function("csc_builder", |b| {
+            b.iter(|| {
+                let cfg = CscBuilderConfig {
+                    cols_per_shard,
+                    memory_bytes: usize::MAX,
+                    spill_after_bytes: usize::MAX,
+                    ..CscBuilderConfig::default()
+                };
+                let mut builder =
+                    CscBuilder::new(n_rows, n_cols, cfg, Box::new(MemSpillStore::new())).unwrap();
+                let mut row_start = 0u64;
+                for s in black_box(&shards) {
+                    builder.push_shard(row_start, s).unwrap();
+                    row_start += s.n_rows() as u64;
+                }
+                let mut em = builder.finish().unwrap();
+                let (mut ip, mut ix, mut dt) = (Vec::new(), Vec::new(), Vec::new());
+                let mut total = 0usize;
+                while em
+                    .next_shard_into(&mut ip, &mut ix, &mut dt)
+                    .unwrap()
+                    .is_some()
+                {
+                    total += ix.len();
+                }
+                total
+            });
+        });
+
+        group.finish();
+    }
+}
+
+criterion_group!(benches, bench_transpose, bench_full_build);
 criterion_main!(benches);

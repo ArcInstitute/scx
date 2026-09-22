@@ -308,7 +308,7 @@ pub fn compute_chunk_cols_with_cap(
 /// is now 8 bytes (i32 index + f32 value) plus small `chunk_n_cols`-sized
 /// `col_counts`/`cursor` workspaces — so the 12 is a conservative over-estimate
 /// that keeps chunking on the safe (smaller-chunk) side.
-fn compute_chunk_cols(
+pub(crate) fn compute_chunk_cols(
     n_rows_total: usize,
     max_memory_bytes: usize,
 ) -> Result<usize, TransposeError> {
@@ -339,7 +339,7 @@ fn compute_chunk_cols(
 ///
 /// Returns a `CscArrays` where `shape = (n_rows_total, col_end - col_start)`,
 /// and `indptr` has length `chunk_n_cols + 1`.
-fn transpose_column_chunk(
+pub(crate) fn transpose_column_chunk(
     shards: &[ScxCsr],
     n_rows_total: usize,
     col_start: usize,

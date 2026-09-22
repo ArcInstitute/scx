@@ -1,0 +1,641 @@
+//! Tests for the push-based CSC builder.
+//!
+//! The load-bearing one is [`builder_matches_the_reference_chunk_for_chunk`]:
+//! the builder's whole claim is that it produces *the same bytes* as
+//! `transpose::transpose_column_chunk` in `2 * nnz` work instead of
+//! `2 * nnz * n_chunks`, so the predecessor is kept as the oracle and every
+//! other test here is a named corner of that comparison.
+//!
+//! Why the comparison has to be element-for-element rather than dense-parity:
+//! a wrong within-column order is a *permutation*, and every dense-parity,
+//! `to_dense` and `col_sums` check in the tree stays green under one. Only an
+//! array comparison, the two golden blake3s, and `scx-gpu`'s policy-gated
+//! `validate_csc` can see it.
+
+use super::*;
+use crate::transpose::{csr_to_csc, streaming_csr_to_csc_iter_with_cap, CscArrays};
+use proptest::prelude::*;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Widen an emitted shard back to `CscArrays` so it can be compared with the
+/// reference. Test-only: production consumes the on-disk widths directly,
+/// which is the point of `next_shard_into`.
+fn to_csc_arrays(n_rows: usize, indptr: &[u64], indices: &[u32], data: &[f32]) -> CscArrays {
+    CscArrays {
+        shape: (n_rows, indptr.len() - 1),
+        indptr: indptr.iter().map(|&v| v as i64).collect(),
+        indices: indices.iter().map(|&v| v as i32).collect(),
+        data: data.to_vec(),
+    }
+}
+
+fn cfg(cols_per_shard: usize, memory_bytes: usize, spill_after_bytes: usize) -> CscBuilderConfig {
+    CscBuilderConfig {
+        cols_per_shard,
+        memory_bytes,
+        spill_after_bytes,
+        target_buckets: DEFAULT_TARGET_BUCKETS,
+        // Tiny blocks so a test-sized matrix actually seals several of them
+        // and reaches the sealed/partial seam; 1 MiB would make every test a
+        // single-block build.
+        block_bytes: 64,
+    }
+}
+
+fn run_with(
+    shards: &[ScxCsr],
+    n_rows: usize,
+    n_cols: usize,
+    cfg: CscBuilderConfig,
+    store: Box<dyn SpillStore>,
+) -> Result<(Vec<(u64, CscArrays)>, CscBuilderStats), CscBuilderError> {
+    let mut b = CscBuilder::new(n_rows, n_cols, cfg, store)?;
+    let mut row_start = 0u64;
+    for s in shards {
+        b.push_shard(row_start, s)?;
+        row_start += s.n_rows() as u64;
+    }
+    let mut em = b.finish()?;
+    let (mut ip, mut ix, mut dt) = (Vec::new(), Vec::new(), Vec::new());
+    let mut out = Vec::new();
+    while let Some(col_start) = em.next_shard_into(&mut ip, &mut ix, &mut dt)? {
+        out.push((col_start, to_csc_arrays(n_rows, &ip, &ix, &dt)));
+    }
+    Ok((out, em.stats().clone()))
+}
+
+fn run(
+    shards: &[ScxCsr],
+    n_rows: usize,
+    n_cols: usize,
+    c: CscBuilderConfig,
+) -> Result<Vec<(u64, CscArrays)>, CscBuilderError> {
+    run_with(shards, n_rows, n_cols, c, Box::new(MemSpillStore::new())).map(|(o, _)| o)
+}
+
+/// The predecessor, driven exactly as production drives it: `current_col_start`
+/// read *before* `next`, chunk by chunk.
+fn reference(
+    shards: &[ScxCsr],
+    n_rows: usize,
+    n_cols: usize,
+    memory_bytes: usize,
+    cols_per_shard: usize,
+) -> Vec<(u64, CscArrays)> {
+    let mut it =
+        streaming_csr_to_csc_iter_with_cap(shards, n_rows, n_cols, memory_bytes, cols_per_shard)
+            .expect("reference iterator");
+    let mut out = Vec::new();
+    loop {
+        let col_start = it.current_col_start() as u64;
+        match it.next() {
+            Some(chunk) => out.push((col_start, chunk.expect("reference chunk"))),
+            None => break,
+        }
+    }
+    out
+}
+
+fn assert_same(got: &[(u64, CscArrays)], want: &[(u64, CscArrays)]) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "shard count: the emitted layout must match the predecessor's"
+    );
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(g.0, w.0, "shard {i} col_start");
+        assert_eq!(g.1.shape, w.1.shape, "shard {i} shape");
+        assert_eq!(g.1.indptr, w.1.indptr, "shard {i} indptr");
+        assert_eq!(g.1.indices, w.1.indices, "shard {i} indices");
+        assert_eq!(g.1.data, w.1.data, "shard {i} data");
+    }
+}
+
+/// Build shards from an explicit `(row, col, value)` list, split at `cuts`.
+fn shards_from(
+    n_rows: usize,
+    n_cols: usize,
+    entries: &[(usize, usize, f32)],
+    cuts: &[usize],
+) -> Vec<ScxCsr> {
+    let mut bounds = vec![0usize];
+    bounds.extend_from_slice(cuts);
+    bounds.push(n_rows);
+    bounds.dedup();
+    let mut out = Vec::new();
+    for w in bounds.windows(2) {
+        let (lo, hi) = (w[0], w[1]);
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for r in lo..hi {
+            let mut row: Vec<_> = entries.iter().filter(|e| e.0 == r).collect();
+            row.sort_by_key(|e| e.1);
+            for e in row {
+                indices.push(e.1 as i32);
+                data.push(e.2);
+            }
+            indptr.push(indices.len() as i64);
+        }
+        out.push(ScxCsr::new_unchecked(
+            (hi - lo, n_cols),
+            indptr,
+            indices,
+            data,
+        ));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The proof, executable
+// ---------------------------------------------------------------------------
+
+/// Rows split into 1..=4 shards, parts allowed to be **empty** and **size-1**.
+///
+/// The existing `proptest_csc_roundtrip.rs` feeds a single-shard slice and says
+/// so; multi-shard reassembly is exactly where a `row_offset` advanced by the
+/// wrong amount lives, and a size-1 or empty part is its strongest detector.
+fn arb_shards() -> impl Strategy<Value = (usize, usize, Vec<ScxCsr>)> {
+    (1usize..=18, 1usize..=14)
+        .prop_flat_map(|(n_rows, n_cols)| {
+            let rows = prop::collection::vec(
+                prop::collection::hash_set(0usize..n_cols, 0..=std::cmp::min(6, n_cols)),
+                n_rows..=n_rows,
+            );
+            let cuts = prop::collection::vec(0usize..=n_rows, 0..=3);
+            (Just(n_rows), Just(n_cols), rows, cuts)
+        })
+        .prop_map(|(n_rows, n_cols, rows, mut cuts)| {
+            let entries: Vec<(usize, usize, f32)> = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(r, cols)| {
+                    let mut cs: Vec<usize> = cols.iter().copied().collect();
+                    cs.sort_unstable();
+                    // Distinct per (row, col) so a permutation shows in `data`
+                    // and not only in `indices`.
+                    cs.into_iter()
+                        .map(move |c| (r, c, (r * 64 + c + 1) as f32))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            cuts.sort_unstable();
+            (n_rows, n_cols, shards_from(n_rows, n_cols, &entries, &cuts))
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Every emitted shard equals `transpose_column_chunk` over the same
+    /// column range, **and** the boundary sequence equals the reference
+    /// iterator's. The second half is the layout-unchanged claim: this PR
+    /// changes what the transpose costs, not what it writes.
+    #[test]
+    fn builder_matches_the_reference_chunk_for_chunk(
+        (n_rows, n_cols, shards) in arb_shards(),
+        cols_per_shard in 1usize..=16,
+        // A multiple of the predecessor's own per-column reserve
+        // (`n_rows * 12`): below one column it refuses outright, and the point
+        // here is to compare the two where both answer, across chunk widths
+        // from one column to all of them.
+        budget_cols in 1usize..=20,
+        spill_after_bytes in 0usize..=4096,
+    ) {
+        let memory_bytes = n_rows * 12 * budget_cols;
+        let want = reference(&shards, n_rows, n_cols, memory_bytes, cols_per_shard);
+        let got = run(
+            &shards,
+            n_rows,
+            n_cols,
+            cfg(cols_per_shard, memory_bytes, spill_after_bytes),
+        ).expect("builder");
+
+        prop_assert_eq!(got.len(), want.len());
+        for ((gs, ga), (ws, wa)) in got.iter().zip(&want) {
+            prop_assert_eq!(gs, ws);
+            prop_assert_eq!(ga.shape, wa.shape);
+            prop_assert_eq!(&ga.indptr, &wa.indptr);
+            prop_assert_eq!(&ga.indices, &wa.indices);
+            prop_assert_eq!(&ga.data, &wa.data);
+        }
+    }
+
+    /// Concatenating the emitted shards reproduces the whole-matrix in-memory
+    /// transpose. A second, independent oracle: `transpose_column_chunk` and
+    /// `csr_to_csc` are different code, so a change that broke both in the
+    /// same way would still have to survive this.
+    #[test]
+    fn concatenated_shards_match_the_in_memory_transpose(
+        (n_rows, n_cols, shards) in arb_shards(),
+        cols_per_shard in 1usize..=16,
+    ) {
+        let whole = {
+            let mut indptr = vec![0i64];
+            let mut indices = Vec::new();
+            let mut data = Vec::new();
+            for s in &shards {
+                for r in 0..s.n_rows() {
+                    let (a, z) = (s.indptr[r] as usize, s.indptr[r + 1] as usize);
+                    indices.extend_from_slice(&s.indices[a..z]);
+                    data.extend_from_slice(&s.data[a..z]);
+                    indptr.push(indices.len() as i64);
+                }
+            }
+            ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data)
+        };
+        let want = csr_to_csc(&whole);
+        let got = run(&shards, n_rows, n_cols, cfg(cols_per_shard, 1 << 20, 1 << 20))
+            .expect("builder");
+
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for (_, chunk) in &got {
+            let base = *indptr.last().expect("seeded");
+            indptr.extend(chunk.indptr[1..].iter().map(|v| v + base));
+            indices.extend_from_slice(&chunk.indices);
+            data.extend_from_slice(&chunk.data);
+        }
+        prop_assert_eq!(indptr, want.indptr);
+        prop_assert_eq!(indices, want.indices);
+        prop_assert_eq!(data, want.data);
+    }
+
+    /// The in-RAM and spilled paths are one encoder, one parser and one
+    /// scatter over two byte sources, so all three settings must agree.
+    ///
+    /// The middle setting is the one that earns its keep: it leaves a bucket
+    /// **part on disk and part in RAM**, so a single column's scatter crosses
+    /// the seam. `never` and `always` both miss that.
+    #[test]
+    fn spill_never_always_and_partial_all_agree(
+        (n_rows, n_cols, shards) in arb_shards(),
+        cols_per_shard in 1usize..=8,
+    ) {
+        // `block_bytes: 8` is below one row block (16 bytes minimum), so every
+        // row seals. Without that, `spill_after_bytes = 0` spills *nothing* on
+        // a matrix too small to fill one block — the bound is over sealed
+        // blocks, and the partial tail is the declared slack — and the
+        // "always" arm would pass while exercising the in-RAM path.
+        let arm = |spill_after_bytes| CscBuilderConfig {
+            block_bytes: 8,
+            ..cfg(cols_per_shard, 1 << 20, spill_after_bytes)
+        };
+        let nnz: u64 = shards.iter().map(|s| s.nnz() as u64).sum();
+
+        let (never, s_never) = run_with(
+            &shards, n_rows, n_cols, arm(usize::MAX), Box::new(MemSpillStore::new()),
+        ).expect("no spill");
+        let (always, s_always) = run_with(
+            &shards, n_rows, n_cols, arm(0), Box::new(MemSpillStore::new()),
+        ).expect("all spilled");
+        let (partial, s_partial) = run_with(
+            &shards, n_rows, n_cols, arm(64), Box::new(MemSpillStore::new()),
+        ).expect("partial spill");
+
+        assert_same(&always, &never);
+        assert_same(&partial, &never);
+        // Premises, so none of the three arms can pass vacuously: the "never"
+        // arm must touch no store at all, and the "always" arm must have
+        // spilled whenever there was a single nonzero to seal.
+        prop_assert_eq!(s_never.spilled_bytes, 0);
+        prop_assert!(nnz == 0 || s_always.spilled_bytes > 0);
+        prop_assert!(s_partial.spilled_bytes <= s_always.spilled_bytes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One test per corner of the identity claim
+// ---------------------------------------------------------------------------
+
+/// A zero-nnz column still gets its `indptr` entry: the emit loops over the
+/// column *range*, never over the columns that happen to be non-empty.
+#[test]
+fn empty_columns_still_get_indptr_entries() {
+    let shards = shards_from(3, 5, &[(0, 1, 1.0), (1, 3, 2.0), (2, 1, 3.0)], &[]);
+    let got = run(&shards, 3, 5, cfg(5, 1 << 20, 1 << 20)).expect("builder");
+    assert_same(&got, &reference(&shards, 3, 5, 1 << 20, 5));
+    assert_eq!(got[0].1.indptr, vec![0, 0, 2, 2, 3, 3]);
+}
+
+/// `n_cols == 0` emits **zero** shards, not one empty one — `run_build_csc`'s
+/// `BuildCscOutcome::NoSidecar` is decided by that count.
+#[test]
+fn zero_columns_emits_no_shards() {
+    let shards = vec![ScxCsr::new_unchecked((4, 0), vec![0; 5], vec![], vec![])];
+    let got = run(&shards, 4, 0, cfg(5000, 1 << 20, 1 << 20)).expect("builder");
+    assert!(got.is_empty(), "got {} shards", got.len());
+    assert_same(&got, &reference(&shards, 4, 0, 1 << 20, 5000));
+}
+
+/// `n_rows == 0` takes the predecessor's `usize::MAX` chunk-width sentinel, so
+/// both agree on one all-columns shard with an all-zero `indptr`.
+#[test]
+fn zero_rows_emits_one_empty_shard() {
+    let got = run(&[], 0, 3, cfg(5000, 1 << 20, 1 << 20)).expect("builder");
+    assert_same(&got, &reference(&[], 0, 3, 1 << 20, 5000));
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].1.indptr, vec![0i64; 4]);
+}
+
+/// A pushed shard with no rows, and rows with no nonzeros, at the start, the
+/// middle and the end of a shard.
+///
+/// This is the case that decides the record format: a row contributing nothing
+/// to a bucket writes no block at all, so a design that inferred the row from
+/// block *position* would drift by exactly the number of empty rows. Empty
+/// rows in all three positions is what makes the drift visible whichever way
+/// it goes.
+#[test]
+fn empty_rows_and_empty_shards_do_not_shift_the_row_axis() {
+    // rows 0 and 4 empty, row 2 empty, plus a zero-row shard in the middle.
+    let entries = [
+        (1, 0, 1.0),
+        (1, 2, 2.0),
+        (3, 1, 3.0),
+        (5, 0, 4.0),
+        (5, 2, 5.0),
+    ];
+    let mut shards = shards_from(6, 3, &entries, &[2, 4]);
+    shards.insert(1, ScxCsr::new_unchecked((0, 3), vec![0], vec![], vec![]));
+    let got = run(&shards, 6, 3, cfg(2, 1 << 20, 0)).expect("builder");
+    // The reference cannot be handed a zero-row shard in the middle and still
+    // be the same matrix, so compare against the same shard list minus it.
+    let flat = shards_from(6, 3, &entries, &[2, 4]);
+    assert_same(&got, &reference(&flat, 6, 3, 1 << 20, 2));
+    assert_eq!(got[0].1.indices, vec![1, 5, 3]);
+}
+
+/// A column with exactly one nonzero, which is where a prefix-sum off-by-one
+/// is visible and nowhere else in a uniform fixture.
+#[test]
+fn a_single_nonzero_column_round_trips() {
+    let shards = shards_from(4, 3, &[(2, 1, 7.5)], &[1, 3]);
+    let got = run(&shards, 4, 3, cfg(1, 1 << 20, 0)).expect("builder");
+    assert_same(&got, &reference(&shards, 4, 3, 1 << 20, 1));
+    assert_eq!(got[1].1.indices, vec![2]);
+    assert_eq!(got[1].1.data, vec![7.5]);
+}
+
+/// A source row whose column indices are **descending**.
+///
+/// Within-row order cannot affect within-column order — each row contributes
+/// at most one nonzero per column — so the output is unchanged, and the only
+/// casualty is a non-monotone `cols` array inside a spill record. That is the
+/// concrete reason the record format stores plain `u32` columns rather than
+/// delta-coding them, and why this test asserts equality with the reference
+/// rather than "the output is canonical".
+#[test]
+fn a_descending_source_row_still_matches_the_reference() {
+    let shards = vec![ScxCsr::new_unchecked(
+        (2, 4),
+        vec![0, 3, 4],
+        vec![3, 1, 0, 2],
+        vec![1.0, 2.0, 3.0, 4.0],
+    )];
+    let (got, stats) = run_with(
+        &shards,
+        2,
+        4,
+        cfg(2, 1 << 20, 0),
+        Box::new(MemSpillStore::new()),
+    )
+    .expect("builder");
+    assert_same(&got, &reference(&shards, 2, 4, 1 << 20, 2));
+    assert_eq!(stats.first_non_strict_column, None);
+}
+
+/// A duplicated `(row, col)` is **preserved**, not coalesced.
+///
+/// Coalescing would move bytes relative to the predecessor, which emits both
+/// entries adjacent in `j` order. It is still a defect in the source — the
+/// resulting sidecar violates `validate_csc`'s `sorted` check and the GPU will
+/// reject it — so the builder reports the column rather than repairing it.
+#[test]
+#[cfg(not(debug_assertions))]
+fn a_duplicate_row_col_is_preserved_and_reported() {
+    let shards = vec![ScxCsr::new_unchecked(
+        (1, 2),
+        vec![0, 2],
+        vec![1, 1],
+        vec![3.0, 4.0],
+    )];
+    let (got, stats) = run_with(
+        &shards,
+        1,
+        2,
+        cfg(2, 1 << 20, 0),
+        Box::new(MemSpillStore::new()),
+    )
+    .expect("builder");
+    assert_same(&got, &reference(&shards, 1, 2, 1 << 20, 2));
+    assert_eq!(got[0].1.data, vec![3.0, 4.0]);
+    assert_eq!(stats.first_non_strict_column, Some(1));
+}
+
+/// The debug half of the case above: in a debug build the same input trips the
+/// strictly-increasing assertion, so the defect is loud in tests and merely
+/// reported in release.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "not strictly increasing")]
+fn a_duplicate_row_col_trips_the_debug_assertion() {
+    let shards = vec![ScxCsr::new_unchecked(
+        (1, 2),
+        vec![0, 2],
+        vec![1, 1],
+        vec![3.0, 4.0],
+    )];
+    let _ = run(&shards, 1, 2, cfg(2, 1 << 20, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Contract errors — each one a condition the predecessor handled worse
+// ---------------------------------------------------------------------------
+
+/// The predecessor derived the global row from *slice position* and had no way
+/// to notice a permuted, repeated or skipped shard. For the rewrite ops this
+/// would shift the whole row axis silently, so the sink checks it.
+#[test]
+fn an_out_of_order_push_is_refused() {
+    let shards = shards_from(4, 2, &[(0, 0, 1.0), (2, 1, 2.0)], &[2]);
+    let mut b =
+        CscBuilder::new(4, 2, cfg(2, 1 << 20, 0), Box::new(MemSpillStore::new())).expect("new");
+    b.push_shard(0, &shards[0]).expect("first");
+    let err = b.push_shard(0, &shards[1]).expect_err("repeated row_start");
+    assert!(
+        matches!(
+            err,
+            CscBuilderError::RowStartMismatch {
+                expected: 2,
+                got: 0
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// The predecessor used `n_rows_total` for `shape` and the shard sum for
+/// `indices`, so a mismatch produced arrays whose shape and contents
+/// disagreed. Silent then, named now.
+#[test]
+fn pushing_the_wrong_number_of_rows_is_refused() {
+    let shards = shards_from(2, 2, &[(0, 0, 1.0)], &[]);
+    let mut b =
+        CscBuilder::new(5, 2, cfg(2, 1 << 20, 0), Box::new(MemSpillStore::new())).expect("new");
+    b.push_shard(0, &shards[0]).expect("push");
+    let err = b.finish().err().expect("short");
+    assert!(
+        matches!(
+            err,
+            CscBuilderError::RowCountMismatch {
+                pushed: 2,
+                declared: 5
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_shard_with_the_wrong_column_count_is_refused() {
+    let wrong = ScxCsr::new_unchecked((1, 3), vec![0, 0], vec![], vec![]);
+    let mut b =
+        CscBuilder::new(1, 2, cfg(2, 1 << 20, 0), Box::new(MemSpillStore::new())).expect("new");
+    let err = b.push_shard(0, &wrong).expect_err("shape");
+    assert!(
+        matches!(
+            err,
+            CscBuilderError::ShapeMismatch {
+                shard_cols: 3,
+                expected_cols: 2
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// A deliberate non-identity. The predecessor casts `(row_offset + row) as
+/// i32` and lets it wrap negative, after which `validate_csc` rejects the file
+/// at the GPU or a CPU kernel's `row >= n_obs` guard silently drops the value.
+#[test]
+fn more_rows_than_i32_can_index_is_refused_up_front() {
+    let made = CscBuilder::new(
+        i32::MAX as usize + 1,
+        2,
+        CscBuilderConfig::default(),
+        Box::new(MemSpillStore::new()),
+    );
+    match made {
+        Err(CscBuilderError::RowCountOverflow(n)) => assert_eq!(n, i32::MAX as usize + 1),
+        Err(other) => panic!("wrong error: {other}"),
+        Ok(_) => panic!("2^31 rows must be refused: the on-disk CSC row index is i32"),
+    }
+}
+
+/// A builder given nowhere to spill fails with a budget message, not an I/O
+/// one, and fails before it has written anything.
+#[test]
+fn a_no_spill_builder_refuses_rather_than_touching_disk() {
+    let entries: Vec<(usize, usize, f32)> = (0..64).map(|r| (r, r % 4, (r + 1) as f32)).collect();
+    let shards = shards_from(64, 4, &entries, &[]);
+    let mut b = CscBuilder::in_memory(64, 4, cfg(4, 1 << 20, 0)).expect("new");
+    let err = b.push_shard(0, &shards[0]).expect_err("must refuse");
+    assert!(matches!(err, CscBuilderError::SpillRefused { .. }), "{err}");
+}
+
+/// ...and the same builder succeeds when the staging fits, so the test above
+/// is about the budget and not about `NoSpillStore` being broken.
+#[test]
+fn a_no_spill_builder_succeeds_within_its_budget() {
+    let entries: Vec<(usize, usize, f32)> = (0..64).map(|r| (r, r % 4, (r + 1) as f32)).collect();
+    let shards = shards_from(64, 4, &entries, &[]);
+    let mut b = CscBuilder::in_memory(64, 4, cfg(4, 1 << 20, usize::MAX)).expect("new");
+    b.push_shard(0, &shards[0]).expect("push");
+    let em = b.finish().expect("finish");
+    assert_eq!(em.stats().spilled_bytes, 0);
+    assert_eq!(em.plan().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The plan, and the bucket cap
+// ---------------------------------------------------------------------------
+
+/// The plan is exact before a byte is read back — which is what finally gives
+/// `build-csc`'s progress bar a real denominator.
+#[test]
+fn the_plan_is_exact_before_any_record_is_read() {
+    // `(r % 7, (r + 1) % 7)` can never collide, where `(r % 7, (r * 3) % 7)`
+    // does at r = 0 — a duplicate (row, col), which is a defect in the
+    // fixture and not something to assert about.
+    let entries: Vec<(usize, usize, f32)> = (0..10)
+        .flat_map(|r| [(r, r % 7, 1.0), (r, (r + 1) % 7, 2.0)])
+        .collect();
+    let shards = shards_from(10, 7, &entries, &[3, 7]);
+    let mut b =
+        CscBuilder::new(10, 7, cfg(3, 1 << 20, 0), Box::new(MemSpillStore::new())).expect("new");
+    let mut row_start = 0u64;
+    for s in &shards {
+        b.push_shard(row_start, s).expect("push");
+        row_start += s.n_rows() as u64;
+    }
+    let mut em = b.finish().expect("finish");
+    let plan: Vec<CscShardSpec> = em.plan().to_vec();
+    assert_eq!(plan.len(), 3);
+    assert_eq!(
+        plan.iter()
+            .map(|s| (s.col_start, s.col_end))
+            .collect::<Vec<_>>(),
+        vec![(0, 3), (3, 6), (6, 7)]
+    );
+    let (mut ip, mut ix, mut dt) = (Vec::new(), Vec::new(), Vec::new());
+    for spec in &plan {
+        em.next_shard_into(&mut ip, &mut ix, &mut dt).expect("emit");
+        assert_eq!(ix.len() as u64, spec.nnz, "planned nnz for {spec:?}");
+    }
+}
+
+/// More shards than `MAX_BUCKETS` means buckets coarser than one shard, which
+/// is the degenerate arm: a bucket then serves several shards and the emit's
+/// column dispatch has to place each record in the right one. Output must
+/// still be identical.
+#[test]
+fn more_shards_than_buckets_still_matches_the_reference() {
+    let n_cols = 600;
+    let entries: Vec<(usize, usize, f32)> = (0..8)
+        .flat_map(|r| {
+            (0..n_cols)
+                .step_by(7)
+                .map(move |c| (r, c, (r * 601 + c) as f32))
+        })
+        .collect();
+    let shards = shards_from(8, n_cols, &entries, &[3]);
+    let c = CscBuilderConfig {
+        target_buckets: 4,
+        ..cfg(1, 1 << 20, 0)
+    };
+    let got = run(&shards, 8, n_cols, c).expect("builder");
+    assert_eq!(
+        got.len(),
+        n_cols,
+        "one shard per column at cols_per_shard=1"
+    );
+    assert_same(&got, &reference(&shards, 8, n_cols, 1 << 20, 1));
+}
+
+/// `cols_per_shard == 0` and `usize::MAX` both mean "no cap", matching
+/// `compute_chunk_cols_with_cap`'s convention.
+#[test]
+fn zero_and_usize_max_cols_per_shard_both_mean_no_cap() {
+    let shards = shards_from(3, 6, &[(0, 0, 1.0), (1, 5, 2.0), (2, 3, 3.0)], &[1]);
+    for cps in [0usize, usize::MAX] {
+        let got = run(&shards, 3, 6, cfg(cps, 1 << 30, 0)).expect("builder");
+        assert_eq!(got.len(), 1, "cols_per_shard={cps}");
+        assert_same(&got, &reference(&shards, 3, 6, 1 << 30, cps));
+    }
+}
