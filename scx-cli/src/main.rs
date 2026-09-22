@@ -420,7 +420,8 @@ enum Commands {
     },
     /// Upgrade a file in place: re-encode + canonicalize CSR shards to
     /// format_version 3 (single-modality; preserves obs/
-    /// var/obsm/uns/indexes). Drops the CSC sidecar — rerun `scx build-csc`.
+    /// var/obsm/uns/indexes). A CSC sidecar is rebuilt from the re-encoded X
+    /// in the same pass (see `--csc`).
     Optimize {
         /// SCX file to optimize
         input: PathBuf,
@@ -468,6 +469,8 @@ enum Commands {
         /// one shard at a time.
         #[arg(long, value_name = "SIZE")]
         memory_budget: Option<String>,
+        #[command(flatten)]
+        csc: cli_utils::CscArgs,
     },
     /// Rewrite file reclaiming space from deletions
     Compact {
@@ -488,23 +491,8 @@ enum Commands {
         /// silently ran `fast` and could roughly double X.
         #[arg(long, default_value = "auto", value_parser = CODEC_INTENT_VALUES)]
         codec: String,
-        /// Rebuild the CSC sidecar on the compacted output (drops +
-        /// re-emits via `scx build-csc`). Without this flag, compact
-        /// drops the CSC sidecar with a warning — the row layout no
-        /// longer matches after deletion-vector application.
-        /// The rebuild's transpose memory budget defaults to 4 GiB; override
-        /// with `--csc-memory-limit`.
-        #[arg(long)]
-        rebuild_csc: bool,
-        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
-        /// is set (default: 5000). Ignored without `--rebuild-csc`.
-        #[arg(long, default_value_t = 5000)]
-        csc_cols_per_shard: usize,
-        /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
-        /// Accepts a binary-prefixed size (`K`/`M`/`G`/`T` or `KiB`..`TiB`);
-        /// decimal `KB`/`MB`/`GB` is rejected. Ignored without `--rebuild-csc`.
-        #[arg(long, default_value = "4G")]
-        csc_memory_limit: String,
+        #[command(flatten)]
+        csc: cli_utils::CscArgs,
         /// Comma-separated obs columns to force-index on the compacted
         /// output. Mirrors `scx convert --index-obs`. Without this
         /// flag, compact drops any input predicate-index sections (the
@@ -604,17 +592,8 @@ enum Commands {
         /// auto (rebuild when sparse), or always. Mirrors `scx convert --bitmap`.
         #[arg(long, default_value = "off", value_parser = ["off", "auto", "always"])]
         bitmap: String,
-        /// Rebuild the CSC sidecar on the sorted output (the reorder
-        /// invalidates the column-major row indices, so it is dropped by
-        /// default with a warning).
-        #[arg(long)]
-        rebuild_csc: bool,
-        /// Maximum columns per emitted CSC shard when `--rebuild-csc` is set.
-        #[arg(long, default_value_t = 5000)]
-        csc_cols_per_shard: usize,
-        /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
-        #[arg(long, default_value = "4G")]
-        csc_memory_limit: String,
+        #[command(flatten)]
+        csc: cli_utils::CscArgs,
         /// Obs column whose label clusters rows into shards (condition /
         /// perturbation grouping). Forced to be the leading sort key; engages
         /// the byte-budget group planner and writes a `group_index` sidecar.
@@ -727,22 +706,8 @@ enum Commands {
         /// silently ran `fast` and could roughly double X.
         #[arg(long, default_value = "auto", value_parser = CODEC_INTENT_VALUES)]
         codec: String,
-        /// Rebuild the CSC sidecar on the merged output (drops +
-        /// re-emits via `scx build-csc`). Without this flag, merge
-        /// drops any input CSC sidecars with a warning.
-        /// The rebuild's transpose memory budget defaults to 4 GiB; override
-        /// with `--csc-memory-limit`.
-        #[arg(long)]
-        rebuild_csc: bool,
-        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
-        /// is set (default: 5000). Ignored without `--rebuild-csc`.
-        #[arg(long, default_value_t = 5000)]
-        csc_cols_per_shard: usize,
-        /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
-        /// Accepts a binary-prefixed size (`K`/`M`/`G`/`T` or `KiB`..`TiB`);
-        /// decimal `KB`/`MB`/`GB` is rejected. Ignored without `--rebuild-csc`.
-        #[arg(long, default_value = "4G")]
-        csc_memory_limit: String,
+        #[command(flatten)]
+        csc: cli_utils::CscArgs,
         /// Comma-separated obs columns to force-index on the merged
         /// output. Mirrors `scx convert --index-obs`. Without this
         /// flag, the merged output has NO predicate-index sections —
@@ -1015,23 +980,8 @@ enum Commands {
         /// input). `compact-trial` and the codec names are explicit forces.
         #[arg(long, default_value = "auto", value_parser = CODEC_INTENT_VALUES)]
         codec: String,
-        /// Rebuild the CSC sidecar on the subset output (drops +
-        /// re-emits via `scx build-csc` against the projected CSR).
-        /// Without this flag, subset drops any input CSC sidecar
-        /// with a warning — the row/column index space changes.
-        /// The rebuild's transpose memory budget defaults to 4 GiB; override
-        /// with `--csc-memory-limit`.
-        #[arg(long)]
-        rebuild_csc: bool,
-        /// Maximum columns per emitted CSC shard when `--rebuild-csc`
-        /// is set (default: 5000). Ignored without `--rebuild-csc`.
-        #[arg(long, default_value_t = 5000)]
-        csc_cols_per_shard: usize,
-        /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
-        /// Accepts a binary-prefixed size (`K`/`M`/`G`/`T` or `KiB`..`TiB`);
-        /// decimal `KB`/`MB`/`GB` is rejected. Ignored without `--rebuild-csc`.
-        #[arg(long, default_value = "4G")]
-        csc_memory_limit: String,
+        #[command(flatten)]
+        csc: cli_utils::CscArgs,
         /// Comma-separated obs columns to force-index on the subset output.
         /// Mirrors `scx convert --index-obs`.
         ///
@@ -1676,6 +1626,7 @@ fn main() {
             row_group_target_nnz,
             shard_obs,
             memory_budget,
+            csc,
         } => optimize::run_optimize(
             &input,
             &output,
@@ -1687,14 +1638,13 @@ fn main() {
             row_group_target_nnz,
             &shard_obs,
             memory_budget.as_deref(),
+            csc.options(None),
         ),
         Commands::Compact {
             input,
             output,
             force,
-            rebuild_csc,
-            csc_cols_per_shard,
-            csc_memory_limit,
+            csc,
             index_obs,
             index_var,
             index_preset,
@@ -1705,9 +1655,7 @@ fn main() {
             &input,
             &output,
             force,
-            rebuild_csc,
-            csc_cols_per_shard,
-            &csc_memory_limit,
+            csc.options(None),
             parse_index_columns(index_obs.as_deref()),
             parse_index_columns(index_var.as_deref()),
             index_preset.filter(|s| !s.trim().is_empty()),
@@ -1732,9 +1680,7 @@ fn main() {
             memory_budget,
             temp_dir,
             bitmap,
-            rebuild_csc,
-            csc_cols_per_shard,
-            csc_memory_limit,
+            csc,
             group_by,
             reference,
             group_target_bytes,
@@ -1758,9 +1704,7 @@ fn main() {
             memory_budget,
             temp_dir,
             &bitmap,
-            rebuild_csc,
-            csc_cols_per_shard,
-            &csc_memory_limit,
+            csc,
             group_by,
             reference,
             group_target_bytes,
@@ -1798,9 +1742,7 @@ fn main() {
             inputs,
             output,
             force,
-            rebuild_csc,
-            csc_cols_per_shard,
-            csc_memory_limit,
+            csc,
             index_obs,
             index_var,
             index_preset,
@@ -1816,9 +1758,7 @@ fn main() {
                 &inputs,
                 &output,
                 force,
-                rebuild_csc,
-                csc_cols_per_shard,
-                &csc_memory_limit,
+                csc.options(None),
                 parse_index_columns(index_obs.as_deref()),
                 parse_index_columns(index_var.as_deref()),
                 index_preset.filter(|s| !s.trim().is_empty()),
@@ -1965,9 +1905,7 @@ fn main() {
             dry_run,
             shard_size,
             codec,
-            rebuild_csc,
-            csc_cols_per_shard,
-            csc_memory_limit,
+            csc,
             index_obs,
             index_var,
             index_preset,
@@ -1982,9 +1920,7 @@ fn main() {
             dry_run,
             shard_size,
             &codec,
-            rebuild_csc,
-            csc_cols_per_shard,
-            &csc_memory_limit,
+            csc.options(None),
             // 0 = no auto-detection, so the flags are the only way to request an
             // index — matching `merge` / `compact`, where an omitted `--index-*`
             // means "no predicate index on the output".

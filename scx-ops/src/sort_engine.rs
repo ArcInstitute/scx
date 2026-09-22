@@ -636,6 +636,13 @@ pub fn sort_with_strategy(
     // Multimodal inputs reorder every modality's X by the same global obs
     // order; the single-modality engine below handles the
     // common case. Multimodal always takes the in-memory obs path.
+    // Decided before any output exists, so a refusal leaves nothing behind.
+    let csc_build = opts.csc.resolve(
+        "sort",
+        crate::csc_carry::reader_has_csc(&reader),
+        reader.is_multimodal(),
+    )?;
+
     if reader.is_multimodal() {
         let sorted_obs = sorted_obs
             .as_ref()
@@ -644,7 +651,6 @@ pub fn sort_with_strategy(
             &reader,
             &in_header,
             output,
-            input,
             &order_old,
             &new_pos_of_old,
             sorted_obs,
@@ -654,16 +660,11 @@ pub fn sort_with_strategy(
     }
 
     // ----- Output writer + header -----
-    // Drop has_deletion_vectors (bit 5) and has_csc (bit 0); the sort applies
-    // the deletion vector and drops the now-stale column-major sidecar.
+    // Drop has_deletion_vectors (bit 5) and has_csc (bit 0): the sort applies
+    // the deletion vector, and the input's sidecar is never copied (the rows
+    // move). `csc_build` decides whether a new one is built from the sorted X
+    // as it is written; `finish()` re-derives bit 0 from the catalog.
     let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
-    if in_header.has_csc() {
-        log::warn!(
-            "scx sort dropped CSC shards from {}: pass --rebuild-csc to restore the \
-             column-major sidecar",
-            input.display()
-        );
-    }
     // Preserve row-group framing: a v4 (framed) input yields a v4 output whose
     // re-encoded shards are all framed (via `set_framing` below), so sorting a
     // default file no longer silently downgrades it to unframed v3.
@@ -684,6 +685,7 @@ pub fn sort_with_strategy(
     let mut writer = ScxWriter::new(output, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
     writer.set_framing(framing_for_rewrite(opts.codec, output_framed, "the input")?);
+    crate::csc_carry::enable(&mut writer, &csc_build)?;
 
     // ----- obs (sorted, re-sharded) + var -----
     // In-memory: slice the materialized sorted obs. Spill: scatter input obs
@@ -938,6 +940,10 @@ pub fn sort_with_strategy(
         x_emitter.ranges.clone()
     };
 
+    // Every X strategy above ends here, so the same-pass sidecar is emitted
+    // once for all of them, before the group index, layers and obsm.
+    crate::csc_carry::emit(&mut writer, "sort")?;
+
     // ----- F1/F6: write the GroupIndex sidecar (reconciled to emitted shards) -----
     if let (Some(plan), Some(group_col)) = (&group_plan, &opts.group_by) {
         // F6 Phase 0: the block-level sub-flush may split a single planner record
@@ -1143,7 +1149,6 @@ fn sort_multimodal(
     reader: &ScxReader,
     in_header: &FileHeader,
     output: &Path,
-    input: &Path,
     order_old: &[u64],
     new_pos_of_old: &[i64],
     sorted_obs: &RecordBatch,
@@ -1157,14 +1162,8 @@ fn sort_multimodal(
         })?
         .clone();
 
+    // `csc_carry::resolve` already warned if a sidecar is being dropped.
     let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
-    if in_header.has_csc() || table.entries.iter().any(|i| i.flags.has_csc()) {
-        log::warn!(
-            "scx sort dropped CSC shards from {}: pass --rebuild-csc to restore the \
-             column-major sidecar",
-            input.display()
-        );
-    }
     let max_n_vars = table.entries.iter().map(|i| i.n_vars).max().unwrap_or(0);
     // Preserve framing (see the single-modality path).
     let output_framed = in_header.format_version >= CURRENT_FORMAT_VERSION;

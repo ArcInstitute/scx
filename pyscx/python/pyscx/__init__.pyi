@@ -1350,6 +1350,9 @@ def optimize(
     codec: str = ...,
     shard_obs: str = ...,
     memory_budget: int | str | None = ...,
+    csc: str = ...,
+    csc_cols_per_shard: int = ...,
+    csc_memory_limit: str = ...,
 ) -> None: ...
 
 
@@ -1367,7 +1370,8 @@ def sort(
     memory_budget: str | None = ...,
     temp_dir: str | None = ...,
     bitmap: str = ...,
-    rebuild_csc: bool = ...,
+    csc: str = ...,
+    rebuild_csc: bool | None = ...,
     csc_cols_per_shard: int = ...,
     csc_memory_limit: str = ...,
     group_by: str | None = ...,
@@ -1395,7 +1399,8 @@ def shuffle(
     memory_budget: str | None = ...,
     temp_dir: str | None = ...,
     bitmap: str = ...,
-    rebuild_csc: bool = ...,
+    csc: str = ...,
+    rebuild_csc: bool | None = ...,
     csc_cols_per_shard: int = ...,
     csc_memory_limit: str = ...,
 ) -> None:

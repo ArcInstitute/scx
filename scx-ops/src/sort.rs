@@ -124,6 +124,9 @@ pub struct SortOptions {
     /// re-arms the hard M1 memory guard). Only meaningful when `group_by` is
     /// `Some`.
     pub group_write_block_bytes: Option<u64>,
+    /// Whether the output carries a CSC sidecar (default: iff the input had
+    /// one), built in the same pass as the sorted X shards.
+    pub csc: crate::csc_carry::CscCarryOptions,
 }
 
 /// How to identify reference rows for grouped sharding (F1).
@@ -153,6 +156,7 @@ impl Default for SortOptions {
             group_target_bytes: None,
             group_max_bytes: None,
             group_write_block_bytes: None,
+            csc: crate::csc_carry::CscCarryOptions::default(),
         }
     }
 }

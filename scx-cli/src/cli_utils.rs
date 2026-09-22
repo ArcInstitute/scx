@@ -10,6 +10,68 @@ use scx_format_io::reader::ScxReader;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// `--csc` on a rewrite op.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CscMode {
+    /// Build one iff the input had one.
+    Carry,
+    /// Build one whether or not the input had one.
+    Always,
+    /// Build none.
+    Off,
+}
+
+/// The CSC-sidecar flags every rewrite op (`compact`, `merge`, `optimize`,
+/// `sort`, `subset`) takes, in one place so their wording cannot drift.
+#[derive(clap::Args, Clone, Debug)]
+pub struct CscArgs {
+    /// Whether the output carries a CSC (column-major) sidecar. `carry`
+    /// (default): one iff the input had one — for merge, iff any input had one.
+    /// `always`: build one regardless. `off`: none. The input's sidecar is
+    /// never copied (its row indices are stale once rows move); a new one is
+    /// built from the output's own X shards in the same pass that writes them,
+    /// so there is no second read of the output. Not supported for a
+    /// multimodal file: `carry` drops its sidecars with a warning and
+    /// `always` is refused.
+    #[arg(long, value_enum, default_value_t = CscMode::Carry)]
+    pub csc: CscMode,
+    /// Deprecated spelling of `--csc always`.
+    #[arg(long, hide = true, conflicts_with = "csc")]
+    pub rebuild_csc: bool,
+    /// Maximum columns per emitted CSC shard (default: 5000).
+    #[arg(long, default_value_t = 5000)]
+    pub csc_cols_per_shard: usize,
+    /// Budget for the sidecar build (default 4G), as for `scx build-csc
+    /// --memory-limit`: it bounds the builder's resident column buckets and
+    /// sizes the sidecar's shard widths. Accepts a binary-prefixed size
+    /// (`K`/`M`/`G`/`T` or `KiB`..`TiB`); decimal `KB`/`MB`/`GB` is rejected.
+    #[arg(long, default_value = "4G")]
+    pub csc_memory_limit: String,
+}
+
+impl CscArgs {
+    /// The ops-level options. `temp_dir` is where the builder spills (`None`:
+    /// the output's own directory).
+    pub fn options(&self, temp_dir: Option<PathBuf>) -> scx_ops::CscCarryOptions {
+        let mode = if self.rebuild_csc {
+            eprintln!("warning: --rebuild-csc is deprecated; it means --csc always");
+            scx_ops::CscOutput::Always
+        } else {
+            match self.csc {
+                CscMode::Carry => scx_ops::CscOutput::Carry,
+                CscMode::Always => scx_ops::CscOutput::Always,
+                CscMode::Off => scx_ops::CscOutput::Off,
+            }
+        };
+        scx_ops::CscCarryOptions {
+            mode,
+            cols_per_shard: self.csc_cols_per_shard,
+            memory_limit: self.csc_memory_limit.clone(),
+            temp_dir,
+        }
+    }
+}
+
 /// Error out if `path` does not exist on disk. Mirrors the message
 /// previously inlined in `merge`/`compact`.
 pub fn validate_scx_file(path: &Path) -> CliResult<()> {

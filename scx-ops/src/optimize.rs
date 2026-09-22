@@ -25,6 +25,7 @@ use scx_format_io::writer::ScxWriter;
 use scx_format_io::{ObsShardPolicy, ScxReader, DEFAULT_SHARD_TARGET_ROWS};
 use scx_sparse::canonicalize_csr;
 
+use crate::csc_carry::CscCarryOptions;
 use crate::error::{OpsError, Result};
 use crate::rewrite_helpers::{append_provenance, copy_predicate_indices};
 
@@ -123,6 +124,31 @@ pub fn optimize_with_budget(
     framing: Option<FramingConfig>,
     memory_budget: Option<u64>,
 ) -> Result<OptimizeStats> {
+    optimize_with_csc(
+        input_path,
+        output_path,
+        codec,
+        obs_shard_policy,
+        framing,
+        memory_budget,
+        &CscCarryOptions::default(),
+    )
+}
+
+/// [`optimize_with_budget`] with control over the output's CSC sidecar. The
+/// other entry points carry one iff the input had one ([`CscCarryOptions`]'s
+/// default); it is rebuilt from the re-encoded X in the same pass, since
+/// canonicalisation may have changed the matrix the input's sidecar mirrored.
+/// A separate entry point for the reason [`optimize_with_budget`] is one.
+pub fn optimize_with_csc(
+    input_path: &Path,
+    output_path: &Path,
+    codec: Option<CodecId>,
+    obs_shard_policy: ObsShardPolicy,
+    framing: Option<FramingConfig>,
+    memory_budget: Option<u64>,
+    csc: &CscCarryOptions,
+) -> Result<OptimizeStats> {
     let reader = ScxReader::open(input_path)?;
     if reader.is_multimodal() {
         return Err(OpsError::InvalidInput(
@@ -136,20 +162,15 @@ pub fn optimize_with_budget(
     let in_header = reader.header().clone();
     let index_dtype = in_header.index_dtype;
 
-    // The CSC sidecar (bit 0) is dropped — re-canonicalizing may change nnz and
-    // would leave the column-major sidecar referencing stale offsets. The
-    // deletion-vector flag (bit 5) is cleared here and re-set below only if we
-    // actually carry the `DeletionVectors` section through (otherwise the header
-    // would claim deletions with no section, and the logically-deleted rows
-    // would silently reappear).
-    let had_csc = in_header.has_csc();
-    if had_csc {
-        log::warn!(
-            "scx optimize dropped CSC shards from {}: rerun `scx build-csc` \
-             to restore the column-major sidecar",
-            input_path.display()
-        );
-    }
+    // The input's CSC sidecar (bit 0) is never copied — re-canonicalizing may
+    // change nnz, which would leave it referencing stale offsets. `csc_build`
+    // decides whether a new one is built from the re-encoded X; `finish()`
+    // re-derives bit 0 from the catalog. The deletion-vector flag (bit 5) is
+    // cleared here and re-set below only if we actually carry the
+    // `DeletionVectors` section through (otherwise the header would claim
+    // deletions with no section, and the logically-deleted rows would silently
+    // reappear).
+    let csc_build = csc.resolve("optimize", crate::csc_carry::reader_has_csc(&reader), false)?;
     // Raw (`adata.raw`) is not carried through optimize's section allowlist.
     // Warn loudly rather than drop it silently (SCX-002), matching
     // compact/sort/merge.
@@ -197,6 +218,7 @@ pub fn optimize_with_budget(
     let out_format_version = out_header.format_version;
     let mut writer = ScxWriter::new(output_path, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
+    crate::csc_carry::enable(&mut writer, &csc_build)?;
 
     // obs / var pass through unchanged (rows are preserved 1:1). Stream
     // shard-by-shard when the input is already sharded so the row-sharded
@@ -285,6 +307,10 @@ pub fn optimize_with_budget(
     // Set when canonicalising X actually changed the matrix — see the
     // detection-bitmap block far below, which is the only consumer.
     let mut x_was_rewritten = false;
+    // X comes first in `entries`; the same-pass sidecar is emitted once the
+    // last X shard is written, before the layers are.
+    let n_x = x_entries.len();
+    let mut written = 0usize;
     let entries: Vec<_> = x_entries
         .into_iter()
         .chain(layer_entries)
@@ -393,9 +419,16 @@ pub fn optimize_with_budget(
                 }
             }
             writer.write_preencoded_shard(pre)?;
+            written += 1;
+            if written == n_x {
+                crate::csc_carry::emit(&mut writer, "optimize")?;
+            }
         }
         at += len;
     }
+    // An empty X never reaches the count above; this is then a no-op call
+    // that closes the sink.
+    crate::csc_carry::emit(&mut writer, "optimize")?;
 
     // Auxiliary matrices (obsm/varm + COO obsp/varp) are unchanged by optimize,
     // so they are copied byte-for-byte. Verbatim copy preserves any sharded

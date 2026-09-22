@@ -79,7 +79,7 @@ compact
   obs                          row-filtered
   var                          verbatim
   X                            row-filtered
-  X CSC sidecar                dropped(warns)
+  X CSC sidecar                conditional
   layers                       row-filtered
   layer CSC sidecars           dropped(SILENT)
   obsm                         row-filtered
@@ -104,7 +104,7 @@ merge
   obs                          rebuilt
   var                          verbatim
   X                            rebuilt
-  X CSC sidecar                dropped(warns)
+  X CSC sidecar                conditional
   layers                       rebuilt
   layer CSC sidecars           dropped(SILENT)
   obsm                         rebuilt
@@ -129,7 +129,7 @@ optimize
   obs                          verbatim
   var                          verbatim
   X                            verbatim
-  X CSC sidecar                dropped(warns)
+  X CSC sidecar                conditional
   layers                       verbatim
   layer CSC sidecars           dropped(SILENT)
   obsm                         verbatim
@@ -151,7 +151,7 @@ sort
   obs                          remapped
   var                          verbatim
   X                            remapped
-  X CSC sidecar                dropped(warns)
+  X CSC sidecar                conditional
   layers                       remapped
   layer CSC sidecars           dropped(SILENT)
   obsm                         remapped
@@ -331,13 +331,13 @@ fn no_cell_still_claims_to_be_an_open_bug() {
 ///
 /// ⚠️ **It does not pin the mirror direction**, and the doc on `audit_staged`
 /// should not be read as claiming it does: a family declared `Dropped` that
-/// `finish()` then auto-emits would pass the pre-persist audit and leave a
-/// persisted artifact violating the policy. `XCsc` is `Dropped` for most ops, so
-/// that shape is only unreachable because every rewrite call site registers its
-/// modalities with `build_csc = false`. That is a property of the call sites,
-/// not of this table, and nothing here enforces it — if a rewrite op ever passes
-/// `build_csc = true`, this test will still be green and the invariant will be
-/// false.
+/// `finish()` then emits would pass the pre-persist audit and leave a persisted
+/// artifact violating the policy. That shape is reachable for `XCsc` in two
+/// ways, and neither is closed by this table: a rewrite call site registering a
+/// modality with `build_csc = true` (none does), and a same-pass sidecar
+/// (`ScxWriter::enable_csc_sidecar`) left for `finish()` to emit. The rewrite
+/// ops emit theirs explicitly right after X, before `audit_staged`, which is
+/// why their `XCsc` cells can be `Conditional`: the audit sees the sidecar.
 #[test]
 fn finish_writes_only_non_asserting_families() {
     for &op in RewriteOp::ALL {

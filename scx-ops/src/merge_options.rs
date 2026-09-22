@@ -80,6 +80,10 @@ pub struct MergeOptions {
     pub sort_by: Vec<String>,
     /// Descending order when `sort_by` is set.
     pub sort_reverse: bool,
+
+    /// Whether the output carries a CSC sidecar (default: iff any input had
+    /// one), built in the same pass as the merged X shards.
+    pub csc: crate::csc_carry::CscCarryOptions,
 }
 
 impl Default for MergeOptions {
@@ -98,6 +102,7 @@ impl Default for MergeOptions {
             shard_target_rows: None,
             sort_by: Vec::new(),
             sort_reverse: false,
+            csc: crate::csc_carry::CscCarryOptions::default(),
         }
     }
 }
@@ -117,6 +122,7 @@ impl MergeOptions {
             shard_target_rows: None,
             sort_by: Vec::new(),
             sort_reverse: false,
+            csc: crate::csc_carry::CscCarryOptions::default(),
         }
     }
 }

@@ -156,6 +156,12 @@ pub fn merge_with_options(
     // modalities (name + type + n_vars). On mismatch, raise with a
     // clear error directing to extract-then-merge.
     let any_multimodal = readers.iter().any(|r| r.is_multimodal());
+    // Decided before any output exists, so a refusal leaves nothing behind.
+    let csc_build = options.csc.resolve(
+        "merge",
+        readers.iter().any(crate::csc_carry::reader_has_csc),
+        any_multimodal,
+    )?;
     if any_multimodal {
         if sorted {
             return Err(OpsError::InvalidInput(
@@ -203,24 +209,12 @@ pub fn merge_with_options(
     // `optimize` documents applies here too — the caller runs `scx compact` when
     // they want the rows physically gone.
 
-    // CSC sidecars are dropped on merge: row layout is
-    // re-concatenated across inputs, so any per-input CSC `indices`
-    // arrays would reference stale row indices in the merged output.
-    // Caller can opt back in via `--rebuild-csc` on the CLI.
-    // Phase H.3.
-    let any_input_had_csc = readers.iter().any(|r| r.header().has_csc());
-    if any_input_had_csc {
-        let inputs_str = input_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        log::warn!(
-            "merge dropped CSC shards from at least one input ({inputs_str}): \
-             rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
-             column-major sidecar on the merged output"
-        );
-    }
+    // No input's CSC sidecar is copied: its row indices are relative to that
+    // input, not to the concatenated row space. `csc_build` decides whether a
+    // new one is built from the merged X as it is written. On the raw-copy
+    // fast path the sidecar builder decodes the copied bytes (nothing is
+    // re-encoded), which is still one read fewer than building it afterwards
+    // from the finished file.
 
     // Raw (`adata.raw`) is not carried through merge: the raw obs axis would
     // need to be concatenated in lockstep with X across inputs, which is not
@@ -268,10 +262,10 @@ pub fn merge_with_options(
         ..Default::default()
     };
 
-    // Merge produces new CSR shards from multiple inputs and drops every
-    // CSC sidecar. Bump past the max input generation so the merged file's
-    // generation strictly exceeds any source; `csc_build_generation`
-    // defaults to 0 (no CSC emitted).
+    // Merge produces new CSR shards from multiple inputs. Bump past the max
+    // input generation so the merged file's generation strictly exceeds any
+    // source; a same-pass sidecar is stamped with it, and without one
+    // `csc_build_generation` stays 0.
     let merged_data_generation = readers
         .iter()
         .map(|r| r.catalog().data_generation)
@@ -285,6 +279,7 @@ pub fn merge_with_options(
         output_framed,
         "at least one input",
     )?);
+    crate::csc_carry::enable(&mut writer, &csc_build)?;
 
     // ---------------------------------------------------------------
     // Phase 2: streaming obs across all inputs.
@@ -633,6 +628,7 @@ pub fn merge_with_options(
             output_shard_row_ranges.push((row_start, cumulative_rows));
         }
     }
+    crate::csc_carry::emit(&mut writer, "merge")?;
 
     // Phase 3b: stream global obsm and varm shard-by-shard. Each input's
     // shards are re-stamped with cumulative `row_start` and emitted as
@@ -1048,7 +1044,8 @@ fn remap_deletion_vectors(
 /// cumulative global obs offset; global `obsm` and per-modality
 /// `obsm` are concatenated row-wise (any key missing in any input is
 /// dropped, matching single-modality semantics). Per-modality CSC
-/// sidecars are dropped (caller can `--rebuild-csc`).
+/// sidecars are dropped: the same-pass builder is single-modality, and
+/// `CscCarryOptions::resolve` has already warned or refused.
 ///
 /// Honours [`MergeOptions`] in full:
 /// * `assume_identical_var` gates the per-modality var-identity
@@ -1085,24 +1082,6 @@ fn merge_multimodal(
 
     let total_n_obs: u64 = readers.iter().map(|r| r.n_obs()).sum();
     let first_header = readers[0].header();
-
-    let any_input_had_csc = readers.iter().any(|r| {
-        r.modality_table()
-            .map(|t| t.entries.iter().any(|info| info.flags.has_csc()))
-            .unwrap_or(false)
-    });
-    if any_input_had_csc {
-        let inputs_str = input_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        log::warn!(
-            "merge dropped per-modality CSC shards from at least one input ({inputs_str}): \
-             rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
-             column-major sidecar on the merged output"
-        );
-    }
 
     let max_n_vars = table.entries.iter().map(|i| i.n_vars).max().unwrap_or(0);
 

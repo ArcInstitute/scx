@@ -262,6 +262,14 @@ impl SectionScope {
     }
 }
 
+/// The `XCsc` cell of every op that rewrites X. The input's sidecar is never
+/// copied — its offsets are stale once rows are re-sharded, concatenated,
+/// permuted or re-canonicalised — but a new one is built from the output's own
+/// X shards as they are written (`ScxWriter::enable_csc_sidecar`), so the
+/// family is present iff the op's `CscCarryOptions` asked for it.
+const XCSC_SAME_PASS: &str = "rebuilt in the same pass when an input had one (--csc carry, the \
+     default) or under --csc always; --csc off or a multimodal input drops it";
+
 /// What an op does with a family **that is present in its input**.
 ///
 /// Every variant is conditional on presence, which is why there is no
@@ -510,10 +518,7 @@ fn compact(family: SectionFamily) -> Carry {
             why: "applied — the output contains only the surviving rows",
             warns: false,
         },
-        F::XCsc => Carry::Dropped {
-            why: "re-sharding invalidates column-major offsets (rebuild: scx build-csc)",
-            warns: true,
-        },
+        F::XCsc => Carry::Conditional { on: XCSC_SAME_PASS },
         F::LayerCsc => Carry::Dropped {
             why: "re-sharding invalidates column-major offsets (nothing rebuilds a layer sidecar)",
             warns: false,
@@ -590,10 +595,7 @@ fn merge(family: SectionFamily) -> Carry {
         F::Varp => Carry::Conditional {
             on: "taken from input 0 only; multimodal global varp omitted by design",
         },
-        F::XCsc => Carry::Dropped {
-            why: "output row space differs from every input's (rebuild: scx build-csc)",
-            warns: true,
-        },
+        F::XCsc => Carry::Conditional { on: XCSC_SAME_PASS },
         F::LayerCsc => Carry::Dropped {
             why: "output row space differs from every input's (nothing rebuilds a layer sidecar)",
             warns: false,
@@ -651,9 +653,8 @@ fn optimize(family: SectionFamily) -> Carry {
         F::Provenance => Carry::Rebuilt,
         // Rejected up front with a message pointing at `scx compact`.
         F::ModalityTable => Carry::Refuse,
-        F::XCsc => Carry::Dropped {
-            why: "re-canonicalisation can change nnz, staleing column offsets (rebuild: scx build-csc)",
-            warns: true,
+        F::XCsc => Carry::Conditional {
+            on: XCSC_SAME_PASS,
         },
         F::LayerCsc => Carry::Dropped {
             why: "re-canonicalisation can change nnz, staleing column offsets (nothing rebuilds a layer sidecar)",
@@ -702,10 +703,7 @@ fn sort(family: SectionFamily) -> Carry {
             why: "applied — the output contains only the surviving rows",
             warns: false,
         },
-        F::XCsc => Carry::Dropped {
-            why: "permuting rows invalidates column-major offsets (rebuild: scx build-csc)",
-            warns: true,
-        },
+        F::XCsc => Carry::Conditional { on: XCSC_SAME_PASS },
         F::LayerCsc => Carry::Dropped {
             why:
                 "permuting rows invalidates column-major offsets (nothing rebuilds a layer sidecar)",

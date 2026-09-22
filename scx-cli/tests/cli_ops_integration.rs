@@ -3038,3 +3038,142 @@ fn benchmark_refuses_a_multimodal_file_and_names_a_remedy() {
         "benchmark on the extracted modality must succeed: {out:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `--csc carry|always|off` on the rewrite ops
+// ---------------------------------------------------------------------------
+
+/// The sidecar the output carries is its own X's transpose.
+fn assert_csc_is_the_transpose(path: &std::path::Path) {
+    let r = ScxReader::open(path).unwrap();
+    assert!(r.header().has_csc(), "{}: no sidecar", path.display());
+    let csr = r.read_all_csr_shards().unwrap();
+    let csc = r.read_all_csc_shards().unwrap();
+    let (n_obs, n_vars) = (r.n_obs() as usize, r.n_vars() as usize);
+    let mut a = vec![0f32; n_obs * n_vars];
+    for row in 0..n_obs {
+        for k in csr.indptr[row] as usize..csr.indptr[row + 1] as usize {
+            a[row * n_vars + csr.indices[k] as usize] = csr.data[k];
+        }
+    }
+    let mut b = vec![0f32; n_obs * n_vars];
+    for col in 0..n_vars {
+        for k in csc.indptr[col] as usize..csc.indptr[col + 1] as usize {
+            b[csc.indices[k] as usize * n_vars + col] = csc.data[k];
+        }
+    }
+    assert_eq!(a, b, "{}: the sidecar is not X's transpose", path.display());
+}
+
+fn has_csc(path: &std::path::Path) -> bool {
+    ScxReader::open(path).unwrap().header().has_csc()
+}
+
+/// Run one rewrite op from `input` to `out` with `extra` flags appended.
+fn run_rewrite(
+    op: &str,
+    input: &std::path::Path,
+    out: &std::path::Path,
+    extra: &[&str],
+) -> std::process::Output {
+    let (i, o) = (input.to_str().unwrap(), out.to_str().unwrap());
+    let mut args: Vec<&str> = match op {
+        "compact" | "optimize" => vec![op, i, o],
+        "sort" => vec!["sort", i, o, "--by", "cell_type"],
+        "subset" => vec!["subset", i, o, "--filter", "cell_type == 'B cell'"],
+        // Merging the input with itself: the sidecar follows `i`.
+        "merge" => vec!["merge", i, i, "--output", o],
+        other => panic!("{other}"),
+    };
+    args.extend_from_slice(extra);
+    scx_cli().args(&args).output().unwrap()
+}
+
+const REWRITE_OPS: [&str; 5] = ["compact", "sort", "merge", "optimize", "subset"];
+
+/// Every rewrite op carries a sidecar by default, built from its own output;
+/// `--csc off` drops it; `--csc always` builds one on an input without.
+#[test]
+fn test_rewrite_ops_carry_csc_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = write_test_file(&dir, "plain.scx", 9, 6);
+    let carried = write_test_file(&dir, "carried.scx", 9, 6);
+    let built = scx_cli()
+        .args([
+            "build-csc",
+            carried.to_str().unwrap(),
+            "--csc-cols-per-shard",
+            "4",
+        ])
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{built:?}");
+
+    for op in REWRITE_OPS {
+        let out = dir.path().join(format!("{op}_carry.scx"));
+        let res = run_rewrite(op, &carried, &out, &["--csc-cols-per-shard", "4"]);
+        assert!(
+            res.status.success(),
+            "{op}: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        assert_csc_is_the_transpose(&out);
+
+        let out = dir.path().join(format!("{op}_off.scx"));
+        let res = run_rewrite(op, &carried, &out, &["--csc", "off"]);
+        assert!(
+            res.status.success(),
+            "{op}: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        assert!(!has_csc(&out), "{op}: --csc off must drop the sidecar");
+
+        let out = dir.path().join(format!("{op}_plain.scx"));
+        let res = run_rewrite(op, &plain, &out, &[]);
+        assert!(
+            res.status.success(),
+            "{op}: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        assert!(!has_csc(&out), "{op}: carry must not invent a sidecar");
+
+        let out = dir.path().join(format!("{op}_always.scx"));
+        let res = run_rewrite(op, &plain, &out, &["--csc", "always"]);
+        assert!(
+            res.status.success(),
+            "{op}: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        assert_csc_is_the_transpose(&out);
+    }
+}
+
+/// `--rebuild-csc` still works, as `--csc always`, and says it is deprecated;
+/// combined with `--csc` it is a usage error.
+#[test]
+fn test_rebuild_csc_is_a_deprecated_alias_for_csc_always() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = write_test_file(&dir, "plain.scx", 9, 6);
+    for op in REWRITE_OPS {
+        let out = dir.path().join(format!("{op}_alias.scx"));
+        let res = run_rewrite(op, &plain, &out, &["--rebuild-csc"]);
+        assert!(
+            res.status.success(),
+            "{op}: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        assert_csc_is_the_transpose(&out);
+        assert!(
+            String::from_utf8_lossy(&res.stderr).contains("deprecated"),
+            "{op}: the alias must say it is deprecated"
+        );
+
+        let out = dir.path().join(format!("{op}_both.scx"));
+        let res = run_rewrite(op, &plain, &out, &["--rebuild-csc", "--csc", "off"]);
+        assert!(
+            !res.status.success(),
+            "{op}: --rebuild-csc with --csc must be refused"
+        );
+        assert!(!out.exists());
+    }
+}

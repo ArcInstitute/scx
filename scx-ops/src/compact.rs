@@ -16,6 +16,7 @@ use scx_format_io::ResolvedCodec;
 use scx_format_io::ScxReader;
 
 use crate::codec_intent::{framing_for_rewrite, seed_codec};
+use crate::csc_carry::CscCarryOptions;
 use crate::error::Result;
 use crate::flock::SharedFileLock;
 use crate::helpers::{encode_values, widest_value_encoding};
@@ -40,6 +41,9 @@ pub struct CompactOptions {
     pub reshape_obs: bool,
     /// Codec intent for the rewritten X / layer / obsp shards.
     pub codec: ResolvedCodec,
+    /// Whether the output carries a CSC sidecar (default: iff the input had
+    /// one), built in the same pass as the X shards.
+    pub csc: CscCarryOptions,
 }
 
 impl Default for CompactOptions {
@@ -54,6 +58,7 @@ impl Default for CompactOptions {
             },
             reshape_obs: false,
             codec: ResolvedCodec::AUTO,
+            csc: CscCarryOptions::default(),
         }
     }
 }
@@ -137,6 +142,13 @@ pub fn compact_with_options(
             input = input_path.display()
         );
     }
+
+    // Decided before any output exists, so a refusal leaves nothing behind.
+    let csc_build = opts.csc.resolve(
+        "compact",
+        crate::csc_carry::reader_has_csc(&reader),
+        reader.is_multimodal(),
+    )?;
 
     // Phase 6: dispatch to the multimodal compact path. The single-modality
     // path below assumes one modality and would silently flatten the
@@ -231,23 +243,13 @@ pub fn compact_with_options(
 
     let new_n_obs = total_kept;
 
-    // CSC sidecars (column-major shards) are dropped by `compact`: the
-    // operation re-shards CSR rows on a different row layout, so any
-    // input CSC shards would silently reference stale row indices.
-    // Caller can opt back in via `--rebuild-csc` on the CLI to re-run
-    // `build-csc` against the compacted output. Phase H.2.
-    let had_csc = in_header.has_csc();
-    if had_csc {
-        log::warn!(
-            "compact dropped CSC shards from {input}: rerun \
-             `scx build-csc` (or pass --rebuild-csc) to restore the \
-             column-major sidecar",
-            input = input_path.display()
-        );
-    }
+    // The input's CSC sidecar is never copied: compact re-shards the rows,
+    // so its row indices would be stale. When `csc_build` says so, a new one
+    // is built from the output's own X shards as they are written.
+    //
     // Carry all input flags except `has_deletion_vectors` (bit 5) — the
     // compacted output applies the deletion vector and drops it — and
-    // `has_csc` (bit 0) — the CSC sidecar is dropped explicitly above.
+    // `has_csc` (bit 0), which `finish()` re-derives from the catalog.
     let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
 
     // Set up output header. Compact re-shards CSR rows via `encode_one_shard`
@@ -274,12 +276,13 @@ pub fn compact_with_options(
     // Copy obsm flag if present
     let has_obsm = in_header.has_obsm();
 
-    // Compact rewrites the CSR shards (re-sharding / row filtering) and
-    // drops the CSC sidecar, so bump the data generation. `csc_build_generation`
-    // defaults to 0 (no CSC emitted); any stale sidecar would mismatch.
+    // Compact rewrites the CSR shards (re-sharding / row filtering), so bump
+    // the data generation. A same-pass sidecar is stamped with the new one;
+    // without it `csc_build_generation` stays 0.
     let mut writer = ScxWriter::new(output_path, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
     writer.set_framing(framing_for_rewrite(opts.codec, output_framed, "the input")?);
+    crate::csc_carry::enable(&mut writer, &csc_build)?;
     if let Some(ref filtered_obs) = eager_filtered_obs {
         scx_format_io::write_obs_section(
             &mut writer,
@@ -409,6 +412,7 @@ pub fn compact_with_options(
         emitted_rows += acc_row_count;
         output_shard_row_ranges.push((shard_row_start, emitted_rows));
     }
+    crate::csc_carry::emit(&mut writer, "compact")?;
 
     // Copy obsm (row-filtered), as row-shards at the input's shard target —
     // the same one this op's X shards use. The keep mask has already been
@@ -1152,16 +1156,6 @@ fn compact_multimodal(
             )
         })?
         .clone();
-
-    let any_input_had_csc = table.entries.iter().any(|info| info.flags.has_csc());
-    if any_input_had_csc {
-        log::warn!(
-            "compact dropped per-modality CSC shards from {input}: \
-             rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
-             column-major sidecar",
-            input = input_path.display()
-        );
-    }
 
     let max_n_vars = table
         .entries
