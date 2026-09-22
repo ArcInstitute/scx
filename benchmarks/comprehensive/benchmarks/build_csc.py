@@ -6,12 +6,16 @@
 metric** before this module. That matters more than an ordinary coverage gap:
 this is the only operation in the suite with a *declared* memory budget —
 `build_csc(memory_limit=…)`, default `"4G"` — and nothing measured the gap
-between what a caller asks for and what the op takes. `write_csc_sidecar` takes
-`&[ScxCsr]` by value and has no streaming path, so the cost is dominated by
-holding the CSR and its column-major transpose at once.
+between what a caller asks for and what the op takes.
 
-Two things are measured, both written up in `thresholds.yaml`'s Deferred
-floors, item 14.
+The figures below are the **pre-fix** measurements, and they are what
+`thresholds.yaml`'s floors were authored against; the after-numbers are in that
+file's comment beside them. At the time they were taken, `run_build_csc`
+collected every decoded CSR shard into a `Vec<ScxCsr>` and held it across both
+the re-encode and the transpose, and the transpose itself rescanned every
+nonzero of every shard twice per column chunk — so the cost was dominated by
+holding the whole CSR and its column-major image at once, and the declared
+budget bounded neither.
 
 **The budget cannot be honoured.** Sweeping it over a 128x range on
 tabula_sapiens_100k (194.9M nnz) moves the op's own allocation by 26% and halves
@@ -185,6 +189,13 @@ def run(
             built = pyscx.open(str(target))
             try:
                 has_csc = bool(built.has_csc)
+                # Same already-open reader, same header, no extra I/O. The
+                # shard count is the layout number `has_csc` cannot express,
+                # and the one a memory bound can be met by regressing: narrow
+                # shards are individually cheap, so a build that fell back to
+                # chunk-width sharding would pass a peak floor while fixing
+                # nothing.
+                n_csc_shards = int(built.n_csc_shards)
             finally:
                 _close = getattr(built, "close", None)
                 if _close is not None:
@@ -222,6 +233,9 @@ def run(
                     "delta_over_memory_limit__build_csc": round(
                         (peak - entry_rss) / _MEMORY_LIMIT_MB, 4
                     ),
+                    # Emitted unconditionally, like the ratios above, so a
+                    # threshold on it can never be a missing-metric violation.
+                    "n_csc_shards__build_csc": n_csc_shards,
                     "memory_limit_mb": _MEMORY_LIMIT_MB,
                     "input_bytes": input_bytes,
                     "output_bytes": output_bytes,
@@ -250,11 +264,15 @@ def run(
     result.metadata["median_delta_over_memory_limit"] = round(
         statistics.median(deltas) / _MEMORY_LIMIT_MB, 4
     )
+    shard_counts = [r.extra["n_csc_shards__build_csc"] for r in result.runs]
+    result.metadata["median_n_csc_shards"] = int(statistics.median(shard_counts))
     logger.info(
-        "build_csc done: %s — median peak %.1f MB = %.2fx the %s budget",
+        "build_csc done: %s — median peak %.1f MB = %.2fx the %s budget, "
+        "%d CSC shards",
         dataset.name,
         result.metadata["median_peak_rss_mb"],
         result.metadata["median_peak_over_memory_limit"],
         _MEMORY_LIMIT,
+        result.metadata["median_n_csc_shards"],
     )
     return result
