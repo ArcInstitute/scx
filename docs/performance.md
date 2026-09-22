@@ -1844,7 +1844,8 @@ The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell f
 
 **CPU DE routing (Phase-2 §5.2/§5.3).** `rank_genes_groups` and `pdex_ref` now
 default to `prefer_format="auto"`: on CPU they take the CSC-direct kernel when the
-file has a valid CSC sidecar and no active row deletion vector, else the CSR
+file has a valid CSC sidecar, no active row deletion vector and — on a backed
+handle — no column projection, else the CSR
 streamer (a lazy transform chain is not a disqualifier — the row-indexed
 `normalize_total` / row-scale transforms are served column-major by looking up
 their per-row factor at the global row CSC `indices` carries, bit-identically); on GPU they stay CSR so the planner can route `gpu_csc_v3`.

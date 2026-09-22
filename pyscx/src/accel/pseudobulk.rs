@@ -235,42 +235,73 @@ pub(super) fn aggregate_pseudobulk(
     let x = adata.getattr("X")?;
 
     let result = if prefer_format == "csc" {
-        // CSC dispatch requires a gene subset, since
-        // full-gene CSC pseudobulk has no measurable speedup over CSR.
-        // Resolve the gene subset: explicit `gene_indices` kwarg takes
-        // precedence; otherwise fall back to the dataset's
-        // `col_projection` if set.
-        let resolved_indices: Vec<u32> = if let Some(gi) = gene_indices {
+        // CSC dispatch requires a gene subset, since full-gene CSC
+        // pseudobulk has no measurable speedup over CSR.
+        //
+        // Two index vectors, deliberately, because they live in different
+        // coordinate spaces and conflating them is a bug that has bitten on
+        // both the lazy and the backed arm:
+        //
+        // * `read_indices` addresses the CSC source. A `BackedCscReader` is
+        //   **full-axis**, so it wants on-disk column ids. A `LazyShardSource`
+        //   already presents the projected axis and maps a request *through*
+        //   the projection, so it wants visible positions.
+        // * `name_indices` indexes `gene_names`, which comes from `adata.var`
+        //   at call time and is therefore **always** the already-subset,
+        //   visible frame. It only ever wants visible positions.
+        //
+        // Using one vector for both meant a backed projected handle looked up
+        // an on-disk id in a shorter visible frame: a non-prefix mask raised
+        // `gene index N out of range`, and — worse — a projection that happens
+        // to keep ids below the visible width silently labelled the counts of
+        // file column `c` with the name of visible gene `c`.
+        let is_lazy = x
+            .extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
+            .is_ok();
+        let backed_projection: Option<Vec<u32>> = x
+            .extract::<PyRef<ScxBackedSparseDataset>>()
+            .ok()
+            .and_then(|b| b.col_projection().map(|c| c.to_vec()));
+
+        let (read_indices, name_indices): (Vec<u32>, Vec<u32>) = if let Some(gi) = gene_indices {
             if gi.is_empty() {
                 return Err(PyRuntimeError::new_err(
                     "prefer_format='csc' requires non-empty gene_indices, \
                      or a column projection on adata.X (e.g. via X[:, var_mask])",
                 ));
             }
-            gi.to_vec()
-        } else if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            match backed.col_projection() {
-                Some(cols) => cols.to_vec(),
-                None => {
-                    return Err(PyRuntimeError::new_err(
-                        "prefer_format='csc' requires a gene subset; pass \
-                         gene_indices=... or apply a column projection \
-                         via adata[:, mask] / X[:, indices] before calling",
-                    ));
-                }
-            }
-        } else if let Ok(lazy) =
-            x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
-        {
+            // `gene_indices` are positions in the *visible* var frame, whether
+            // or not a projection is active. On a backed handle with a
+            // projection they must be composed through it to reach the
+            // full-axis reader; everywhere else they already address what the
+            // source exposes.
+            let reads: Vec<u32> = match &backed_projection {
+                Some(proj) => gi
+                    .iter()
+                    .map(|&i| {
+                        proj.get(i as usize).copied().ok_or_else(|| {
+                            PyRuntimeError::new_err(format!(
+                                "gene index {i} out of range for the {} visible genes",
+                                proj.len()
+                            ))
+                        })
+                    })
+                    .collect::<PyResult<Vec<_>>>()?,
+                None => gi.to_vec(),
+            };
+            (reads, gi.to_vec())
+        } else if let Some(proj) = backed_projection {
+            // Backed: read on-disk ids, label by visible position.
+            let names: Vec<u32> = (0..proj.len() as u32).collect();
+            (proj, names)
+        } else if is_lazy {
+            let lazy = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()?;
             match lazy.col_projection() {
-                // Identity positions, NOT the global ids the projection holds:
-                // both the lazy CSC source and `gene_names` (taken from the
-                // already-subset `adata.var`) are on the projected axis, so a
-                // global id would read the wrong column *and* label it with
-                // the wrong name — or fall off the end of the visible
-                // `gene_names` and be rejected as out of range. See the note
-                // in `accel::col_aggs`.
-                Some(cols) => (0..cols.len() as u32).collect(),
+                // Lazy: the source is already projected, so one space serves.
+                Some(cols) => {
+                    let ids: Vec<u32> = (0..cols.len() as u32).collect();
+                    (ids.clone(), ids)
+                }
                 None => {
                     return Err(PyRuntimeError::new_err(
                         "prefer_format='csc' requires a gene subset; pass \
@@ -278,17 +309,24 @@ pub(super) fn aggregate_pseudobulk(
                     ));
                 }
             }
+        } else if x.extract::<PyRef<ScxBackedSparseDataset>>().is_ok() {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' requires a gene subset; pass \
+                 gene_indices=... or apply a column projection \
+                 via adata[:, mask] / X[:, indices] before calling",
+            ));
         } else {
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' requires adata.X to be a backed or lazy \
                  SCX dataset; got a regular scipy/dense matrix",
             ));
         };
+        let resolved_indices = read_indices;
 
         let n_obs = obs_groups[0].len();
         let (cell_to_group, group_labels) = scx_accel::build_group_mapping(&obs_groups, n_obs);
         let n_groups = group_labels.len();
-        let projected_gene_names: Vec<String> = resolved_indices
+        let projected_gene_names: Vec<String> = name_indices
             .iter()
             .map(|&c| {
                 gene_names.get(c as usize).cloned().ok_or_else(|| {

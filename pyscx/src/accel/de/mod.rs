@@ -256,8 +256,12 @@ fn reject_csc_on_subset(backed: &ScxBackedSparseDataset) -> PyResult<()> {
 
 /// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
 ///
-/// Mirrors the single capability-detection point (`as_column_source`): a valid
-/// CSC route needs a sidecar present and no active row-deletion vector. A lazy
+/// Close to the single capability-detection point (`as_column_source`), with
+/// one addition of its own: a valid CSC route needs a sidecar present, no
+/// active row-deletion vector, and — on a **backed** handle only — no column
+/// projection. That third conjunct is enforced here rather than in
+/// `as_column_source`, because the full-axis sidecar it hands back cannot
+/// serve a projected gene axis while a lazy source remaps one itself. A lazy
 /// transform chain is no longer a disqualifier — every `Transform` is
 /// CSC-applicable — which **widens what `auto` picks**: a
 /// `normalize_total → log1p` chain used to resolve to `cpu_csr` here and now

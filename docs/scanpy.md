@@ -2013,7 +2013,7 @@ other `prefer_format`-taking function defaults to `"csr"`.**
 work — DE previously defaulted to `"csr"`) resolves at call time
 against the *selected* matrix: on CPU it takes the CSC-direct route
 when a valid sidecar is available (sidecar present ∧ no active row
-deletion vector — the same capability gate `"csc"` enforces) and CSR
+deletion vector ∧, on a *backed* handle, no column projection) and CSR
 otherwise; on GPU it stays CSR so the planner routes `gpu_csc_v3` when a
 sidecar is present. The route and
 `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`

@@ -517,11 +517,114 @@ def test_projected_lazy_qc_gene_axis_matches_the_csr_route(tmp_path):
     pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=4)
     keep = np.arange(16) >= 8
 
-    out = {}
-    for prefer in ("csr", "csc"):
-        h = pyscx.open(str(path)).to_anndata(backed=True)[:, keep]
-        pyscx.accel.normalize_total(h, target_sum=1e4)
-        pyscx.accel.calculate_qc_metrics(h, prefer_format=prefer, inplace=True)
-        out[prefer] = np.asarray(h.var["total_counts"], dtype=np.float64)
+    for chain in ("log1p", "normalize_then_log1p"):
+        out = {}
+        for prefer in ("csr", "csc"):
+            h = pyscx.open(str(path)).to_anndata(backed=True)[:, keep]
+            if chain == "normalize_then_log1p":
+                pyscx.accel.normalize_total(h, target_sum=1e4)
+            pyscx.accel.log1p(h)
+            pyscx.accel.calculate_qc_metrics(h, prefer_format=prefer, inplace=True)
+            out[prefer] = np.asarray(h.var["total_counts"], dtype=np.float64)
+        np.testing.assert_allclose(
+            out["csc"], out["csr"], rtol=1e-6,
+            err_msg=f"{chain}: projected lazy QC gene axis disagrees with CSR",
+        )
 
-    np.testing.assert_allclose(out["csc"], out["csr"], rtol=1e-6)
+
+# ---------------------------------------------------------------------------
+# Round-3 regression: pseudobulk's two coordinate spaces.
+#
+# `resolved_indices` addressed the CSC source and indexed `adata.var` at once.
+# Those are different spaces on a projected *backed* handle — the reader is
+# full-axis, `adata.var` is already subset — so a non-prefix mask raised, and a
+# mask that kept every id below the visible width silently labelled file column
+# `c` with visible gene `c`. Pre-existing; reachable through the very path the
+# projection table in docs/scanpy.md recommends.
+# ---------------------------------------------------------------------------
+
+
+def _pseudobulk_adata():
+    import anndata as ad
+    import pandas as pd
+
+    rng = np.random.default_rng(9)
+    n_obs, n_vars = 120, 20
+    mat = sp.random(n_obs, n_vars, density=0.6, format="csr", dtype=np.float32, random_state=rng)
+    mat.data = (mat.data * 40).astype(np.float32).round() + 1.0
+    a = ad.AnnData(X=mat)
+    a.obs["cell_id"] = [f"c{i}" for i in range(n_obs)]
+    a.obs["cond"] = pd.Categorical(["ctrl"] * 60 + ["trt"] * 60)
+    # Three donors inside each condition, so every condition has the >= 2
+    # pseudobulk replicates the NB-GLM needs.
+    a.obs["donor"] = pd.Categorical([f"d{i % 3}" for i in range(60)] * 2)
+    a.var["gene_id"] = [f"g{i}" for i in range(n_vars)]
+    return a
+
+
+def _pb(path, keep, prefer, gene_indices=None):
+    import pyscx
+
+    h = pyscx.open(str(path)).to_anndata(backed=True)[:, keep]
+    return pyscx.accel.pseudobulk_dex(
+        h, groupby=["cond", "donor"], test_col="cond", reference="ctrl",
+        prefer_format=prefer, gene_indices=gene_indices,
+    ).set_index("gene")
+
+
+def test_projected_backed_pseudobulk_reads_and_labels_the_visible_genes(tmp_path):
+    """A non-prefix projection: raised `gene index 10 out of range` before.
+
+    The mask keeps the second half, so every on-disk id is >= the visible
+    width — which is exactly what made the conflated index vector fail loudly
+    rather than quietly.
+    """
+    import pyscx
+
+    adata = _pseudobulk_adata()
+    path = tmp_path / "pb.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=5)
+    keep = np.arange(20) >= 10
+
+    csc = _pb(path, keep, "csc")
+    csr = _pb(path, keep, "csr")
+
+    assert list(csc.index) == list(csr.index), "CSC labelled different genes than CSR"
+    # Premise: the projection really is non-prefix, so a conflated index
+    # vector could not have survived by coincidence.
+    assert list(csc.index) == [str(i) for i in range(10, 20)]
+    np.testing.assert_allclose(
+        csc["baseMean"].to_numpy(), csr["baseMean"].to_numpy(), rtol=1e-4,
+        err_msg="CSC read different columns than CSR for the same visible genes",
+    )
+
+
+def test_gene_indices_on_a_projected_backed_handle_compose_through_the_projection(tmp_path):
+    """The silent half: positions are *visible*, the reader is full-axis.
+
+    `gene_indices=[0, 5]` after `[:, 10:]` means visible genes 10 and 15. The
+    conflated vector sent 0 and 5 straight to the full-axis reader, returning
+    file columns 0 and 5 under the names of genes 10 and 15 — no error, just
+    the wrong numbers.
+    """
+    import pyscx
+
+    adata = _pseudobulk_adata()
+    path = tmp_path / "pb2.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=5)
+    keep = np.arange(20) >= 10
+
+    sub = _pb(path, keep, "csc", gene_indices=[0, 5])
+    assert list(sub.index) == ["10", "15"]
+
+    # The values must come from genes 10 and 15, not file columns 0 and 5.
+    # Compared against a projection restricted to those same two genes, so both
+    # runs aggregate the identical gene set and share their size factors.
+    pair = np.zeros(20, dtype=bool)
+    pair[[10, 15]] = True
+    ref = _pb(path, pair, "csr")
+    assert list(ref.index) == ["10", "15"]
+    np.testing.assert_allclose(
+        sub["baseMean"].to_numpy(), ref["baseMean"].to_numpy(), rtol=1e-4,
+        err_msg="gene_indices were not composed through the column projection",
+    )
