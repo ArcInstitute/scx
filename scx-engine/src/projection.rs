@@ -403,7 +403,10 @@ pub fn project_csc(csc: &ScxCsc, gene_indices: &[u32]) -> ScxCsc {
 /// n_obs` skip every CSC kernel already performs — a reader must not panic on a
 /// malformed slab. Debug builds assert instead, so a real bug is loud in tests.
 ///
-/// `O(nnz)`, one pass, no allocation.
+/// `O(nnz)`, one pass, and in place — there is never a second logical slab. It
+/// is not allocation-*free*: a compaction that leaves the buffers more than
+/// half empty releases the dead tail, which may reallocate and copy once (see
+/// the `shrink_to_fit` below and why its threshold exists).
 pub fn compact_csc_rows_in_place(csc: &mut ScxCsc, global_to_live: &[i32], n_live: usize) {
     debug_assert!(
         csc.indices

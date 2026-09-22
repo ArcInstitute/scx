@@ -2821,7 +2821,10 @@ All accelerators write results to standard AnnData slots (same as scanpy), so do
 Several accelerators take a `prefer_format` kwarg selecting between the row-major
 CSR path and the column-major CSC sidecar path. The DE ops (`rank_genes_groups`,
 `pdex_ref`) default to `"auto"` (CPU routes CSC-direct when a valid sidecar is
-present, else CSR; GPU stays CSR for the `gpu_csc_v3` planner route); every other
+present **and** the handle's row window still spans at least half the CSR shards,
+else CSR; GPU stays CSR for the `gpu_csc_v3` planner route, chosen under the same
+condition — an explicit `prefer_format="csc"` skips that policy and is served on
+any window); every other
 `prefer_format`-taking op defaults to `"csr"`. See
 [scanpy.md § prefer_format](scanpy.md#prefer_formatautocsrcsc-column-major-dispatch)
 for the full dispatch rules and requirements.

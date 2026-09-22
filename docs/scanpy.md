@@ -2132,9 +2132,10 @@ bullet; the only direct measurement points the other way.
   pre-filter. Without a sidecar — e.g. an in-memory scipy CSR — the same call
   falls back to `gpu_csr_v3` (`fallback_reason == "no_csc_sidecar"`), which is
   *GPU-supported but not GPU-fast*. A **windowed or transformed** handle
-  reaches the CSC-direct route too; it used to be downgraded to `gpu_csr_v3`
-  because the only CSC source it could offer was the full-axis sidecar reader,
-  and it now passes its own view instead.
+  reaches the CSC-direct route too — while its row window still spans at least
+  half the CSR shards — where it used to be downgraded to `gpu_csr_v3`
+  unconditionally, because the only CSC source it could offer was the full-axis
+  sidecar reader; it now passes its own view instead.
 - **Wilcoxon rank-sum (`rank_genes_groups`) takes the same v3 *routes* as `pdex_ref` — but
   not, on the one shape measured, the same *timing*.** With a CSC sidecar it runs CSC-direct
   (`gpu_csc_v3`); without one it runs CSR-direct (`gpu_csr_v3`,
@@ -3117,7 +3118,8 @@ SCX offers several DE functions covering different experimental designs:
 | `pdex_nb_glm` | Perturbation NB-GLM with replicate-forming stratification | Rust-native negative-binomial GLM |
 
 All Wilcoxon rank-sum-based functions support GPU via `device="gpu"` (CSC-direct
-`gpu_csc_v3` when a sidecar is present, CSR-direct `gpu_csr_v3` otherwise).
+`gpu_csc_v3` when a sidecar is present **and** the handle's row window still
+spans at least half the CSR shards, CSR-direct `gpu_csr_v3` otherwise).
 The NB-GLM functions are CPU-only.
 
 #### `pyscx.accel.rank_genes_groups`
@@ -3166,8 +3168,8 @@ df = pyscx.accel.rank_genes_groups_df(adata, group="0")  # + pct_nz_group, pct_n
 | `rankby_abs` | `False` | Sort genes by absolute z-score instead of signed score. `False` (default) matches scanpy's default: highest positive z-score first. `True` ranks by significance regardless of direction. |
 | `tie_correct` | `False` | Apply the `Σ(t³−t)` tie correction to the Wilcoxon rank-sum variance estimate. The default `False` matches **scanpy's default** (`scanpy.tl.rank_genes_groups` takes the same parameter, also defaulting to `False`); `True` matches **scipy**, which always corrects. These are two different answers, not two precisions — see [Numerical parity](#numerical-parity-against-scanpy-and-scipy) below. |
 | `gene_chunk_size` | `None` | Process genes in chunks of this size to limit memory. `None` processes all genes at once. |
-| `prefer_format` | `"auto"` | `"auto"` (default; CPU routes CSC-direct when a valid sidecar is present, else CSR), `"csr"`, or `"csc"`. |
-| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present, or CSR-direct (`gpu_csr_v3`) otherwise. |
+| `prefer_format` | `"auto"` | `"auto"` (default; CPU routes CSC-direct when a valid sidecar is present **and** the row window spans at least half the CSR shards, else CSR), `"csr"`, or `"csc"` — the explicit `"csc"` skips that policy. |
+| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present and the row window spans at least half the CSR shards, or CSR-direct (`gpu_csr_v3`) otherwise. |
 
 **A group with fewer than two cells is refused, whichever way you ask.** Any
 **participating** group raises scanpy's `Could not calculate statistics for
@@ -3316,7 +3318,7 @@ df = pyscx.accel.pdex_ref(adata, "perturbation", groups=["KO_1", "KO_7"])
 | `cpm_filter` | `None` | Optional CPM floor `T`: keep a gene iff `target_cpm > T` or `ref_cpm > T` (pooled arithmetic CPM, mode-independent); drops other rows, FDR recomputed over survivors. |
 | `gene_chunk_size` | `None` | Process genes in chunks to limit memory |
 | `prefer_format` | `"auto"` | `"auto"` (default), `"csr"`, or `"csc"` |
-| `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present. |
+| `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present and the row window spans at least half the CSR shards. |
 | `output` | `"pandas"` | `"pandas"` (needs no extra) or `"polars"` (needs the `eval` extra; what `cell_eval` consumes) |
 
 ### Pseudobulk Differential Expression (`pyscx.accel.pseudobulk_dex`)

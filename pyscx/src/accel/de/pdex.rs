@@ -718,7 +718,8 @@ pub fn pdex_ref(
     };
     // `prefer_format="csc"` selects the CPU column-major path (it is a CPU-only
     // knob — the GPU CSC-direct route `gpu_csc_v3` is reached via the *default*
-    // prefer_format="csr", chosen by the planner when a CSC sidecar is present).
+    // prefer_format="csr", chosen by the planner when a CSC sidecar is present and
+    // the row window spans at least half the CSR shards).
     // Reject when the user explicitly asked for GPU; for device="auto" fall back
     // to CPU, but nudge on a GPU host so the silent CPU pin is not surprising.
     let gpu_device_id = if prefer_format == "csc" {
@@ -740,7 +741,8 @@ pub fn pdex_ref(
                      prefer_format=\"csc\" pins the CPU column-major path even on a GPU \
                      host. For GPU CSC-direct DE (route gpu_csc_v3), drop prefer_format \
                      (pass \"csr\" explicitly) with device=\"auto\"/\"gpu\" — the planner \
-                     routes to gpu_csc_v3 automatically when a CSC sidecar is present.",
+                     routes to gpu_csc_v3 automatically when a CSC sidecar is present \
+                     and the row window spans at least half the CSR shards.",
                     py.get_type::<pyo3::exceptions::PyUserWarning>(),
                 ),
             )?;

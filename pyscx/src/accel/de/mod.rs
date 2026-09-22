@@ -223,45 +223,14 @@ fn select_de_matrix<'py>(
     }
 }
 
-/// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
-///
-/// The single capability-detection point (`as_column_source`) **plus a policy
-/// question** — `LazyShardSource::csc_preferred_for_auto` — and the split
-/// between those two is the point. It used to carry a condition of its own — on
-/// a *backed* handle, no column projection — because `as_column_source` handed
-/// back the **full-axis** sidecar reader, which cannot serve a projected gene
-/// axis and would trip the kernel's `n_vars` guard. Both handle kinds now hand
-/// back a view that remaps columns into the projected axis and renumbers rows
-/// onto the live one, so neither is a *capability* disqualifier and the two
-/// branches are the same question.
-///
-/// Capability is not the same as "should run", though, and answering only the
-/// first is how `auto` would follow a narrow row window into a full-height
-/// column read that CSC cannot prune. `csc_preferred_for_auto` is that second
-/// question; an explicit `prefer_format="csc"` skips it.
-///
-/// That **widens what `auto` picks**, twice over: a
-/// `normalize_total → log1p` chain resolves to `cpu_csc` rather than `cpu_csr`,
-/// and now so does a handle carrying a `filter_cells` row filter or a
-/// `filter_genes` column projection — the shape of essentially every real
-/// pipeline. The routes produce the same output (pinned bit-for-bit in
-/// `pyscx/src/lazy_transform/shard_source_tests.rs` and value-for-value in
-/// `pyscx/tests/test_csc_dispatch_lazy.py`), so the visible difference is the
-/// recorded route and the wall time.
-///
-/// Never errors: a `false` result just routes `auto` to the CSR streamer. A
-/// materialized matrix (numpy/scipy, e.g. `use_raw`/`layer`) is not a
-/// backed/lazy SCX dataset → `false`.
-fn csc_route_available(x: &Bound<'_, PyAny>) -> bool {
-    crate::accel::csc_source_for(x).is_some_and(|s| s.csc_preferred_for_auto())
-}
-
 /// Resolve `prefer_format` to a concrete `"csr"` / `"csc"` route.
 ///
 /// `"auto"` (the default since Phase-2 §5.2) picks the CSC-direct CPU route when
-/// a valid CSC sidecar is available and the op runs on CPU; on GPU it stays
-/// `"csr"` so the planner routes `gpu_csc_v3` from the CSR path when a sidecar
-/// is present. Explicit `"csr"` / `"csc"` pass through unchanged.
+/// a valid CSC sidecar is available, the handle's row window still spans at
+/// least half the CSR shards, and the op runs on CPU; on GPU it stays `"csr"`
+/// so the planner routes `gpu_csc_v3` from the CSR path under the same
+/// condition. Explicit `"csr"` / `"csc"` pass through unchanged — `"csc"` is
+/// served on any window the reader can compact.
 fn resolve_de_format(
     prefer_format: &str,
     gpu_device_id: Option<usize>,
@@ -271,7 +240,18 @@ fn resolve_de_format(
         "auto" => {
             if gpu_device_id.is_some() {
                 "csr"
-            } else if csc_route_available(x) {
+            } else if crate::accel::csc_source_for(x).is_some_and(|s| s.csc_preferred_for_auto()) {
+                // Capability *and* policy, in one expression. This used to be a
+                // `csc_route_available` wrapper; `csc_source_for` now owns the
+                // backed-vs-lazy decision it used to make, and
+                // `csc_preferred_for_auto` the narrow-window one, leaving a
+                // function that only spelled the `&&`.
+                //
+                // The split is the point: being *able* to serve CSC is not a
+                // reason to prefer it, because a CSC column shard spans the
+                // whole row axis and cannot prune what a narrow row window
+                // dropped. An explicit `prefer_format="csc"` skips this and is
+                // served on any window the reader can compact.
                 "csc"
             } else {
                 "csr"

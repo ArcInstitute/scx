@@ -883,20 +883,41 @@ def test_a_filtered_hvg_csc_route_matches_csr(tmp_path):
     path = tmp_path / "hvg_csc.scx"
     pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=10)
 
-    def hvg(prefer):
-        a = _filtered_handle(path, adata, transforms=False)
+    def hvg(prefer, filtered=True):
+        a = _filtered_handle(path, adata, rows=filtered, transforms=False)
         pyscx.accel.highly_variable_genes(
             a, n_top_genes=20, flavor="seurat_v3", span=1.0, prefer_format=prefer, device="cpu"
         )
         return (
             np.asarray(a.var["highly_variable"].values),
             np.asarray(a.var["variances"], dtype=np.float64),
+            a.uns["scx_accel"]["highly_variable_genes"],
         )
 
-    csc_flags, csc_var = hvg("csc")
-    csr_flags, csr_var = hvg("csr")
+    csc_flags, csc_var, csc_info = hvg("csc")
+    csr_flags, csr_var, csr_info = hvg("csr")
     np.testing.assert_array_equal(csc_flags, csr_flags)
     np.testing.assert_allclose(csc_var, csr_var, rtol=1e-6)
+
+    # The route stamp, not just the numbers. `hvg_exec_info`'s `csc_available`
+    # argument is a *route* input — `plan_hvg_route` picks `CpuCsc` from it —
+    # so an attempt to report the real capability through it stamped `cpu_csc`
+    # over the CSR kernel on every sidecar-carrying file, filtered or not.
+    # Comparing variances cannot see that; this can.
+    assert csc_info["route"] == "cpu_csc"
+    assert csr_info["route"] == "cpu_csr", (
+        f"the default CSR path must record cpu_csr, got {csr_info['route']!r}"
+    )
+    assert csr_info["csc_available"] is True, (
+        "the file has a sidecar, and the CSR stamp must say so without claiming "
+        "the CSC route ran"
+    )
+
+    # Same stamp, unfiltered — the shape where nothing declined CSC and the
+    # capability is equally true.
+    _, _, unfiltered_info = hvg("csr", filtered=False)
+    assert unfiltered_info["route"] == "cpu_csr"
+    assert unfiltered_info["csc_available"] is True
 
 
 def test_a_filtered_pseudobulk_dex_matches_csr(tmp_path):

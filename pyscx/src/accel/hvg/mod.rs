@@ -433,16 +433,24 @@ pub fn highly_variable_genes<'py>(
     // orthogonal to whether the op finished. `RouteStamp` covers the latter —
     // the stamp is rolled back if any branch below raises, so a present entry
     // means the route ran *and* completed.
-    // `csc_available` is the *capability*, not the route: this CSR stamp is also
-    // what a row-filtered handle gets, and that handle's file may well have a
-    // sidecar — the auto-route declined it (see `backed_x_has_csc_sidecar`)
-    // because the column-major walk is slower here. Reporting `false` would
-    // tell the route gates the file had no sidecar.
-    let info = super::route::hvg_exec_info(
-        device,
-        seurat_v3_family,
-        crate::accel::csc_source_for(&adata.getattr("X")?).is_some(),
-    );
+    // Plan with `false`, then correct only the capability field.
+    //
+    // `hvg_exec_info`'s third argument is a **route** input, not a metadata
+    // one: `plan_hvg_route` picks `CpuCsc` / `GpuCscV3` from it, and derives
+    // `reduction` from the route it picked. This stamp belongs to the CSR
+    // fall-through — the branch reached *after* the CSC auto-route has been
+    // declined — so passing the real capability here named a CSC kernel over a
+    // CSR one: `cpu_csc` for any sidecar file on CPU, and `gpu_csc_v3` with
+    // `reduction="deterministic"` for a row-filtered GPU run whose reduce is
+    // the atomic CSR one. That is the shape DE avoids by planning the CSR
+    // layout and overwriting the field afterwards, and it is what this now
+    // does.
+    //
+    // Capability comes from `x`, the matrix this op will actually read, not
+    // from `adata.X`: under `layer=` those differ, the sidecar lives on `X`,
+    // and the layer's own is not usable here.
+    let mut info = super::route::hvg_exec_info(device, seurat_v3_family, false);
+    info.csc_available = Some(crate::accel::csc_source_for(&x).is_some());
     super::route::announce_route(py, "highly_variable_genes", device, &info);
     // Rolled back if any branch below raises (a loess singularity across every
     // batch, a missing `batch_key`, …) — see RouteStamp.
