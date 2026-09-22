@@ -43,7 +43,7 @@
 //! ## What this cannot see
 //!
 //! Read this before citing a green run as "the rewrite did not change bytes".
-//! It is true of these sixteen arms and of nothing else.
+//! It is true of these seventeen arms and of nothing else.
 //!
 //! **Regions of the file.** `FileHeader::file_checksum` is deliberately outside
 //! the digest (it covers the `Provenance` section, which is itself excluded),
@@ -106,7 +106,9 @@ use common::{
 use scx_codec::ValueEncoding;
 use scx_testkit::ab::{assert_manifests_eq, resolve_against_env, OpDigestManifest};
 use scx_testkit::digest::Strictness;
-use scx_testkit::fixtures::{mixed_codec_file, mixed_codec_file_with, FixtureOpts};
+use scx_testkit::fixtures::{
+    csc_multi_shard_file, mixed_codec_file, mixed_codec_file_with, FixtureOpts,
+};
 
 /// Every arm, in the order the manifest reports them (`labels()` walks a
 /// `BTreeMap`, so this constant is asserted **sorted**): the nine labels over
@@ -118,7 +120,7 @@ use scx_testkit::fixtures::{mixed_codec_file, mixed_codec_file_with, FixtureOpts
 /// obs the caller can hand them a categorical in, added when they stopped
 /// decoding those to plain strings), `sort_categorical_spilled` (the obs
 /// spill-scatter write, which is a *different writer* from the `sort` arm's
-/// in-memory one), and `optimize_framed` and `optimize_csr_obsp` — sixteen in
+/// in-memory one), and `optimize_framed` and `optimize_csr_obsp` — seventeen in
 /// all.
 /// `optimize_framed` is the **only** arm whose output goes through the
 /// row-group-framed encoder, and `optimize_csr_obsp` the **only** one whose
@@ -131,6 +133,7 @@ const EXPECTED_OPS: &[&str] = &[
     "attach_var",
     "build_csc",
     "build_csc_indexed",
+    "build_csc_multi_shard",
     "compact",
     "compact_indexed",
     "delete",
@@ -279,6 +282,30 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     let out = dir.join("build_csc.scx");
     scx_ops::run_build_csc(&csc_src, &out, "1G", false, 1024, None, None).unwrap();
     m.record("build_csc", &out, Strictness::Content).unwrap();
+
+    // --- build-csc emitting SEVERAL CSC shards ----------------------------
+    //
+    // The arm above emits exactly **one** CSC shard in one column chunk (1024
+    // columns per shard against 40, a 1 GiB budget against 24 rows), so it
+    // pins nothing about `col_start` stamping, chunk boundaries, or the
+    // concatenation between them. Every byte of multi-shard CSC emission was
+    // unpinned until this arm.
+    //
+    // `cols_per_shard = 3` over 7 columns gives `[0,3) [3,6) [6,7)` — three
+    // shards with a **short last one**, which is the boundary an off-by-one in
+    // the final chunk lands on. The fixture's irregular geometry (5/1/11-row
+    // shards, per-row nnz from 0 to 7, empty columns at both ends and in the
+    // middle) is documented on `csc_multi_shard_file`; each irregularity buys
+    // one specific failure that uniform geometry hides.
+    //
+    // The budget is generous on purpose, so the boundaries come from
+    // `cols_per_shard` alone and this arm is byte-identical across the
+    // streaming-builder change rather than needing a bless.
+    let csc_multi = csc_multi_shard_file(&dir.join("csc_multi_src.scx")).unwrap();
+    let out = dir.join("build_csc_multi_shard.scx");
+    scx_ops::run_build_csc(&csc_multi, &out, "1G", false, 3, None, None).unwrap();
+    m.record("build_csc_multi_shard", &out, Strictness::Content)
+        .unwrap();
 
     // --- the same two ops over an input carrying per-shard `column_stats` ---
     //
