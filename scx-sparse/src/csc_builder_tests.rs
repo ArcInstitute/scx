@@ -909,3 +909,54 @@ fn every_allocated_bucket_is_reachable() {
         assert_same(&got, &reference(&shards, 4, n_cols, 1 << 30, 1));
     }
 }
+
+/// A corrupt spill stream must come back as `SpillCorrupt`, not a panic.
+///
+/// The first version recorded the bad column and returned from that one row
+/// block, leaving `drain_bucket` to walk the rest — so a later record could
+/// index past the planned slots and panic before the note was read. The
+/// callback is fallible now and stops at the first bad record.
+#[test]
+fn a_corrupt_spill_stream_errors_instead_of_panicking() {
+    /// A store that hands back bytes nobody wrote.
+    #[derive(Default)]
+    struct EvilStore {
+        inner: MemSpillStore,
+        payload: Vec<u8>,
+    }
+    impl SpillStore for EvilStore {
+        fn append(&mut self, bucket: usize, block: &[u8]) -> std::io::Result<()> {
+            self.inner.append(bucket, block)
+        }
+        fn reader(&self, _bucket: usize) -> std::io::Result<Option<Box<dyn std::io::Read + '_>>> {
+            Ok(Some(Box::new(self.payload.as_slice())))
+        }
+        fn spilled_bytes(&self, _bucket: usize) -> u64 {
+            self.payload.len() as u64
+        }
+    }
+
+    // One row block claiming a column far outside any bucket's range.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes()); // row 0
+    payload.extend_from_slice(&1u32.to_le_bytes()); // one record
+    payload.extend_from_slice(&9_999u32.to_le_bytes()); // column 9999
+    payload.extend_from_slice(&1.0f32.to_le_bytes());
+
+    let shards = shards_from(2, 4, &[(0, 0, 1.0), (1, 3, 2.0)], &[]);
+    let store = EvilStore {
+        payload,
+        ..Default::default()
+    };
+    let mut b = CscBuilder::new(2, 4, cfg(2, 1 << 20, 0), Box::new(store)).expect("new");
+    b.push_shard(0, &shards[0]).expect("push");
+    let mut em = b.finish().expect("finish");
+    let (mut ip, mut ix, mut dt) = (Vec::new(), Vec::new(), Vec::new());
+    let err = em
+        .next_shard_into(&mut ip, &mut ix, &mut dt)
+        .expect_err("a column outside the bucket must be refused");
+    assert!(
+        matches!(err, CscBuilderError::SpillCorrupt { .. }),
+        "expected SpillCorrupt, got {err}"
+    );
+}

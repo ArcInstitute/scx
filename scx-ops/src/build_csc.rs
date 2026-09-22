@@ -276,6 +276,25 @@ pub fn run_build_csc(
             max_int_val = max_int_val.max(stats.value_max);
         }
     }
+    // Re-order by the header's own offset, not the catalog's.
+    //
+    // `csr_shards_sorted` keys on `ShardStats::major_start` and sinks a
+    // stats-less entry to `u64::MAX`. That is fine when every shard has stats
+    // or none does, but the format permits a stats-less entry *beside* a
+    // stats-bearing one — and then an early stats-less shard sorts last, the
+    // walk below sees a non-zero `global_offset` first, and the tiling guard
+    // rejects a perfectly valid file. `ShardHeader.global_offset` is present
+    // on every shard, so once the headers are read there is a total order
+    // that does not depend on optional metadata.
+    //
+    // A stable sort, so shards that genuinely share an offset keep catalog
+    // order and the guard reports the duplicate rather than a shuffle.
+    let mut order: Vec<usize> = (0..csr_entries.len()).collect();
+    order.sort_by_key(|&i| per_shard[i].2);
+    let csr_entries: Vec<_> = order.iter().map(|&i| csr_entries[i]).collect();
+    let per_shard: Vec<_> = order.iter().map(|&i| per_shard[i]).collect();
+    let declared_encs: Vec<_> = order.iter().map(|&i| declared_encs[i]).collect();
+
     // One spelling of the SCX-004 widening rule, shared with
     // `ScxWriter`'s finish-time sidecar emit. `None` means the integer path
     // found no source shard to take a codec from; the guard above means a file
@@ -645,6 +664,131 @@ mod tests {
         }
         writer.finish().unwrap();
         path
+    }
+
+    /// Clear `ShardStats` from the CSR shard entries whose position **in
+    /// catalog order among CSR shards** is listed in `drop_at`, by appending a
+    /// rewritten full catalog and repointing the header at it.
+    ///
+    /// No in-tree writer emits a `stats: None` CSR entry — `write_shard_inner`
+    /// and every sibling always attach `Some(stats)` — but the format permits
+    /// one, and `csr_shards_sorted` sinks it to `u64::MAX`. So the mixed
+    /// `Some`/`None` catalog that reorders has to be constructed rather than
+    /// written.
+    ///
+    /// Only the catalog moves: every section body, and therefore every
+    /// per-entry checksum, is untouched. `header.file_checksum` does go stale,
+    /// which is harmless here because `ScxReader::open` does not verify it
+    /// (`verify_file_checksum` is opt-in, for `scx validate`).
+    fn strip_csr_stats(path: &std::path::Path, drop_at: &[usize]) {
+        let (mut catalog, mut header) = {
+            let r = ScxReader::open(path).unwrap();
+            (r.catalog().clone(), r.header().clone())
+        };
+        let mut seen = 0usize;
+        for e in catalog.entries.iter_mut() {
+            if e.section_type == scx_format::SectionType::CsrShard {
+                if drop_at.contains(&seen) {
+                    e.stats = None;
+                }
+                seen += 1;
+            }
+        }
+        assert!(
+            drop_at.iter().all(|&i| i < seen),
+            "strip_csr_stats: asked to clear shard {drop_at:?} of {seen}"
+        );
+
+        let mut catalog_buf = Vec::new();
+        catalog.write_to(&mut catalog_buf).unwrap();
+
+        let mut bytes = std::fs::read(path).unwrap();
+        while !bytes.len().is_multiple_of(8) {
+            bytes.push(0);
+        }
+        header.full_catalog_offset = bytes.len() as u64;
+        header.full_catalog_length = catalog_buf.len() as u64;
+        bytes.extend_from_slice(&catalog_buf);
+
+        let mut header_buf = Vec::new();
+        header.write_to(&mut header_buf).unwrap();
+        bytes[..header_buf.len()].copy_from_slice(&header_buf);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// A file whose **first** CSR shard has no `ShardStats` and whose later
+    /// shards do must build a sidecar, and the same one as if every shard
+    /// carried stats.
+    ///
+    /// `csr_shards_sorted` keys on `ShardStats::major_start` and sinks a
+    /// stats-less entry to `u64::MAX`. All-stats and no-stats files are both
+    /// fine — the first sorts correctly, the second keeps catalog order — but a
+    /// mixed catalog sorts the stats-less shard *last*, so the walk meets
+    /// `global_offset = rows_per` with `rows_pushed = 0` and the tiling guard
+    /// rejects a valid file. `ShardHeader.global_offset` is present on every
+    /// shard, so the walk re-orders on that instead.
+    ///
+    /// Reported by review (codex - gpt-5.6-sol), which also asked for this
+    /// case specifically: the all-statsless coverage in
+    /// `scx-ops/tests/column_stats_staleness.rs` cannot see it, because with
+    /// no stats anywhere the sort is a no-op.
+    #[test]
+    fn a_stats_less_shard_beside_a_stats_bearing_one_still_tiles() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Control: the same fixture with stats on every shard.
+        let pristine = write_test_input_multi_shard(&dir, 40, 6, 4);
+        let control = dir.path().join("control.scx");
+        run_build_csc(&pristine, &control, "4G", false, 2, None, None).unwrap();
+
+        // The case: shard 0 — the one that must sort FIRST — loses its stats.
+        let mixed = dir.path().join("mixed.scx");
+        std::fs::copy(&pristine, &mixed).unwrap();
+        strip_csr_stats(&mixed, &[0]);
+
+        // Premise: the catalog really is mixed, and `csr_shards_sorted` really
+        // does mis-order it. Without this the test could pass because the
+        // strip silently did nothing.
+        {
+            let r = ScxReader::open(&mixed).unwrap();
+            let entries = r.catalog().csr_shards_sorted();
+            assert_eq!(entries.len(), 4);
+            assert!(
+                entries.iter().filter(|e| e.stats.is_none()).count() == 1
+                    && entries.iter().filter(|e| e.stats.is_some()).count() == 3,
+                "setup: exactly one stats-less entry beside three stats-bearing ones"
+            );
+            assert!(
+                entries.last().unwrap().stats.is_none(),
+                "setup: the stats-less shard must sort LAST, or there is nothing to re-order"
+            );
+        }
+
+        let out = dir.path().join("mixed_csc.scx");
+        run_build_csc(&mixed, &out, "4G", false, 2, None, None)
+            .expect("a stats-less shard beside a stats-bearing one is a valid file");
+
+        // Same sidecar, not merely some sidecar: a re-order that got the
+        // permutation wrong would still tile and still produce CSC shards.
+        let got = ScxReader::open(&out).unwrap();
+        let want = ScxReader::open(&control).unwrap();
+        assert_eq!(got.header().n_csc_shards, want.header().n_csc_shards);
+        let got_csc = got.read_all_csc_shards().unwrap();
+        let want_csc = want.read_all_csc_shards().unwrap();
+        assert_eq!(got_csc.shape, want_csc.shape);
+        assert_eq!(got_csc.indptr, want_csc.indptr);
+        assert_eq!(got_csc.indices, want_csc.indices);
+        assert_eq!(got_csc.data, want_csc.data);
+
+        // And the re-emitted CSR is the input's, in input row order.
+        let src = ScxReader::open(&pristine)
+            .unwrap()
+            .read_all_csr_shards()
+            .unwrap();
+        let re = got.read_all_csr_shards().unwrap();
+        assert_eq!(re.indptr, src.indptr);
+        assert_eq!(re.indices, src.indices);
+        assert_eq!(re.data, src.data);
     }
 
     /// build-csc is documented as preserving obs metadata, and a row-sharded

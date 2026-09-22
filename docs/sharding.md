@@ -1196,9 +1196,18 @@ The sidecar moves through four stages over a file's life:
 1. **Creation.** At conversion time via the `csc` policy (`auto` / `always`
    on `pyscx.from_anndata` / `from_h5ad` / `from_10x` / `scx convert`), or
    after the fact with `scx build-csc input.scx` (in place) or
-   `scx build-csc input.scx output.scx` (copy out). All paths run the
-   memory-bounded streaming CSR→CSC transpose and set the `has_csc` header
-   flag.
+   `scx build-csc input.scx output.scx` (copy out). Both routes set the
+   `has_csc` header flag and produce the same bytes, but they transpose
+   differently, because they start from different places. `scx build-csc`
+   streams: it decodes one CSR shard at a time, pushes it into a
+   `CscBuilder` that routes each nonzero into a column bucket and spills
+   whole blocks to `--temp-dir` when the buckets exceed their share of
+   `--memory-limit`, then emits the CSC shards from those buckets. Nothing
+   holds the whole matrix. Conversion-time creation goes through
+   `write_csc_sidecar`, whose caller is already holding the matrix as one
+   in-memory CSR: there bucketing would be a *second* copy of it, so that
+   path scatters straight out of the resident CSR (one counting pass, then
+   one range-filtered scatter per shard) and its peak is the caller's.
 2. **Consumption.** Column algorithms opt into the sidecar with
    `prefer_format="csc"` (CPU) or, for GPU `pdex_ref` / `rank_genes_groups`,
    the `gpu_csc_v3` route (the default GPU DE route when a CSC sidecar is

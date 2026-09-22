@@ -24,14 +24,18 @@
 //!
 //! ⚠️ **What the table does not bound.** Read `enforced` before quoting a row
 //! as a guarantee; the flag is the difference between "we sized this" and
-//! "nothing exceeds this". **Every row here is still `enforced: false` except
-//! none** — all seven are unenforced, and this change does not alter that.
-//! What it changes is the *estimate*: the two **ingest** rows now size the
-//! whole worker phase (payload, the encoder's value copy and the framed
-//! encode's buffers, via [`WORKER_PHASE_BYTES_PER_NNZ`]) instead of the reader
-//! stage alone, and the **export** row is sized from its own decode model
-//! rather than borrowing the ingest one. Widening a cost model is not proving
-//! a ceiling; each row names what it still does not bound.
+//! "nothing exceeds this". **Eight of the ten rows are `enforced: false`**, and
+//! `unenforced_reservations_are_declared_not_silent` pins that count so a ninth
+//! cannot arrive unannounced. The two that are enforced are the CSC builder's
+//! bucket rows, in both of its phases: the builder keeps a running total of
+//! staged bucket bytes and spills whenever a push takes it past its share, so
+//! that row is a ceiling the code maintains rather than an estimate it hopes
+//! for. Every other row is an estimate, and each names what it does not bound —
+//! the two **ingest** rows size the whole worker phase (payload, the encoder's
+//! value copy and the framed encode's buffers, via
+//! [`WORKER_PHASE_BYTES_PER_NNZ`]) rather than the reader stage alone, and the
+//! **export** row is sized from its own decode model rather than borrowing the
+//! ingest one. Widening a cost model is not proving a ceiling.
 //!
 //! # Why the encode term is charged, and how it is derived
 //!
@@ -622,8 +626,18 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: scx_format_io::csc_budget::CSC_BUILD_BUCKET_SHARE,
         multiplicity: 1,
         site: "scx_sparse::CscBuilder::push_shard, sized in \
-               csc_sidecar::write_csc_sidecar and scx-ops/src/build_csc.rs",
-        // ENFORCED, and it is the only CSC row that can say so.
+               scx-ops/src/build_csc.rs and \
+               ScxWriter::auto_emit_csc_for_marked_modalities",
+        // ENFORCED — as is the emit-phase row below that re-declares these
+        // same bytes. The other two CSC rows are not, and say why.
+        //
+        // Only the two *builder* callers are sized here.
+        // `csc_sidecar::write_csc_sidecar` is deliberately not one of them:
+        // its caller is already holding the whole matrix as a resident
+        // `ScxCsr`, so it scatters straight out of that through
+        // `ResidentCscSource` and never allocates a bucket. Bucketing there
+        // would be a second copy of the caller's matrix, which is why that
+        // path has no row in this table at all — its peak is the caller's.
         //
         // The builder keeps one running total of staged bucket bytes and
         // spills the largest bucket whenever a push takes it past exactly this

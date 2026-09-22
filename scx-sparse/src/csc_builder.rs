@@ -1029,26 +1029,30 @@ impl CscEmitter {
             .sum::<u64>()
             .max(1) as usize;
 
-        let mut out_of_range: Option<usize> = None;
         {
             let plan = &self.plan;
             let built = &mut built;
             let cursor = &mut cursor;
-            let out_of_range = &mut out_of_range;
-            let mut scatter = |row: u32, payload: &[u8]| {
+            let mut scatter = |row: u32, payload: &[u8]| -> Result<(), CscBuilderError> {
                 let (recs, tail) = payload.as_chunks::<SPILL_BYTES_PER_NNZ>();
                 debug_assert!(tail.is_empty(), "a row block's payload is 8 B per nonzero");
                 for rec in recs {
                     let col = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
                     let val = f32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
-                    // Bound the column before it indexes anything. In release
-                    // the `debug_assert` below is compiled out, so a corrupt
-                    // spill naming a column outside this bucket would underflow
-                    // `col - bucket_col_lo` or index past `built`, panicking
-                    // instead of surfacing as `SpillCorrupt`.
+                    // Fail at the FIRST bad record rather than noting it and
+                    // reading on. Recording the column and returning from this
+                    // one block left `drain_bucket` walking the rest, so a
+                    // later record — or two individually legal blocks whose
+                    // totals exceed the planned slots — could index past
+                    // `indices` and panic before the note was ever inspected.
                     if col < bucket_col_lo || col >= bucket_col_hi {
-                        *out_of_range = Some(col);
-                        return;
+                        return Err(CscBuilderError::SpillCorrupt {
+                            bucket: b,
+                            detail: format!(
+                                "column {col} is outside this bucket's range \
+                                 [{bucket_col_lo}, {bucket_col_hi})"
+                            ),
+                        });
                     }
                     // Which shard owns this column. `shard_cols` is uniform, so
                     // this is a divide, not a search; the `.min` guards the
@@ -1059,10 +1063,25 @@ impl CscEmitter {
                     let lc = col - plan[s].col_start;
                     let flat = col - bucket_col_lo;
                     let dest = (target.indptr[lc] + cursor[flat]) as usize;
+                    // The planned slot count for this column is exact, so a
+                    // stream carrying more records for it than were counted
+                    // during the push is corrupt — and would otherwise write
+                    // into the next column's slots, or past the end.
+                    if cursor[flat] >= target.indptr[lc + 1] - target.indptr[lc] {
+                        return Err(CscBuilderError::SpillCorrupt {
+                            bucket: b,
+                            detail: format!(
+                                "column {col} carries more records than the {} counted \
+                                 for it during the push",
+                                target.indptr[lc + 1] - target.indptr[lc]
+                            ),
+                        });
+                    }
                     target.indices[dest] = row;
                     target.data[dest] = val;
                     cursor[flat] += 1;
                 }
+                Ok(())
             };
             drain_bucket(
                 &*self.store,
@@ -1071,15 +1090,6 @@ impl CscEmitter {
                 max_records,
                 &mut scatter,
             )?;
-        }
-        if let Some(col) = out_of_range {
-            return Err(CscBuilderError::SpillCorrupt {
-                bucket: b,
-                detail: format!(
-                    "column {col} is outside this bucket's range \
-                     [{bucket_col_lo}, {bucket_col_hi})"
-                ),
-            });
         }
 
         for (i, t) in built.iter().enumerate() {
@@ -1158,6 +1168,12 @@ impl CscShardSource for CscEmitter {
     }
 }
 
+/// What a bucket walk hands each row block: the global row, then its packed
+/// `(cols, vals)` payload. Fallible because the scatter validates every column
+/// it is handed — a corrupt spill stream must surface as an error, not as an
+/// out-of-range index into the shard arrays.
+type RowBlockSink<'a> = &'a mut dyn FnMut(u32, &[u8]) -> Result<(), CscBuilderError>;
+
 /// Walk `bucket`'s records in append order: the spilled prefix, then the RAM
 /// tail. The seam between them is an append-order seam, so a column whose rows
 /// span it still comes out ascending.
@@ -1166,7 +1182,7 @@ fn drain_bucket(
     bucket: &mut Bucket,
     index: usize,
     max_records: usize,
-    f: &mut dyn FnMut(u32, &[u8]),
+    f: RowBlockSink<'_>,
 ) -> Result<(), CscBuilderError> {
     if let Some(rd) = store.reader(index)? {
         let mut rd = std::io::BufReader::with_capacity(256 * 1024, rd);
@@ -1210,7 +1226,7 @@ fn drain_bucket(
                     ),
                 });
             }
-            f(row, &payload);
+            f(row, &payload)?;
         }
     }
     // The RAM tail: sealed blocks first, then the block still being filled.
@@ -1224,11 +1240,7 @@ fn drain_bucket(
     walk_blocks(&cur, index, f)
 }
 
-fn walk_blocks(
-    block: &[u8],
-    index: usize,
-    f: &mut dyn FnMut(u32, &[u8]),
-) -> Result<(), CscBuilderError> {
+fn walk_blocks(block: &[u8], index: usize, f: RowBlockSink<'_>) -> Result<(), CscBuilderError> {
     let mut at = 0usize;
     while at < block.len() {
         if at + ROW_BLOCK_HEADER_BYTES > block.len() {
@@ -1247,7 +1259,7 @@ fn walk_blocks(
                 detail: format!("row {row} declares {n} nonzeros past the end of a staged block"),
             });
         }
-        f(row, &block[lo..hi]);
+        f(row, &block[lo..hi])?;
         at = hi;
     }
     Ok(())
