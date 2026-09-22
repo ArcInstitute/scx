@@ -294,11 +294,13 @@ pub(super) fn aggregate_pseudobulk(
             })
             .collect::<PyResult<Vec<_>>>()?;
 
-        if crate::accel::is_scx_matrix_handle(&x) {
+        {
             // One call for either handle kind: both hand back the same view.
-            // Gated on `is_scx_matrix_handle` rather than on the source being
-            // `Some`, so a handle whose file has no sidecar raises instead of
-            // falling through to the scipy/dense materialisation below.
+            // No handle-type check here — `projection_width` above already
+            // returned for anything that is not a backed or lazy SCX handle,
+            // so a second `is_scx_matrix_handle` guard only added an
+            // `unreachable!` arm, plus a comment claiming it stopped a
+            // fallthrough this branch cannot reach.
             let source =
                 crate::accel::csc_source_for(&x).ok_or_else(crate::accel::csc_unavailable)?;
             scx_accel::pseudobulk_aggregate_csc(
@@ -313,8 +315,6 @@ pub(super) fn aggregate_pseudobulk(
                 min_cells_per_group,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        } else {
-            unreachable!("type check above")
         }
     } else if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         // The handle's *view*: `obs_groups` came from `adata.obs`, so it is one

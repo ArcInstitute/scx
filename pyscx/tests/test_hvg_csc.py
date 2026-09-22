@@ -206,6 +206,10 @@ def test_gpu_hvg_does_not_auto_route_a_filtered_handle_to_csc(tmp_path):
     assert _route(a) == "gpu_csr", (
         f"a filtered handle must not auto-route into the slower CSC reduce, got {_route(a)!r}"
     )
+    # And the stamp must not claim the file had no sidecar: declining on policy
+    # is a different diagnosis from a sidecar-less file, and the route gates
+    # read exactly this field.
+    assert a.uns["scx_accel"]["highly_variable_genes"]["csc_available"] is True
 
     # Premise: the same handle, unfiltered, does auto-route — so the assertion
     # above is the row filter's doing and not a missing sidecar.

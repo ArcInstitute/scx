@@ -140,7 +140,12 @@ fn backed_x_has_csc_sidecar(x: &Bound<'_, PyAny>) -> bool {
 ///         on CPU it runs the CSC reduce (route `cpu_csc`). Note: even
 ///         under the default `prefer_format="csr"`, a single-batch
 ///         seurat_v3 GPU run on a backed dataset that has a CSC sidecar
-///         auto-routes to `gpu_csc_v3` (mirrors GPU DE).
+///         auto-routes to `gpu_csc_v3` — but **only when no row filter is
+///         active**. The column-major walk is slower than the row-major
+///         sweep here, so that auto-route exists for the case where the
+///         sidecar costs nothing; a filtered handle would add a row
+///         compaction on top and is left on `gpu_csr`. An explicit
+///         `prefer_format="csc"` is still honoured on any window.
 ///     layer: Read counts from `adata.layers[layer]` instead of
 ///         `adata.X`. Mirrors `scanpy.pp.highly_variable_genes(layer=)`
 ///         and is the canonical way to compute `flavor="seurat_v3"`
@@ -383,8 +388,10 @@ pub fn highly_variable_genes<'py>(
     // prefer_format="csr". Restricted to `layer is None` (the sidecar lives
     // on adata.X, not on arbitrary layers) and to a GPU run
     // (`effective_gpu_id.is_some()`) — we do not silently switch the CPU
-    // default from CSR to CSC. `backed_x_has_csc_sidecar` mirrors the
-    // `as_column_source` capability gate.
+    // default from CSR to CSC. `backed_x_has_csc_sidecar` is the
+    // `as_column_source` capability gate **plus** "no row filter" — it is a
+    // policy predicate, not a mirror of the capability one, because this op's
+    // CSC walk is the slower of the two.
     if effective_gpu_id.is_some()
         && single_batch
         && seurat_v3_family
@@ -426,7 +433,16 @@ pub fn highly_variable_genes<'py>(
     // orthogonal to whether the op finished. `RouteStamp` covers the latter —
     // the stamp is rolled back if any branch below raises, so a present entry
     // means the route ran *and* completed.
-    let info = super::route::hvg_exec_info(device, seurat_v3_family, false);
+    // `csc_available` is the *capability*, not the route: this CSR stamp is also
+    // what a row-filtered handle gets, and that handle's file may well have a
+    // sidecar — the auto-route declined it (see `backed_x_has_csc_sidecar`)
+    // because the column-major walk is slower here. Reporting `false` would
+    // tell the route gates the file had no sidecar.
+    let info = super::route::hvg_exec_info(
+        device,
+        seurat_v3_family,
+        crate::accel::csc_source_for(&adata.getattr("X")?).is_some(),
+    );
     super::route::announce_route(py, "highly_variable_genes", device, &info);
     // Rolled back if any branch below raises (a loess singularity across every
     // batch, a missing `batch_key`, …) — see RouteStamp.

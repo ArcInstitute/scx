@@ -1132,17 +1132,27 @@ def test_a_narrow_row_window_leaves_auto_on_csr(tmp_path):
         pyscx.accel.rank_genes_groups(
             a, groupby="grp", method="wilcoxon", device="cpu", prefer_format=prefer
         )
-        return (a.uns["scx_accel"]["rank_genes_groups"]["route"],
-                a.uns["rank_genes_groups"])
+        return a.uns["scx_accel"]["rank_genes_groups"], a.uns["rank_genes_groups"]
 
-    route_auto, res_auto = de("auto")
-    assert route_auto == "cpu_csr", (
-        f"a window spanning 2 of 6 shards must not auto-route to CSC, got {route_auto!r}"
+    info_auto, res_auto = de("auto")
+    assert info_auto["route"] == "cpu_csr", (
+        f"a window spanning 2 of 6 shards must not auto-route to CSC, "
+        f"got {info_auto['route']!r}"
+    )
+    # The route is only half of it. `csc_available` is documented as whether a
+    # sidecar was *available* at dispatch, and the benchmark route gates read it
+    # to tell a silent CSC→CSR fallback from a file that never had a sidecar.
+    # Declining CSC on policy must not report the file as sidecar-less — which
+    # is exactly what the first version of this policy did, because it expressed
+    # the decision by removing CSC from the kernel input.
+    assert info_auto["csc_available"] is True, (
+        "the file has a sidecar; a policy decline must not claim otherwise"
     )
 
     # The capability is still there for a caller who asks for it, and it agrees.
-    route_csc, res_csc = de("csc")
-    assert route_csc == "cpu_csc"
+    info_csc, res_csc = de("csc")
+    assert info_csc["route"] == "cpu_csc"
+    assert info_csc["csc_available"] is True
     for field in ("scores", "pvals", "logfoldchanges"):
         np.testing.assert_array_equal(
             np.array([list(r) for r in res_auto[field]]),
@@ -1171,4 +1181,6 @@ def test_a_wide_row_window_still_auto_routes_csc(tmp_path):
     pyscx.accel.normalize_total(a, target_sum=1e4)
     pyscx.accel.log1p(a)
     pyscx.accel.rank_genes_groups(a, groupby="grp", method="wilcoxon", device="cpu")
-    assert a.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc"
+    info = a.uns["scx_accel"]["rank_genes_groups"]
+    assert info["route"] == "cpu_csc"
+    assert info["csc_available"] is True

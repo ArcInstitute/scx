@@ -2185,9 +2185,13 @@ bullet; the only direct measurement points the other way.
 >
 > - **GPU-fast DE:** pass `device="gpu"` (or `"auto"`) with `prefer_format`
 >   left at its `"auto"` default (or set to `"csr"`) — both keep GPU on the
->   planner-driven path. When the backed file has a CSC sidecar the planner
->   routes to `gpu_csc_v3` automatically; without one it uses `gpu_csr_v3`. This
->   is the intended GPU-fast entry point.
+>   planner-driven path. When the backed file has a CSC sidecar **and** the
+>   handle's row window still spans at least half the CSR shards, the planner
+>   routes to `gpu_csc_v3` automatically; without a sidecar, or on a window
+>   narrower than that, it uses `gpu_csr_v3` (see § `prefer_format` for why the
+>   window matters, and note that a route declined by that policy still records
+>   `csc_available=true`, with `fallback_reason=perf_policy`). This is the
+>   intended GPU-fast entry point.
 > - `prefer_format="csc"` selects the **CPU** column-major streaming path
 >   (`cpu_csc`) — there is no GPU kernel behind that knob. With `device="auto"`
 >   it runs on CPU; combining it with an explicit `device="gpu"` raises a

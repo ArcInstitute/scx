@@ -36,7 +36,7 @@ use scx_format_io::BackedCsrReader;
 
 use crate::backed::detached;
 use crate::backed::ScxBackedSparseDataset;
-use crate::lazy_transform::{LazyShardSource, ScxLazyTransformedDataset};
+use crate::lazy_transform::LazyShardSource;
 use crate::projected_agg;
 
 /// Helper: validate `prefer_format` and translate to a discriminator.
@@ -119,17 +119,19 @@ impl CsrHandle {
 /// `&dyn ColumnShardSource` and `LazyShardSource` implements it, so one
 /// existed only to call `f(&self.0)`.
 fn csc_source(dataset: &Bound<'_, PyAny>) -> PyResult<(LazyShardSource, Vec<u32>, usize)> {
-    let n_obs = if let Ok(backed) = dataset.extract::<PyRef<ScxBackedSparseDataset>>() {
-        backed.shape_val.0
-    } else if let Ok(lazy) = dataset.extract::<PyRef<ScxLazyTransformedDataset>>() {
-        lazy.shape_val.0
-    } else {
+    if !crate::accel::is_scx_matrix_handle(dataset) {
         return Err(PyRuntimeError::new_err(
             "prefer_format='csc' requires dataset to be ScxBackedSparseDataset \
              or ScxLazyTransformedDataset",
         ));
-    };
+    }
     let src = crate::accel::csc_source_for(dataset).ok_or_else(crate::accel::csc_unavailable)?;
+    // Both axes off the source, which owns the authoritative visible shape.
+    // This used to walk backed-vs-lazy by hand purely to read `shape_val.0`,
+    // which `csc_source_for` then walked again — and it did it with the bare
+    // `extract::<PyRef<ScxBackedSparseDataset>>()` form that misses a backed
+    // *layer* handle, the exact shape `backed_dataset_ref` exists to catch.
+    let n_obs = scx_format_io::ColumnShardSource::n_obs(&src);
     let cols: Vec<u32> = (0..scx_format_io::ShardSource::n_vars(&src) as u32).collect();
     Ok((src, cols, n_obs))
 }

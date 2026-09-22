@@ -446,6 +446,17 @@ pub fn compact_csc_rows_in_place(csc: &mut ScxCsc, global_to_live: &[i32], n_liv
     }
     csc.indices.truncate(w);
     csc.data.truncate(w);
+    // `truncate` frees no capacity, so a compacted slab would keep the whole
+    // pre-compaction allocation while `LazyShardSource::csc_shard_size_hint`
+    // prices it at the compacted *length* — and the GPU staging budget is
+    // computed from that hint. Release the dead tail only when it is worth a
+    // copy: a light filter (the ordinary `filter_cells`) drops almost nothing
+    // and should not pay a realloc, while a sparse window can be holding most
+    // of a shard for no one.
+    if csc.indices.capacity() > 2 * w {
+        csc.indices.shrink_to_fit();
+        csc.data.shrink_to_fit();
+    }
     csc.shape.0 = n_live;
 
     debug_assert_eq!(csc.shape.0, n_live);

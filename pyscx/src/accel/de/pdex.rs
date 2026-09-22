@@ -108,6 +108,15 @@ fn run_pdex_ref_inner(
         // GPU-only: the concrete reader backs the CSC-direct `Backed` input.
         #[cfg(feature = "gpu")]
         let reader = std::sync::Arc::clone(&backed.backed);
+        // The *capability*, recorded independently of the route the policy
+        // picked. `AccelExecutionInfo::csc_available` is documented as whether
+        // a sidecar was available at dispatch time, and the benchmark route
+        // gates read it to tell a silent CSC->CSR fallback from a file that
+        // never had a sidecar. Deriving it from the input the policy chose
+        // reported `csc_available=false` on a sidecar-carrying file whenever
+        // `csc_preferred_for_auto` declined — the two questions have to stay
+        // separate here as well as in the routing.
+        let csc_capable = source.supports_csc();
         #[cfg(feature = "gpu")]
         let has_view = backed.has_axis_view();
         // G4.3: if a CSC sidecar reader exists on the dataset, hand it to
@@ -128,7 +137,9 @@ fn run_pdex_ref_inner(
                     // The concrete `csc_reader` is the file; `source` is this
                     // handle's window on both axes and serves as both sides,
                     // so a subset handle keeps the CSC-direct `gpu_csc_v3`
-                    // route instead of giving it up for `Lazy`.
+                    // route instead of giving it up for `Lazy` — while
+                    // `csc_preferred_for_auto` still sends a window too narrow
+                    // for CSC to prune back to `Lazy` on purpose.
                     let input = if !has_view {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: reader.as_ref(),
@@ -157,6 +168,21 @@ fn run_pdex_ref_inner(
                         cpm_filter,
                     )
                 })
+                .map(|mut r| {
+                    // The policy declined an available sidecar, so the planner
+                    // — which derives capability from the input it was handed —
+                    // stamped `csc_available=false` / `no_csc_sidecar`. Both are
+                    // false about the file. Restore the capability and name the
+                    // actual reason, which `FallbackReason::PerfPolicy` already
+                    // exists for.
+                    if csc_capable && r.exec_info.csc_available != Some(true) {
+                        r.exec_info.csc_available = Some(true);
+                        if r.exec_info.fallback_reason == scx_accel::FallbackReason::NoCscSidecar {
+                            r.exec_info.fallback_reason = scx_accel::FallbackReason::PerfPolicy;
+                        }
+                    }
+                    r
+                })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string())),
             #[cfg(not(feature = "gpu"))]
             Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
@@ -179,7 +205,7 @@ fn run_pdex_ref_inner(
                         device,
                         scx_accel::InputLayout::BackedCsr,
                         true,
-                        false,
+                        csc_capable,
                         Some(chunk_size),
                     );
                     r
@@ -220,6 +246,17 @@ fn run_pdex_ref_inner(
                         cpm_filter,
                     )
                 })
+                .map(|mut r| {
+                    // Same as the backed arm: a declined-but-present sidecar must
+                    // not read as a missing one.
+                    if lazy_src.supports_csc() && r.exec_info.csc_available != Some(true) {
+                        r.exec_info.csc_available = Some(true);
+                        if r.exec_info.fallback_reason == scx_accel::FallbackReason::NoCscSidecar {
+                            r.exec_info.fallback_reason = scx_accel::FallbackReason::PerfPolicy;
+                        }
+                    }
+                    r
+                })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
         }
     }
@@ -232,6 +269,8 @@ fn run_pdex_ref_inner(
     if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         let chunk_size = gene_chunk_size.unwrap_or(500);
         let lazy_src = lazy.as_shard_source().with_cached_reads();
+        // Capability, not route — see the backed arm above.
+        let csc_capable = lazy_src.supports_csc();
         drop(lazy);
         return py
             .detach(|| {
@@ -252,7 +291,7 @@ fn run_pdex_ref_inner(
                     device,
                     scx_accel::InputLayout::LazyCsr,
                     true,
-                    false,
+                    csc_capable,
                     Some(chunk_size),
                 );
                 r
