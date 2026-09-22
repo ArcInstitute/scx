@@ -11,8 +11,17 @@
 // `scx-convert`) so sibling crates like `scx-ops` can share it without
 // a dependency cycle.
 //
-// This is a PARSER, not a budget model: what a budget buys is declared in
-// `scx_convert::budget`, which owns the shares and the per-element costs.
+// It also owns [`Share`], the exact rational arithmetic for dividing a budget.
+// That lives here rather than in `scx_convert::budget` for one reason:
+// `Share::min_budget_for` is the single source of both a refusal predicate
+// and its "need at least N bytes" message, and `scx-format-io` and `scx-ops`
+// both now make such a refusal (the CSC builder's largest-input-shard check).
+// A copy of the type would be a copy of that function, which is what its own
+// doc comment records having drifted once already.
+//
+// What a budget *buys* is still declared in `scx_convert::budget`, which owns
+// the shares, the per-element costs and the allocation table; the CSC
+// builder's shares are in this crate's `csc_budget`.
 
 /// Namespacing struct; constructors live as associated functions.
 pub struct MemoryBudget;
@@ -98,6 +107,60 @@ impl MemoryBudget {
 
         n.checked_mul(multiplier)
             .ok_or_else(|| format!("memory budget '{}' overflows u64", trimmed))
+    }
+}
+
+/// An exact rational share of a memory budget.
+///
+/// Integer, not `f64`: the per-phase invariant `scx_convert::budget`'s allocation
+/// table asserts must be exact, and a design in which three phases each take a
+/// third must sum to exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Share {
+    num: u64,
+    den: u64,
+}
+
+impl Share {
+    pub const fn new(num: u64, den: u64) -> Self {
+        assert!(num > 0 && den > 0 && num <= den, "share must be in (0, 1]");
+        Self { num, den }
+    }
+
+    /// Bytes of `budget` this share may claim.
+    pub const fn of(self, budget: u64) -> u64 {
+        budget / self.den * self.num
+    }
+
+    /// The smallest budget admitting one whole `unit` under this share.
+    ///
+    /// The refusal predicate and the "need at least N bytes" message must come
+    /// from this one function. They used to be written separately, and drifted:
+    /// the guard tested `budget / row_bytes == 0` while the message advertised
+    /// `4 x row_bytes`, so a budget of twice a row passed a check that claimed
+    /// to require four.
+    pub const fn min_budget_for(self, unit: u64) -> u64 {
+        // Smallest `b` with `self.of(b) >= unit`. Since `of` floors the
+        // division, that is `ceil(unit / num) * den` -- rounding *up*, not
+        // `unit * den / num`, which truncates and can report a budget whose
+        // own share is smaller than the unit it was supposed to admit.
+        // `Share(3,4).min_budget_for(1)` was the case that caught it.
+        let units = unit.saturating_add(self.num - 1) / self.num;
+        units.saturating_mul(self.den)
+    }
+
+    pub const fn numerator(self) -> u64 {
+        self.num
+    }
+
+    pub const fn denominator(self) -> u64 {
+        self.den
+    }
+
+    /// How many units of this share fit in a budget — the ceiling the worker
+    /// derate solves against.
+    pub const fn max_concurrent(self) -> u64 {
+        self.den / self.num
     }
 }
 

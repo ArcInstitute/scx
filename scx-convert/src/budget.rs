@@ -120,58 +120,12 @@
 //! production callers *are* hdf5-gated, so at default features the items here
 //! are dead by construction while the tests still exercise them.
 
-/// An exact rational share of a memory budget.
+/// The exact rational share type, re-exported from `scx-format-io`.
 ///
-/// Integer, not `f64`: the invariant in [`ALLOCATION_TABLE`] must be exact, and
-/// a design in which three phases each take a third must sum to exactly one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Share {
-    num: u64,
-    den: u64,
-}
-
-impl Share {
-    pub(crate) const fn new(num: u64, den: u64) -> Self {
-        assert!(num > 0 && den > 0 && num <= den, "share must be in (0, 1]");
-        Self { num, den }
-    }
-
-    /// Bytes of `budget` this share may claim.
-    pub(crate) const fn of(self, budget: u64) -> u64 {
-        budget / self.den * self.num
-    }
-
-    /// The smallest budget admitting one whole `unit` under this share.
-    ///
-    /// The refusal predicate and the "need at least N bytes" message must come
-    /// from this one function. They used to be written separately, and drifted:
-    /// the guard tested `budget / row_bytes == 0` while the message advertised
-    /// `4 x row_bytes`, so a budget of twice a row passed a check that claimed
-    /// to require four.
-    pub(crate) const fn min_budget_for(self, unit: u64) -> u64 {
-        // Smallest `b` with `self.of(b) >= unit`. Since `of` floors the
-        // division, that is `ceil(unit / num) * den` -- rounding *up*, not
-        // `unit * den / num`, which truncates and can report a budget whose
-        // own share is smaller than the unit it was supposed to admit.
-        // `Share(3,4).min_budget_for(1)` was the case that caught it.
-        let units = unit.saturating_add(self.num - 1) / self.num;
-        units.saturating_mul(self.den)
-    }
-
-    pub(crate) const fn numerator(self) -> u64 {
-        self.num
-    }
-
-    pub(crate) const fn denominator(self) -> u64 {
-        self.den
-    }
-
-    /// How many units of this share fit in a budget — the ceiling the worker
-    /// derate solves against.
-    pub(crate) const fn max_concurrent(self) -> u64 {
-        self.den / self.num
-    }
-}
+/// It lives there so `scx-format-io` and `scx-ops` — both *below* this crate —
+/// can make a budget refusal from the same `min_budget_for` this table's shares
+/// are checked against. The shares and cost models below stay here.
+pub(crate) use scx_format_io::mem::Share;
 
 // ---------------------------------------------------------------------------
 // Cost models — bytes actually held, per element or per nonzero.
