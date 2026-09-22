@@ -1178,6 +1178,13 @@ one node, median of three: 1.40x on `pbmc10k` (7 CSC shards), 2.05x on
 `census_1m`** (173 — 966 s to 103 s). See
 [CSC Sidecar Architecture](architecture.md#csc-sidecar-architecture).
 
+Making the build an in-place append — no CSR shard re-encoded, obs/var and
+the auxiliary sections no longer copied — took a further 1.11-1.29x off the
+wall and brought peak RSS at census_1m from 7,216 MB to 5,879 MB (1.76x to
+1.44x of the declared 4 GiB; census_500k 1.35x to 1.25x), measured the same
+way. The disk cost is now the sidecar alone (1.15 GB at census_1m) rather than
+a staged second copy of the file.
+
 ### Inspecting the CSC layout
 
 `scx info` shows the CSC shard count on the Shards line and prints a
