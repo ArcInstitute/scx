@@ -293,11 +293,26 @@ impl Layout {
         let shard_cols = compute_chunk_cols_with_cap(n_rows, cfg.memory_bytes, cfg.cols_per_shard)?;
         let n_shards = n_cols.div_ceil(shard_cols);
         let target = cfg.target_buckets.clamp(1, MAX_BUCKETS);
-        let n_buckets = target.min(n_shards);
-        let shards_per_bucket = if n_buckets == 0 {
+        let shards_per_bucket = {
+            let want = target.min(n_shards);
+            if want == 0 {
+                0
+            } else {
+                n_shards.div_ceil(want)
+            }
+        };
+        // Recomputed from `shards_per_bucket`, NOT left at `target.min(n_shards)`.
+        // Rounding the shards-per-bucket up means fewer buckets are actually
+        // reachable: at `n_shards = 65, target = 64` it is 2, so `bucket_of`
+        // tops out at bucket 32 and buckets 33..64 can never be routed to.
+        // Keeping the higher count allocated one live block per phantom bucket
+        // (31 MiB there, 6 MiB at the 173-shard census layout) and charged it
+        // against the staging budget, and `bucket_shards` handed those indices
+        // an inverted range.
+        let n_buckets = if shards_per_bucket == 0 {
             0
         } else {
-            n_shards.div_ceil(n_buckets)
+            n_shards.div_ceil(shards_per_bucket)
         };
         let bucket_cols = shards_per_bucket.saturating_mul(shard_cols);
         Ok(Self {
@@ -572,19 +587,25 @@ impl CscBuilder {
                 // so every byte handed to the store holds whole row blocks and
                 // the count field is never patched after it has left.
                 bucket.close_row();
-                debug_assert_eq!(
-                    bucket.cur.capacity(),
-                    self.block_capacity,
-                    "a staging block reallocated; its cost is no longer the \
-                     figure the budget was checked against"
-                );
                 let sealed = std::mem::take(&mut bucket.cur);
+                // Charge what was actually allocated, not `block_capacity`.
+                // The two are equal for canonical input — `block_capacity`
+                // reserves one nonzero per column the bucket owns, so no row
+                // can overflow it — but a source row carrying DUPLICATE
+                // coordinates contributes more than one record per column and
+                // makes the block grow. `ScxCsr::new` does not reject
+                // duplicates (its own docs say so), and `run_build_csc`
+                // deliberately accepts non-canonical pre-v3 input, so this is
+                // reachable. Asserting the capacity instead would panic in
+                // debug on data the op is documented to accept.
                 bucket.sealed_bytes += sealed.capacity();
+                let grew = sealed.capacity();
                 bucket.sealed.push(sealed);
                 bucket.cur = Vec::with_capacity(self.block_capacity);
-                // The sealed block keeps its capacity and the replacement adds
-                // its own, so the bucket's cost rises by exactly one block.
-                self.in_memory_bytes += self.block_capacity;
+                // The block that was already charged at `block_capacity` is
+                // retained at its real capacity and a fresh one replaces it,
+                // so the bucket's cost rises by exactly the retained block.
+                self.in_memory_bytes += grew;
             }
         }
         self.touched.clear();
@@ -605,9 +626,12 @@ impl CscBuilder {
                 .filter(|&(_, n)| n > 0)
             else {
                 // Nothing sealed anywhere: every bucket holds only a partial
-                // block. That is the declared slack — the realized bound is
-                // `spill_after_bytes + n_buckets * block_bytes` — so there is
-                // nothing further to give.
+                // block, which is the declared slack
+                // (`spill_after_bytes + 2 * n_buckets * block_capacity`, the
+                // expression `CscBuilderConfig` documents and
+                // `staged_bytes_never_exceed_the_declared_bound` asserts), so
+                // there is nothing further to give. This `break` means "no
+                // sealed block left to spill", not "the bound holds".
                 break;
             };
             if !self.store.can_spill() {
@@ -968,17 +992,38 @@ impl CscEmitter {
         // Per-column write cursors, flat across the whole bucket range.
         let mut cursor = vec![0u64; bucket_col_hi - bucket_col_lo];
         let shard_cols = self.layout.shard_cols;
+        // The widest row block this bucket's writer could have produced: one
+        // record per column it owns. A duplicate-bearing source row can exceed
+        // it, so allow the whole bucket's nnz as the ceiling rather than the
+        // column count — the point is to reject a corrupt length, not to
+        // second-guess a legal one.
+        let max_records = self.plan[shard_lo..shard_hi]
+            .iter()
+            .map(|s| s.nnz)
+            .sum::<u64>()
+            .max(1) as usize;
 
+        let mut out_of_range: Option<usize> = None;
         {
             let plan = &self.plan;
             let built = &mut built;
             let cursor = &mut cursor;
+            let out_of_range = &mut out_of_range;
             let mut scatter = |row: u32, payload: &[u8]| {
                 let (recs, tail) = payload.as_chunks::<SPILL_BYTES_PER_NNZ>();
                 debug_assert!(tail.is_empty(), "a row block's payload is 8 B per nonzero");
                 for rec in recs {
                     let col = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
                     let val = f32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+                    // Bound the column before it indexes anything. In release
+                    // the `debug_assert` below is compiled out, so a corrupt
+                    // spill naming a column outside this bucket would underflow
+                    // `col - bucket_col_lo` or index past `built`, panicking
+                    // instead of surfacing as `SpillCorrupt`.
+                    if col < bucket_col_lo || col >= bucket_col_hi {
+                        *out_of_range = Some(col);
+                        return;
+                    }
                     // Which shard owns this column. `shard_cols` is uniform, so
                     // this is a divide, not a search; the `.min` guards the
                     // `usize::MAX` width the zero-row case produces.
@@ -993,7 +1038,22 @@ impl CscEmitter {
                     cursor[flat] += 1;
                 }
             };
-            drain_bucket(&*self.store, &mut self.buckets[b], b, &mut scatter)?;
+            drain_bucket(
+                &*self.store,
+                &mut self.buckets[b],
+                b,
+                max_records,
+                &mut scatter,
+            )?;
+        }
+        if let Some(col) = out_of_range {
+            return Err(CscBuilderError::SpillCorrupt {
+                bucket: b,
+                detail: format!(
+                    "column {col} is outside this bucket's range \
+                     [{bucket_col_lo}, {bucket_col_hi})"
+                ),
+            });
         }
 
         for (i, t) in built.iter().enumerate() {
@@ -1017,17 +1077,22 @@ impl CscEmitter {
                     t.indptr[lc + 1] - t.indptr[lc]
                 );
                 let (a, z) = (t.indptr[lc] as usize, t.indptr[lc + 1] as usize);
-                if let Some(off) = t.indices[a..z].windows(2).position(|w| w[0] >= w[1]) {
+                if t.indices[a..z].windows(2).any(|w| w[0] >= w[1]) {
+                    // Reported in BOTH profiles, never panicked in either.
+                    //
+                    // A non-strict column means the *source* carried a
+                    // duplicate `(row, col)`; it is not this builder's bug,
+                    // and `run_build_csc` accepts such input by design. A
+                    // `debug_assert!(false)` here made the contract depend on
+                    // the build profile — panic in debug, silently emit in
+                    // release — which is worse than either. The bytes match
+                    // the predecessor's (both entries, in `j` order) and the
+                    // caller gets the column so it can warn; `validate_csc`
+                    // is what rejects such a sidecar at the GPU.
                     let col = spec.col_start + lc;
-                    let cur = self.stats.first_non_strict_column;
-                    if cur.is_none_or(|c| col < c) {
+                    if self.stats.first_non_strict_column.is_none_or(|c| col < c) {
                         self.stats.first_non_strict_column = Some(col);
                     }
-                    debug_assert!(
-                        false,
-                        "column {col} rows are not strictly increasing at {off}: \
-                         the source carried a duplicate (row, col)"
-                    );
                 }
             }
         }
@@ -1074,6 +1139,7 @@ fn drain_bucket(
     store: &dyn SpillStore,
     bucket: &mut Bucket,
     index: usize,
+    max_records: usize,
     f: &mut dyn FnMut(u32, &[u8]),
 ) -> Result<(), CscBuilderError> {
     if let Some(rd) = store.reader(index)? {
@@ -1093,6 +1159,20 @@ fn drain_bucket(
             }
             let row = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
             let n = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+            // Bound the declared count before allocating for it. `n` comes
+            // straight off disk, so a truncated or corrupt spill can name a
+            // count whose `resize` is an OOM abort rather than an error the
+            // caller can see. `max_records` is the widest row block the writer
+            // could have produced for this bucket.
+            if n > max_records {
+                return Err(CscBuilderError::SpillCorrupt {
+                    bucket: index,
+                    detail: format!(
+                        "row {row} declares {n} nonzeros, more than the {max_records} \
+                         this bucket can hold"
+                    ),
+                });
+            }
             payload.resize(n * SPILL_BYTES_PER_NNZ, 0);
             let got = read_full(&mut rd, &mut payload)?;
             if got != payload.len() {

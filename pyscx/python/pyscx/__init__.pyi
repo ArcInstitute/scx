@@ -1324,6 +1324,7 @@ def build_csc(
     memory_limit: str = ...,
     force: bool = ...,
     csc_cols_per_shard: int = ...,
+    temp_dir: str | None = ...,
 ) -> None:
     """Add a CSC (column-major) sidecar built from `input`'s CSR shards.
 

@@ -666,15 +666,36 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         enforced: false,
     },
     Reservation {
+        name: "CSC builder buckets still resident during emit",
+        phase: Phase::CscBuilderEmit,
+        share: scx_format_io::csc_budget::CSC_BUILD_BUCKET_SHARE,
+        multiplicity: 1,
+        site: "scx_sparse::CscEmitter (owns every bucket it has not drained)",
+        // The same bytes as the push-phase bucket row, still held. Declared
+        // again here because they are concurrent with the emitted arrays
+        // below, which the first version of this table denied.
+        enforced: true,
+    },
+    Reservation {
         name: "CSC emitted shard arrays + raw values + encoder streams",
         phase: Phase::CscBuilderEmit,
         share: scx_format_io::csc_budget::CSC_EMIT_SHARE,
         multiplicity: 1,
         site: "csc_sidecar::emit_csc_shards -> ScxWriter::write_csc_shard{,_for}",
-        // Whole budget rather than a share: the emit runs after the last
-        // push, so the buckets are gone by the time a shard is materialised.
-        // That is why this is a separate phase and not a third row summed with
-        // the two above.
+        // A quarter, and the phase carries the bucket share alongside it --
+        // a correction from review. An earlier version of this row claimed
+        // the whole budget on the grounds that "the emit runs after the last
+        // push, so the buckets are gone by the time a shard is materialised".
+        // That is false: `CscEmitter` owns every bucket it has not drained,
+        // and `build_bucket` materialises all the shards one bucket owns
+        // (three at the 173-shard census layout) before yielding the first.
+        // So the buckets ARE concurrent with the emitted arrays, and the two
+        // shares must sum.
+        //
+        // What genuinely is not concurrent is the source shard: the last
+        // `push_shard` has returned and its decode/re-encode buffers are
+        // dropped before `finish()`. That is the only reason this is a
+        // separate phase at all.
         //
         // NOT enforced. Two of the three full-length copies the old row named
         // are gone -- `next_shard_into` fills on-disk widths directly, so

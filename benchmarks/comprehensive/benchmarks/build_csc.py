@@ -216,14 +216,13 @@ def run(
                 # chunk-width sharding would pass a peak floor while fixing
                 # nothing.
                 #
-                # `getattr` because `Experiment.n_csc_shards` is newer than
-                # this module, and a before/after capture has to be able to run
-                # this benchmark against an older pyscx. `0` is impossible for
-                # a real build — the premise check above already refused a file
-                # with no sidecar — so it reads unambiguously as "that build
-                # could not tell us", and the floor's `min` side rejects it
-                # rather than letting it pass as a small number.
-                n_csc_shards = int(getattr(built, "n_csc_shards", 0) or 0)
+                # Read directly. A `getattr(..., 0)` fallback carried the
+                # before/after capture against an older pyscx, but that capture
+                # is done and the fallback is now worse than useless: a rename
+                # would record `0` and fail the `min: 173` floor for the wrong
+                # reason, looking like a layout regression instead of a missing
+                # attribute.
+                n_csc_shards = int(built.n_csc_shards)
             finally:
                 _close = getattr(built, "close", None)
                 if _close is not None:

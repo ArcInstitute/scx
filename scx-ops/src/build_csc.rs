@@ -247,6 +247,7 @@ pub fn run_build_csc(
     let mut per_shard: Vec<(CodecId, ValueEncoding)> = Vec::with_capacity(csr_entries.len());
     let mut declared_encs: Vec<ValueEncoding> = Vec::with_capacity(csr_entries.len());
     let mut max_int_val: u32 = 0;
+    let mut worst_decoded_bytes: u64 = 0;
     for entry in &csr_entries {
         let sh = reader.read_shard_header(entry)?;
         let ve = ValueEncoding::from_u8(sh.value_encoding).ok_or(
@@ -256,6 +257,15 @@ pub fn run_build_csc(
             .ok_or(crate::error::OpsError::UnknownCodec(sh.codec_id))?;
         per_shard.push((ci, ve));
         declared_encs.push(ve);
+        // The exact decoded cost of THIS shard, from the header that is
+        // already in hand. `ShardHeader` carries both `nnz` and `n_major`, so
+        // neither term needs `ShardStats` — which is format-permitted to be
+        // absent, and whose absence would otherwise let a shard contribute
+        // nothing to the refusal below.
+        worst_decoded_bytes = worst_decoded_bytes.max(csc_budget::decoded_csr_shard_bytes(
+            sh.nnz,
+            sh.n_major as u64,
+        ));
         if let Some(stats) = entry.stats.as_ref() {
             max_int_val = max_int_val.max(stats.value_max);
         }
@@ -280,19 +290,22 @@ pub fn run_build_csc(
     // helps and the op should say so before writing anything. The byte figure
     // comes from `Share::min_budget_for`, which exists so a refusal and its
     // "raise it to at least N" message cannot drift apart.
-    let max_shard_nnz_in = csr_entries
-        .iter()
-        .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
-        .max()
-        .unwrap_or(0);
-    if max_shard_nnz_in > 0 {
-        let unit = csc_budget::decoded_csr_shard_bytes(max_shard_nnz_in, n_rows as u64);
-        let need = csc_budget::CSC_BUILD_INPUT_SHARE.min_budget_for(unit);
+    //
+    // `worst_decoded_bytes` is folded from each `ShardHeader` above, not from
+    // `ShardStats`, and both of its terms are per-shard. The first version of
+    // this guard got both halves wrong: it took `nnz` from `entry.stats` — so
+    // a stats-less shard contributed nothing, and a file whose shards all lack
+    // stats skipped the check entirely — and it charged `n_obs` for the indptr
+    // instead of the shard's own `n_major`, which on a 1M-row file with 20k-row
+    // shards is ~8 MB of phantom indptr per shard and refuses budgets that
+    // actually fit. The header carries both numbers exactly.
+    if worst_decoded_bytes > 0 {
+        let need = csc_budget::CSC_BUILD_INPUT_SHARE.min_budget_for(worst_decoded_bytes);
         if (max_bytes as u64) < need {
             return Err(format!(
-                "build-csc: --memory-limit {memory_limit} is too small for {}: its largest CSR \
-                 shard holds {max_shard_nnz_in} nonzeros, which one decode needs ~{unit} bytes \
-                 for; raise --memory-limit to at least {need}",
+                "build-csc: --memory-limit {memory_limit} is too small for {}: decoding its \
+                 largest CSR shard needs ~{worst_decoded_bytes} bytes; raise --memory-limit \
+                 to at least {need}",
                 input.display()
             )
             .into());
@@ -881,6 +894,34 @@ mod tests {
     /// `build_csc` benchmark measured a declared 512 MiB producing a 2,233 MB
     /// allocation on tabula, 4.4x over, with no error. The op cannot run
     /// bounded below one shard, so saying so beats overshooting silently.
+    /// The refusal must size the shard it is about to decode, not the matrix.
+    ///
+    /// Both halves of this were wrong in the first version and neither was
+    /// visible to `test_build_csc_refuses_a_budget_below_one_source_shard`,
+    /// whose fixture is a single 10-row shard *with* stats — so `n_obs`
+    /// equalled `n_major` and `entry.stats` was always present.
+    ///
+    /// (a) Charging `n_obs` for every shard's indptr over-states a multi-shard
+    /// file: 40 rows in 4 shards is 10 rows of indptr each, not 40. At census
+    /// proportions — 20k-row shards in a 1M-row file — that is ~8 MB of
+    /// phantom indptr per shard, multiplied by four by the 1/4 share, and it
+    /// refuses budgets that fit.
+    #[test]
+    fn the_refusal_sizes_one_shard_not_the_whole_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_input_multi_shard(&dir, 40, 6, 4);
+        let output = dir.path().join("sized.scx");
+
+        // Each shard is 10 rows x 2 nnz = 20 nnz: 20*8 + 11*8 = 248 B, so the
+        // 1/4 share needs 992 B. Charging all 40 rows of indptr would make it
+        // 20*8 + 41*8 = 488 B -> 1952 B, so a budget between the two is the
+        // discriminating case: it must be accepted.
+        run_build_csc(&input, &output, "1200", false, 5000, None, None).expect(
+            "1200 B admits a 10-row shard; only the whole-matrix indptr made it look too small",
+        );
+        assert!(ScxReader::open(&output).unwrap().header().has_csc());
+    }
+
     #[test]
     fn test_build_csc_refuses_a_budget_below_one_source_shard() {
         let dir = tempfile::tempdir().unwrap();

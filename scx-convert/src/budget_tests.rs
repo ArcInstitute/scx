@@ -167,9 +167,17 @@ fn the_csc_builder_rows_cite_the_shared_constants() {
         push.contains(&scx_format_io::csc_budget::CSC_BUILD_INPUT_SHARE),
         "the source-shard row must cite CSC_BUILD_INPUT_SHARE, got {push:?}"
     );
-    assert_eq!(
-        of(Phase::CscBuilderEmit),
-        vec![scx_format_io::csc_budget::CSC_EMIT_SHARE],
+    // The emit phase carries the bucket share too: `CscEmitter` owns every
+    // bucket it has not drained, so those bytes are concurrent with the
+    // emitted arrays rather than released before them.
+    let emit = of(Phase::CscBuilderEmit);
+    assert!(
+        emit.contains(&scx_format_io::csc_budget::CSC_BUILD_BUCKET_SHARE),
+        "the emit phase must declare the buckets still resident, got {emit:?}"
+    );
+    assert!(
+        emit.contains(&scx_format_io::csc_budget::CSC_EMIT_SHARE),
+        "the emit row must cite CSC_EMIT_SHARE, got {emit:?}"
     );
 }
 

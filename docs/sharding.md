@@ -1135,7 +1135,7 @@ Two reasons to split CSC by column range rather than emitting one
 giant shard:
 
 1. **Column-range pushdown.** `BackedCscReader::read_csc_columns(c_lo..c_hi)` consults `BackedCscIndex::shards_for_col_range(c_lo, c_hi)` and skips non-overlapping shards entirely; partial-overlap shards are sliced post-decode. With 5000 cols/shard on a 36K-gene matrix, a single-gene DE query touches one shard out of eight — a 7/8 I/O reduction even before catalog-level pushdown via `ShardStats.col_range`.
-2. **Bounded emit working set.** The builder materialises one emitted shard at a time, so the emit's working set scales with that shard's non-zeros rather than with the full matrix.
+2. **Bounded emit working set.** The builder materialises one *bucket's* shards at a time — `shards_per_bucket`, three at the census layout — so the emit's working set scales with a bucket's non-zeros rather than with the full matrix. Buckets it has not drained yet are still resident alongside them, which is why `scx_convert::budget` sums the bucket share with the emit share instead of treating the emit as succeeding the push.
 
 ### Cost: write-time transpose, ~equal storage
 
@@ -1144,8 +1144,9 @@ and the CSC shards add roughly the same compressed bytes (the same
 nnz, just laid out column-major; codec compression ratios are similar
 under Scx1 / Zstd / Pcodec).
 
-Write-time cost is one full-matrix transpose, and `--memory-limit`
-(default 4G) now bounds it. `scx-sparse::CscBuilder` is fed one decoded
+Write-time cost is one full-matrix transpose. `--memory-limit` (default
+4G) bounds the **column-bucket staging**, not the whole op — see the
+table below. `scx-sparse::CscBuilder` is fed one decoded
 CSR shard at a time and spills its column buckets against the budget's
 bucket share, so the op holds one source shard plus the buckets rather
 than every decoded shard at once. It **refuses** a budget that cannot

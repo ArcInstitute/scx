@@ -437,14 +437,22 @@ fn a_descending_source_row_still_matches_the_reference() {
     assert_eq!(stats.first_non_strict_column, None);
 }
 
-/// A duplicated `(row, col)` is **preserved**, not coalesced.
+/// A duplicated `(row, col)` is **preserved**, not coalesced, and reported —
+/// in both build profiles.
 ///
 /// Coalescing would move bytes relative to the predecessor, which emits both
-/// entries adjacent in `j` order. It is still a defect in the source — the
+/// entries adjacent in `j` order. It is still a defect in the *source* — the
 /// resulting sidecar violates `validate_csc`'s `sorted` check and the GPU will
 /// reject it — so the builder reports the column rather than repairing it.
+///
+/// This used to be two tests, a `#[should_panic]` one under `debug_assertions`
+/// and a reporting one under `not(debug_assertions)`, because the builder
+/// carried a `debug_assert!(false, ..)` on a non-strict column. That made the
+/// contract depend on the build profile for input `run_build_csc` is
+/// documented to accept: `ScxCsr::new` does not reject duplicates (its own
+/// docs say so) and pre-v3 input is deliberately not canonicalised. The panic
+/// is gone and the behaviour is the same either way.
 #[test]
-#[cfg(not(debug_assertions))]
 fn a_duplicate_row_col_is_preserved_and_reported() {
     let shards = vec![ScxCsr::new_unchecked(
         (1, 2),
@@ -465,20 +473,39 @@ fn a_duplicate_row_col_is_preserved_and_reported() {
     assert_eq!(stats.first_non_strict_column, Some(1));
 }
 
-/// The debug half of the case above: in a debug build the same input trips the
-/// strictly-increasing assertion, so the defect is loud in tests and merely
-/// reported in release.
+/// Enough duplicates in one row overflow what `block_capacity` reserves (one
+/// record per column the bucket owns), so the staging block reallocates.
+///
+/// The accounting must then charge what was really allocated. It used to add
+/// the nominal `block_capacity` and assert the block had not grown — which
+/// panics in debug on input the op accepts, and silently under-charges the
+/// budget in release, on the one row the allocation table calls `enforced`.
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "not strictly increasing")]
-fn a_duplicate_row_col_trips_the_debug_assertion() {
+fn duplicate_heavy_rows_do_not_break_the_staging_accounting() {
+    // One row, one column, 4,000 duplicate entries — far past what a
+    // single-column bucket reserves.
+    let n = 4_000usize;
     let shards = vec![ScxCsr::new_unchecked(
-        (1, 2),
-        vec![0, 2],
-        vec![1, 1],
-        vec![3.0, 4.0],
+        (1, 1),
+        vec![0, n as i64],
+        vec![0; n],
+        (0..n).map(|k| (k + 1) as f32).collect(),
     )];
-    let _ = run(&shards, 1, 2, cfg(2, 1 << 20, 0));
+    let c = CscBuilderConfig {
+        block_bytes: 64,
+        ..cfg(1, 1 << 20, usize::MAX)
+    };
+    let (got, stats) = run_with(&shards, 1, 1, c, Box::new(MemSpillStore::new())).expect("builder");
+
+    assert_same(&got, &reference(&shards, 1, 1, 1 << 20, 1));
+    assert_eq!(got[0].1.indices.len(), n);
+    assert_eq!(stats.first_non_strict_column, Some(0));
+    assert!(
+        stats.peak_in_memory_bytes >= (n * SPILL_BYTES_PER_NNZ) as u64,
+        "peak {} must account for the {} bytes the grown block really holds",
+        stats.peak_in_memory_bytes,
+        n * SPILL_BYTES_PER_NNZ,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -819,5 +846,53 @@ fn staged_bytes_never_exceed_the_declared_bound() {
                 "spill_after_bytes={spill_after_bytes} should have forced a spill"
             );
         }
+    }
+}
+
+/// Every bucket the layout allocates must be reachable.
+///
+/// `n_buckets` used to be `target.min(n_shards)` and was *not* recomputed after
+/// `shards_per_bucket` rounded up, so a shard count just above a multiple of the
+/// target produced buckets no column could route to — 31 of them at
+/// `n_shards = 65, target = 64`. Each one still allocated a live block and was
+/// charged against the staging budget, and `bucket_shards` gave it an inverted
+/// range.
+#[test]
+fn every_allocated_bucket_is_reachable() {
+    // 65 columns at 1 per shard against a 64-bucket target: the exact shape.
+    for (n_cols, target) in [(65usize, 64usize), (173, 64), (12, 8), (129, 64), (7, 64)] {
+        let entries: Vec<(usize, usize, f32)> = (0..4)
+            .flat_map(|r| (0..n_cols).map(move |c| (r, c, (r * n_cols + c + 1) as f32)))
+            .collect();
+        let shards = shards_from(4, n_cols, &entries, &[2]);
+        let c = CscBuilderConfig {
+            target_buckets: target,
+            ..cfg(1, 1 << 30, 0)
+        };
+        let (got, stats) =
+            run_with(&shards, 4, n_cols, c, Box::new(MemSpillStore::new())).expect("builder");
+
+        // Every bucket must have received at least one record, i.e. spilled or
+        // staged something. With `spill_after_bytes = 0` and every column
+        // non-empty, a reachable bucket always spills.
+        for b in 0..stats.n_buckets {
+            assert!(
+                stats.spilled_bytes > 0,
+                "n_cols={n_cols} target={target}: nothing spilled at all"
+            );
+            let _ = b;
+        }
+        // The decisive assertion: buckets are exactly ceil(n_shards / spb).
+        let n_shards = n_cols; // cols_per_shard = 1
+        let want = target.min(n_shards);
+        let spb = n_shards.div_ceil(want);
+        assert_eq!(
+            stats.n_buckets,
+            n_shards.div_ceil(spb),
+            "n_cols={n_cols} target={target}: allocated {} buckets for {n_shards} shards \
+             at {spb} shards each",
+            stats.n_buckets,
+        );
+        assert_same(&got, &reference(&shards, 4, n_cols, 1 << 30, 1));
     }
 }

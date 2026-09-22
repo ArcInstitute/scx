@@ -23,18 +23,36 @@ pub const CSC_PAYLOAD_BYTES_PER_NNZ: u64 = 8;
 /// phase.
 ///
 /// This is the one share the builder **enforces**: it spills against exactly
-/// this figure, and the realized bound is it plus `n_buckets * block_bytes`.
+/// this figure, and the realized bound is it plus
+/// `2 * n_buckets * block_capacity` of block slack (`block_capacity` is
+/// `block_bytes` plus one maximal row block; the factor of two is because
+/// sealing sweeps every bucket a pushed row touched before the spill loop
+/// runs). `CscBuilderConfig` declares it and
+/// `staged_bytes_never_exceed_the_declared_bound` asserts it.
+///
+/// Note this share is **live during the emit phase too** — see
+/// [`CSC_EMIT_SHARE`].
 pub const CSC_BUILD_BUCKET_SHARE: Share = Share::new(1, 2);
 
 /// One source CSR shard decoded, and on the `build-csc` path re-encoded, in
 /// flight at a time.
 pub const CSC_BUILD_INPUT_SHARE: Share = Share::new(1, 4);
 
-/// The emitted shard's arrays, its raw-value buffer and the encoder's streams.
+/// The emitted shards' arrays, their raw-value buffer and the encoder's
+/// streams.
 ///
-/// The whole budget rather than a share: the emit runs after the last push, so
-/// the buckets are gone by the time a shard is materialised.
-pub const CSC_EMIT_SHARE: Share = Share::new(1, 1);
+/// A quarter, not the whole budget, and the reason is a correction: the emit
+/// does **not** start with the buckets gone. `CscEmitter` owns every bucket
+/// that has not been drained yet, and `build_bucket` materialises *all* the
+/// shards one bucket owns (`shards_per_bucket`, three at the census layout)
+/// before the first is yielded. So up to `CSC_BUILD_BUCKET_SHARE` of
+/// un-spilled buckets is concurrent with this, which is why the emit is a
+/// phase that *sums* with the bucket share rather than one that succeeds it.
+///
+/// What is no longer concurrent is the source shard: the last `push_shard`
+/// has returned and its decode and re-encode buffers are dropped before
+/// `finish()`.
+pub const CSC_EMIT_SHARE: Share = Share::new(1, 4);
 
 /// Bytes one decoded CSR shard of `nnz` nonzeros over `n_rows` rows occupies.
 ///

@@ -15,7 +15,7 @@
 //     `Ok(None)` and the emit reads its RAM tail alone.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use scx_sparse::SpillStore;
@@ -80,10 +80,12 @@ impl SpillStore for TempDirSpillStore {
             self.bytes.resize(bucket + 1, 0);
         }
         let path = self.bucket_path(bucket);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(block)?;
-        w.flush()?;
+        // No `BufWriter`: `block` is already a whole staging block (1 MiB by
+        // default), so buffering it adds an 8 KiB allocation and a copy hop
+        // around a single `write_all` that is orders of magnitude larger than
+        // the buffer.
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(block)?;
         self.bytes[bucket] += block.len() as u64;
         Ok(())
     }

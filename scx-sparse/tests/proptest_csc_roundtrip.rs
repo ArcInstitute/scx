@@ -3,10 +3,10 @@
 //! Generates random small CSR matrices and verifies that:
 //!
 //! 1. `csr_to_csc(csr).to_csr() == csr` (round-trip exact).
-//! 2. The streaming chunked transpose
-//!    (`streaming_csr_to_csc_iter_with_cap`) produces the same
-//!    column-axis arrays (indptr / indices / data, modulo column-
-//!    range slicing) as the in-memory `csr_to_csc(...)`.
+//! 2. The chunked CSC build (`CscBuilder`, which replaced the
+//!    `streaming_csr_to_csc_iter_with_cap` this file used to drive)
+//!    produces the same column-axis arrays (indptr / indices / data,
+//!    modulo column-range slicing) as the in-memory `csr_to_csc(...)`.
 //! 3. Densifying both CSR and CSC views produces the same dense
 //!    matrix (parity with a row-major dense reference).
 //!
