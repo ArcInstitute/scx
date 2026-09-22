@@ -209,9 +209,10 @@ fn rewrite_with_current_version(
     // --deep` would rightly reject it.
     //
     // The three rewriting ops split on this and only two got it right:
-    // `optimize` canonicalizes and so legitimately stamps v3; `build_csc` does
-    // not canonicalize and so clamps its output version to the source's
-    // (SCX-005). `upgrade` did neither — it stamped v3 over whatever it was
+    // `optimize` canonicalizes and so legitimately stamps v3; `build_csc` did
+    // not canonicalize and so clamped its output version to the source's
+    // (SCX-005) — it has since become an append that leaves the version
+    // alone. `upgrade` did neither — it stamped v3 over whatever it was
     // handed. Clamping is not an option here, because producing v3 is the whole
     // point of the command, so it canonicalizes, like `optimize`.
     // Set when canonicalization actually changed a shard — see the CSC block.
@@ -325,7 +326,8 @@ fn rewrite_with_current_version(
         },
     )?;
 
-    // Same half-carry `build-csc` and `optimize` had, and for the same reason:
+    // Same half-carry `optimize` had (and `build-csc`, while it rewrote the
+    // CSR), and for the same reason:
     // the helper above copies the predicate-index *section*, but this op decodes
     // and re-emits every CSR shard, and `compute_shard_stats` produces no
     // `column_stats`. Level-1 pruning reads those, not the section — so without
@@ -339,8 +341,8 @@ fn rewrite_with_current_version(
 
     // `upgrade` is the one op in the carry table whose call site lives outside
     // `scx-ops`, so the audit is wired here rather than inside the shared helper
-    // above — which is also shared with `build-csc`, whose policy differs on the
-    // CSC sidecar. Before `finish()`, so a violation drops the staged tempfile
+    // above — which `build-csc` also used while it was a rewrite. Before
+    // `finish()`, so a violation drops the staged tempfile
     // instead of reporting a loss the `--in-place` rename has already made
     // permanent.
     scx_ops::carry::audit_staged(
@@ -393,8 +395,8 @@ mod tests {
     /// An upgrade re-emits every CSR shard, so it must bring the per-shard obs
     /// `column_stats` with it — those, not the `ObsPredicateIndex` section, are
     /// what Level-1 pruning reads. `build-csc` and `optimize` had this defect and
-    /// were fixed first; `upgrade` reaches the same `Carry::Verbatim` arm through
-    /// `other => build_csc(other)` in `carry.rs` and was missed, because the first
+    /// were fixed first; `upgrade` then reached the same `Carry::Verbatim` arm
+    /// through `other => build_csc(other)` in `carry.rs` and was missed, because the first
     /// pass counted explicit match arms. Found by review
     /// (Cursor Agent - Grok 4.6 High) on PR #451; this test was added after a
     /// second reviewer (Antigravity - Gemini 3.7 Flash) noted the fix had shipped

@@ -322,7 +322,7 @@ pub fn codec_for_canonicalized(source: CodecId, encoding: ValueEncoding) -> Code
 /// Section families this file's copy helpers do **not** carry, checked against
 /// the input so the loss can be reported rather than discovered later.
 ///
-/// The list mirrors what `copy_auxiliary_sections` actually copies; keep the
+/// The list mirrors what `copy_auxiliary_sections_canonicalizing` actually copies; keep the
 /// two in step.
 ///
 /// It used to be eleven entries long. Review §6.3 is why: `varm`, `obsp`,
@@ -352,7 +352,7 @@ const DROPPED_SECTION_FAMILIES: &[(SectionType, &str)] = &[(
 
 /// Warn, once per family, about input sections this rewrite is about to drop.
 ///
-/// `copy_auxiliary_sections` is an allowlist, so anything it does not name is
+/// `copy_auxiliary_sections_canonicalizing` is an allowlist, so anything it does not name is
 /// dropped — silently, until this existed. Its caller (`scx upgrade`) can rename
 /// a wholly new file over the target with no prior catalog, so `scx rollback`
 /// cannot recover what goes missing.
@@ -1094,7 +1094,7 @@ mod tests {
         );
     }
 
-    /// `copy_auxiliary_sections` is an allowlist, so what it does not name is
+    /// `copy_auxiliary_sections_canonicalizing` is an allowlist, so what it does not name is
     /// dropped — and both its callers rename over the target with no prior
     /// catalog, so the drop cannot be rolled back. The warning is the only
     /// notice a user gets, which makes "does it name the right families?" worth

@@ -380,13 +380,11 @@ impl ScxWriter {
     /// Override the CSR-data generation stamped into the output catalog.
     ///
     /// Defaults to `1` for a fresh write. CSR-mutating ops (`compact`,
-    /// `merge`) call this with `source + 1`; CSC-only rewrites
-    /// (`build-csc`) call it with the *unchanged* source generation so the
-    /// freshly-emitted sidecar reads as fresh
-    /// (`csc_build_generation == data_generation`). (`append` builds its
-    /// catalog manually rather than via `finish()`, so it bumps the
-    /// generation there, not through this setter; `subset` writes a fresh
-    /// file at the default generation.)
+    /// `merge`) call this with `source + 1`. (`append` and `build-csc` build
+    /// their catalogs manually rather than via `finish()` — `append` bumps the
+    /// generation there, and `build-csc`, an in-place append of the sidecar,
+    /// keeps it and stamps `csc_build_generation` to match; `subset` writes a
+    /// fresh file at the default generation.)
     pub fn with_data_generation(mut self, data_generation: u64) -> Self {
         self.data_generation = data_generation;
         self

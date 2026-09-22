@@ -34,8 +34,8 @@ pub const CSC_PAYLOAD_BYTES_PER_NNZ: u64 = 8;
 /// [`CSC_EMIT_SHARE`].
 pub const CSC_BUILD_BUCKET_SHARE: Share = Share::new(1, 2);
 
-/// One source CSR shard decoded, and on the `build-csc` path re-encoded, in
-/// flight at a time.
+/// One source CSR shard decoded in flight at a time. (The `build-csc` path
+/// also re-encoded it until it became an in-place append.)
 pub const CSC_BUILD_INPUT_SHARE: Share = Share::new(1, 4);
 
 /// The emitted shards' arrays, their raw-value buffer and the encoder's
@@ -50,8 +50,7 @@ pub const CSC_BUILD_INPUT_SHARE: Share = Share::new(1, 4);
 /// phase that *sums* with the bucket share rather than one that succeeds it.
 ///
 /// What is no longer concurrent is the source shard: the last `push_shard`
-/// has returned and its decode and re-encode buffers are dropped before
-/// `finish()`.
+/// has returned and its decode buffers are dropped before `finish()`.
 pub const CSC_EMIT_SHARE: Share = Share::new(1, 4);
 
 /// Bytes one decoded CSR shard of `nnz` nonzeros over `n_rows` rows occupies.

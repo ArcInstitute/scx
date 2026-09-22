@@ -142,9 +142,9 @@ pub struct CscSidecarStats {
 /// chunk".
 ///
 /// Framing is **not** scoped here. [`write_csc_sidecar`] scopes it around the
-/// whole call, and `run_build_csc` sets it once for both its CSR re-emit and
-/// its CSC shards; scoping it a second time inside the drain would restore the
-/// writer's previous framing part-way through.
+/// whole call, and `scx_ops::rebuild_csc_inplace` sets it once on the adopted
+/// writer it emits the sidecar through; scoping it a second time inside the
+/// drain would restore the writer's previous framing part-way through.
 pub fn emit_csc_shards(
     writer: &mut ScxWriter,
     source: &mut dyn CscShardSource,

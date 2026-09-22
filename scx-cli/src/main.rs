@@ -1902,14 +1902,10 @@ fn main() {
             csc_cols_per_shard,
             temp_dir,
         } => {
-            // Framing must come from `framing_for_csc_rebuild` on BOTH arms.
-            // Both ends of the range are wrong (see its contract): `None`
-            // strips row-group framing off a v4 input — via
-            // `rewrite_output_format_version(&[4], 1) == 3`, which is what the
-            // copy-out arm used to do, silently downgrading a framed file — and
-            // a `FramingConfig` carrying `decode_target: Some(_)` would
-            // re-authorise per-shard codec re-selection, the opposite of what a
-            // sidecar rebuild needs.
+            // Framing from `framing_for_csc_rebuild` on both arms: `Some` iff
+            // the input is v4, which is exactly what the in-place append admits
+            // (it refuses `Some` on a <= v3 file, and frames the sidecar on v4
+            // either way).
             let framing = scx_ops::framing_for_csc_rebuild(&input);
             // `run_build_csc` says whether it built anything: an empty matrix
             // (0 rows or 0 columns) gets no sidecar, and "Built" would be a lie.
@@ -1918,7 +1914,8 @@ fn main() {
             // keeps the one line it has always printed.
             let no_sidecar = |what: &str| {
                 println!(
-                    "{} is an empty matrix (0 rows or 0 columns); no CSC sidecar to build{what}",
+                    "{} is an empty matrix (0 rows or 0 columns); no CSC sidecar to build \
+                     (a stale one, if present, is dropped){what}",
                     input.display()
                 )
             };

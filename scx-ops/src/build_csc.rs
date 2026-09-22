@@ -437,7 +437,7 @@ pub fn rebuild_csc_inplace(
             log::warn!(
                 "build-csc: dropping the stale layer CSC sidecar on {} (built at generation \
                  {}, file is at {}); nothing rebuilds a layer sidecar, and its {bytes} bytes \
-                 stay unreferenced until `scx compact`",
+                 stay unreferenced until `scx compact --rebuild-csc`",
                 path.display(),
                 prep.old_catalog.csc_build_generation,
                 prep.old_catalog.data_generation
@@ -724,8 +724,9 @@ pub fn run_build_csc(
     // other writer leaves its output at `0o666 & !umask`, so this does too.
     scx_format_io::chmod_to_umask(output)?;
 
-    if outcome == BuildCscOutcome::Built {
-        let r = ScxReader::open(output)?;
+    // Best-effort: the output is already persisted, so failing to reopen it
+    // for the summary must not turn a finished build into an error.
+    if let (BuildCscOutcome::Built, Ok(r)) = (outcome, ScxReader::open(output)) {
         let csc: Vec<_> = r
             .catalog()
             .entries
@@ -1323,8 +1324,8 @@ mod tests {
 
     /// An empty matrix (`n_obs == 0` here) has nothing to transpose, so
     /// `build-csc` is a no-op that still produces the requested output — the
-    /// `--rebuild-csc` / `rebuild_csc=True` callers rename that output into
-    /// place and must not fail on a rewrite that yielded zero rows. Distinct
+    /// `--rebuild-csc` / `rebuild_csc=True` callers run it on whatever their
+    /// rewrite produced and must not fail on one that yielded zero rows. Distinct
     /// from `test_build_csc_no_csr_error`, whose header *claims* rows.
     #[test]
     fn test_build_csc_empty_matrix_is_a_noop() {

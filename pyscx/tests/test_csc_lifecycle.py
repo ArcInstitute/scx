@@ -240,8 +240,8 @@ def test_build_csc_force_overwrite(small_adata, tmp_path):
 
 
 def test_build_csc_rejects_same_input_output(small_adata, tmp_path):
-    """input == output is rejected up front (run_build_csc would delete the
-    source before reopening it)."""
+    """input == output is rejected up front (the copy-out form would copy the
+    source onto a staging file and rename it over itself)."""
     import pyscx
 
     src = tmp_path / "csr_only.scx"
