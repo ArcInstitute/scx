@@ -1213,7 +1213,9 @@ one worth reaching for on performance grounds. Both halves are **output-neutral*
   `PyRef` cannot cross `py.detach(...)`, so each entry now snapshots what the scan needs
   into an owned handle (`Arc` clones + owned index vectors; no matrix data copied), runs
   the kernel detached, and re-acquires only to build the array. The CSC dispatchers needed
-  a new owned accessor (`as_column_source_owned`) under the identical deletion-vector gate.
+  an owned accessor for the same reason; `as_column_source()` is now that accessor on both
+  handle kinds — it returns an owned view rather than a borrow, so the separate
+  `as_column_source_owned` it once needed is gone.
 
   `pyscx/tests/test_col_aggs_gil.py` measures the property directly rather than as a
   throughput ratio, which would be flaky on a loaded host: a monitor thread stamps

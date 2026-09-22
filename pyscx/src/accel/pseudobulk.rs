@@ -294,30 +294,15 @@ pub(super) fn aggregate_pseudobulk(
             })
             .collect::<PyResult<Vec<_>>>()?;
 
-        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            let source = backed
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
+        if crate::accel::is_scx_matrix_handle(&x) {
+            // One call for either handle kind: both hand back the same view.
+            // Gated on `is_scx_matrix_handle` rather than on the source being
+            // `Some`, so a handle whose file has no sidecar raises instead of
+            // falling through to the scipy/dense materialisation below.
+            let source =
+                crate::accel::csc_source_for(&x).ok_or_else(crate::accel::csc_unavailable)?;
             scx_accel::pseudobulk_aggregate_csc(
                 &source,
-                &cell_to_group,
-                n_groups,
-                group_labels,
-                groupby,
-                &projected_gene_names,
-                &resolved_indices,
-                method,
-                min_cells_per_group,
-            )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        } else if let Ok(lazy) =
-            x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
-        {
-            let lazy_src = lazy
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
-            scx_accel::pseudobulk_aggregate_csc(
-                &lazy_src,
                 &cell_to_group,
                 n_groups,
                 group_labels,

@@ -2011,9 +2011,10 @@ Entries that accept it:
 other `prefer_format`-taking function defaults to `"csr"`.**
 `"auto"` (a **compatibility change** in the CPU-accelerator Phase-2
 work — DE previously defaulted to `"csr"`) resolves at call time
-against the *selected* matrix: on CPU it takes the CSC-direct route
-whenever the file has a sidecar, and CSR otherwise; on GPU it stays CSR
-so the planner routes `gpu_csc_v3` when a sidecar is present. The route and
+against the *selected* matrix: on CPU it takes the CSC-direct route when the
+file has a sidecar **and** the handle's row window still spans at least half
+the CSR shards, and CSR otherwise; on GPU it stays CSR so the planner routes
+`gpu_csc_v3` under the same condition. The route and
 `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`
 (`cpu_csc` vs `cpu_csr`; `cpu_csc_nnz` when the 1-vs-rest exact-nnz Wilcoxon
 kernel is opted into with `SCX_ACCEL_WILCOXON_NNZ=1`). Pass `prefer_format="csr"` explicitly to pin
@@ -2062,6 +2063,19 @@ ordinary `filter_cells → filter_genes → normalize_total → log1p →
 rank_genes_groups` pipeline now records `cpu_csc` where it recorded `cpu_csr`.
 The output is the same (pinned bit-for-bit against the CSR route); the wall
 time and the recorded route are not.
+
+**`"auto"` asks a second question that an explicit `"csc"` does not.** Being
+*able* to serve a window is not a reason to prefer it: a CSC column shard spans
+the whole row axis, so a narrow row window (`adata[:10_000]` of a million
+cells) decodes every physical cell of the columns it asks for and discards most
+of them, where the CSR path skips the shards the window empties outright. So
+`auto` takes CSC only while the kept rows still span **at least half** the CSR
+shards — true for the ordinary `filter_cells` that keeps ~99 % of cells, where
+every shard retains survivors and nothing is skippable, and false for a slice
+confined to a few shards. That cut is coarse and deliberately so: it is chosen
+to be right at both ends rather than tuned, and where exactly it belongs in
+between is not something the measurements here establish. `prefer_format="csc"`
+bypasses it and is served on any window the reader can compact.
 
 Unknown values (e.g. `"CSC"`, `"bogus"`) raise `ValueError`. `"auto"`
 is accepted by `rank_genes_groups` / `pdex_ref` (and is their default);

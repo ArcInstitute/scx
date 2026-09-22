@@ -225,14 +225,20 @@ fn select_de_matrix<'py>(
 
 /// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
 ///
-/// Exactly the single capability-detection point (`as_column_source`), for both
-/// handle kinds, and nothing else. It used to carry a condition of its own — on
+/// The single capability-detection point (`as_column_source`) **plus a policy
+/// question** — `LazyShardSource::csc_preferred_for_auto` — and the split
+/// between those two is the point. It used to carry a condition of its own — on
 /// a *backed* handle, no column projection — because `as_column_source` handed
 /// back the **full-axis** sidecar reader, which cannot serve a projected gene
 /// axis and would trip the kernel's `n_vars` guard. Both handle kinds now hand
 /// back a view that remaps columns into the projected axis and renumbers rows
-/// onto the live one, so neither a projection nor a row filter is a
-/// disqualifier and the two branches are the same question.
+/// onto the live one, so neither is a *capability* disqualifier and the two
+/// branches are the same question.
+///
+/// Capability is not the same as "should run", though, and answering only the
+/// first is how `auto` would follow a narrow row window into a full-height
+/// column read that CSC cannot prune. `csc_preferred_for_auto` is that second
+/// question; an explicit `prefer_format="csc"` skips it.
 ///
 /// That **widens what `auto` picks**, twice over: a
 /// `normalize_total → log1p` chain resolves to `cpu_csc` rather than `cpu_csr`,
@@ -247,13 +253,7 @@ fn select_de_matrix<'py>(
 /// materialized matrix (numpy/scipy, e.g. `use_raw`/`layer`) is not a
 /// backed/lazy SCX dataset → `false`.
 fn csc_route_available(x: &Bound<'_, PyAny>) -> bool {
-    if let Some(handle) = crate::accel::backed_dataset_ref(x) {
-        return handle.get().as_column_source().is_some();
-    }
-    if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
-        return lazy.as_column_source().is_some();
-    }
-    false
+    crate::accel::csc_source_for(x).is_some_and(|s| s.csc_preferred_for_auto())
 }
 
 /// Resolve `prefer_format` to a concrete `"csr"` / `"csc"` route.

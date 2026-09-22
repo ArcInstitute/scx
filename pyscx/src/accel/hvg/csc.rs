@@ -4,8 +4,6 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::types::PyDict;
 
 use super::*;
-use crate::backed::ScxBackedSparseDataset;
-use crate::lazy_transform::ScxLazyTransformedDataset;
 use crate::optional_deps::{import_optional, EXTRA_HVG};
 
 /// Loess fit on (log10 mean, log10 var) for non-constant genes — the
@@ -204,21 +202,13 @@ pub(crate) fn hvg_seurat_v3_csc(
     //    used to be pinned to CPU because it held a borrowed `&dyn
     //    ColumnShardSource`, which is not `Sync`; that was a property of the
     //    borrow, not of the data. ──
-    let source = if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        backed
-            .borrow()
-            .as_column_source()
-            .ok_or_else(crate::accel::csc_unavailable)?
-    } else if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
-        lazy.borrow()
-            .as_column_source()
-            .ok_or_else(crate::accel::csc_unavailable)?
-    } else {
+    if !crate::accel::is_scx_matrix_handle(&x) {
         return Err(PyRuntimeError::new_err(
             "prefer_format='csc' requires adata.X to be ScxBackedSparseDataset \
              or ScxLazyTransformedDataset (got a regular scipy/dense matrix)",
         ));
-    };
+    }
+    let source = crate::accel::csc_source_for(&x).ok_or_else(crate::accel::csc_unavailable)?;
 
     let n_obs = ColumnShardSource::n_obs(&source);
     let n_vars = ColumnShardSource::n_vars(&source);

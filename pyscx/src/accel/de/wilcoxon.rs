@@ -450,27 +450,13 @@ fn dispatch_rank_genes_kernels(
         // detached. (`LazyShardSource` is `Send`, where a `&dyn
         // ColumnShardSource` was not — which is why the two arms used to
         // differ.)
-        let source = if let Some(handle) = crate::accel::backed_dataset_ref(x) {
-            let source = handle
-                .get()
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
-            drop(handle);
-            source
-        } else if let Ok(lazy) =
-            x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
-        {
-            let source = lazy
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
-            drop(lazy);
-            source
-        } else {
+        if !crate::accel::is_scx_matrix_handle(x) {
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
                  dataset; got a regular scipy/dense matrix",
             ));
-        };
+        }
+        let source = crate::accel::csc_source_for(x).ok_or_else(crate::accel::csc_unavailable)?;
 
         let result = py
             .detach(|| {
@@ -541,7 +527,11 @@ fn dispatch_rank_genes_kernels(
                     // the projected one — and serves as both the CSR and the
                     // CSC side, so a filtered or gene-subset handle keeps
                     // `gpu_csc_v3`. `Lazy` remains for the case with no
-                    // sidecar to offer.
+                    // sidecar to offer — and for a window so narrow that CSC's
+                    // full-height column reads would lose to the shard
+                    // skipping the CSR path can do
+                    // (`csc_preferred_for_auto`), since on GPU the route is
+                    // chosen by the planner rather than requested.
                     let input = if !has_view {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: reader.as_ref(),
@@ -549,7 +539,7 @@ fn dispatch_rank_genes_kernels(
                                 .as_deref()
                                 .map(|c| c as &(dyn scx_format_io::ColumnShardSource + Sync)),
                         }
-                    } else if source.supports_csc() {
+                    } else if source.csc_preferred_for_auto() {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &source,
                             csc: Some(&source),
@@ -620,7 +610,7 @@ fn dispatch_rank_genes_kernels(
                     let chunk_size = gene_chunk_size.unwrap_or(500);
                     let lazy_src = lazy.as_shard_source();
                     drop(lazy);
-                    let input = if lazy_src.supports_csc() {
+                    let input = if lazy_src.csc_preferred_for_auto() {
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &lazy_src,
                             csc: Some(&lazy_src),

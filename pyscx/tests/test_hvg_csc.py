@@ -179,3 +179,38 @@ def test_gpu_csc_on_a_row_filtered_handle(tmp_path):
     np.testing.assert_allclose(
         a_csc.var["means"].to_numpy(), dense.mean(axis=0), rtol=1e-5, atol=1e-8
     )
+
+
+def test_gpu_hvg_does_not_auto_route_a_filtered_handle_to_csc(tmp_path):
+    """The auto-route is policy, and a row filter is outside it.
+
+    `backed_x_has_csc_sidecar` decides whether a default
+    `prefer_format="csr"` GPU run silently takes the column-major reduce. It
+    used to miss a `filter_cells` handle only because the capability gate
+    refused one; once that gate opened, the auto-route would have fired for an
+    op whose CSC walk is *slower* than the row-major sweep — adding a
+    compaction pass over every column shard on top, for a caller who never
+    asked for CSC. So the predicate now requires no row filter. The test above
+    is the other half: an explicit request is still honoured on the same
+    handle.
+    """
+    src = _raw_counts_adata()
+    keep = np.zeros(src.n_obs, dtype=bool)
+    keep[::3] = True
+
+    a = _open_backed(tmp_path / "csc_autoroute.scx", src, "always")
+    pyscx.accel.subset_obs(a, keep)
+    pyscx.accel.highly_variable_genes(
+        a, n_top_genes=30, flavor="seurat_v3", device="gpu"
+    )
+    assert _route(a) == "gpu_csr", (
+        f"a filtered handle must not auto-route into the slower CSC reduce, got {_route(a)!r}"
+    )
+
+    # Premise: the same handle, unfiltered, does auto-route — so the assertion
+    # above is the row filter's doing and not a missing sidecar.
+    b = _open_backed(tmp_path / "csc_autoroute_unfiltered.scx", src, "always")
+    pyscx.accel.highly_variable_genes(
+        b, n_top_genes=30, flavor="seurat_v3", device="gpu"
+    )
+    assert _route(b) == "gpu_csc_v3"

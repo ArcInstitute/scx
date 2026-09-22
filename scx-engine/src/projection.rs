@@ -426,9 +426,13 @@ pub fn compact_csc_rows_in_place(csc: &mut ScxCsc, global_to_live: &[i32], n_liv
     for col in 0..n_cols {
         let read_end = csc.indptr[col + 1] as usize;
         for r in read_start..read_end {
-            let live = global_to_live
-                .get(csc.indices[r] as usize)
-                .copied()
+            // `usize::try_from` rather than `as usize`: a negative row index
+            // in a malformed slab would otherwise wrap to `usize::MAX` and be
+            // dropped by `get`, which is the right *behaviour* reached by an
+            // implicit two's-complement cast. Say it instead.
+            let live = usize::try_from(csc.indices[r])
+                .ok()
+                .and_then(|row| global_to_live.get(row).copied())
                 .unwrap_or(-1);
             if live >= 0 {
                 csc.indices[w] = live;

@@ -566,8 +566,19 @@ def test_gpu_de_keeps_csc_direct_on_a_transformed_handle(csc_path):
     def run(device):
         adata = _backed(csc_path)
         pyscx.accel.subset_obs(adata, ROW_KEEP)
-        pyscx.accel.normalize_total(adata, target_sum=1e4)
-        pyscx.accel.log1p(adata)
+        # `device="cpu"` on the transforms, deliberately. Left at the default
+        # `"auto"` they route through rapids-singlecell on a GPU host, which
+        # **materialises** `X` — so the handle reaching DE is an in-memory
+        # scipy matrix, not a lazy SCX one, `GpuDeShardInput::Csr` is what the
+        # dispatch picks, and the route comes back `gpu_csr_v3` without the
+        # lazy arm this test exists for ever being reached. That is how the
+        # first version of this test failed: it asserted the right thing about
+        # a shape it never built.
+        pyscx.accel.normalize_total(adata, target_sum=1e4, device="cpu")
+        pyscx.accel.log1p(adata, device="cpu")
+        assert type(adata.X).__name__ == "ScxLazyTransformedDataset", (
+            f"premise: the chain must leave X lazy, got {type(adata.X).__name__}"
+        )
         pyscx.accel.rank_genes_groups(
             adata, groupby="pert", method="wilcoxon", device=device
         )

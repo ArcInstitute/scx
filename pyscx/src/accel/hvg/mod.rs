@@ -68,13 +68,23 @@ impl scx_format_io::ShardSource for InMemoryCsrSource<'_> {
     }
 }
 
-/// Whether `x` is a backed SCX dataset that exposes a usable CSC sidecar
-/// (the same capability gate as `ScxBackedSparseDataset::as_column_source`,
-/// whose one condition is that a sidecar is present). Used to auto-route
-/// single-batch seurat_v3 GPU HVG to the column-major reduce.
+/// Whether `x` is a backed SCX dataset this op should **auto-route** to the
+/// column-major GPU reduce: a CSC sidecar is present *and* no row filter is
+/// active.
+///
+/// The row-filter clause is a policy choice, not a capability one — the reader
+/// serves a filtered handle's CSC reads perfectly well, and an explicit
+/// `prefer_format="csc"` still gets them. But HVG is the one CSC consumer
+/// whose column-major walk is *slower* than the row-major sweep it replaces
+/// (see the `highly_variable_genes` row in `docs/api.md`), so this auto-route
+/// exists only for the case where the sidecar is otherwise free. A row filter
+/// adds a compaction pass over every column shard on top of a walk that was
+/// already losing, and nobody asked for CSC: `filter_cells` →
+/// `highly_variable_genes(device="gpu")` would silently record `gpu_csc_v3`.
 fn backed_x_has_csc_sidecar(x: &Bound<'_, PyAny>) -> bool {
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        backed.borrow().as_column_source().is_some()
+        let b = backed.borrow();
+        b.kept_to_global.is_none() && b.as_column_source().is_some()
     } else {
         false
     }

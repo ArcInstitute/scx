@@ -113,6 +113,42 @@ pub(crate) fn reject_presentation_ordered_source(x: &Bound<'_, PyAny>, op: &str)
     Ok(())
 }
 
+/// Whether `x` is one of the two SCX matrix handles (backed or lazy).
+///
+/// Distinguishes "this is an SCX handle with no sidecar" — which must raise
+/// [`csc_unavailable`] — from "this is a scipy/dense matrix", which several
+/// ops materialise instead. [`csc_source_for`] returns `None` for both, so a
+/// caller that needs to tell them apart asks this first.
+pub(crate) fn is_scx_matrix_handle(x: &Bound<'_, PyAny>) -> bool {
+    backed_dataset_ref(x).is_some()
+        || x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
+            .is_ok()
+}
+
+/// This handle's CSC column source, whichever kind of handle it is.
+///
+/// One ladder, in one place. It used to be six copies, and it had to be: the
+/// backed arm handed back a borrowed full-axis `BackedCscReader` while the lazy
+/// arm handed back an owned view, so the two arms differed in type, in lifetime
+/// and in the column space their caller then had to address. Both now return
+/// the same owned [`LazyShardSource`], which left six identical ladders behind.
+///
+/// `None` means the file brought no CSC sidecar — see [`csc_unavailable`] for
+/// the error every caller pairs this with. A non-SCX `X` (numpy/scipy, e.g.
+/// from `use_raw`/`layer`) is also `None`, and callers that want to say so
+/// specifically check the handle types themselves.
+pub(crate) fn csc_source_for(
+    x: &Bound<'_, PyAny>,
+) -> Option<crate::lazy_transform::LazyShardSource> {
+    if let Some(handle) = backed_dataset_ref(x) {
+        return handle.get().as_column_source();
+    }
+    if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
+        return lazy.as_column_source();
+    }
+    None
+}
+
 /// The error for `as_column_source()` returning `None`.
 ///
 /// There is exactly one cause left, which is why this takes no arguments. It

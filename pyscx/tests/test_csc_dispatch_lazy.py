@@ -1091,3 +1091,84 @@ def test_the_csc_column_reductions_answer_in_sorted_projection_order(tmp_path):
     np.testing.assert_allclose(
         csc_sums, dense[:, sorted(requested)].sum(axis=0).astype(np.float64), rtol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# Capability is not policy: `auto` must not follow a narrow row window into a
+# scan CSC cannot prune.
+#
+# A CSC column shard spans the whole row axis, so a window confined to a few
+# CSR shards still reads every physical cell of the columns it asks for, where
+# the CSR path skips the emptied shards outright. `csc_preferred_for_auto` is
+# the second question; `prefer_format="csc"` skips it.
+# ---------------------------------------------------------------------------
+
+
+def _multishard_csc_file(tmp_path, adata, name, shard_size=20):
+    import pyscx
+
+    path = tmp_path / name
+    pyscx.from_anndata(
+        adata, str(path), shard_size=shard_size, csc="always", csc_cols_per_shard=6
+    )
+    exp = pyscx.open(str(path))
+    assert exp.shard_count >= 4, f"premise: need several CSR shards, got {exp.shard_count}"
+    assert exp.has_csc
+    return path
+
+
+def test_a_narrow_row_window_leaves_auto_on_csr(tmp_path):
+    """One shard's worth of rows out of six: `auto` stays CSR."""
+    import pyscx
+
+    adata = _counts_adata(n_obs=120, n_vars=24)
+    path = _multishard_csc_file(tmp_path, adata, "narrow.scx")
+
+    def de(prefer):
+        a = pyscx.open(str(path)).to_anndata(backed=True)
+        a.obs["grp"] = pd.Categorical(adata.obs["grp"].to_numpy())
+        a = a[np.arange(18)]  # rows 0..17 — shard 0 and a sliver of shard 1
+        assert a.n_obs == 18
+        pyscx.accel.rank_genes_groups(
+            a, groupby="grp", method="wilcoxon", device="cpu", prefer_format=prefer
+        )
+        return (a.uns["scx_accel"]["rank_genes_groups"]["route"],
+                a.uns["rank_genes_groups"])
+
+    route_auto, res_auto = de("auto")
+    assert route_auto == "cpu_csr", (
+        f"a window spanning 2 of 6 shards must not auto-route to CSC, got {route_auto!r}"
+    )
+
+    # The capability is still there for a caller who asks for it, and it agrees.
+    route_csc, res_csc = de("csc")
+    assert route_csc == "cpu_csc"
+    for field in ("scores", "pvals", "logfoldchanges"):
+        np.testing.assert_array_equal(
+            np.array([list(r) for r in res_auto[field]]),
+            np.array([list(r) for r in res_csc[field]]),
+            err_msg=f"{field} differs between the CSR and CSC routes",
+        )
+
+
+def test_a_wide_row_window_still_auto_routes_csc(tmp_path):
+    """The complement, and the premise for the test above.
+
+    Without it, `csc_preferred_for_auto` could return `false` unconditionally
+    and the narrow-window assertion would still pass — while the PR's whole
+    payoff had quietly reverted. Every other cell, so every shard keeps
+    survivors and the CSR path has nothing to skip.
+    """
+    import pyscx
+
+    adata = _counts_adata(n_obs=120, n_vars=24)
+    path = _multishard_csc_file(tmp_path, adata, "wide.scx")
+
+    a = pyscx.open(str(path)).to_anndata(backed=True)
+    a.obs["grp"] = pd.Categorical(adata.obs["grp"].to_numpy())
+    a = a[np.arange(0, 120, 2)]
+    assert a.n_obs == 60
+    pyscx.accel.normalize_total(a, target_sum=1e4)
+    pyscx.accel.log1p(a)
+    pyscx.accel.rank_genes_groups(a, groupby="grp", method="wilcoxon", device="cpu")
+    assert a.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc"

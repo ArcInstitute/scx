@@ -165,10 +165,25 @@ impl LazyShardSource {
     ///
     /// `None` means no compaction is owed: either no row filter is active, or
     /// there is no sidecar to read in the first place.
-    fn global_to_live(&self) -> Option<&Vec<i32>> {
+    ///
+    /// **`kept_to_global` must be ascending**, and the compaction depends on it
+    /// more sharply than the CSR path does. A monotone map is what preserves
+    /// each column's stored row order through the renumbering — which
+    /// `scx-gpu`'s `validate_csc` requires and `scx_accel::csc::pseudobulk`
+    /// relies on. A descending or shuffled map would come out unsorted and
+    /// mislabel rather than fail. Every producer in the tree is ascending
+    /// (`axis_align::compose_rows_positional`, `compute_kept_to_global`, and
+    /// anndata's `_subset`, which materialises a non-ascending selection rather
+    /// than expressing it as a window), so this is an assertion, not a branch.
+    fn global_to_live(&self) -> Option<&[i32]> {
         let kept = self.kept_to_global.as_ref()?;
         let backed_csc = self.backed_csc.as_ref()?;
         Some(self.global_to_live.get_or_init(|| {
+            debug_assert!(
+                kept.windows(2).all(|w| w[0] < w[1]),
+                "kept_to_global must be strictly ascending; a non-monotone map \
+                 renumbers a column's rows out of order",
+            );
             // Sized from the *sidecar's* row count, which is the space its
             // `indices` live in, not from this view's visible count.
             let mut map = vec![-1i32; backed_csc.n_obs()];
@@ -179,6 +194,47 @@ impl LazyShardSource {
             }
             map
         }))
+    }
+
+    /// Whether the **automatic** route should prefer CSC for this source.
+    ///
+    /// Deliberately separate from [`Self::supports_csc`], which answers whether
+    /// CSC *can* be served. Using capability as policy is wrong in one
+    /// direction that matters: a CSC column shard spans the whole row axis, so
+    /// a narrow row window still decodes every physical cell of the columns it
+    /// asks for and throws most of them away, where the CSR path skips the
+    /// shards the window empties outright (`visible_shard_indices`). A
+    /// `adata[:10_000]` view of a million-cell file is a full-height column
+    /// read on the row-major path's terms.
+    ///
+    /// The discriminator is therefore how much of the file the window actually
+    /// spans: CSR's shard skipping is worth something only when the kept rows
+    /// leave whole shards empty, and worth nothing when every shard still has
+    /// survivors — which is the ordinary `filter_cells` that keeps ~99 % of
+    /// cells, where CSC's column locality wins. Half the shards is a coarse cut
+    /// between those two regimes rather than a tuned constant, and it is **not
+    /// measured**: it is chosen to be obviously right at both ends (an
+    /// unfiltered or lightly filtered handle takes CSC, a handful of rows takes
+    /// CSR) and its exact placement in between is not something this change
+    /// establishes.
+    ///
+    /// Only `auto` consults this. An explicit `prefer_format="csc"` is served
+    /// on any window the reader can compact — the capability is the caller's to
+    /// spend.
+    pub(crate) fn csc_preferred_for_auto(&self) -> bool {
+        if !self.supports_csc() {
+            return false;
+        }
+        let Some(kept) = self.kept_to_global.as_ref() else {
+            // No row filter: there is nothing for CSR to prune.
+            return true;
+        };
+        let index = self.backed.index();
+        let n_shards = index.n_shards();
+        if n_shards == 0 {
+            return true;
+        }
+        index.shards_with_kept_rows(kept).len() * 2 >= n_shards
     }
 }
 
@@ -585,9 +641,20 @@ impl scx_format_io::ColumnShardSource for LazyShardSource {
     /// reaching this type instead of `BackedCscReader` would otherwise be a
     /// staging regression, not just a different code path.
     ///
-    /// Forwarded verbatim. The hint counts **columns** per shard, which a row
-    /// filter cannot change; under a column projection it becomes an
-    /// over-estimate, which is what the contract asks for ("an upper bound").
+    /// Describes the **view**, not the file, and that is load-bearing in the
+    /// other direction: those allocations are eager, so forwarding the
+    /// sidecar's physical hint would have a tiny window reserve the whole
+    /// file's widest shard — ~24 B of pinned host memory and 8 B of device
+    /// memory per physical nonzero, newly reachable because these handles used
+    /// to take the CSR route instead.
+    ///
+    /// Both terms are sound upper bounds rather than estimates. `max_rows` is
+    /// the column count, which under a projection is the widest *projected*
+    /// shard. `max_nnz` is bounded by `n_live * that`, since a compacted slab
+    /// holds at most one nonzero per (visible row, column) pair — and is
+    /// min'd with the inner hint so it can only ever tighten it. With no
+    /// window active the product dwarfs the physical bound and this reduces to
+    /// forwarding verbatim.
     ///
     /// `csc_shards_for_col_range` is deliberately **not** forwarded:
     /// `BackedCscReader` overrides it with a binary search over on-disk column
@@ -595,7 +662,24 @@ impl scx_format_io::ColumnShardSource for LazyShardSource {
     /// default is expressed over `csc_shard_col_range` above, which already
     /// reports projected ranges.
     fn csc_shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
-        scx_format_io::ColumnShardSource::csc_shard_size_hint(self.backed_csc.as_ref()?.as_ref())
+        let inner = scx_format_io::ColumnShardSource::csc_shard_size_hint(
+            self.backed_csc.as_ref()?.as_ref(),
+        )?;
+        let max_cols = if self.col_projection.is_some() {
+            (0..scx_format_io::ColumnShardSource::n_csc_shards(self))
+                .filter_map(|i| {
+                    scx_format_io::ColumnShardSource::csc_shard_col_range(self, i)
+                        .map(|(lo, hi)| hi.saturating_sub(lo) as usize)
+                })
+                .max()
+                .unwrap_or(0)
+        } else {
+            inner.max_rows
+        };
+        Some(scx_format_io::ShardSizeHint {
+            max_rows: max_cols,
+            max_nnz: self.shape_val.0.saturating_mul(max_cols).min(inner.max_nnz),
+        })
     }
 }
 

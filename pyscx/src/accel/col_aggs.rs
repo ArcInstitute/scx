@@ -23,7 +23,7 @@
 //! already released it.
 //!
 //! A `PyRef` cannot cross `py.detach(...)`, so each entry first snapshots what
-//! the scan needs into an owned [`CsrHandle`] / [`CscHandle`] (`Arc` clones and
+//! the scan needs into an owned [`CsrHandle`] / a `LazyShardSource` (`Arc` clones and
 //! owned index vectors — no matrix data is copied), drops the `PyRef`, runs the
 //! kernel detached, and re-acquires only to build the numpy array.
 
@@ -38,8 +38,6 @@ use crate::backed::detached;
 use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{LazyShardSource, ScxLazyTransformedDataset};
 use crate::projected_agg;
-
-type AggResult<T> = std::result::Result<T, scx_format_io::ScxError>;
 
 /// Helper: validate `prefer_format` and translate to a discriminator.
 fn validated_prefer(prefer_format: &str) -> PyResult<&'static str> {
@@ -106,58 +104,34 @@ impl CsrHandle {
     }
 }
 
-/// Owned CSC source for the `prefer_format="csc"` path.
+/// `(source, columns, n_obs)` for the `prefer_format="csc"` path.
 ///
-/// One type for both handle kinds. It used to be an enum, because the backed
-/// handle's `as_column_source` handed back the full-axis `BackedCscReader`
-/// while the lazy one handed back a view; both now yield the view, which is
-/// what lets a filtered or projected handle take this path at all.
+/// `columns` are **identity positions**, never `col_projection()`: the source
+/// already exposes the projected axis (`n_vars()` is the projected width, and
+/// `read_csc_columns` maps a requested range *through* the projection).
+/// Passing global ids back in would apply the projection a second time —
+/// silently reading the wrong genes, or indexing past a short slab and
+/// panicking in `walk_csc_runs`. `n_obs` is likewise the visible count, which
+/// is what the compacted slab's rows index into.
 ///
-/// Owned because the scan runs under `py.detach(...)` and a borrow from the
-/// `PyRef` cannot cross it.
-struct CscHandle(LazyShardSource);
-
-impl CscHandle {
-    /// `(source, columns, n_obs)` for either handle kind.
-    ///
-    /// `columns` are **identity positions**, never `col_projection()`: the
-    /// source already exposes the projected axis (`n_vars()` is the projected
-    /// width, and `read_csc_columns` maps a requested range *through* the
-    /// projection). Passing global ids back in would apply the projection a
-    /// second time — silently reading the wrong genes, or indexing past a
-    /// short slab and panicking in `walk_csc_runs`. `n_obs` is likewise the
-    /// visible count, which is what the compacted slab's rows index into.
-    fn extract(dataset: &Bound<'_, PyAny>) -> PyResult<(Self, Vec<u32>, usize)> {
-        let (src, n_obs) = if let Ok(backed) = dataset.extract::<PyRef<ScxBackedSparseDataset>>() {
-            let src = backed
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
-            (src, backed.shape_val.0)
-        } else if let Ok(lazy) = dataset.extract::<PyRef<ScxLazyTransformedDataset>>() {
-            let src = lazy
-                .as_column_source()
-                .ok_or_else(crate::accel::csc_unavailable)?;
-            (src, lazy.shape_val.0)
-        } else {
-            return Err(PyRuntimeError::new_err(
-                "prefer_format='csc' requires dataset to be ScxBackedSparseDataset \
-                 or ScxLazyTransformedDataset",
-            ));
-        };
-        let cols: Vec<u32> = (0..scx_format_io::ShardSource::n_vars(&src) as u32).collect();
-        Ok((CscHandle(src), cols, n_obs))
-    }
-
-    /// Run `f` against the column source.
-    ///
-    /// A closure rather than handing out a `&dyn ColumnShardSource` because the
-    /// CSC kernels are generic over `S: ColumnShardSource`.
-    fn with<T>(
-        &self,
-        f: impl Fn(&dyn scx_format_io::ColumnShardSource) -> AggResult<T>,
-    ) -> AggResult<T> {
-        f(&self.0 as &dyn scx_format_io::ColumnShardSource)
-    }
+/// Owned, because the scan runs under `py.detach(...)` and a borrow from the
+/// `PyRef` cannot cross it. There is no wrapper type: the kernels take
+/// `&dyn ColumnShardSource` and `LazyShardSource` implements it, so one
+/// existed only to call `f(&self.0)`.
+fn csc_source(dataset: &Bound<'_, PyAny>) -> PyResult<(LazyShardSource, Vec<u32>, usize)> {
+    let n_obs = if let Ok(backed) = dataset.extract::<PyRef<ScxBackedSparseDataset>>() {
+        backed.shape_val.0
+    } else if let Ok(lazy) = dataset.extract::<PyRef<ScxLazyTransformedDataset>>() {
+        lazy.shape_val.0
+    } else {
+        return Err(PyRuntimeError::new_err(
+            "prefer_format='csc' requires dataset to be ScxBackedSparseDataset \
+             or ScxLazyTransformedDataset",
+        ));
+    };
+    let src = crate::accel::csc_source_for(dataset).ok_or_else(crate::accel::csc_unavailable)?;
+    let cols: Vec<u32> = (0..scx_format_io::ShardSource::n_vars(&src) as u32).collect();
+    Ok((src, cols, n_obs))
 }
 
 fn to_py_err(e: scx_format_io::ScxError) -> PyErr {
@@ -174,11 +148,9 @@ pub fn col_sums<'py>(
     prefer_format: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
     if validated_prefer(prefer_format)? == "csc" {
-        let (src, cols, _n_obs) = CscHandle::extract(dataset)?;
-        let sums = detached(py, || {
-            src.with(|s| projected_agg::col_sums_projected_csc(s, &cols))
-        })
-        .map_err(to_py_err)?;
+        let (src, cols, _n_obs) = csc_source(dataset)?;
+        let sums = detached(py, || projected_agg::col_sums_projected_csc(&src, &cols))
+            .map_err(to_py_err)?;
         return Ok(PyArray::from_vec(py, sums).into_any());
     }
 
@@ -202,11 +174,9 @@ pub fn col_nnz<'py>(
     prefer_format: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
     if validated_prefer(prefer_format)? == "csc" {
-        let (src, cols, _n_obs) = CscHandle::extract(dataset)?;
-        let counts = detached(py, || {
-            src.with(|s| projected_agg::col_nnz_projected_csc(s, &cols))
-        })
-        .map_err(to_py_err)?;
+        let (src, cols, _n_obs) = csc_source(dataset)?;
+        let counts = detached(py, || projected_agg::col_nnz_projected_csc(&src, &cols))
+            .map_err(to_py_err)?;
         return Ok(PyArray::from_vec(py, counts).into_any());
     }
 
@@ -237,9 +207,9 @@ pub fn col_max<'py>(
     prefer_format: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
     if validated_prefer(prefer_format)? == "csc" {
-        let (src, cols, n_obs) = CscHandle::extract(dataset)?;
+        let (src, cols, n_obs) = csc_source(dataset)?;
         let res = detached(py, || {
-            src.with(|s| projected_agg::col_max_projected_csc(s, &cols, n_obs))
+            projected_agg::col_max_projected_csc(&src, &cols, n_obs)
         })
         .map_err(to_py_err)?;
         return Ok(PyArray::from_vec(py, res).into_any());
@@ -267,9 +237,9 @@ pub fn col_min<'py>(
     prefer_format: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
     if validated_prefer(prefer_format)? == "csc" {
-        let (src, cols, n_obs) = CscHandle::extract(dataset)?;
+        let (src, cols, n_obs) = csc_source(dataset)?;
         let res = detached(py, || {
-            src.with(|s| projected_agg::col_min_projected_csc(s, &cols, n_obs))
+            projected_agg::col_min_projected_csc(&src, &cols, n_obs)
         })
         .map_err(to_py_err)?;
         return Ok(PyArray::from_vec(py, res).into_any());
@@ -298,9 +268,9 @@ pub fn col_var<'py>(
     prefer_format: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
     if validated_prefer(prefer_format)? == "csc" {
-        let (src, cols, n_obs) = CscHandle::extract(dataset)?;
+        let (src, cols, n_obs) = csc_source(dataset)?;
         let res = detached(py, || {
-            src.with(|s| projected_agg::col_var_projected_csc(s, &cols, n_obs))
+            projected_agg::col_var_projected_csc(&src, &cols, n_obs)
         })
         .map_err(to_py_err)?;
         return Ok(PyArray::from_vec(py, res).into_any());

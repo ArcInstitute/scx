@@ -1856,20 +1856,13 @@ impl RowQcOutputs {
 }
 
 fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<u32>)> {
-    // One arm for both handle kinds: each hands back a `LazyShardSource`
-    // presenting its own visible axes.
-    let source = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-        backed
-            .as_column_source()
-            .ok_or_else(crate::accel::csc_unavailable)?
-    } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
-        lazy.as_column_source()
-            .ok_or_else(crate::accel::csc_unavailable)?
-    } else {
+    if !crate::accel::is_scx_matrix_handle(x) {
         return Err(PyRuntimeError::new_err(
             "prefer_format='csc' requires backed or lazy SCX dataset",
         ));
-    };
+    }
+    // One source for both handle kinds, presenting its own visible axes.
+    let source = crate::accel::csc_source_for(x).ok_or_else(crate::accel::csc_unavailable)?;
     // Identity positions — see the note in `accel::col_aggs`: the source is
     // already on the projected axis, so passing `col_projection()` back in
     // would apply it twice.
