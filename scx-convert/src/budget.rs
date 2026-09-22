@@ -626,11 +626,14 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         // ENFORCED, and it is the only CSC row that can say so.
         //
         // The builder keeps one running total of staged bucket bytes and
-        // spills the largest bucket whenever a push would take it past exactly
-        // this share, so the resident set is bounded by construction rather
-        // than by an estimate. The realized bound is that share plus
-        // `n_buckets * block_bytes` of partial-block slack, which is declared
-        // on `CscBuilderConfig` rather than hidden.
+        // spills the largest bucket whenever a push takes it past exactly this
+        // share, so the resident set is bounded by construction rather than by
+        // an estimate. The realized bound is that share plus
+        // `2 * n_buckets * block_capacity` of block slack, declared on
+        // `CscBuilderConfig` and asserted by
+        // `staged_bytes_never_exceed_the_declared_bound` rather than hidden.
+        // (The factor of two is real: sealing sweeps every bucket a pushed row
+        // touched before the spill loop runs.)
         //
         // What this replaces, so the change is legible: the single "CSC
         // sidecar transpose" row this splits from was `enforced: false`

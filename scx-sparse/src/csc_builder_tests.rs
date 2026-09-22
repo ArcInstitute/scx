@@ -746,3 +746,78 @@ fn a_spilling_build_at_scale_matches_the_reference() {
 
     assert_same(&got, &reference(&shards, N_ROWS, N_COLS, memory_bytes, 64));
 }
+
+/// The staging bound is a **promise**, so assert it rather than the code that
+/// is supposed to keep it.
+///
+/// This test did not exist when the builder was written, and its absence cost
+/// a measurement: `in_memory_bytes` counted the bytes *written* into each
+/// staging block while the process pays for each block's **capacity**, and a
+/// `Vec` grown by `extend_from_slice` doubles — so the realized bound was up
+/// to 2x the declared one. The census_1m capture showed 1.92x of a 4 GiB
+/// budget and tabula's peak got 10 % *worse* than the code being replaced,
+/// which is how it was found. A green suite said nothing, because nothing
+/// asserted the number.
+///
+/// The bound is `spill_after_bytes + 2 * n_buckets * block_capacity`: the
+/// share the builder spills against, plus the slack `CscBuilderConfig`
+/// declares. The factor of two is the second thing this test found — sealing
+/// runs once per pushed row across every bucket that row touched, and the
+/// spill loop runs after that sweep, so a row writing into all of them leaves
+/// a sealed block *and* a fresh live block per bucket before anything is
+/// released. The first draft of this test declared `1 *` and failed at
+/// 9,072 against 8,256, which is the gap being described rather than a
+/// tolerance being widened to fit.
+#[test]
+fn staged_bytes_never_exceed_the_declared_bound() {
+    let entries: Vec<(usize, usize, f32)> = (0..400)
+        .flat_map(|r| (0..40).map(move |k| (r, (r * 13 + k * 7) % 96, (r + k + 1) as f32)))
+        .collect();
+    let shards = shards_from(400, 96, &entries, &[100, 101, 250]);
+
+    for spill_after_bytes in [0usize, 1 << 10, 1 << 14, usize::MAX] {
+        let c = CscBuilderConfig {
+            cols_per_shard: 8,
+            memory_bytes: 400 * 12 * 8,
+            spill_after_bytes,
+            target_buckets: 8,
+            block_bytes: 512,
+        };
+        let mut b = CscBuilder::new(400, 96, c, Box::new(MemSpillStore::new())).expect("new");
+        let mut row_start = 0u64;
+        for sh in &shards {
+            b.push_shard(row_start, sh).expect("push");
+            row_start += sh.n_rows() as u64;
+        }
+        let em = b.finish().expect("finish");
+        let stats = em.stats();
+
+        // The same arithmetic the config documents, recomputed here rather
+        // than read back from the builder, so a change to how the builder
+        // sizes a block has to be reflected in both.
+        //
+        // 96 columns at 8 per shard is 12 shards; `target_buckets: 8` caps the
+        // bucket count at 8, so each bucket owns ceil(12/8) = 2 shards = 16
+        // columns. One header plus one nonzero per owned column is the widest
+        // row block a bucket can hold.
+        let bucket_cols = 2 * 8;
+        let max_row_block = 8 + SPILL_BYTES_PER_NNZ * bucket_cols;
+        let block_capacity = 512 + max_row_block;
+        let bound = spill_after_bytes.saturating_add(2 * stats.n_buckets * block_capacity);
+        assert!(
+            stats.peak_in_memory_bytes <= bound as u64,
+            "spill_after_bytes={spill_after_bytes}: peak {} exceeds the declared \
+             bound {bound} ({} buckets x {block_capacity} B of slack)",
+            stats.peak_in_memory_bytes,
+            stats.n_buckets,
+        );
+        // Premise: at the tight settings the builder really did have to spill,
+        // so the bound above is not being met by never filling anything.
+        if spill_after_bytes <= 1 << 14 {
+            assert!(
+                stats.spilled_bytes > 0,
+                "spill_after_bytes={spill_after_bytes} should have forced a spill"
+            );
+        }
+    }
+}

@@ -220,8 +220,15 @@ pub struct CscBuilderConfig {
     /// separate from `spill_after_bytes` because the two bound different
     /// things, and conflating them is what tied layout to the writer's budget.
     pub memory_bytes: usize,
-    /// Ceiling on staged bucket bytes during the push phase. The realized
-    /// bound is this plus `n_buckets * block_bytes` of block slack.
+    /// Ceiling on staged bucket bytes during the push phase.
+    ///
+    /// The realized bound is this plus **`2 * n_buckets * block_capacity`**,
+    /// where `block_capacity` is `block_bytes` plus one maximal row block. The
+    /// factor of two is not padding: sealing happens once per pushed row over
+    /// every bucket that row touched, and the spill loop runs after that
+    /// sweep, so a row that writes into all of them leaves one freshly sealed
+    /// block *and* one fresh live block per bucket before anything is
+    /// released.
     pub spill_after_bytes: usize,
     /// Buckets to aim for; capped at [`MAX_BUCKETS`] and at the shard count.
     pub target_buckets: usize,
@@ -338,8 +345,8 @@ impl Layout {
 #[derive(Debug, Default)]
 struct Bucket {
     sealed: Vec<Vec<u8>>,
-    /// Running total of `sealed`, so choosing a spill victim is O(n_buckets)
-    /// rather than O(n_buckets x blocks).
+    /// Running total of `sealed`'s **capacity**, so choosing a spill victim is
+    /// O(n_buckets) rather than O(n_buckets x blocks).
     sealed_bytes: usize,
     cur: Vec<u8>,
     /// Offset of the open row block's header within `cur`, and its running
@@ -349,6 +356,24 @@ struct Bucket {
 }
 
 impl Bucket {
+    /// A fresh block, pre-sized so it never reallocates.
+    ///
+    /// Load-bearing for the budget, not a micro-optimisation: a `Vec` grown by
+    /// `extend_from_slice` doubles, so a block sealed at `block_bytes` of
+    /// *length* can hold up to twice that in *capacity* — and capacity is what
+    /// the process is charged for. Counting length made the enforced bound up
+    /// to 2x looser than it declared, which measurement caught as a 1.10x
+    /// peak regression on a dataset small enough never to spill.
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            sealed: Vec::new(),
+            sealed_bytes: 0,
+            cur: Vec::with_capacity(cap),
+            open: None,
+            last_row: None,
+        }
+    }
+
     #[inline]
     fn push(&mut self, row: u32, col: u32, value: f32) {
         if self.open.is_none() || self.last_row != Some(row) {
@@ -388,6 +413,11 @@ pub struct CscBuilder {
     n_rows: usize,
     n_cols: usize,
     cfg: CscBuilderConfig,
+    /// Bytes every staging block is allocated at, and therefore exactly what
+    /// each one costs. `block_bytes` plus the largest single row block, so a
+    /// block sealed at `block_bytes` can always absorb the row that crossed
+    /// the threshold without reallocating.
+    block_capacity: usize,
     layout: Layout,
     store: Box<dyn SpillStore>,
     buckets: Vec<Bucket>,
@@ -422,12 +452,20 @@ impl CscBuilder {
             return Err(CscBuilderError::ColCountOverflow(n_cols));
         }
         let layout = Layout::plan(n_rows, n_cols, &cfg)?;
+        // The widest row block a bucket can ever hold: one header plus one
+        // nonzero for every column the bucket owns.
+        let max_row_block =
+            ROW_BLOCK_HEADER_BYTES + SPILL_BYTES_PER_NNZ * layout.bucket_cols.min(n_cols.max(1));
+        let block_capacity = cfg.block_bytes.max(1).saturating_add(max_row_block);
         let mut buckets = Vec::new();
-        buckets.resize_with(layout.n_buckets, Bucket::default);
+        buckets.resize_with(layout.n_buckets, || Bucket::with_capacity(block_capacity));
+        // Every bucket holds one live block from the start; charge it.
+        let in_memory_bytes = layout.n_buckets.saturating_mul(block_capacity);
         Ok(Self {
             n_rows,
             n_cols,
             cfg,
+            block_capacity,
             layout,
             store,
             buckets,
@@ -436,8 +474,8 @@ impl CscBuilder {
             touch_stamp: vec![0u64; layout.n_buckets],
             rows_pushed: 0,
             nnz: 0,
-            in_memory_bytes: 0,
-            peak_in_memory_bytes: 0,
+            in_memory_bytes,
+            peak_in_memory_bytes: in_memory_bytes,
         })
     }
 
@@ -512,9 +550,7 @@ impl CscBuilder {
                     self.touch_stamp[b] = global_row as u64 + 1;
                     self.touched.push(b);
                 }
-                let before = self.buckets[b].cur.len();
                 self.buckets[b].push(global_row, col as u32, csr.data[j]);
-                self.in_memory_bytes += self.buckets[b].cur.len() - before;
             }
             self.seal_and_maybe_spill()?;
         }
@@ -528,16 +564,27 @@ impl CscBuilder {
     /// `spill_after_bytes`.
     fn seal_and_maybe_spill(&mut self) -> Result<(), CscBuilderError> {
         let block_bytes = self.cfg.block_bytes.max(1);
-        for &i in &self.touched {
+        for idx in 0..self.touched.len() {
+            let i = self.touched[idx];
             let bucket = &mut self.buckets[i];
             if bucket.cur.len() >= block_bytes {
                 // Seal only at a row-block boundary: close the open row first,
                 // so every byte handed to the store holds whole row blocks and
                 // the count field is never patched after it has left.
                 bucket.close_row();
+                debug_assert_eq!(
+                    bucket.cur.capacity(),
+                    self.block_capacity,
+                    "a staging block reallocated; its cost is no longer the \
+                     figure the budget was checked against"
+                );
                 let sealed = std::mem::take(&mut bucket.cur);
-                bucket.sealed_bytes += sealed.len();
+                bucket.sealed_bytes += sealed.capacity();
                 bucket.sealed.push(sealed);
+                bucket.cur = Vec::with_capacity(self.block_capacity);
+                // The sealed block keeps its capacity and the replacement adds
+                // its own, so the bucket's cost rises by exactly one block.
+                self.in_memory_bytes += self.block_capacity;
             }
         }
         self.touched.clear();
