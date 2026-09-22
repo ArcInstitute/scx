@@ -506,9 +506,13 @@ fn duplicate_heavy_rows_do_not_break_the_staging_accounting() {
     assert_eq!(got[0].1.indices.len(), n);
     assert_eq!(stats.first_non_strict_column, Some(0));
 
-    // 32 kB of payload in ONE row against a 256-byte staging budget. Without
-    // the mid-row cut in `Bucket::push`, the whole row is appended before the
-    // seal/spill loop can run, so the bound is unbounded in `n`.
+    // 32 kB of payload in ONE row against a 256-byte staging budget. The
+    // bound holds because `push_shard` seals AND spills at the push that
+    // crossed `block_bytes`, inside the row. Sealing alone is not enough — it
+    // only moves bytes from `cur` into `sealed` — and running either at the
+    // row's END leaves the peak unbounded in `n`, which is what this measured
+    // at 45,760 bytes before the split. (`Bucket::push` itself never cuts; it
+    // starts a fresh row block only because `seal_bucket` called `close_row`.)
     let block_capacity = block_bytes + 8 + SPILL_BYTES_PER_NNZ;
     let bound = spill_after + 2 * stats.n_buckets * block_capacity;
     assert!(

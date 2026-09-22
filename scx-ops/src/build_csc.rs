@@ -426,6 +426,28 @@ pub fn run_build_csc(
     for (i, shard_entry) in csr_entries.iter().enumerate() {
         let (ci, ve, shard_row_start) = per_shard[i];
 
+        // The row axis this shard claims, checked against the walk's own
+        // running count **before** anything is read, decoded, re-encoded or
+        // written. A catalog whose shards do not tile `[0, n_obs)` in order is
+        // an error rather than a silently shifted sidecar, and it costs
+        // nothing to say so: `shard_row_start` is `ShardHeader.global_offset`,
+        // already in hand from the header pre-pass. Doing the read first meant
+        // an invalid file paid a full decode + re-encode + disk write per
+        // shard before the refusal. `ScxWriter::auto_emit_csc_for_marked_
+        // modalities` has always checked in this position.
+        //
+        // (`csr_shards_sorted` sorts by `major_start`, but an entry with no
+        // stats sorts last at `u64::MAX`, so the walk re-orders on
+        // `global_offset` above and this check is what confirms the result
+        // tiles.)
+        if shard_row_start != rows_pushed {
+            return Err(format!(
+                "build-csc: CSR shard {i} declares row_start {shard_row_start}, but \
+                 {rows_pushed} rows precede it; the shards do not tile [0, {n_rows}) in order"
+            )
+            .into());
+        }
+
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
         let n_shard_rows = indptr.len() - 1;
         let shard = scx_sparse::ScxCsr::new((n_shard_rows, n_cols), indptr, indices, data)?;
@@ -444,21 +466,8 @@ pub fn run_build_csc(
         )?;
         drop((indptr_u64, indices_u32, raw_values));
 
-        // Consumer 2: the CSC builder. The row axis it is fed is the walk's
-        // own running count, checked against the shard header's own
-        // `global_offset`, so a catalog whose shards do not tile `[0, n_obs)`
-        // in order is an error rather than a silently shifted sidecar.
-        // (`csr_shards_sorted` sorts by `major_start`, but an entry with no
-        // stats sorts last at `u64::MAX` and keeps catalog order, so the two
-        // can genuinely disagree — and the header is what settles it, since
-        // it is present whether or not `ShardStats` is.)
-        if shard_row_start != rows_pushed {
-            return Err(format!(
-                "build-csc: CSR shard {i} declares row_start {shard_row_start}, but \
-                 {rows_pushed} rows precede it; the shards do not tile [0, {n_rows}) in order"
-            )
-            .into());
-        }
+        // Consumer 2: the CSC builder, fed the walk's own running count —
+        // equal to `shard_row_start` by the check at the top of the loop.
         builder.push_shard(rows_pushed, &shard)?;
         rows_pushed += n_shard_rows as u64;
 
