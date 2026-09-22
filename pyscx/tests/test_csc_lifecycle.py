@@ -131,32 +131,50 @@ def test_csc_survives_log1p_lazy(small_adata, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_csc_disabled_after_filter_cells(small_adata, tmp_path):
+def test_csc_survives_filter_cells(small_adata, tmp_path):
+    """A row filter keeps the CSC route, and answers over the live rows.
+
+    This asserted a `RuntimeError` until the CSC read path learned to renumber
+    a slab's rows onto the live row space. The refusal was correct while it
+    could not: CSC `indices` are global physical rows and a filter renumbers
+    the live ones, so the slab and the caller disagreed about what row 3 meant.
+    What matters now is not that the call succeeds but that it answers the
+    *visible* matrix — a compaction that silently dropped the wrong rows would
+    also "succeed".
+    """
     import pyscx
 
     path = tmp_path / "with_csc.scx"
     pyscx.from_anndata(small_adata, str(path), csc="always", csc_cols_per_shard=4)
 
     adata = pyscx.open(str(path)).to_anndata(backed=True)
-    # Force a row deletion vector by filtering cells. The threshold has to
-    # actually drop one: a filter that keeps every cell is a no-op (see
-    # `test_no_op_filter_cells_keeps_csc`).
-    threshold = float(np.median(np.asarray(adata.X.to_memory().sum(axis=1)).ravel()))
+    # The threshold has to actually drop one: a filter that keeps every cell is
+    # a no-op (see `test_no_op_filter_cells_keeps_csc`) and would leave this
+    # passing for the wrong reason.
+    dense_all = np.asarray(small_adata.X.todense(), dtype=np.float64)
+    threshold = float(np.median(dense_all.sum(axis=1)))
     pyscx.accel.filter_cells(adata, min_counts=threshold)
     assert adata.n_obs < small_adata.n_obs, "fixture must actually drop cells"
-    # CSC dispatch must raise — `kept_to_global` is now active.
-    with pytest.raises(RuntimeError, match="CSC|deletion"):
-        pyscx.accel.col_sums(adata.X, prefer_format="csc")
+
+    keep = dense_all.sum(axis=1) >= threshold
+    assert int(keep.sum()) == adata.n_obs, "the keep mask must match the handle"
+    np.testing.assert_allclose(
+        np.asarray(pyscx.accel.col_sums(adata.X, prefer_format="csc")),
+        dense_all[keep].sum(axis=0),
+        rtol=1e-6,
+    )
 
 
 def test_no_op_filter_cells_keeps_csc(small_adata, tmp_path):
-    """A filter that drops nothing must not cost the CSC sidecar.
+    """A filter that drops nothing must not cost anything.
 
     `filter_cells` used to install a `kept_to_global` unconditionally, and any
-    `kept_to_global` — even the identity one — closes the CSC capability gate
-    (`as_column_source` returns `None`). So a threshold every cell cleared
-    permanently downgraded the file's `gpu_csc_v3` CSC-direct DE route, with
-    nothing in the data to explain why.
+    `kept_to_global` — even the identity one — closed the CSC capability gate,
+    so a threshold every cell cleared permanently downgraded the file's
+    `gpu_csc_v3` CSC-direct DE route with nothing in the data to explain why.
+    A row filter no longer closes that gate, so what an identity one would
+    cost now is smaller but not nothing: a row-compaction pass over every CSC
+    slab that cannot drop a single entry. Same fix, same test.
     """
     import pyscx
 

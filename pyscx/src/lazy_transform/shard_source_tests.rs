@@ -814,3 +814,175 @@ fn the_csc_gate_refuses_without_a_sidecar_whatever_the_chain() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The same parity contract under a row filter.
+//
+// A filtered handle used to be refused by the CSC gate, because the slab's
+// `indices` are global physical rows while every consumer works in live row
+// space. The read path now renumbers them
+// (`scx_engine::projection::compact_csc_rows_in_place`), and these tests are
+// what says the renumbering agrees with what the CSR path produces for the
+// same filter — which is the only comparison that can catch it, since a CSC
+// kernel handed an unrenumbered slab silently *skips* the rows it cannot
+// place rather than failing.
+//
+// Reachable here without a real sidecar because both stages are plain
+// functions over the two layouts. The end-to-end route, on a file that has a
+// sidecar, is covered from Python (`test_csc_dispatch_lazy.py`).
+// ---------------------------------------------------------------------------
+
+/// `global_to_live` for a sorted list of kept global rows.
+fn live_map(n_physical: usize, kept: &[u64]) -> Vec<i32> {
+    let mut map = vec![-1i32; n_physical];
+    for (live, &g) in kept.iter().enumerate() {
+        map[g as usize] = live as i32;
+    }
+    map
+}
+
+/// CSR: transforms then row filter. CSC: transforms then compaction. Compare.
+fn assert_bit_identical_under_filter(chain: &[Transform], kept: &[u64], label: &str) {
+    let (mut csr, mut csc, _) = parity_matrix();
+    let n_physical = csr.shape.0;
+
+    super::super::transforms::apply_transforms_to_csr(chain, &mut csr, 0);
+    let csr = super::extract_rows(&csr, kept);
+
+    super::apply_transforms_to_csc(chain, &mut csc);
+    scx_engine::projection::compact_csc_rows_in_place(
+        &mut csc,
+        &live_map(n_physical, kept),
+        kept.len(),
+    );
+
+    assert_eq!(
+        csr.shape.0, csc.shape.0,
+        "{label}: the two layouts disagree on the live row count"
+    );
+    let a = csr_cells(&csr);
+    let b = csc_cells(&csc);
+    assert_eq!(a.len(), b.len(), "{label}: nnz differs after filtering");
+    for ((rc_a, va), (rc_b, vb)) in a.iter().zip(b.iter()) {
+        assert_eq!(rc_a, rc_b, "{label}: cell coordinates diverged");
+        assert_eq!(
+            va.to_bits(),
+            vb.to_bits(),
+            "{label}: cell {rc_a:?} differs — CSR {va} vs CSC {vb}",
+        );
+    }
+}
+
+/// Drops rows 1, 4 and 6 — so the survivors shift by three different amounts,
+/// and the dropped set includes both the largest-value row and the one that
+/// cancels to a sum of exactly zero.
+const KEPT: [u64; 5] = [0, 2, 3, 5, 7];
+
+#[test]
+fn normalize_total_is_bit_identical_under_a_row_filter() {
+    let (_, _, sums) = parity_matrix();
+    assert_bit_identical_under_filter(&[normalize(&sums)], &KEPT, "normalize_total + filter");
+}
+
+#[test]
+fn the_standard_normalize_then_log1p_chain_is_bit_identical_under_a_row_filter() {
+    let (_, _, sums) = parity_matrix();
+    assert_bit_identical_under_filter(
+        &[normalize(&sums), Transform::Log1p],
+        &KEPT,
+        "normalize -> log1p + filter",
+    );
+}
+
+#[test]
+fn row_scale_is_bit_identical_under_a_row_filter() {
+    let factors = vec![1.0 / 3.0, 7.0, 1.0 / 7.0, 2.0, 0.5, 1e6, -0.25, 3.5];
+    assert_bit_identical_under_filter(
+        &[Transform::RowScale {
+            factors: Arc::new(factors),
+        }],
+        &KEPT,
+        "row_scale + filter",
+    );
+}
+
+#[test]
+fn a_mixed_chain_is_bit_identical_under_a_row_filter() {
+    let (_, _, sums) = parity_matrix();
+    let factors = vec![1.0 / 3.0, 7.0, 1.0 / 7.0, 2.0, 0.5, 1e6, -0.25, 3.5];
+    assert_bit_identical_under_filter(
+        &[
+            normalize(&sums),
+            Transform::Log1p,
+            Transform::RowScale {
+                factors: Arc::new(factors),
+            },
+            Transform::Scale { factor: 2.5 },
+        ],
+        &KEPT,
+        "mixed chain + filter",
+    );
+}
+
+/// An identity filter must be indistinguishable from no filter at all — the
+/// case `adata[np.arange(n_obs)]` produces.
+#[test]
+fn an_identity_row_filter_is_indistinguishable_from_no_filter() {
+    let (_, _, sums) = parity_matrix();
+    let all: Vec<u64> = (0..8).collect();
+    assert_bit_identical_under_filter(&[normalize(&sums), Transform::Log1p], &all, "identity");
+}
+
+/// Keeping a single row is the boundary the write cursor is most likely to get
+/// wrong, and it keeps the zero-sum row so the `sum > 0.0` false branch is
+/// still exercised under a filter.
+#[test]
+fn keeping_only_the_zero_sum_row_still_agrees() {
+    let (_, _, sums) = parity_matrix();
+    assert_bit_identical_under_filter(&[normalize(&sums), Transform::Log1p], &[3], "single row");
+}
+
+/// The order of the two stages is a correctness constraint, not a preference,
+/// and this is what encodes it.
+///
+/// `row_sums` / `factors` are built at global physical length, so a slab
+/// already renumbered to live rows looks up **another cell's** factor. The
+/// failure is silent — every value is finite and in range — so the only way to
+/// pin it is to run the wrong order deliberately and require that it disagree.
+#[test]
+fn compacting_before_the_transforms_would_read_the_wrong_rows_factors() {
+    let (_, csc_proto, sums) = parity_matrix();
+    let chain = [normalize(&sums)];
+    let map = live_map(8, &KEPT);
+
+    let mut right = csc_proto.clone();
+    super::apply_transforms_to_csc(&chain, &mut right);
+    scx_engine::projection::compact_csc_rows_in_place(&mut right, &map, KEPT.len());
+
+    let mut wrong = csc_proto;
+    scx_engine::projection::compact_csc_rows_in_place(&mut wrong, &map, KEPT.len());
+    // The wrong order cannot use the global-length vector it was handed, so
+    // give it the one it would have if someone "fixed" the length too — the
+    // point is that the *values* move, not that it panics.
+    super::apply_transforms_to_csc(&chain, &mut wrong);
+
+    assert_ne!(
+        csc_cells(&right),
+        csc_cells(&wrong),
+        "compacting first must change the answer; if it does not, this fixture \
+         no longer distinguishes the two orders and the constraint is untested"
+    );
+    // Concretely: global row 5 (sum 7) becomes live row 3, whose global
+    // neighbour in `row_sums` is the stored-zeros row (sum 0). The wrong order
+    // therefore leaves it unscaled.
+    let right_cells = csc_cells(&right);
+    let scaled = right_cells
+        .iter()
+        .find(|&&((r, c), _)| (r, c) == (3, 2))
+        .expect("live row 3 keeps its column-2 value");
+    assert!(
+        (scaled.1 as f64 - 1e4).abs() < 1.0,
+        "live row 3 is global row 5, sum 7, one stored value -> target_sum; got {}",
+        scaled.1
+    );
+}

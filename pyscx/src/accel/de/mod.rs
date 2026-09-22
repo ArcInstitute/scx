@@ -11,7 +11,6 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 
 pub(crate) mod frames;
@@ -224,70 +223,34 @@ fn select_de_matrix<'py>(
     }
 }
 
-/// Refuse an explicit `prefer_format="csc"` on a **subset** backed handle.
-///
-/// The gene-major sidecar is written against the full axis and has no
-/// projection surface, so a subset handle reaches the CSC kernel with
-/// visible-width `gene_names` (or a row count the sidecar cannot express).
-/// The kernel does catch it, but as a bare
-/// `gene_names length 15 != source.n_vars() 30` — say what actually happened.
-///
-/// Only the *explicit* CSC request lands here; `prefer_format="auto"` never
-/// picks CSC for a subset handle (`csc_route_available` excludes a projected
-/// one, and any `kept_to_global` makes `as_column_source()` return `None`).
-fn reject_csc_on_subset(backed: &ScxBackedSparseDataset) -> PyResult<()> {
-    if backed.kept_to_global.is_some() {
-        return Err(PyRuntimeError::new_err(
-            "CSC requested but unavailable: a row deletion vector is active \
-             (this dataset has been subset along obs, e.g. by filter_cells). \
-             Use prefer_format='csr'.",
-        ));
-    }
-    if backed.col_projection_arc().is_some() {
-        return Err(PyRuntimeError::new_err(
-            "CSC requested but unavailable: a column projection is active \
-             (this dataset has been subset along var, e.g. by filter_genes or \
-             highly_variable_genes(subset=True)); the CSC sidecar is full-axis. \
-             Use prefer_format='csr'.",
-        ));
-    }
-    Ok(())
-}
-
 /// Runtime CSC-sidecar availability probe for the `prefer_format="auto"` policy.
 ///
-/// Close to the single capability-detection point (`as_column_source`), with
-/// one addition of its own: a valid CSC route needs a sidecar present, no
-/// active row-deletion vector, and — on a **backed** handle only — no column
-/// projection. That third conjunct is enforced here rather than in
-/// `as_column_source`, because the full-axis sidecar it hands back cannot
-/// serve a projected gene axis while a lazy source remaps one itself. A lazy
-/// transform chain is no longer a disqualifier — every `Transform` is
-/// CSC-applicable — which **widens what `auto` picks**: a
-/// `normalize_total → log1p` chain used to resolve to `cpu_csr` here and now
-/// resolves to `cpu_csc`. The two produce bit-identical output (pinned in
-/// `pyscx/src/lazy_transform/shard_source_tests.rs`), so the visible difference
-/// is the recorded route and the wall time.
+/// Exactly the single capability-detection point (`as_column_source`), for both
+/// handle kinds, and nothing else. It used to carry a condition of its own — on
+/// a *backed* handle, no column projection — because `as_column_source` handed
+/// back the **full-axis** sidecar reader, which cannot serve a projected gene
+/// axis and would trip the kernel's `n_vars` guard. Both handle kinds now hand
+/// back a view that remaps columns into the projected axis and renumbers rows
+/// onto the live one, so neither a projection nor a row filter is a
+/// disqualifier and the two branches are the same question.
+///
+/// That **widens what `auto` picks**, twice over: a
+/// `normalize_total → log1p` chain resolves to `cpu_csc` rather than `cpu_csr`,
+/// and now so does a handle carrying a `filter_cells` row filter or a
+/// `filter_genes` column projection — the shape of essentially every real
+/// pipeline. The routes produce the same output (pinned bit-for-bit in
+/// `pyscx/src/lazy_transform/shard_source_tests.rs` and value-for-value in
+/// `pyscx/tests/test_csc_dispatch_lazy.py`), so the visible difference is the
+/// recorded route and the wall time.
 ///
 /// Never errors: a `false` result just routes `auto` to the CSR streamer. A
 /// materialized matrix (numpy/scipy, e.g. `use_raw`/`layer`) is not a
 /// backed/lazy SCX dataset → `false`.
 fn csc_route_available(x: &Bound<'_, PyAny>) -> bool {
     if let Some(handle) = crate::accel::backed_dataset_ref(x) {
-        let backed = handle.get();
-        // `as_column_source` exposes the *full-axis* CSC reader and ignores an
-        // active column projection (a gene subset, e.g. `adata[:, highly_variable]`
-        // on a backed file that keeps its sidecar). Routing such a projected
-        // dataset to the CSC kernel would trip its `n_vars` guard and raise,
-        // where the CSR streamer read the projected columns fine. §5.2 lists
-        // "filtering" among the `auto` gates — so exclude projected backed
-        // datasets from CSC-direct (they fall back to CSR). The lazy path below
-        // does not need this: its CSC reader honours the projection.
-        return backed.col_projection_arc().is_none() && backed.as_column_source().is_some();
+        return handle.get().as_column_source().is_some();
     }
     if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
-        // A materialized matrix (numpy/scipy from `use_raw`/`layer`) is neither
-        // a backed nor a lazy SCX dataset, so it never reaches here → CSR.
         return lazy.as_column_source().is_some();
     }
     false

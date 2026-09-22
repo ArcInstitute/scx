@@ -373,7 +373,7 @@ mod tests {
             0,
             crate::diffexp::GpuDeShardInput::Backed {
                 csr: &csr_reader,
-                csc: Some(&csc_reader),
+                csc: Some(&csc_reader as &(dyn scx_format_io::ColumnShardSource + Sync)),
             },
             &gene_names,
             &groups,

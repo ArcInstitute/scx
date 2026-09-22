@@ -924,7 +924,9 @@ mod tests {
             0,
             GpuDeShardInput::Backed {
                 csr: &csr_reader,
-                csc: csc_reader.as_ref(),
+                csc: csc_reader
+                    .as_ref()
+                    .map(|c| c as &(dyn scx_format_io::ColumnShardSource + Sync)),
             },
             gene_names,
             groups,
@@ -1148,7 +1150,7 @@ mod tests {
                 0,
                 GpuDeShardInput::Backed {
                     csr: &csr_reader,
-                    csc: Some(&csc_reader),
+                    csc: Some(&csc_reader as &(dyn scx_format_io::ColumnShardSource + Sync)),
                 },
                 &gn,
                 &gr,

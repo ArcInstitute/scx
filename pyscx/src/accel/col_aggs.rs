@@ -32,7 +32,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::sync::Arc;
 
-use scx_format_io::{BackedCscReader, BackedCsrReader};
+use scx_format_io::BackedCsrReader;
 
 use crate::backed::detached;
 use crate::backed::ScxBackedSparseDataset;
@@ -108,64 +108,55 @@ impl CsrHandle {
 
 /// Owned CSC source for the `prefer_format="csc"` path.
 ///
-/// Both variants are `Send`, which is the point: `as_column_source()` hands
-/// back a `&dyn ColumnShardSource` borrowed from the `PyRef` and so cannot be
-/// moved into a detached closure.
-enum CscHandle {
-    Backed(Arc<BackedCscReader>),
-    Lazy(Box<LazyShardSource>),
-}
+/// One type for both handle kinds. It used to be an enum, because the backed
+/// handle's `as_column_source` handed back the full-axis `BackedCscReader`
+/// while the lazy one handed back a view; both now yield the view, which is
+/// what lets a filtered or projected handle take this path at all.
+///
+/// Owned because the scan runs under `py.detach(...)` and a borrow from the
+/// `PyRef` cannot cross it.
+struct CscHandle(LazyShardSource);
 
 impl CscHandle {
+    /// `(source, columns, n_obs)` for either handle kind.
+    ///
+    /// `columns` are **identity positions**, never `col_projection()`: the
+    /// source already exposes the projected axis (`n_vars()` is the projected
+    /// width, and `read_csc_columns` maps a requested range *through* the
+    /// projection). Passing global ids back in would apply the projection a
+    /// second time — silently reading the wrong genes, or indexing past a
+    /// short slab and panicking in `walk_csc_runs`. `n_obs` is likewise the
+    /// visible count, which is what the compacted slab's rows index into.
     fn extract(dataset: &Bound<'_, PyAny>) -> PyResult<(Self, Vec<u32>, usize)> {
-        if let Ok(backed) = dataset.extract::<PyRef<ScxBackedSparseDataset>>() {
-            let csc = backed.as_column_source_owned().ok_or_else(|| {
-                crate::accel::csc_unavailable(
-                    backed.backed_csc.is_some(),
-                    backed.kept_to_global.is_some(),
-                )
-            })?;
-            let cols: Vec<u32> = match backed.col_projection() {
-                Some(c) => c.to_vec(),
-                None => (0..backed.shape_val.1 as u32).collect(),
-            };
-            return Ok((CscHandle::Backed(csc), cols, backed.shape_val.0));
-        }
-        if let Ok(lazy) = dataset.extract::<PyRef<ScxLazyTransformedDataset>>() {
-            let src = lazy.as_column_source().ok_or_else(|| {
-                crate::accel::csc_unavailable(
-                    lazy.backed_csc.is_some(),
-                    lazy.kept_to_global.is_some(),
-                )
-            })?;
-            // Identity positions, NOT `lazy.col_projection()`: `src` already
-            // exposes the projected axis (`n_vars()` is the projected width,
-            // and `read_csc_columns` maps a requested range *through* the
-            // projection). Passing the global ids back in would apply the
-            // projection a second time — silently reading the wrong genes, or
-            // indexing past a short slab and panicking in `walk_csc_runs`.
-            let cols: Vec<u32> = (0..scx_format_io::ShardSource::n_vars(&src) as u32).collect();
-            return Ok((CscHandle::Lazy(Box::new(src)), cols, lazy.shape_val.0));
-        }
-        Err(PyRuntimeError::new_err(
-            "prefer_format='csc' requires dataset to be ScxBackedSparseDataset \
-             or ScxLazyTransformedDataset",
-        ))
+        let (src, n_obs) = if let Ok(backed) = dataset.extract::<PyRef<ScxBackedSparseDataset>>() {
+            let src = backed
+                .as_column_source()
+                .ok_or_else(crate::accel::csc_unavailable)?;
+            (src, backed.shape_val.0)
+        } else if let Ok(lazy) = dataset.extract::<PyRef<ScxLazyTransformedDataset>>() {
+            let src = lazy
+                .as_column_source()
+                .ok_or_else(crate::accel::csc_unavailable)?;
+            (src, lazy.shape_val.0)
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' requires dataset to be ScxBackedSparseDataset \
+                 or ScxLazyTransformedDataset",
+            ));
+        };
+        let cols: Vec<u32> = (0..scx_format_io::ShardSource::n_vars(&src) as u32).collect();
+        Ok((CscHandle(src), cols, n_obs))
     }
 
-    /// Run `f` against whichever concrete column source this holds.
+    /// Run `f` against the column source.
     ///
-    /// A closure rather than `&dyn ColumnShardSource` because the CSC kernels
-    /// are generic over `S: ColumnShardSource` and the two variants are
-    /// different concrete types.
+    /// A closure rather than handing out a `&dyn ColumnShardSource` because the
+    /// CSC kernels are generic over `S: ColumnShardSource`.
     fn with<T>(
         &self,
         f: impl Fn(&dyn scx_format_io::ColumnShardSource) -> AggResult<T>,
     ) -> AggResult<T> {
-        match self {
-            CscHandle::Backed(csc) => f(csc.as_ref() as &dyn scx_format_io::ColumnShardSource),
-            CscHandle::Lazy(src) => f(src.as_ref() as &dyn scx_format_io::ColumnShardSource),
-        }
+        f(&self.0 as &dyn scx_format_io::ColumnShardSource)
     }
 }
 

@@ -190,10 +190,10 @@ fn subset_axis(
     crate::accel::preprocessing::clear_gpu_normalize_marker(adata)?;
 
     // A filter that keeps everything must change nothing. Subsetting anyway
-    // would install an identity `kept_to_global` / `col_projection`, and a
-    // `kept_to_global` — even the identity one — disables the CSC sidecar
-    // (`as_column_source` returns `None`), permanently downgrading the
-    // `gpu_csc_v3` CSC-direct DE route on a file that was never filtered.
+    // would install an identity `kept_to_global` / `col_projection`, which no
+    // longer closes the CSC capability gate but does make every CSC read pay a
+    // row-compaction pass that cannot drop anything, on a file that was never
+    // filtered.
     if keep.iter().all(|&k| k) {
         return Ok(());
     }

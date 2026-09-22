@@ -1843,12 +1843,15 @@ The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell f
 `pyscx.accel.pdex_ref` (perturbation-screen Mann–Whitney U + pseudobulk geometric-mean log fold change, pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex)) tracks similarly: 0.59 s on pbmc3k, 5.52 s on pbmc10k, 42.04 s on tabula_sapiens_100k, 119.86 s on census_500k, 268.28 s on census_1m. The CPU path uses gene-chunked dense materialisation (default `gene_chunk_size=500`) with rayon-parallel per-gene rank tests — peak RSS is `O(n_obs × gene_chunk_size)`, not `O(n_obs × n_vars)`. CPU numbers improved 20-40% vs the prior `v0.4.3-g1-gpu-de` baseline after the `pdex-unsorted-csr` fix (commit b423a2f).
 
 **CPU DE routing (Phase-2 §5.2/§5.3).** `rank_genes_groups` and `pdex_ref` now
-default to `prefer_format="auto"`: on CPU they take the CSC-direct kernel when the
-file has a valid CSC sidecar, no active row deletion vector and — on a backed
-handle — no column projection, else the CSR
-streamer (a lazy transform chain is not a disqualifier — the row-indexed
-`normalize_total` / row-scale transforms are served column-major by looking up
-their per-row factor at the global row CSC `indices` carries, bit-identically); on GPU they stay CSR so the planner can route `gpu_csc_v3`.
+default to `prefer_format="auto"`: on CPU they take the CSC-direct kernel whenever
+the file has a CSC sidecar, else the CSR streamer. Neither a lazy transform chain,
+nor a row filter, nor a column projection is a disqualifier any more — the
+row-indexed `normalize_total` / row-scale transforms are served column-major by
+looking up their per-row factor at the global row CSC `indices` carries
+(bit-identically), and a filtered or gene-subset handle has its slab's rows
+renumbered onto the live row space and its columns remapped into the projected
+one on the way out of the reader. On GPU they stay CSR so the planner can route
+`gpu_csc_v3`, which a windowed or transformed handle now also reaches.
 The route + `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`.
 This is a compatibility change (DE previously defaulted to `"csr"`); pin
 `prefer_format="csr"` for the old behaviour. An **exact sparse-nnz Wilcoxon**

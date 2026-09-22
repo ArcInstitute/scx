@@ -7,10 +7,17 @@ Verifies the capability gate on lazy datasets:
   - `NormalizeTotal` is row-*indexed*, not column-local, and `csc`
     serves it anyway by looking up `row_sums[indices[k]]` — `indices`
     *is* the global row. Bit-identical to CSR.
-  - A row deletion vector still disqualifies, and that one is a
-    correctness barrier rather than conservatism: it renumbers the live
-    rows while CSC `indices` stay global.
+  - A row filter no longer disqualifies either. CSC `indices` stay
+    global, but the read path renumbers them onto the live row space
+    before the slab leaves the reader, so what a kernel receives is
+    addressed the way it already assumed.
+  - The only remaining disqualifier is a file with no CSC sidecar.
   - `prefer_format="csr"` works on every transform chain.
+
+The row-filter tests compare **values**, not just the recorded route,
+and that is deliberate: every CSC kernel skips a row it cannot place
+(`row >= n_obs`), so a wrong renumbering drops nonzeros and mislabels
+the rest without raising. A route assertion cannot see it.
 
 Sibling to `test_csc_dispatch.py`. The point of this file is the
 *lazy* path specifically — `test_csc_dispatch.py` exercises the
@@ -174,40 +181,50 @@ def test_lazy_log1p_then_normalize_total_stays_csc_capable(small_adata, tmp_path
     assert not np.allclose(after_log1p, csc_sums)
 
 
-def test_a_row_deletion_vector_still_disqualifies_csc(small_adata, tmp_path):
-    """The one gate condition this change does *not* relax.
+def test_a_deletion_vector_no_longer_disqualifies_csc(small_adata, tmp_path):
+    """The gate condition this change relaxes, and the one that used to be
+    called a correctness barrier rather than conservatism.
 
-    CSC `indices` encode **global** row ids. A deletion vector renumbers the
-    live rows, so a row-indexed transform would read the wrong entry of its
-    per-row vector — unlike `normalize_total`, this is not a lookup away.
+    It *was* a barrier as written: CSC `indices` encode **global** row ids and
+    a deletion vector renumbers the live rows, so a slab handed over unchanged
+    would have scattered into the wrong output rows. The read path renumbers
+    it instead. Compared against the CSR route, because the failure mode is a
+    silently dropped row, not an error.
     """
     import pyscx
 
     path = tmp_path / "with_csc.scx"
     pyscx.from_anndata(small_adata, str(path), csc="always", csc_cols_per_shard=4)
-    exp = pyscx.open(str(path))
     mask = np.zeros(small_adata.n_obs, dtype=bool)
     mask[:2] = True
-    exp.mark_deleted(mask)
+    pyscx.open(str(path)).mark_deleted(mask)
+
     a = pyscx.open(str(path)).to_anndata(backed=True)
-    # Premise: the deletion vector really is active on this handle, so the
-    # refusal below is the row filter's doing and not a missing sidecar.
+    # Premise: the deletion vector really is active on this handle, so what
+    # follows is the row filter's doing.
     assert a.n_obs == small_adata.n_obs - 2
     pyscx.accel.normalize_total(a, target_sum=1e4)
-    # The message must name *this* cause. `build_csc` is the wrong repair
-    # here — the file already has a sidecar — so the error must not offer it.
-    with pytest.raises(RuntimeError, match="row deletion vector is active") as e:
-        pyscx.accel.col_sums(a.X, prefer_format="csc")
-    assert "build_csc" not in str(e.value), (
-        "a sidecar-carrying file filtered by rows must not be told to build one"
+    csc_sums = np.asarray(pyscx.accel.col_sums(a.X, prefer_format="csc"))
+
+    # Against the live matrix computed in numpy, not against the CSR route:
+    # `col_sums(prefer_format="csr")` does not accept a lazy handle at all
+    # (it refuses and tells you to materialise), so the dense window is the
+    # available oracle — and the stronger one, since it cannot be wrong the
+    # same way both routes might be.
+    dense = small_adata.X.toarray()[2:]
+    scale = 1e4 / dense.sum(axis=1, keepdims=True)
+    np.testing.assert_allclose(
+        csc_sums, (dense * scale).sum(axis=0).astype(np.float64), rtol=1e-5
     )
 
 
-def test_a_missing_sidecar_names_the_other_cause(small_adata, tmp_path):
-    """The complement: the same helper, the other branch.
+def test_a_missing_sidecar_is_now_the_only_cause(small_adata, tmp_path):
+    """The complement, and after this change the whole of it.
 
-    Without this, `csc_unavailable` could return the deletion-vector string
-    unconditionally and the test above would still pass.
+    `csc_unavailable` used to take two booleans and pick between two causes.
+    A row filter is no longer one of them, so the helper names the one that is
+    left — and must still name it, rather than having been collapsed into
+    something vaguer.
     """
     import pyscx
 
@@ -217,6 +234,7 @@ def test_a_missing_sidecar_names_the_other_cause(small_adata, tmp_path):
     pyscx.accel.normalize_total(a, target_sum=1e4)
     with pytest.raises(RuntimeError, match="no CSC sidecar") as e:
         pyscx.accel.col_sums(a.X, prefer_format="csc")
+    assert "build_csc" in str(e.value), "the message must name the repair"
     assert "deletion vector" not in str(e.value)
 
 
@@ -627,4 +645,449 @@ def test_gene_indices_on_a_projected_backed_handle_compose_through_the_projectio
     np.testing.assert_allclose(
         sub["baseMean"].to_numpy(), ref["baseMean"].to_numpy(), rtol=1e-4,
         err_msg="gene_indices were not composed through the column projection",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Row filters: the shape every real pipeline has.
+#
+# `filter_cells` drops rows, which renumbers the live row axis while the CSC
+# sidecar keeps addressing the file's. Serving that needs the slab's rows
+# translated, and the translation is invisible if it is wrong: every CSC
+# kernel skips a row it cannot place (`row >= n_obs`) and reads
+# `groups[row]` / `cell_to_group[row]` for the ones it can, so a bad map
+# silently drops nonzeros and mislabels the rest. Hence every test here
+# compares values against the CSR route rather than asserting a route.
+# ---------------------------------------------------------------------------
+
+
+def _counts_adata(n_obs=120, n_vars=24, seed=5):
+    import anndata as ad
+
+    rng = np.random.default_rng(seed)
+    mat = sp.random(n_obs, n_vars, density=0.5, format="csr", dtype=np.float32, random_state=rng)
+    mat.data = (mat.data * 100).astype(np.float32).round() + 1.0
+    adata = ad.AnnData(X=mat)
+    adata.obs["cell_id"] = [f"c{i}" for i in range(n_obs)]
+    adata.obs["grp"] = pd.Categorical(
+        ["A"] * (n_obs // 3) + ["B"] * (n_obs // 3) + ["C"] * (n_obs - 2 * (n_obs // 3))
+    )
+    adata.var["gene_id"] = [f"g{i}" for i in range(n_vars)]
+    return adata
+
+
+def _min_genes_that_drops(adata):
+    """A `filter_cells` threshold that provably drops at least one cell.
+
+    Hard-coding one is the trap this avoids: at `min_genes=200` pbmc3k drops
+    *nothing*, so a probe written there reports `cpu_csc` while never having
+    reached the gate at all. The median genes-per-cell always drops some.
+    """
+    per_cell = np.diff(adata.X.indptr)
+    thresh = int(np.median(per_cell))
+    assert (per_cell < thresh).sum() > 0, "fixture cannot exercise a row filter"
+    return thresh
+
+
+def _dense_view(a):
+    x = a.X[:]
+    return x.toarray() if sp.issparse(x) else np.asarray(x)
+
+
+def _filtered_handle(path, adata, *, rows=True, cols=False, transforms=True, obs_grp=True):
+    """Open `path` and apply the requested window and chain."""
+    import pyscx
+
+    a = pyscx.open(str(path)).to_anndata(backed=True)
+    if obs_grp:
+        a.obs["grp"] = pd.Categorical(adata.obs["grp"].to_numpy())
+    if rows:
+        pyscx.accel.filter_cells(a, min_genes=_min_genes_that_drops(adata))
+        assert a.n_obs < adata.n_obs, "premise: the row filter dropped cells"
+    if cols:
+        # Sized from the *live* window's own per-gene counts. A threshold
+        # taken from the unfiltered matrix is too high for a row-filtered
+        # handle and drops every gene; a fixed fraction of `n_obs` drops
+        # none. Both pass a bare `n_vars < adata.n_vars` premise — the first
+        # at `n_vars == 0` — so assert both bounds.
+        window = _dense_view(a)
+        pyscx.accel.filter_genes(a, min_cells=int(np.median((window > 0).sum(axis=0))))
+        assert 0 < a.n_vars < adata.n_vars, (
+            f"premise: the gene filter must drop some genes and keep some; "
+            f"kept {a.n_vars} of {adata.n_vars}"
+        )
+    if transforms:
+        pyscx.accel.normalize_total(a, target_sum=1e4)
+        pyscx.accel.log1p(a)
+    return a
+
+
+@pytest.mark.parametrize("cols", [False, True], ids=["rows", "rows+cols"])
+@pytest.mark.parametrize("transforms", [False, True], ids=["raw", "norm_log1p"])
+def test_a_row_filtered_handle_serves_csc_column_reductions(tmp_path, cols, transforms):
+    """The four combinations of window and chain, on `col_sums` and `col_var`.
+
+    The `raw` arms are the ones the unification adds: with no transform chain
+    the handle is still an `ScxBackedSparseDataset`, whose column source used
+    to be the full-axis sidecar reader and so had to refuse a window outright.
+
+    The oracle is the materialised window, not the CSR route:
+    `col_sums(prefer_format="csr")` refuses a lazy handle outright, so on the
+    `norm_log1p` arms there is no CSR route to compare against — and numpy
+    over `a.X[:]` cannot be wrong in the same way a shared kernel bug would
+    make both routes wrong.
+    """
+    import pyscx
+
+    adata = _counts_adata()
+    path = tmp_path / "counts_csc.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=6)
+
+    a = _filtered_handle(path, adata, cols=cols, transforms=transforms)
+    csc_sums = np.asarray(pyscx.accel.col_sums(a.X, prefer_format="csc"))
+    csc_var = np.asarray(pyscx.accel.col_var(a.X, prefer_format="csc"))
+    dense = _dense_view(a)
+
+    assert csc_sums.shape == (a.n_vars,)
+    np.testing.assert_allclose(csc_sums, dense.sum(axis=0).astype(np.float64), rtol=1e-5)
+    np.testing.assert_allclose(csc_var, dense.var(axis=0).astype(np.float64), rtol=1e-4)
+
+    if not transforms:
+        # A backed handle also has a CSR route, so pin the two against each
+        # other where both are available.
+        b = _filtered_handle(path, adata, cols=cols, transforms=False)
+        np.testing.assert_allclose(
+            csc_sums, np.asarray(pyscx.accel.col_sums(b.X, prefer_format="csr")), rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            csc_var, np.asarray(pyscx.accel.col_var(b.X, prefer_format="csr")), rtol=1e-6
+        )
+
+
+def test_the_full_pipeline_shape_routes_csc_and_matches_csr(tmp_path):
+    """`filter_cells` + `filter_genes` + `normalize_total` + `log1p` → DE.
+
+    All four conditions at once, which is what `pipeline_ooc_constrained` and
+    any ordinary scanpy-shaped workflow presents. Before this change the row
+    filter alone forced `cpu_csr`; `auto` is DE's default, so this is what a
+    caller who passes no `prefer_format` now gets.
+    """
+    import pyscx
+
+    adata = _counts_adata()
+    path = tmp_path / "pipeline_csc.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=6)
+
+    def de(prefer):
+        a = _filtered_handle(path, adata, cols=True)
+        pyscx.accel.rank_genes_groups(
+            a, groupby="grp", method="wilcoxon", device="cpu", prefer_format=prefer
+        )
+        route = (a.uns.get("scx_accel") or {}).get("rank_genes_groups", {}).get("route")
+        return route, a.uns["rank_genes_groups"]
+
+    route_csr, res_csr = de("csr")
+    route_csc, res_csc = de("csc")
+    route_auto, res_auto = de("auto")
+
+    assert route_csr == "cpu_csr"
+    assert route_csc == "cpu_csc"
+    assert route_auto == "cpu_csc"
+
+    for field in ("scores", "pvals", "logfoldchanges"):
+        a = np.array([list(r) for r in res_csr[field]])
+        b = np.array([list(r) for r in res_csc[field]])
+        assert a.shape == b.shape
+        np.testing.assert_array_equal(a, b, err_msg=f"{field} differs between routes")
+    assert np.array_equal(
+        np.array([list(r) for r in res_csr["names"]]),
+        np.array([list(r) for r in res_auto["names"]]),
+    )
+
+
+def test_a_row_filter_that_empties_whole_csr_shards_still_reads(tmp_path):
+    """A window confined to one shard.
+
+    On the CSR side `visible_shard_indices` skips the emptied shards. The CSC
+    side has no equivalent — every column shard spans the whole row axis — so
+    this is a test that the compaction handles a slab where most rows are gone
+    rather than a test of shard skipping.
+    """
+    import pyscx
+
+    adata = _counts_adata(n_obs=120)
+    path = tmp_path / "shards_csc.scx"
+    pyscx.from_anndata(adata, str(path), shard_size=20, csc="always", csc_cols_per_shard=6)
+    assert pyscx.open(str(path)).shard_count > 1, "premise: more than one CSR shard"
+
+    a = pyscx.open(str(path)).to_anndata(backed=True)
+    # Keep only rows 0..15 — the first shard, partially.
+    a = a[np.arange(16)]
+    assert a.n_obs == 16
+    pyscx.accel.normalize_total(a, target_sum=1e4)
+    csc_sums = np.asarray(pyscx.accel.col_sums(a.X, prefer_format="csc"))
+
+    dense = adata.X.toarray()[:16]
+    scale = 1e4 / dense.sum(axis=1, keepdims=True)
+    np.testing.assert_allclose(
+        csc_sums, (dense * scale).sum(axis=0).astype(np.float64), rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("cols", [False, True], ids=["rows", "rows+cols"])
+def test_a_filtered_qc_gene_axis_matches_the_csr_route(tmp_path, cols):
+    """`calculate_qc_metrics`' gene axis, which reads `col_sums_and_nnz`.
+
+    Its per-gene `n_cells_by_counts` is an nnz count off `indptr` deltas, so a
+    slab still carrying dropped rows' nonzeros inflates it — a wrong answer
+    that no bounds check can catch.
+
+    The `rows+cols` arm is also the one case where this op's *column* space
+    changed: its backed arm used to pass `col_projection()`'s global ids to a
+    full-axis reader, and now passes identity positions to a projected view.
+    Passing the global ids to the view would apply the projection twice.
+    """
+    import pyscx
+
+    adata = _counts_adata()
+    path = tmp_path / "qc_csc.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=6)
+
+    def qc(prefer):
+        a = _filtered_handle(path, adata, cols=cols, transforms=False)
+        pyscx.accel.calculate_qc_metrics(a, inplace=True, prefer_format=prefer)
+        return (
+            np.asarray(a.var["total_counts"], dtype=np.float64),
+            np.asarray(a.var["n_cells_by_counts"], dtype=np.float64),
+            _dense_view(a),
+        )
+
+    csc_total, csc_cells, dense = qc("csc")
+    csr_total, csr_cells, _ = qc("csr")
+    np.testing.assert_allclose(csc_total, csr_total, rtol=1e-6)
+    np.testing.assert_array_equal(csc_cells, csr_cells)
+    np.testing.assert_allclose(csc_total, dense.sum(axis=0), rtol=1e-5)
+    np.testing.assert_array_equal(csc_cells, (dense > 0).sum(axis=0))
+
+
+def test_a_filtered_hvg_csc_route_matches_csr(tmp_path):
+    """HVG's CSC mean/var kernel divides by `source.n_obs()`.
+
+    So it is wrong in two directions at once on an uncompacted slab: the sums
+    include dropped rows while the divisor counts only live ones.
+    """
+    import pyscx
+
+    pytest.importorskip("skmisc")
+    adata = _counts_adata(n_obs=200, n_vars=60, seed=9)
+    path = tmp_path / "hvg_csc.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=10)
+
+    def hvg(prefer):
+        a = _filtered_handle(path, adata, transforms=False)
+        pyscx.accel.highly_variable_genes(
+            a, n_top_genes=20, flavor="seurat_v3", span=1.0, prefer_format=prefer, device="cpu"
+        )
+        return (
+            np.asarray(a.var["highly_variable"].values),
+            np.asarray(a.var["variances"], dtype=np.float64),
+        )
+
+    csc_flags, csc_var = hvg("csc")
+    csr_flags, csr_var = hvg("csr")
+    np.testing.assert_array_equal(csc_flags, csr_flags)
+    np.testing.assert_allclose(csc_var, csr_var, rtol=1e-6)
+
+
+def test_a_filtered_pseudobulk_dex_matches_csr(tmp_path):
+    """The CSC pseudobulk aggregation reads `cell_to_group[row]`, a
+    **visible**-length vector.
+
+    An uncompacted slab indexes it with a global row, so a cell's counts land
+    in another cell's group — and under a non-prefix filter that is a
+    different group, not a missing one. `pseudobulk_dex` is the only entry
+    point onto that kernel, so the comparison runs through the whole op; the
+    aggregation is what differs between the routes, the GLM is not.
+    """
+    import pyscx
+
+    adata = _counts_adata(n_obs=150, n_vars=30, seed=3)
+    # A replicate column, so the default NB-GLM backend has something to fit.
+    adata.obs["donor"] = pd.Categorical([f"d{i % 2}" for i in range(adata.n_obs)])
+    path = tmp_path / "pb_csc.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=8)
+
+    def pb(prefer):
+        a = _filtered_handle(path, adata, cols=True, transforms=False)
+        a.obs["donor"] = pd.Categorical(adata.obs["donor"].to_numpy()[: a.n_obs])
+        return pyscx.accel.pseudobulk_dex(
+            a,
+            groupby=["grp", "donor"],
+            test_col="grp",
+            reference="A",
+            min_cells_per_group=1,
+            prefer_format=prefer,
+        )
+
+    csc = pb("csc")
+    csr = pb("csr")
+    assert len(csc) > 0, "premise: the op produced results to compare"
+    assert list(csc.columns) == list(csr.columns)
+    csc = csc.sort_values(list(csc.columns[:2])).reset_index(drop=True)
+    csr = csr.sort_values(list(csr.columns[:2])).reset_index(drop=True)
+    for col in csr.columns:
+        if np.issubdtype(np.asarray(csr[col]).dtype, np.number):
+            np.testing.assert_allclose(
+                np.asarray(csc[col], dtype=np.float64),
+                np.asarray(csr[col], dtype=np.float64),
+                rtol=1e-5,
+                err_msg=f"{col} differs between routes",
+            )
+        else:
+            assert list(csc[col]) == list(csr[col]), col
+
+
+def test_a_filtered_pdex_ref_matches_csr(tmp_path):
+    """The second DE entry point, which shares the dense scatter but not the
+    statistic."""
+    import pyscx
+
+    adata = _counts_adata()
+    path = tmp_path / "pdex_csc.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=6)
+
+    def run(prefer):
+        a = _filtered_handle(path, adata)
+        res = pyscx.accel.pdex_ref(
+            a, "grp", reference="A", device="cpu", prefer_format=prefer
+        )
+        route = (a.uns.get("scx_accel") or {}).get("pdex_ref", {}).get("route")
+        return route, res
+
+    route_csc, res_csc = run("csc")
+    route_csr, res_csr = run("csr")
+    assert route_csc == "cpu_csc"
+    assert route_csr == "cpu_csr"
+    for col in res_csr.columns:
+        if np.issubdtype(np.asarray(res_csr[col]).dtype, np.number):
+            np.testing.assert_allclose(
+                np.asarray(res_csc[col], dtype=np.float64),
+                np.asarray(res_csr[col], dtype=np.float64),
+                rtol=1e-6,
+                err_msg=f"{col} differs between routes",
+            )
+        else:
+            assert list(res_csc[col]) == list(res_csr[col]), col
+
+
+# ---------------------------------------------------------------------------
+# The exact-nnz Wilcoxon kernel under a row filter.
+#
+# `SCX_ACCEL_WILCOXON_NNZ=1` swaps in a structurally different kernel that does
+# not densify: it sorts each gene's stored values and derives the zero
+# tie-block arithmetically, as `n_obs - (n_neg + n_pos)` pooled and
+# `group_cell_counts[g] - nonzero_in_g[g]` per bucket. Both sides of those
+# subtractions have to be live counts. If a slab still carried dropped rows'
+# nonzeros the pooled count could exceed `n_obs`, which the kernel reports as
+# a non-canonical sidecar — or, worse, not exceed it and quietly widen the
+# rank block.
+# ---------------------------------------------------------------------------
+
+_FILTERED_NNZ_PROBE = r"""
+import sys, numpy as np, pandas as pd, scipy.sparse as sp, anndata as ad, pyscx
+
+rng = np.random.default_rng(7)
+mat = sp.random(120, 24, density=0.5, format="csr", dtype=np.float32, random_state=rng)
+mat.data = (mat.data * 100).astype(np.float32).round() + 1.0
+adata = ad.AnnData(X=mat)
+adata.obs["cell_id"] = [f"c{i}" for i in range(120)]
+adata.obs["grp"] = pd.Categorical(["A"] * 60 + ["B"] * 60)
+adata.var["gene_id"] = [f"g{i}" for i in range(24)]
+
+path = sys.argv[1]
+pyscx.from_anndata(adata, path, csc="always", csc_cols_per_shard=6)
+thresh = int(np.median(np.diff(adata.X.indptr)))
+
+
+def run(prefer):
+    a = pyscx.open(path).to_anndata(backed=True)
+    a.obs["grp"] = pd.Categorical(adata.obs["grp"].to_numpy())
+    pyscx.accel.filter_cells(a, min_genes=thresh)
+    assert a.n_obs < 120, "premise: the row filter dropped cells"
+    pyscx.accel.rank_genes_groups(
+        a, "grp", device="cpu", prefer_format=prefer, reference="rest"
+    )
+    route = a.uns["scx_accel"]["rank_genes_groups"]["route"]
+    scores = np.array([list(r) for r in a.uns["rank_genes_groups"]["scores"]])
+    names = np.array([list(r) for r in a.uns["rank_genes_groups"]["names"]])
+    return route, scores, names
+
+
+route_csc, scores_csc, names_csc = run("csc")
+route_csr, scores_csr, names_csr = run("csr")
+print(route_csc)
+print(route_csr)
+print(int(np.array_equal(scores_csc, scores_csr)))
+print(int(np.array_equal(names_csc, names_csr)))
+"""
+
+
+def test_the_exact_nnz_wilcoxon_kernel_serves_a_filtered_handle(tmp_path):
+    """Subprocess, not tidiness: the gate is read through a `OnceLock`, so
+    setting it inside an interpreter that has already taken the CSC path once
+    has no effect."""
+    pytest.importorskip("anndata")
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["SCX_ACCEL_WILCOXON_NNZ"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-c", _FILTERED_NNZ_PROBE, str(tmp_path / "nnz.scx")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [ln for ln in out.stdout.strip().splitlines() if ln.strip()]
+    assert len(lines) == 4, out.stdout + out.stderr
+    assert lines[0] == "cpu_csc_nnz", f"the gate must select the nnz kernel: {lines[0]}"
+    assert lines[1] == "cpu_csr"
+    assert lines[2] == "1", f"scores differ between the nnz CSC kernel and CSR\n{out.stderr}"
+    assert lines[3] == "1", f"gene order differs between the nnz CSC kernel and CSR\n{out.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Presentation order on the CSC path: unchanged, and pinned so it stays that
+# way rather than being assumed.
+# ---------------------------------------------------------------------------
+
+
+def test_the_csc_column_reductions_answer_in_sorted_projection_order(tmp_path):
+    """`col_sums` on the CSC path reports sorted-projection order, not the
+    caller's requested order — before this change and after it.
+
+    Not an endorsement: `col_aggs` is one of the two CSC consumers that does
+    not call `reject_presentation_ordered_source`, so a `preserve_var_order`
+    handle has always been answered in sorted order here while the CSR path
+    reorders. The unification does not touch that — the backed path passed the
+    (sorted) `col_projection()` before and the view emits sorted-projection
+    order now — and this test says so, so a future change to either has to
+    decide deliberately.
+    """
+    import pyscx
+
+    adata = _counts_adata(n_obs=60, n_vars=12, seed=2)
+    path = tmp_path / "order_csc.scx"
+    pyscx.from_anndata(adata, str(path), csc="always", csc_cols_per_shard=4)
+
+    a = pyscx.open(str(path)).to_anndata(backed=True)
+    requested = [5, 1, 9]
+    a = a[:, requested]
+    csc_sums = np.asarray(pyscx.accel.col_sums(a.X, prefer_format="csc"))
+
+    dense = adata.X.toarray()
+    np.testing.assert_allclose(
+        csc_sums, dense[:, sorted(requested)].sum(axis=0).astype(np.float64), rtol=1e-6
     )

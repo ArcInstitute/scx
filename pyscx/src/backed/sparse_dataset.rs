@@ -34,7 +34,9 @@ pub struct ScxBackedSparseDataset {
     pub(crate) backed: Arc<BackedCsrReader>,
     /// Optional CSC sidecar reader. Populated when the file has CSC
     /// shards AND the open path requested CSC capability. `None` ⇒
-    /// `as_column_source()` always returns `None`.
+    /// `as_column_source()` always returns `None`, and it is the only
+    /// remaining reason for that — a row filter or a column projection is
+    /// served by the view `as_shard_source()` builds, not refused.
     pub(crate) backed_csc: Option<Arc<BackedCscReader>>,
     pub(crate) shape_val: (usize, usize),
     pub(crate) n_shards: usize,
@@ -166,59 +168,39 @@ impl ScxBackedSparseDataset {
     }
 
     /// Attach an optional CSC sidecar reader. After this call,
-    /// `as_column_source()` may return `Some` if the gate conditions
-    /// are also satisfied. Returns `&mut Self` for builder-style use.
+    /// `as_column_source()` returns `Some`. Returns `&mut Self` for
+    /// builder-style use.
     pub fn with_csc_reader(&mut self, backed_csc: Option<Arc<BackedCscReader>>) -> &mut Self {
         self.backed_csc = backed_csc;
         self
     }
 
-    /// Capability gate: returns `Some(&dyn ColumnShardSource)` iff this
-    /// dataset can serve CSC reads. **Single capability-detection point
-    /// in the codebase** for `prefer_format="csc"` dispatch.
+    /// Capability gate: this handle's **view** as a CSC source, or `None` when
+    /// the file brought no sidecar. **Single capability-detection point in the
+    /// codebase** for `prefer_format="csc"` dispatch, now shared verbatim with
+    /// [`crate::lazy_transform::ScxLazyTransformedDataset::as_column_source`]
+    /// — the two gates used to be separate and to disagree.
     ///
-    /// Returns `Some` iff:
-    /// - `backed_csc` is set (file has a CSC sidecar AND the open path
-    ///   requested CSC capability), AND
-    /// - `kept_to_global` is `None` (no row deletion vector active —
-    ///   CSC indices encode global rows; deletions would require a
-    ///   per-shard index remap that the CSC reader doesn't perform).
+    /// It returns an owned [`LazyShardSource`] rather than a borrowed
+    /// `&dyn ColumnShardSource` for two reasons that turned out to be the same
+    /// reason. The borrowed form could only ever be the **full-axis**
+    /// `BackedCscReader`, which is why this gate had to refuse a row filter and
+    /// why a column projection had to be excluded by hand one level up: the
+    /// sidecar is written against the file's axes, not this handle's. Going
+    /// through `as_shard_source()` instead hands back a source that renumbers
+    /// rows onto the live space and remaps columns into the projected one, so
+    /// a filtered or projected handle is served rather than refused. Being
+    /// owned, it also crosses a `py.detach(...)` boundary, which is what
+    /// `as_column_source_owned` used to exist for.
     ///
-    /// Note: column projection is intentionally NOT a hard
-    /// disqualifier here. `BackedCscReader::read_csc_columns_subset`
-    /// supports gather-style column projection, so consumers that
-    /// honor `col_projection()` can still use the CSC path.
-    /// However, this base wrapper does not transparently apply
-    /// `col_projection` to CSC reads — that is the consumer's
-    /// responsibility (or, more typically, lives on
-    /// `ScxLazyTransformedDataset` which does apply it). Direct
-    /// callers of `as_column_source` on a projected
-    /// `ScxBackedSparseDataset` get the full-axis view; reach for
-    /// `col_projection()` if you need projected reads.
-    pub fn as_column_source(&self) -> Option<&dyn scx_format_io::ColumnShardSource> {
-        if self.kept_to_global.is_some() {
-            return None;
-        }
-        let backed_csc = self.backed_csc.as_ref()?;
-        Some(backed_csc.as_ref() as &dyn scx_format_io::ColumnShardSource)
-    }
-
-    /// [`Self::as_column_source`] as an **owned** handle, under the identical
-    /// gate.
-    ///
-    /// The borrowed form is tied to the `PyRef` it came from, so it cannot
-    /// cross a `py.detach(...)` boundary. Callers that release the GIL for the
-    /// streaming scan — `pyscx.accel.col_*` with `prefer_format="csc"` — take
-    /// this instead and get an `Arc` they can move into the detached closure.
-    ///
-    /// Keep the two gates in step: an `Arc` handed out here bypasses nothing,
-    /// but if the deletion-vector condition above ever grows a clause, this
-    /// must grow it too.
-    pub(crate) fn as_column_source_owned(&self) -> Option<Arc<BackedCscReader>> {
-        if self.kept_to_global.is_some() {
-            return None;
-        }
-        self.backed_csc.as_ref().map(Arc::clone)
+    /// **A consumer must therefore address the projected axis.** `n_vars()` is
+    /// the visible width and `read_csc_columns` maps a requested range
+    /// *through* the projection, so passing global column ids back in applies
+    /// the projection twice — silently reading the wrong genes, or indexing
+    /// past a short slab. Identity positions are what the source wants.
+    pub(crate) fn as_column_source(&self) -> Option<crate::lazy_transform::LazyShardSource> {
+        let source = self.as_shard_source();
+        source.supports_csc().then_some(source)
     }
 
     /// Set column projection on this dataset.
@@ -338,8 +320,9 @@ impl ScxBackedSparseDataset {
     /// presentation-ordered handle via
     /// [`crate::accel::reject_preserve_var_order`].
     pub(crate) fn as_shard_source(&self) -> crate::lazy_transform::LazyShardSource {
-        crate::lazy_transform::LazyShardSource::new(
+        crate::lazy_transform::LazyShardSource::new_with_csc(
             Arc::clone(&self.backed),
+            self.backed_csc.clone(),
             Vec::new(),
             self.kept_to_global.clone(),
             self.col_projection.clone(),
@@ -358,12 +341,18 @@ impl ScxBackedSparseDataset {
     /// `ShardSource` cannot express — GPU DE's CSC-direct route, which takes
     /// `GpuDeShardInput::Backed { csr, csc }`.
     ///
-    /// On that route the switch is **load-bearing**: the `csc` handed to
-    /// `Backed` is read straight off `backed_csc`, so it never passes through
-    /// `as_column_source()`'s deletion gate, and `csc_route_available` is not
-    /// consulted on GPU at all. Without this predicate a subset handle with a
-    /// sidecar runs the CSC-direct kernel against *on-disk* columns, and the
-    /// widths agree, so nothing catches it.
+    /// On that route it decides **which** CSC source to hand over, not
+    /// whether to hand one over. A subset handle's `backed_csc` is the
+    /// *on-disk* matrix: full row axis, full column axis. Reading it under a
+    /// subset handle's visible-width `gene_names` used to be a silent wrong
+    /// answer, because `Backed::shape()` takes `n_vars` from `gene_names.len()`
+    /// and the widths agree — so the dispatch downgraded such a handle to the
+    /// CSR-shaped `Lazy` input and gave up the route. It no longer has to:
+    /// `as_shard_source()` builds a CSC source that renumbers rows onto the
+    /// live space and remaps columns into the projected one, and the GPU input
+    /// takes it as a trait object. What survives here is the choice between
+    /// the concrete readers (unsubset — they carry `csc_shard_size_hint` and a
+    /// binary-search shard lookup) and the view (subset).
     ///
     /// Only the GPU DE dispatch needs this today — the CPU kernels are all
     /// generic over `ShardSource` and take the view unconditionally.
@@ -408,11 +397,11 @@ impl ScxBackedSparseDataset {
                 rows,
                 self.shape_val.0,
             )?;
-            // An identity map is not a subset. Installing one anyway would set
-            // `kept_to_global`, and *any* `kept_to_global` closes the CSC
-            // capability gate (`as_column_source` returns `None`) — permanently
-            // downgrading the `gpu_csc_v3` CSC-direct DE route on a file that
-            // was never really subset. The mutating ops guard this with an
+            // An identity map is not a subset. Installing one anyway would
+            // set `kept_to_global`, which no longer closes the CSC capability
+            // gate but does make every CSC read pay a compaction pass that
+            // cannot drop anything, and makes the GPU dispatch prefer the view
+            // over the concrete readers. The mutating ops guard this with an
             // all-kept early return; this covers a caller that reaches
             // `_subset` directly, e.g. `adata[np.arange(n_obs)]`.
             if !crate::axis_align::is_identity_rows(

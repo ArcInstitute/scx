@@ -45,8 +45,8 @@ impl PreferFormat {
 /// - `prefer == Csc` and `source.is_none()` → returns
 ///   [`AccelError::CscRequestedNotAvailable`] with `reason` describing
 ///   the missing capability (caller's responsibility to populate this
-///   string with the most specific cause they know — typical messages
-///   name the missing CSC sidecar or an active row deletion vector).
+///   string with the most specific cause they know — from pyscx that is
+///   a file with no CSC sidecar, which is the only cause left).
 /// - `prefer == Csr` → returns [`AccelError::CscNotRequested`]
 ///   (sentinel; the caller's match arm should immediately fall through
 ///   to the existing CSR path).

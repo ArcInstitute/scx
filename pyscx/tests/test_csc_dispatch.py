@@ -348,12 +348,19 @@ def test_rank_genes_groups_auto_routes_csc_when_sidecar_present(small_adata, tmp
     )
 
 
-def test_rank_genes_groups_auto_gene_subset_backed_does_not_error(small_adata, tmp_path):
-    """Regression: a *projected* (gene-subset) backed dataset that still carries a
-    CSC sidecar must NOT route to CSC-direct under the `auto` default — the CSC
-    kernel's full-axis `n_vars` guard would raise, whereas the CSR streamer reads
-    the projected columns fine. `auto` must fall back to CSR (route cpu_csr) and
-    match an explicit-CSR run (review: the flip must not regress a working call)."""
+def test_rank_genes_groups_auto_gene_subset_backed_routes_csc(small_adata, tmp_path):
+    """A *projected* (gene-subset) backed dataset with a sidecar now routes
+    CSC-direct under the `auto` default, and agrees with an explicit-CSR run.
+
+    This test used to assert the opposite, and was right to: the backed
+    handle's column source was the **full-axis** `BackedCscReader`, which
+    cannot serve a projected gene axis — the CSC kernel's `n_vars` guard would
+    have raised where the CSR streamer read the projected columns fine, so
+    `auto` had to exclude a projected backed handle by hand. The handle now
+    hands back a view that remaps columns into the projected axis, so there is
+    nothing left to exclude. The result equality is the half of the original
+    assertion that still carries the weight.
+    """
     import pyscx
 
     a_auto = _open_with_csc(tmp_path / "sub.scx", small_adata)
@@ -365,11 +372,14 @@ def test_rank_genes_groups_auto_gene_subset_backed_does_not_error(small_adata, t
     pyscx.accel.rank_genes_groups(sub_auto, "group", device="cpu")  # auto default
     pyscx.accel.rank_genes_groups(sub_csr, "group", prefer_format="csr", device="cpu")
 
-    assert sub_auto.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csr"
-    assert (
-        np.asarray(sub_auto.uns["rank_genes_groups"]["names"]).tolist()[0]
-        == np.asarray(sub_csr.uns["rank_genes_groups"]["names"]).tolist()[0]
-    )
+    assert sub_auto.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc"
+    assert sub_csr.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csr"
+    for field in ("names", "scores", "pvals"):
+        np.testing.assert_array_equal(
+            np.asarray(sub_auto.uns["rank_genes_groups"][field]).tolist(),
+            np.asarray(sub_csr.uns["rank_genes_groups"][field]).tolist(),
+            err_msg=f"{field} differs between the CSC and CSR routes",
+        )
 
 
 def test_pdex_ref_csc_with_device_auto_falls_back_to_cpu(small_adata, tmp_path):

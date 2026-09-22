@@ -129,3 +129,53 @@ def test_csr_only_backed_gpu_stays_csr(tmp_path):
         a, n_top_genes=30, flavor="seurat_v3", device="gpu"
     )
     assert _route(a) == "gpu_csr"
+
+
+def test_gpu_csc_on_a_row_filtered_handle(tmp_path):
+    """A windowed backed handle reaches the CSC reduce, over its own window.
+
+    `backed_x_has_csc_sidecar` mirrors the `as_column_source` capability gate,
+    and that gate used to refuse a row filter — so this auto-route was
+    unreachable for a filtered handle and the run fell to the CSR atomic
+    kernel. It is reachable now, which makes this the test that says the row
+    renumbering reached the GPU staging path as well as the CPU one: the CSC
+    mean/var kernel divides by `source.n_obs()`, so an uncompacted slab would
+    be wrong in two directions at once — sums over the file's rows, divided by
+    the window's count.
+
+    Compared against the CSR GPU route on the same window, which is the only
+    oracle that cannot share a bug with the path under test.
+    """
+    src = _raw_counts_adata()
+    keep = np.zeros(src.n_obs, dtype=bool)
+    keep[::3] = True  # interleaved, so every survivor shifts by a different amount
+
+    a_csc = _open_backed(tmp_path / "csc_filtered.scx", src, "always")
+    pyscx.accel.subset_obs(a_csc, keep)
+    assert a_csc.n_obs == int(keep.sum()) < src.n_obs
+    pyscx.accel.highly_variable_genes(
+        a_csc, n_top_genes=30, flavor="seurat_v3", device="gpu", prefer_format="csc"
+    )
+    assert _route(a_csc) == "gpu_csc_v3"
+
+    a_csr = _open_backed(tmp_path / "csr_filtered.scx", src, "off")
+    pyscx.accel.subset_obs(a_csr, keep)
+    pyscx.accel.highly_variable_genes(
+        a_csr, n_top_genes=30, flavor="seurat_v3", device="gpu"
+    )
+    assert _route(a_csr) == "gpu_csr"
+
+    np.testing.assert_allclose(
+        a_csc.var["means"].to_numpy(), a_csr.var["means"].to_numpy(), rtol=1e-5, atol=1e-8
+    )
+    np.testing.assert_allclose(
+        a_csc.var["variances"].to_numpy(), a_csr.var["variances"].to_numpy(),
+        rtol=1e-5, atol=1e-6,
+    )
+    assert _hvg_set(a_csc) == _hvg_set(a_csr)
+    # And against numpy over the window, so both GPU routes being wrong the
+    # same way would still fail.
+    dense = np.asarray(src.X.todense(), dtype=np.float64)[keep]
+    np.testing.assert_allclose(
+        a_csc.var["means"].to_numpy(), dense.mean(axis=0), rtol=1e-5, atol=1e-8
+    )

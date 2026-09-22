@@ -2,7 +2,7 @@
 //
 // Extracted from the former pyscx/src/lazy_transform.rs (T5.7).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use scx_format_io::{BackedCscReader, BackedCsrReader};
 use scx_sparse::{ScxCsc, ScxCsr};
@@ -27,6 +27,8 @@ pub(crate) struct LazyShardSource {
     transforms: Vec<Transform>,
     kept_to_global: Option<Arc<Vec<u64>>>,
     col_projection: Option<Arc<Vec<u32>>>,
+    /// Inverse of `kept_to_global`, memoised. See [`Self::global_to_live`].
+    global_to_live: OnceLock<Vec<i32>>,
     shape_val: (usize, usize),
     /// Serve shard decodes from the reader's decoded-shard LRU instead of
     /// decoding fresh every time. See [`Self::with_cached_reads`].
@@ -53,6 +55,7 @@ impl LazyShardSource {
             transforms,
             kept_to_global,
             col_projection,
+            global_to_live: OnceLock::new(),
             shape_val: (n_obs, n_vars),
             cached_reads: false,
         }
@@ -119,29 +122,63 @@ impl LazyShardSource {
             transforms,
             kept_to_global,
             col_projection,
+            global_to_live: OnceLock::new(),
             shape_val: (n_obs, n_vars),
             cached_reads: false,
         }
     }
 
-    /// Returns `true` if this lazy source can serve CSC reads: CSC sidecar
-    /// present and no row deletion vector active.
+    /// Returns `true` if this lazy source can serve CSC reads: a CSC sidecar
+    /// is present.
     ///
-    /// The transform chain is deliberately **not** a condition. Every
-    /// `Transform` is applied column-major by `apply_transforms_to_csc`,
-    /// including the row-indexed `NormalizeTotal` / `RowScale`, which read
-    /// their per-row vector at the global row `ScxCsc::indices` already
-    /// carries. A predicate here would have no false case to return.
+    /// Neither the transform chain nor a row filter is a condition, and both
+    /// used to be. Every `Transform` is applied column-major by
+    /// `apply_transforms_to_csc`, including the row-indexed `NormalizeTotal` /
+    /// `RowScale`, which read their per-row vector at the global row
+    /// `ScxCsc::indices` already carries. A row filter is handled by
+    /// [`scx_engine::projection::compact_csc_rows_in_place`], which renumbers
+    /// a slab's rows onto the live row space before it leaves this reader — so
+    /// what a consumer
+    /// receives is addressed the way it already assumes: rows are live indices
+    /// and `n_obs()` is their count.
     ///
-    /// The deletion-vector clause is the one that is a correctness barrier
-    /// rather than conservatism: CSC `indices` are *global* row ids, and a row
-    /// filter renumbers the live rows.
+    /// What is left is not a predicate over this source's *state* at all, only
+    /// over whether the file brought a sidecar, which is why there is nothing
+    /// else to test here.
     ///
-    /// Predicate used by `ScxLazyTransformedDataset::as_column_source()`
-    /// (the analog to `ScxBackedSparseDataset::as_column_source` for
-    /// the lazy-transformed wrapper).
+    /// Predicate used by both `as_column_source()` implementations —
+    /// `ScxLazyTransformedDataset`'s and `ScxBackedSparseDataset`'s, which
+    /// routes through this type precisely to get the compaction.
     pub(crate) fn supports_csc(&self) -> bool {
-        self.backed_csc.is_some() && self.kept_to_global.is_none()
+        self.backed_csc.is_some()
+    }
+
+    /// The inverse of `kept_to_global`: `global_to_live[g]` is the live index
+    /// of global physical row `g`, or `-1` when the row is filtered out.
+    ///
+    /// The CSC path needs the inverse because a sidecar slab arrives addressed
+    /// by global row while every consumer works in live row space. Built once
+    /// per source on the first CSC read — 4 B x n_obs_physical, so 4 MB at a
+    /// million rows — and never at all for the CSR consumers of
+    /// `new_with_csc`, which is why it is a `OnceLock` rather than constructor
+    /// work.
+    ///
+    /// `None` means no compaction is owed: either no row filter is active, or
+    /// there is no sidecar to read in the first place.
+    fn global_to_live(&self) -> Option<&Vec<i32>> {
+        let kept = self.kept_to_global.as_ref()?;
+        let backed_csc = self.backed_csc.as_ref()?;
+        Some(self.global_to_live.get_or_init(|| {
+            // Sized from the *sidecar's* row count, which is the space its
+            // `indices` live in, not from this view's visible count.
+            let mut map = vec![-1i32; backed_csc.n_obs()];
+            for (live, &g) in kept.iter().enumerate() {
+                if let Some(slot) = map.get_mut(g as usize) {
+                    *slot = live as i32;
+                }
+            }
+            map
+        }))
     }
 }
 
@@ -335,8 +372,13 @@ impl scx_format_io::ShardSource for LazyShardSource {
 /// The row-indexed arms (`NormalizeTotal`, `RowScale`) read their per-row
 /// vector at `csc.indices[k]`, which is the nonzero's **global** row. That is
 /// the same index CSR reaches as `global_row_offset + row`, so both routes
-/// index the same vector the same way. The gate keeps a row-deletion vector
-/// out precisely because it would renumber those rows.
+/// index the same vector the same way.
+///
+/// That is also why a row filter is applied **after** this function, never
+/// before: `row_sums` / `factors` are built at global physical length, so on a
+/// slab already renumbered to live rows every lookup would silently return
+/// another cell's factor. The callers order the two stages, and
+/// `shard_source_tests.rs` pins the order with a test rather than a comment.
 ///
 /// A `NormalizeTotal → Log1p` pair is **fused** on the CSR side, in both
 /// `transforms.rs` (slices and shard reads) and `dataset_index.rs` (fancy
@@ -432,19 +474,30 @@ impl scx_format_io::ColumnShardSource for LazyShardSource {
         }
     }
 
+    /// Decode -> transforms -> row filter -> column projection.
+    ///
+    /// The row filter runs after the transforms because they index their
+    /// per-row vectors at the global row (see `apply_transforms_to_csc`), and
+    /// before the projection because compacting first leaves `project_csc`
+    /// fewer entries to copy. Both stages are skipped when they do not apply.
     fn read_csc_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsc> {
-        if self.kept_to_global.is_some() {
-            return Err(scx_format_io::ScxError::Io(std::io::Error::other(
-                "CSC unavailable: row deletion vector is active",
-            )));
-        }
         let backed = self.backed_csc.as_ref().ok_or_else(|| {
             scx_format_io::ScxError::Io(std::io::Error::other(
                 "CSC unavailable: file has no CSC sidecar (open with CSC enabled)",
             ))
         })?;
-        let mut csc = (*backed.read_shard_cached(shard_idx)?).clone();
+        // `try_unwrap` for symmetry with the CSR path, and for the honest
+        // reason rather than an optimistic one: the decoded-shard LRU normally
+        // holds a second strong reference, so this clones exactly as it always
+        // did. It takes ownership for free only where the cache is off or the
+        // entry was already evicted, and the transforms and the compaction
+        // both need an owned slab regardless.
+        let arc = backed.read_shard_cached(shard_idx)?;
+        let mut csc = Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone());
         apply_transforms_to_csc(&self.transforms, &mut csc);
+        if let Some(map) = self.global_to_live() {
+            scx_engine::projection::compact_csc_rows_in_place(&mut csc, map, self.shape_val.0);
+        }
         if let Some(ref proj) = self.col_projection {
             // `proj` is sorted/dedup'd GLOBAL column IDs, but `csc` is a
             // shard slab whose own column space is `0..shard_n_cols`.
@@ -466,11 +519,6 @@ impl scx_format_io::ColumnShardSource for LazyShardSource {
     }
 
     fn read_csc_columns(&self, col_range: std::ops::Range<u32>) -> scx_format_io::Result<ScxCsc> {
-        if self.kept_to_global.is_some() {
-            return Err(scx_format_io::ScxError::Io(std::io::Error::other(
-                "CSC unavailable: row deletion vector is active",
-            )));
-        }
         let backed = self.backed_csc.as_ref().ok_or_else(|| {
             scx_format_io::ScxError::Io(std::io::Error::other(
                 "CSC unavailable: file has no CSC sidecar (open with CSC enabled)",
@@ -502,6 +550,12 @@ impl scx_format_io::ColumnShardSource for LazyShardSource {
         };
 
         apply_transforms_to_csc(&self.transforms, &mut csc);
+        // Same order as `read_csc_shard`, for the same reason. There is no
+        // projection stage here — the column window was translated before the
+        // read — so the compaction is the last thing that touches the slab.
+        if let Some(map) = self.global_to_live() {
+            scx_engine::projection::compact_csc_rows_in_place(&mut csc, map, self.shape_val.0);
+        }
         Ok(csc)
     }
 
@@ -520,6 +574,28 @@ impl scx_format_io::ColumnShardSource for LazyShardSource {
             }
             None => Some((g_lo, g_hi)),
         }
+    }
+
+    /// Forwarded from the sidecar, and load-bearing on GPU.
+    ///
+    /// `RawGpuCscShardSource::new` pre-sizes its pinned and device buffers
+    /// from this and derives its staging prefetch depth from it; a source that
+    /// answers `None` gets a grow-on-demand capacity of one and is not bounded
+    /// by `SCX_GPU_STAGING_MEMORY_BUDGET` at all. So the CSC-direct GPU route
+    /// reaching this type instead of `BackedCscReader` would otherwise be a
+    /// staging regression, not just a different code path.
+    ///
+    /// Forwarded verbatim. The hint counts **columns** per shard, which a row
+    /// filter cannot change; under a column projection it becomes an
+    /// over-estimate, which is what the contract asks for ("an upper bound").
+    ///
+    /// `csc_shards_for_col_range` is deliberately **not** forwarded:
+    /// `BackedCscReader` overrides it with a binary search over on-disk column
+    /// ranges, which is the wrong axis once a projection is active. The trait
+    /// default is expressed over `csc_shard_col_range` above, which already
+    /// reports projected ranges.
+    fn csc_shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+        scx_format_io::ColumnShardSource::csc_shard_size_hint(self.backed_csc.as_ref()?.as_ref())
     }
 }
 

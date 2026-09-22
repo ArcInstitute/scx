@@ -59,83 +59,58 @@ fn run_pdex_ref_inner(
         }
         let chunk_size = gene_chunk_size.unwrap_or(500);
 
-        if let Some(handle) = crate::accel::backed_dataset_ref(&x) {
-            let backed = handle.get();
-            reject_csc_on_subset(backed)?;
-            let csc_reader = backed
-                .backed_csc
-                .as_ref()
-                .ok_or_else(|| {
-                    PyRuntimeError::new_err(
-                        "CSC requested but unavailable: file has no CSC sidecar",
-                    )
-                })?
-                .clone();
+        // One source type for either handle kind — see the matching block in
+        // `run_rank_genes_groups_inner`. `as_column_source` hands back a view
+        // that renumbers rows onto the live space and remaps columns into the
+        // projected one, so a filtered or gene-subset handle is served here
+        // rather than refused outright, as it used to be.
+        let source = if let Some(handle) = crate::accel::backed_dataset_ref(&x) {
+            let source = handle
+                .get()
+                .as_column_source()
+                .ok_or_else(crate::accel::csc_unavailable)?;
             drop(handle);
-            return py
-                .detach(|| {
-                    scx_accel::pdex_ref_streaming_csc(
-                        csc_reader.as_ref(),
-                        &gene_names,
-                        &groups,
-                        &unique_groups,
-                        ref_idx,
-                        chunk_size,
-                        mode,
-                        epsilon,
-                        cpm_filter,
-                    )
-                })
-                .map(|mut r| {
-                    r.exec_info = crate::accel::route::cpu_exec_info(
-                        device,
-                        scx_accel::InputLayout::BackedCsc,
-                        false, // no GPU CSC kernel
-                        true,
-                        Some(chunk_size),
-                    );
-                    r
-                })
-                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
-        }
-        if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
-            let lazy_src = lazy.as_column_source().ok_or_else(|| {
-                crate::accel::csc_unavailable(
-                    lazy.backed_csc.is_some(),
-                    lazy.kept_to_global.is_some(),
-                )
-            })?;
+            source
+        } else if let Ok(lazy) =
+            x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
+        {
+            let source = lazy
+                .as_column_source()
+                .ok_or_else(crate::accel::csc_unavailable)?;
             drop(lazy);
-            return py
-                .detach(|| {
-                    scx_accel::pdex_ref_streaming_csc(
-                        &lazy_src,
-                        &gene_names,
-                        &groups,
-                        &unique_groups,
-                        ref_idx,
-                        chunk_size,
-                        mode,
-                        epsilon,
-                        cpm_filter,
-                    )
-                })
-                .map(|mut r| {
-                    r.exec_info = crate::accel::route::cpu_exec_info(
-                        device,
-                        scx_accel::InputLayout::BackedCsc,
-                        false, // no GPU CSC kernel
-                        true,
-                        Some(chunk_size),
-                    );
-                    r
-                })
-                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
-        }
-        return Err(PyRuntimeError::new_err(
-            "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
-             dataset; got a regular scipy/dense matrix",
-        ));
+            source
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
+                 dataset; got a regular scipy/dense matrix",
+            ));
+        };
+
+        return py
+            .detach(|| {
+                scx_accel::pdex_ref_streaming_csc(
+                    &source,
+                    &gene_names,
+                    &groups,
+                    &unique_groups,
+                    ref_idx,
+                    chunk_size,
+                    mode,
+                    epsilon,
+                    cpm_filter,
+                )
+            })
+            .map(|mut r| {
+                r.exec_info = crate::accel::route::cpu_exec_info(
+                    device,
+                    scx_accel::InputLayout::BackedCsc,
+                    false, // no GPU CSC kernel
+                    true,
+                    Some(chunk_size),
+                );
+                r
+            })
+            .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
     }
 
     if let Some(handle) = crate::accel::backed_dataset_ref(&x) {
@@ -161,18 +136,27 @@ fn run_pdex_ref_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    // Subset handle → generic `Lazy`; unsubset → `Backed`,
-                    // preserving the CSC-direct `gpu_csc_v3` route. See the
-                    // matching branch in `run_rank_genes_groups_inner`: this
-                    // switch is what stops a subset handle running the
-                    // CSC-direct kernel against on-disk columns.
-                    let input = if has_view {
-                        scx_accel::GpuDeShardInput::Lazy(&source)
-                    } else {
+                    // Which CSC source to hand over, not whether to hand
+                    // one over — see the matching branch in
+                    // `run_rank_genes_groups_inner` for the full reasoning.
+                    // The concrete `csc_reader` is the file; `source` is this
+                    // handle's window on both axes and serves as both sides,
+                    // so a subset handle keeps the CSC-direct `gpu_csc_v3`
+                    // route instead of giving it up for `Lazy`.
+                    let input = if !has_view {
                         scx_accel::GpuDeShardInput::Backed {
-                            csr: &reader,
-                            csc: csc_reader.as_deref(),
+                            csr: reader.as_ref(),
+                            csc: csc_reader
+                                .as_deref()
+                                .map(|c| c as &(dyn scx_format_io::ColumnShardSource + Sync)),
                         }
+                    } else if source.supports_csc() {
+                        scx_accel::GpuDeShardInput::Backed {
+                            csr: &source,
+                            csc: Some(&source),
+                        }
+                    } else {
+                        scx_accel::GpuDeShardInput::Lazy(&source)
                     };
                     scx_accel::pdex_ref_gpu(
                         device_id,
@@ -218,19 +202,28 @@ fn run_pdex_ref_inner(
         };
     }
 
-    // G1.8: ScxLazyTransformedDataset (non-CSC GPU path). See the matching
-    // branch in `run_rank_genes_groups_inner`.
+    // G1.8: ScxLazyTransformedDataset. `Backed` when the chain carries a
+    // sidecar, `Lazy` when it does not — see the matching branch in
+    // `run_rank_genes_groups_inner` for why this arm used to be CSR-only.
     #[cfg(feature = "gpu")]
     if let Some(device_id) = gpu_device_id {
         if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
             let chunk_size = gene_chunk_size.unwrap_or(500);
             let lazy_src = lazy.as_shard_source();
             drop(lazy);
+            let input = if lazy_src.supports_csc() {
+                scx_accel::GpuDeShardInput::Backed {
+                    csr: &lazy_src,
+                    csc: Some(&lazy_src),
+                }
+            } else {
+                scx_accel::GpuDeShardInput::Lazy(&lazy_src)
+            };
             return py
                 .detach(|| {
                     scx_accel::pdex_ref_gpu(
                         device_id,
-                        scx_accel::GpuDeShardInput::Lazy(&lazy_src),
+                        input,
                         &gene_names,
                         &groups,
                         &unique_groups,

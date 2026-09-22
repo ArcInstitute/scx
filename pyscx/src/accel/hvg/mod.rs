@@ -69,9 +69,9 @@ impl scx_format_io::ShardSource for InMemoryCsrSource<'_> {
 }
 
 /// Whether `x` is a backed SCX dataset that exposes a usable CSC sidecar
-/// (the same capability gate as `ScxBackedSparseDataset::as_column_source`:
-/// a CSC sidecar is present and no row deletion vector is active). Used to
-/// auto-route single-batch seurat_v3 GPU HVG to the column-major reduce.
+/// (the same capability gate as `ScxBackedSparseDataset::as_column_source`,
+/// whose one condition is that a sidecar is present). Used to auto-route
+/// single-batch seurat_v3 GPU HVG to the column-major reduce.
 fn backed_x_has_csc_sidecar(x: &Bound<'_, PyAny>) -> bool {
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         backed.borrow().as_column_source().is_some()

@@ -245,11 +245,26 @@ pub fn pdex_ref_gpu_dense(
 pub enum GpuDeShardInput<'a> {
     /// In-memory scipy-style CSR. Never carries a CSC sidecar.
     Csr(&'a scx_sparse::ScxCsr),
-    /// SCX-backed CSR reader plus an optional gene-major CSC sidecar. When the
-    /// sidecar is present and v3 is enabled, dispatch routes CSC-direct.
+    /// An SCX CSR shard source plus an optional gene-major CSC source. When
+    /// the CSC source is present, dispatch routes CSC-direct (`gpu_csc_v3`).
+    ///
+    /// Both are trait objects, which is what lets a **windowed** handle keep
+    /// the CSC-direct route. The concrete pair is the file itself: full row
+    /// axis, full column axis. A subset handle's `gene_names` is narrower than
+    /// that, and since [`Self::shape`] takes `n_vars` from `gene_names.len()`
+    /// the widths agreed and nothing caught the mismatch — so pyscx used to
+    /// downgrade any windowed handle to [`Self::Lazy`] and give the route up.
+    /// A `LazyShardSource` presents the window on both axes instead
+    /// (rows renumbered onto the live space, columns remapped into the
+    /// projected one), and satisfies both bounds.
+    ///
+    /// Pass the concrete readers when the handle *is* the file: they carry a
+    /// `csc_shard_size_hint` (which sizes the GPU staging buffers and bounds
+    /// them by `SCX_GPU_STAGING_MEMORY_BUDGET`) and a binary-search shard
+    /// lookup that the generic view cannot express under a projection.
     Backed {
-        csr: &'a scx_format_io::backed::BackedCsrReader,
-        csc: Option<&'a scx_format_io::backed::BackedCscReader>,
+        csr: &'a (dyn ShardSource + Sync),
+        csc: Option<&'a (dyn scx_format_io::ColumnShardSource + Sync)>,
     },
     /// Generic lazy `ShardSource` (CSR-shaped; no CSC capability surface).
     Lazy(&'a (dyn ShardSource + Sync)),
@@ -269,6 +284,13 @@ impl GpuDeShardInput<'_> {
     /// `(n_obs, n_vars)`. The in-memory CSR shape is authoritative; backed/lazy
     /// take `n_vars` from `gene_names` / the source (matching the former
     /// per-shape entry points).
+    ///
+    /// `n_obs` comes from the CSR source, which is what keeps it in the same
+    /// row space as the caller's `groups` — a concrete reader reports the
+    /// file's rows and a windowed source its visible ones, matching whichever
+    /// was passed. Nothing downstream re-checks that:
+    /// `ensure_cell_table_covers` catches a per-row table that is too *short*,
+    /// never one in a different row space.
     fn shape(&self, gene_names_len: usize) -> (usize, usize) {
         match self {
             GpuDeShardInput::Csr(csr) => csr.shape,
@@ -534,6 +556,11 @@ pub fn wilcoxon_rank_sum_gpu(
 
     let dev = open_device(device_id)?;
     let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
+    // One derivation, from the input's own shape, as `pdex_ref_gpu` does. The
+    // three arms used to spell their layout out locally, which is how the
+    // `Backed` arm came to re-derive `BackedCsc` / `BackedCsr` by hand beside
+    // an `input_layout()` that already answered it.
+    let layout = input.input_layout();
 
     match input {
         GpuDeShardInput::Csr(csr) => {
@@ -554,7 +581,7 @@ pub fn wilcoxon_rank_sum_gpu(
             wilcoxon_rank_sum_gpu_dispatch(
                 &dev,
                 &mut source,
-                InputLayout::CsrHost,
+                layout,
                 n_obs,
                 n_vars,
                 chunk_size,
@@ -584,7 +611,7 @@ pub fn wilcoxon_rank_sum_gpu(
             wilcoxon_rank_sum_gpu_dispatch(
                 &dev,
                 &mut source,
-                InputLayout::LazyCsr,
+                layout,
                 n_obs,
                 n_vars,
                 chunk_size,
@@ -598,13 +625,8 @@ pub fn wilcoxon_rank_sum_gpu(
             )
         }
         GpuDeShardInput::Backed { csr, csc } => {
-            // Hand the CSC sidecar (when present) to the matrix source so the
+            // Hand the CSC source (when present) to the matrix source so the
             // planner can reach the CSC-direct v3 Wilcoxon driver.
-            let layout = if csc.is_some() {
-                InputLayout::BackedCsc
-            } else {
-                InputLayout::BackedCsr
-            };
             let mut source = match csc {
                 Some(csc) => BackedGpuMatrixSource::with_csc(&dev, csr, csc),
                 None => BackedGpuMatrixSource::new(&dev, csr),
