@@ -195,7 +195,11 @@ pub fn run_append(
     // target's framing (a v4 target must stay framed after the rebuild).
     if rebuild_csc {
         let framing = crate::cli_utils::framing_for_file(target);
-        scx_ops::rebuild_csc_inplace(target, csc_cols_per_shard, csc_memory_limit, framing)?;
+        // No `--temp-dir` on this op: the CSC builder's spill root defaults to the
+        // output's own directory, which is already where the rewrite staged a whole
+        // copy of it, and the spill only happens at all on an undersized
+        // `--csc-memory-limit`.
+        scx_ops::rebuild_csc_inplace(target, csc_cols_per_shard, csc_memory_limit, framing, None)?;
         println!("Rebuilt CSC sidecar on {}", target.display());
     }
 

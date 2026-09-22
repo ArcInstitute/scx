@@ -676,6 +676,10 @@ pub fn h5ad_to_scx_streaming(
             opts.csc_cols_per_shard,
             &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
             opts.framing_preserving_codec(),
+            // `--temp-dir` already names the spill root for the Phase 2
+            // external transpose; the CSC builder's buckets are the same kind
+            // of spill and honour the same flag.
+            opts.temp_dir.as_deref(),
         )
         .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
     }
@@ -783,6 +787,7 @@ fn convert_then_sort_grouped(
                 opts.csc_cols_per_shard,
                 &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
                 opts.framing_preserving_codec(),
+                opts.temp_dir.as_deref(),
             )
             .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
         }
@@ -930,6 +935,10 @@ pub fn tenx_to_scx_streaming(
             opts.csc_cols_per_shard,
             &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
             opts.framing_preserving_codec(),
+            // `--temp-dir` already names the spill root for the Phase 2
+            // external transpose; the CSC builder's buckets are the same kind
+            // of spill and honour the same flag.
+            opts.temp_dir.as_deref(),
         )
         .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
     }

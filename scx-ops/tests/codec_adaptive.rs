@@ -481,6 +481,7 @@ fn build_csc_preserves_per_shard_csr_codec() {
         5000,
         // Exactly what `scx-cli`'s `framing_for_file()` passes.
         Some(FramingConfig::default()),
+        None,
     )
     .unwrap();
 
@@ -523,7 +524,7 @@ fn a_csc_rebuild_carrying_decode_target_does_override_the_codec() {
     );
 
     let out = d.path().join("csc_overridden.scx");
-    scx_ops::build_csc::run_build_csc(&inp, &out, "4G", false, 5000, Some(rewrite_framing))
+    scx_ops::build_csc::run_build_csc(&inp, &out, "4G", false, 5000, Some(rewrite_framing), None)
         .unwrap();
 
     let (after, _) = x_codecs_and_bytes(&out);
@@ -564,7 +565,8 @@ fn framing_for_csc_rebuild_preserves_v4_and_re_selects_nothing() {
     );
 
     let out = d.path().join("csc.scx");
-    scx_ops::build_csc::run_build_csc(&framed, &out, "4G", false, 5000, Some(chosen)).unwrap();
+    scx_ops::build_csc::run_build_csc(&framed, &out, "4G", false, 5000, Some(chosen), None)
+        .unwrap();
 
     let reader = ScxReader::open(&out).unwrap();
     assert_eq!(
@@ -692,7 +694,8 @@ fn build_csc_widens_the_sidecar_to_the_widest_declared_shard_encoding() {
 
     // --- the op ------------------------------------------------------------
     let output = d.path().join("multi_int_csc.scx");
-    scx_ops::build_csc::run_build_csc(&input, &output, "4G", false, MS_CSC_COLS, None).unwrap();
+    scx_ops::build_csc::run_build_csc(&input, &output, "4G", false, MS_CSC_COLS, None, None)
+        .unwrap();
 
     // The sidecar: widest DECLARED integer encoding across shards — Uint16, from
     // shard 1. Per-shard codec / encoding / row_start preservation and "the

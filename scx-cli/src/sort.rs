@@ -125,6 +125,9 @@ pub fn run_sort(
     });
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
+    // `temp_dir` is moved into `opts`; the CSC rebuild below wants it too, and
+    // it is the same kind of spill for the same reason.
+    let csc_temp_dir = temp_dir.clone();
     let opts = scx_ops::SortOptions {
         by,
         reverse,
@@ -185,7 +188,13 @@ pub fn run_sort(
     // output back to unframed v3).
     if rebuild_csc {
         let framing = crate::cli_utils::framing_for_file(output);
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
+        scx_ops::rebuild_csc_inplace(
+            output,
+            csc_cols_per_shard,
+            csc_memory_limit,
+            framing,
+            csc_temp_dir.as_deref(),
+        )?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 

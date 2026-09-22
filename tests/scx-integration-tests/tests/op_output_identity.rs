@@ -277,7 +277,7 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     // build-csc.
     let csc_src = mixed_codec_file(&dir.join("csc_src.scx")).unwrap();
     let out = dir.join("build_csc.scx");
-    scx_ops::run_build_csc(&csc_src, &out, "1G", false, 1024, None).unwrap();
+    scx_ops::run_build_csc(&csc_src, &out, "1G", false, 1024, None, None).unwrap();
     m.record("build_csc", &out, Strictness::Content).unwrap();
 
     // --- the same two ops over an input carrying per-shard `column_stats` ---
@@ -306,7 +306,7 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
         .unwrap();
 
     let out = dir.join("build_csc_indexed.scx");
-    scx_ops::run_build_csc(&indexed, &out, "1G", false, 1024, None).unwrap();
+    scx_ops::run_build_csc(&indexed, &out, "1G", false, 1024, None, None).unwrap();
     m.record("build_csc_indexed", &out, Strictness::Content)
         .unwrap();
 

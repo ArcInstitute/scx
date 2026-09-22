@@ -2463,7 +2463,7 @@ fn test_csc_generation_lifecycle_append_then_rebuild() {
     // build-csc preserves the (bumped) data generation and rebuilds a
     // fresh sidecar matching it.
     let rebuilt = dir.path().join("csc_gen_rebuilt.scx");
-    scx_ops::run_build_csc(&path, &rebuilt, "4G", false, 4, None).unwrap();
+    scx_ops::run_build_csc(&path, &rebuilt, "4G", false, 4, None, None).unwrap();
 
     let r3 = ScxReader::open(&rebuilt).unwrap();
     assert!(r3.header().has_csc());

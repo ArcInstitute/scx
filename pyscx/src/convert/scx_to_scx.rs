@@ -483,6 +483,9 @@ pub(crate) fn route_scx_backed_to_scx(
                 csc_cols_per_shard,
                 "4G",
                 csc_framing,
+                // No `temp_dir` on this path; the spill root defaults to the
+                // output's own directory, which is where this write already is.
+                None,
             )
             .map_err(|e| e.to_string())
         })
@@ -693,6 +696,9 @@ pub(crate) fn route_scx_lazy_to_scx(
                 csc_cols_per_shard,
                 "4G",
                 csc_framing,
+                // No `temp_dir` on this path; the spill root defaults to the
+                // output's own directory, which is where this write already is.
+                None,
             )
             .map_err(|e| e.to_string())
         })
