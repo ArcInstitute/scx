@@ -63,7 +63,9 @@ pub use bitmap::{
 pub use categorical::filter_codes_by_keep_mask;
 #[cfg(feature = "deletion-vectors")]
 pub use categorical::GlobalCategoryAccum;
-pub use csc_sidecar::{write_csc_sidecar, CscSidecarOptions, DEFAULT_CSC_MEMORY_BYTES};
+pub use csc_sidecar::{
+    pick_csc_encoding, write_csc_sidecar, CscSidecarOptions, DEFAULT_CSC_MEMORY_BYTES,
+};
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::DeletionVectors;
 pub use distinct::DistinctAccumulator;

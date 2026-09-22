@@ -226,18 +226,16 @@ pub fn run_build_csc(
     // surviving decode, so total header *parses* go 4n+1 -> 2n; what this loop
     // removes is n+1 standalone reads, and with them the second decode pass.
     //
-    // `widest_declared` is folded through `widest_value_encoding` — the
-    // crate-wide spelling of the SCX-004 widening rule, which `compact` uses
-    // for its own re-shard — rather than accumulated by hand. Folding a
-    // total-order max pairwise gives the same answer as one call over the whole
-    // list, and the `Uint8` seed matches what the helper returns for an empty
-    // one. Flooring on each shard's *declared* encoding matters beyond
+    // The rule itself is `scx_format_io::pick_csc_encoding`, shared with
+    // `ScxWriter`'s finish-time sidecar emit, which used to carry a
+    // hand-rolled copy of it. This loop's job is only to collect its two
+    // inputs. Flooring on each shard's *declared* encoding matters beyond
     // `stats.value_max`: a shard may lack stats (format-permitted), so
     // `value_max` would contribute nothing and a wide integer shard could be
     // under-picked as Uint8.
     let mut per_shard: Vec<(CodecId, ValueEncoding)> = Vec::with_capacity(csr_entries.len());
+    let mut declared_encs: Vec<ValueEncoding> = Vec::with_capacity(csr_entries.len());
     let mut max_int_val: u32 = 0;
-    let mut widest_declared = ValueEncoding::Uint8;
     for entry in &csr_entries {
         let sh = reader.read_shard_header(entry)?;
         let ve = ValueEncoding::from_u8(sh.value_encoding).ok_or(
@@ -246,36 +244,22 @@ pub fn run_build_csc(
         let ci = CodecId::from_u8(sh.codec_id)
             .ok_or(crate::error::OpsError::UnknownCodec(sh.codec_id))?;
         per_shard.push((ci, ve));
-        widest_declared = crate::helpers::widest_value_encoding(&[widest_declared, ve]);
+        declared_encs.push(ve);
         if let Some(stats) = entry.stats.as_ref() {
             max_int_val = max_int_val.max(stats.value_max);
         }
     }
-    // The helper maps any float shard to `Float32` and never yields `Float16`,
-    // so this one predicate is the whole `any_float` test.
-    let (csc_value_encoding, csc_codec) = if matches!(widest_declared, ValueEncoding::Float32) {
-        // Pcodec is the canonical float codec; the first shard's codec may be
-        // an integer-only codec (Scx1) that cannot represent float values.
-        (ValueEncoding::Float32, CodecId::Pcodec)
-    } else {
-        let by_value = if max_int_val <= u8::MAX as u32 {
-            ValueEncoding::Uint8
-        } else if max_int_val <= u16::MAX as u32 {
-            ValueEncoding::Uint16
-        } else {
-            ValueEncoding::Uint32
-        };
-        // The wider of the value-derived and declared widths. Both are integer
-        // encodings here, so the helper's float arm cannot fire.
-        let enc = crate::helpers::widest_value_encoding(&[widest_declared, by_value]);
-        // `.first()` rather than `csr_entries[0]`: the guard above means a file
-        // with rows always has shards, so this reports the same condition that
-        // guard already names instead of panicking.
-        let (codec, _) = *per_shard
-            .first()
-            .ok_or_else(|| "Input file has no CSR shards".to_string())?;
-        (enc, codec)
-    };
+    // One spelling of the SCX-004 widening rule, shared with
+    // `ScxWriter`'s finish-time sidecar emit. `None` means the integer path
+    // found no source shard to take a codec from; the guard above means a file
+    // with rows always has shards, so this reports that same condition instead
+    // of panicking.
+    let (csc_value_encoding, csc_codec) = scx_format_io::pick_csc_encoding(
+        &declared_encs,
+        max_int_val,
+        per_shard.first().map(|&(codec, _)| codec),
+    )
+    .ok_or_else(|| "Input file has no CSR shards".to_string())?;
 
     // 7. Read CSR shards individually (preserves shard boundaries for streaming transpose)
     let csr_shards: Vec<scx_sparse::ScxCsr> = csr_entries

@@ -24,6 +24,47 @@ use crate::writer::ScxWriter;
 /// `cols_per_shard`.
 pub const DEFAULT_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Pick the value encoding and codec for a CSC sidecar built from `encs`.
+///
+/// The sidecar's encoding must cover **every** source shard, not just the
+/// first (SCX-004): a `Uint8` first shard followed by a `Float32` shard would
+/// truncate the float values. Two inputs decide it — the shards' *declared*
+/// encodings and the largest integer value the catalog reports:
+///
+/// - any float shard ⇒ `(Float32, Pcodec)`. The codec is not the source's:
+///   the first shard's codec may be integer-only (`Scx1`), which cannot
+///   represent float values at all.
+/// - otherwise the wider of the declared integer width and the width
+///   `max_int_val` needs. Flooring on the declared width matters because a
+///   shard with no `ShardStats` contributes nothing to `max_int_val` and would
+///   otherwise be under-picked as `Uint8`.
+///
+/// Returns `None` only on the integer path with `first_codec: None`, i.e. no
+/// source shards at all — a condition both callers already guard, and which
+/// they report in their own words rather than sharing a message.
+pub fn pick_csc_encoding(
+    encs: &[ValueEncoding],
+    max_int_val: u32,
+    first_codec: Option<CodecId>,
+) -> Option<(ValueEncoding, CodecId)> {
+    let declared = ValueEncoding::widest_for_write(encs);
+    // `widest_for_write` maps any float shard to `Float32` and never yields
+    // `Float16`, so this one predicate is the whole `any_float` test.
+    if matches!(declared, ValueEncoding::Float32) {
+        return Some((ValueEncoding::Float32, CodecId::Pcodec));
+    }
+    let by_value = if max_int_val <= u8::MAX as u32 {
+        ValueEncoding::Uint8
+    } else if max_int_val <= u16::MAX as u32 {
+        ValueEncoding::Uint16
+    } else {
+        ValueEncoding::Uint32
+    };
+    // Both are integer encodings here, so the float arm cannot fire.
+    let enc = ValueEncoding::widest_for_write(&[declared, by_value]);
+    Some((enc, first_codec?))
+}
+
 /// Configuration options for writing a CSC sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CscSidecarOptions {
@@ -158,6 +199,72 @@ fn write_csc_sidecar_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::pick_csc_encoding;
+    use scx_codec::{CodecId, ValueEncoding};
+
+    /// SCX-004 itself: the encoding must cover every shard, so one float shard
+    /// after an integer one takes the whole sidecar to `Float32` — and to
+    /// `Pcodec`, *not* the source's codec, because `Scx1` is integer-only and
+    /// cannot represent a float value at all. Passing `Scx1` here is the point
+    /// of the case, not incidental.
+    #[test]
+    fn a_later_float_shard_widens_the_whole_sidecar_and_forces_pcodec() {
+        let got = pick_csc_encoding(
+            &[ValueEncoding::Uint8, ValueEncoding::Float32],
+            200,
+            Some(CodecId::Scx1),
+        );
+        assert_eq!(got, Some((ValueEncoding::Float32, CodecId::Pcodec)));
+    }
+
+    /// `ShardStats` is format-permitted to be absent, and `max_int_val` is
+    /// folded only over the shards that have it. Flooring on the *declared*
+    /// width is what stops a stats-less `Uint32` shard being encoded `Uint8`
+    /// and truncated.
+    #[test]
+    fn a_wide_integer_shard_without_stats_is_not_under_picked() {
+        let got = pick_csc_encoding(&[ValueEncoding::Uint32], 0, Some(CodecId::Scx1));
+        assert_eq!(got, Some((ValueEncoding::Uint32, CodecId::Scx1)));
+    }
+
+    /// The other direction: a shard that declares `Uint8` but whose catalog
+    /// reports a value no `Uint8` holds widens from the value side.
+    #[test]
+    fn a_value_wider_than_the_declared_encoding_widens_it() {
+        let got = pick_csc_encoding(&[ValueEncoding::Uint8], 70_000, Some(CodecId::Zstd));
+        assert_eq!(got, Some((ValueEncoding::Uint32, CodecId::Zstd)));
+    }
+
+    /// Write semantics, not `ValueEncoding::widest`'s reporting semantics: a
+    /// uniform `Float16` family *reports* as `Float16` but must be *written*
+    /// as `Float32`, which is the divergence the two functions exist to keep
+    /// apart.
+    #[test]
+    fn an_all_float16_family_is_written_as_float32() {
+        assert_eq!(
+            ValueEncoding::widest(&[ValueEncoding::Float16, ValueEncoding::Float16]),
+            Some(ValueEncoding::Float16),
+        );
+        let got = pick_csc_encoding(
+            &[ValueEncoding::Float16, ValueEncoding::Float16],
+            0,
+            Some(CodecId::Scx1),
+        );
+        assert_eq!(got, Some((ValueEncoding::Float32, CodecId::Pcodec)));
+    }
+
+    /// `None` is reachable on exactly one path — integer, with no shard to
+    /// take a codec from. The float path never needs one, so it answers even
+    /// with an empty shard list.
+    #[test]
+    fn no_shards_yields_none_only_on_the_integer_path() {
+        assert_eq!(pick_csc_encoding(&[], 0, None), None);
+        assert_eq!(
+            pick_csc_encoding(&[ValueEncoding::Float32], 0, None),
+            Some((ValueEncoding::Float32, CodecId::Pcodec)),
+        );
+    }
+
     use super::*;
     use crate::header::FileHeader;
     use crate::reader::ScxReader;

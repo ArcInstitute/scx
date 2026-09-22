@@ -82,26 +82,13 @@ fn lift_range_error(e: scx_codec::CodecError) -> OpsError {
 /// single output shard — merge X/layers (sorted and concat paths) — so the
 /// chosen encoding can hold the widest value across all inputs rather than
 /// truncating to the first shard's encoding.
+///
+/// A one-line delegate: the rule itself lives in `scx-codec` as
+/// [`ValueEncoding::widest_for_write`], because the CSC sidecar builder in
+/// `scx-format-io` needs the same rule and sits *below* this crate. Keeping the
+/// name here leaves this crate's eight call sites and their tests untouched.
 pub(crate) fn widest_value_encoding(encs: &[ValueEncoding]) -> ValueEncoding {
-    let mut any_float = false;
-    let mut max_int = ValueEncoding::Uint8;
-    for &e in encs {
-        match e {
-            ValueEncoding::Float32 | ValueEncoding::Float16 => any_float = true,
-            ValueEncoding::Uint16 => {
-                if matches!(max_int, ValueEncoding::Uint8) {
-                    max_int = ValueEncoding::Uint16;
-                }
-            }
-            ValueEncoding::Uint32 => max_int = ValueEncoding::Uint32,
-            ValueEncoding::Uint8 => {}
-        }
-    }
-    if any_float {
-        ValueEncoding::Float32
-    } else {
-        max_int
-    }
+    ValueEncoding::widest_for_write(encs)
 }
 
 #[cfg(test)]
