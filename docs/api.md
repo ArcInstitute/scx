@@ -1239,7 +1239,7 @@ pub trait ColumnShardSource {
 | Type | Crate | Behavior |
 |------|-------|---------|
 | `BackedCscReader` | `scx-format` | Reads raw decoded CSC shards from disk (cache + index-driven shard skip) |
-| `LazyShardSource` | `pyscx` (internal) | Applies the column-local subset of transforms (Log1p only) post-decode; honors column projection |
+| `LazyShardSource` | `pyscx` (internal) | Applies the full transform chain post-decode — the row-indexed `NormalizeTotal` / `RowScale` included, read at the global row `ScxCsc::indices` carries; honors column projection |
 
 **Capability gate:** the trait is *not* a sub-trait of `ShardSource`.
 Consumers that want CSC dispatch take the bound explicitly (`fn
@@ -1247,8 +1247,10 @@ require_csc<S: ColumnShardSource>(...)`); the runtime "does this
 dataset support CSC?" question is answered exactly once at
 `ScxBackedSparseDataset::as_column_source()` /
 `ScxLazyTransformedDataset::as_column_source()`. Returns `Some` iff
-the file has a CSC sidecar AND the transform chain is column-local
-AND no row deletion vector is active. See `pyscx.accel.*
+the file has a CSC sidecar AND no row deletion vector is active — a
+transform chain is not a disqualifier (every `Transform` is
+CSC-applicable), while a deletion vector is, because it renumbers the
+live rows that CSC `indices` encode globally. See `pyscx.accel.*
 prefer_format` below.
 
 **Used by:** `scx-accel::csc::{streaming_mean_var_csc,
@@ -2830,11 +2832,11 @@ when the dataset is large enough to benefit — `n_obs ≥ 50000` **and**
 `n_vars ≥ 5000` by default, tunable via `SCX_CSC_AUTO_OBS_THRESHOLD` /
 `SCX_CSC_AUTO_VARS_THRESHOLD`.
 
-| Op | `supports_csc` | Default format | GPU-fast with CSC | Notes |
+| Op | `supports_csc` | Default `prefer_format` | GPU-fast with CSC | Notes |
 |----|:--:|:--:|:--:|-------|
-| `pdex_ref` | ✅ | CSR | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. |
-| `rank_genes_groups` (Wilcoxon rank-sum) | ✅ | CSR | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. CPU CSC kernel via `prefer_format="csc"`. |
-| `rank_genes_groups_df` | ✅ | CSR | ✅ (`gpu_csc_v3`) | Same Wilcoxon rank-sum engine as above. |
+| `pdex_ref` | ✅ | **`auto`** | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. |
+| `rank_genes_groups` (Wilcoxon rank-sum) | ✅ | **`auto`** | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. On CPU the `auto` default takes the CSC kernel when the file has a sidecar, no row deletion vector is active, and — on a *backed* handle — no column projection; a lazy transform chain no longer disqualifies, so an ordinary `normalize_total → log1p` now routes CSC. |
+| `rank_genes_groups_df` | ✅ | **`auto`** | ✅ (`gpu_csc_v3`) | Same Wilcoxon rank-sum engine as above. |
 | `pseudobulk_dex` | ✅ (gene subset) | CSR | N/A (CPU + pydeseq2) | CSC requires a gene subset (`gene_indices` or `col_projection`); full-gene CSC has no win. |
 | `highly_variable_genes` (seurat_v3) | ✅ (single-batch) | CSR | ❌ | CSC routes single-batch seurat_v3; multi-batch / GPU / other flavors raise on CSC. |
 | `calculate_qc_metrics` | ✅ (gene axis) | CSR | N/A | Gene-axis aggregation uses CSC; cell-axis stays CSR. `prefer_format="csc"` specifically rejects a scipy/dense `X` and a layer source — the sidecar belongs to `X`. `layer=` itself is supported on the default CSR route. |

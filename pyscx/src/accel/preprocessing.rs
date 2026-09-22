@@ -248,11 +248,11 @@ pub fn normalize_total(
             }],
             non_negative,
         )
-        // Forward CSC sidecar so a later log1p() preserves the
-        // CSC-dispatch capability (NormalizeTotal itself is not
-        // column-local, but a NormalizeTotal+Log1p chain is — the
-        // gate at as_column_source() will reject it for now;
-        // carrying the handle costs nothing).
+        // Forward the CSC sidecar so this NormalizeTotal — and anything
+        // appended after it — keeps the CSC-dispatch capability. The gate used
+        // to reject a row-indexed transform and the handle was carried anyway
+        // because it cost nothing; it now pays, since `NormalizeTotal` reads
+        // `row_sums` at the global row `ScxCsc::indices` already carries.
         .with_csc_reader(backed_ref.backed_csc.clone())
         .with_source_path(backed_ref.source_path.clone());
         // Drop the borrow before setattr to avoid RefCell borrow conflict
@@ -519,8 +519,8 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 ///         (`total_counts`, `n_cells_by_counts`) accumulators read the CSC
 ///         sidecar instead of streaming CSR shards. The cell-axis stays
 ///         on CSR — row aggregations have no CSC win. Capability gate
-///         applies (no row deletion vector, no non-column-local
-///         transforms; raises on missing CSC sidecar).
+///         applies (raises on a missing CSC sidecar or an active row
+///         deletion vector; a lazy transform chain is not a disqualifier).
 ///
 /// Subsets are packed into a 64-bit per-column bitmask, so up to 64 `qc_vars`
 /// share one shard pass; beyond that the row pass repeats once per additional
@@ -1520,10 +1520,9 @@ fn count_mt_prefix_in_feature_name(adata: &Bound<'_, PyAny>) -> usize {
 /// Compute per-gene `(total_counts, n_cells_by_counts)` via the CSC
 /// path. Used by `calculate_qc_metrics(prefer_format="csc")`.
 ///
-/// Capability gate (raised on missing CSC sidecar / non-column-local
-/// transforms / row deletion vector active) is delegated to
-/// `as_column_source()`. Honors `col_projection` if set on the
-/// dataset.
+/// Capability gate (raised on a missing CSC sidecar or an active row deletion
+/// vector) is delegated to `as_column_source()`. Honors `col_projection` if set
+/// on the dataset.
 /// Width of the per-column subset bitmask; `qc_vars` beyond this are handled by
 /// running additional row passes (see [`resolve_qc_masks`]).
 const QC_MASK_BITS: usize = 64;
@@ -1859,9 +1858,9 @@ impl RowQcOutputs {
 fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<u32>)> {
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let source = backed.as_column_source().ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "CSC requested but unavailable: file has no CSC sidecar, \
-                 or a row deletion vector is active",
+            crate::accel::csc_unavailable(
+                backed.backed_csc.is_some(),
+                backed.kept_to_global.is_some(),
             )
         })?;
         let cols_owned: Vec<u32> = match backed.col_projection() {
@@ -1873,16 +1872,12 @@ fn compute_gene_axis_csc(x: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, Vec<u32>)>
     }
     if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         let lazy_src = lazy.as_column_source().ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "CSC requested but unavailable: file has no CSC sidecar, \
-                 the transform chain contains a non-column-local op, or a \
-                 row deletion vector is active",
-            )
+            crate::accel::csc_unavailable(lazy.backed_csc.is_some(), lazy.kept_to_global.is_some())
         })?;
-        let cols_owned: Vec<u32> = match lazy.col_projection() {
-            Some(c) => c.to_vec(),
-            None => (0..lazy.shape_val.1 as u32).collect(),
-        };
+        // Identity positions — see the note in `accel::col_aggs`: a
+        // `LazyShardSource` is already on the projected axis.
+        let cols_owned: Vec<u32> =
+            (0..scx_format_io::ShardSource::n_vars(&lazy_src) as u32).collect();
         return projected_agg::col_sums_and_nnz_projected_csc(&lazy_src, &cols_owned)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()));
     }

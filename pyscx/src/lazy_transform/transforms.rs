@@ -39,18 +39,37 @@ pub(crate) fn apply_transforms_to_csr(
                         *v = ((*v as f64 * factor) as f32).ln_1p();
                     }
                 } else {
-                    // Zero-sum row: all stored values must be zero for CSR
-                    // from count data. In the unfused path, NormalizeTotal
-                    // skips the row and Log1p applies ln(0+1)=0, so both
-                    // paths produce identical results when this invariant
-                    // holds. Assert to catch upstream data corruption.
+                    // Non-positive row total: `NormalizeTotal` skips the row
+                    // (scanpy's rule — an empty cell stays empty rather than
+                    // being divided by zero), but `Log1p` still applies. This
+                    // branch used to do neither, on the premise that such a row
+                    // stores only zeros and `ln_1p(0) == 0` makes the omission
+                    // invisible; it asserted that premise in debug builds.
+                    //
+                    // The premise does not hold for signed data, which
+                    // `from_anndata` accepts: a row `[0.5, -0.5]` sums to 0 and
+                    // a row `[-2.0, 1.0]` to -1. On those this branch left the
+                    // values untouched while the unfused path below,
+                    // `apply_transforms_to_csc`, and `sc.pp.normalize_total` +
+                    // `sc.pp.log1p` all applied `ln_1p`, so the fusion was the
+                    // outlier and the assertion fired on input the public API
+                    // does not reject.
+                    //
+                    // `dataset_index.rs::apply_transforms_per_row` carries a
+                    // second copy of this fusion, for fancy indexing and for
+                    // any read once a deletion vector is set. It had the same
+                    // bug and carries the same repair — the two must stay in
+                    // step, or one matrix answers differently depending on how
+                    // it is addressed.
+                    //
+                    // Applying `ln_1p` here makes all four agree. Counts data
+                    // is unaffected: a sum of non-negative f32 values is 0 only
+                    // when every stored value is 0, and `ln_1p(0) == 0`.
                     let start = csr.indptr[row] as usize;
                     let end = csr.indptr[row + 1] as usize;
-                    debug_assert!(
-                        csr.data[start..end].iter().all(|&v| v == 0.0),
-                        "Fused NormalizeTotal+Log1p: zero-sum row {} has non-zero values",
-                        g
-                    );
+                    for v in &mut csr.data[start..end] {
+                        *v = v.ln_1p();
+                    }
                 }
             }
             // Apply remaining transforms (index 2+)

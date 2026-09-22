@@ -113,6 +113,48 @@ pub(crate) fn reject_presentation_ordered_source(x: &Bound<'_, PyAny>, op: &str)
     Ok(())
 }
 
+/// The error for `as_column_source()` returning `None`, naming which of the two
+/// causes actually fired.
+///
+/// A lazy transform chain is **not** among them: every `Transform` has a
+/// column-major form in `lazy_transform::shard_source::apply_transforms_to_csc`,
+/// because a CSC reader knows each nonzero's global row and the two row-indexed
+/// transforms carry their per-row vector with them. What
+/// remains is a missing sidecar and an active row deletion vector — two causes
+/// the backed and lazy paths share, which is why one helper serves both and
+/// this text lives in one place instead of the nine copies it replaced.
+///
+/// It takes the two facts rather than returning one vague string because the
+/// remedies are opposite: `build_csc` fixes a missing sidecar and is exactly
+/// the wrong advice after `filter_cells` on a file that already has one.
+/// Callers have both booleans in hand at the `ok_or_else`.
+pub(crate) fn csc_unavailable(has_sidecar: bool, has_row_filter: bool) -> PyErr {
+    let cause = match (has_sidecar, has_row_filter) {
+        (false, false) => {
+            "the file has no CSC sidecar — add one with `pyscx.build_csc(path)` \
+             or `scx build-csc`, or re-import with `csc=\"always\"`"
+        }
+        (true, true) => {
+            "a row deletion vector is active (e.g. after `filter_cells`), and CSC \
+             `indices` are global row ids that a row filter renumbers — \
+             `materialize()` or rebuild the file"
+        }
+        // Both wrong at once: lead with the sidecar, since rebuilding the file
+        // is the step that resolves both.
+        (false, true) => {
+            "the file has no CSC sidecar and a row deletion vector is active — \
+             rebuild the file with `csc=\"always\"`"
+        }
+        // Unreachable via `as_column_source()`, which only returns `None` for
+        // the two causes above. Answer honestly rather than assert.
+        (true, false) => "the dataset cannot serve CSC reads",
+    };
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "CSC requested but unavailable: {cause}. Pass `prefer_format='csr'` to \
+         use the row-major path."
+    ))
+}
+
 /// A borrow of the backed dataset behind `adata.X` **or** a backed layer handle.
 ///
 /// `adata.X` on a backed file is [`crate::backed::ScxBackedSparseDataset`];

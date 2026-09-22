@@ -124,17 +124,24 @@ impl LazyShardSource {
         }
     }
 
-    /// Returns `true` if this lazy source can serve CSC reads:
-    /// CSC sidecar present, all transforms column-local, no row
-    /// deletion vector active.
+    /// Returns `true` if this lazy source can serve CSC reads: CSC sidecar
+    /// present and no row deletion vector active.
+    ///
+    /// The transform chain is deliberately **not** a condition. Every
+    /// `Transform` is applied column-major by `apply_transforms_to_csc`,
+    /// including the row-indexed `NormalizeTotal` / `RowScale`, which read
+    /// their per-row vector at the global row `ScxCsc::indices` already
+    /// carries. A predicate here would have no false case to return.
+    ///
+    /// The deletion-vector clause is the one that is a correctness barrier
+    /// rather than conservatism: CSC `indices` are *global* row ids, and a row
+    /// filter renumbers the live rows.
     ///
     /// Predicate used by `ScxLazyTransformedDataset::as_column_source()`
     /// (the analog to `ScxBackedSparseDataset::as_column_source` for
     /// the lazy-transformed wrapper).
     pub(crate) fn supports_csc(&self) -> bool {
-        self.backed_csc.is_some()
-            && self.transforms.iter().all(Transform::is_column_local)
-            && self.kept_to_global.is_none()
+        self.backed_csc.is_some() && self.kept_to_global.is_none()
     }
 }
 
@@ -317,18 +324,37 @@ impl scx_format_io::ShardSource for LazyShardSource {
     // and the cached path is shared.
 }
 
-/// Apply column-local transforms in-place on a decoded CSC shard.
+/// Apply lazy transforms in-place on a decoded CSC shard.
 ///
-/// The capability gate at `ScxBackedSparseDataset::as_column_source`
-/// usually filters out non-column-local transforms before this path
-/// runs. As a defense in depth, this helper returns an error rather
-/// than silently producing wrong results if a non-column-local
-/// transform sneaks through (e.g., a future caller that bypasses the
-/// gate).
-fn apply_transforms_to_csc(
-    transforms: &[Transform],
-    csc: &mut ScxCsc,
-) -> scx_format_io::Result<()> {
+/// Every arm here mirrors `apply_transforms_to_csr`'s arithmetic **exactly**,
+/// including the order and width of each cast, because the two routes must
+/// agree bit for bit and not merely within a tolerance. These are element-wise
+/// maps with no accumulation, so exact agreement is achievable and anything
+/// less would mean one of the two is wrong.
+///
+/// The row-indexed arms (`NormalizeTotal`, `RowScale`) read their per-row
+/// vector at `csc.indices[k]`, which is the nonzero's **global** row. That is
+/// the same index CSR reaches as `global_row_offset + row`, so both routes
+/// index the same vector the same way. The gate keeps a row-deletion vector
+/// out precisely because it would renumber those rows.
+///
+/// A `NormalizeTotal → Log1p` pair is **fused** on the CSR side, in both
+/// `transforms.rs` (slices and shard reads) and `dataset_index.rs` (fancy
+/// indexing). On a row whose total is not positive those fused paths skip the
+/// normalisation — scanpy's rule — but still apply `ln_1p`, which is what this
+/// function does by running the two in sequence. They used to skip `ln_1p`
+/// too, which made them disagree with this path on any signed row; that is
+/// fixed, and `shard_source_tests.rs` pins the agreement on a cancelling row
+/// and a negative-total row.
+///
+/// Infallible by construction: every `Transform` has a column-major form, so
+/// there is no arm left to refuse. The `match` below is exhaustive with no
+/// wildcard, and that is the whole guard — a new variant fails to compile here
+/// until someone decides what it means column-major. **If that decision is
+/// "it cannot be served column-major", refuse it in
+/// [`LazyShardSource::supports_csc`] rather than writing an approximate arm
+/// here**; the gate is the right place for that and this function is not.
+fn apply_transforms_to_csc(transforms: &[Transform], csc: &mut ScxCsc) {
     for transform in transforms {
         match transform {
             Transform::Log1p => {
@@ -341,16 +367,50 @@ fn apply_transforms_to_csc(
                     *v = (*v as f64 * *factor) as f32;
                 }
             }
-            Transform::NormalizeTotal { .. } | Transform::RowScale { .. } => {
-                return Err(scx_format_io::ScxError::Io(std::io::Error::other(
-                    "CSC unavailable: chain contains a non-column-local transform \
-                     (NormalizeTotal or RowScale). Use prefer_format='csr' or remove \
-                     the transform.",
-                )));
+            Transform::NormalizeTotal {
+                row_sums,
+                target_sum,
+            } => {
+                // Split the borrow: the value being written and the row index
+                // being read live in two fields of the same struct.
+                let (data, indices) = (&mut csc.data, &csc.indices);
+                debug_assert!(
+                    indices
+                        .iter()
+                        .all(|&r| r >= 0 && (r as usize) < row_sums.len()),
+                    "CSC row index outside row_sums ({}); a shard's indices must be \
+                     global physical rows",
+                    row_sums.len(),
+                );
+                for (v, &row) in data.iter_mut().zip(indices.iter()) {
+                    let sum = row_sums[row as usize];
+                    // `sum > 0.0` and *not* an else-branch: CSR leaves a
+                    // zero-sum row's values untouched rather than zeroing
+                    // them, and a following Log1p then maps 0 -> ln(1) = 0.
+                    if sum > 0.0 {
+                        *v = (*v as f64 * (*target_sum / sum)) as f32;
+                    }
+                }
+            }
+            Transform::RowScale { factors } => {
+                let (data, indices) = (&mut csc.data, &csc.indices);
+                debug_assert!(
+                    indices
+                        .iter()
+                        .all(|&r| r >= 0 && (r as usize) < factors.len()),
+                    "CSC row index outside factors ({}); a shard's indices must be \
+                     global physical rows",
+                    factors.len(),
+                );
+                for (v, &row) in data.iter_mut().zip(indices.iter()) {
+                    // f32 multiply, matching CSR. NormalizeTotal above goes
+                    // through f64 and this one does not; that asymmetry is
+                    // CSR's, and copying it is the point.
+                    *v *= factors[row as usize] as f32;
+                }
             }
         }
     }
-    Ok(())
 }
 
 impl scx_format_io::ColumnShardSource for LazyShardSource {
@@ -384,7 +444,7 @@ impl scx_format_io::ColumnShardSource for LazyShardSource {
             ))
         })?;
         let mut csc = (*backed.read_shard_cached(shard_idx)?).clone();
-        apply_transforms_to_csc(&self.transforms, &mut csc)?;
+        apply_transforms_to_csc(&self.transforms, &mut csc);
         if let Some(ref proj) = self.col_projection {
             // `proj` is sorted/dedup'd GLOBAL column IDs, but `csc` is a
             // shard slab whose own column space is `0..shard_n_cols`.
@@ -441,7 +501,7 @@ impl scx_format_io::ColumnShardSource for LazyShardSource {
             None => backed.read_csc_columns(col_range)?,
         };
 
-        apply_transforms_to_csc(&self.transforms, &mut csc)?;
+        apply_transforms_to_csc(&self.transforms, &mut csc);
         Ok(csc)
     }
 

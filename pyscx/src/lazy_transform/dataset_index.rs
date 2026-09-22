@@ -252,16 +252,16 @@ impl ScxLazyTransformedDataset {
                             *v = ((*v as f64 * factor) as f32).ln_1p();
                         }
                     } else {
-                        // Zero-sum row: all stored values must be zero for CSR
-                        // from count data. In the unfused path, NormalizeTotal
-                        // skips the row and Log1p applies ln(0+1)=0, so both
-                        // paths produce identical results when this invariant
-                        // holds. Assert to catch upstream data corruption.
-                        debug_assert!(
-                            csr.data[start..end].iter().all(|&v| v == 0.0),
-                            "Fused NormalizeTotal+Log1p: zero-sum row {} has non-zero values",
-                            g
-                        );
+                        // Non-positive row total: `NormalizeTotal` is skipped
+                        // but `Log1p` still applies. Kept identical to the
+                        // shard/range twin in `transforms.rs` — this is the
+                        // *same* fusion, and a row read through `X[[...]]`
+                        // must not differ from the same row read through
+                        // `X[:]`. Both used to skip `ln_1p` here, which made
+                        // the values access-mode-dependent on a signed row.
+                        for v in &mut csr.data[start..end] {
+                            *v = v.ln_1p();
+                        }
                     }
                     // Apply remaining transforms (index 2+)
                     for transform in &self.transforms[2..] {

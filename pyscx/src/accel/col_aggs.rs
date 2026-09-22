@@ -120,9 +120,9 @@ impl CscHandle {
     fn extract(dataset: &Bound<'_, PyAny>) -> PyResult<(Self, Vec<u32>, usize)> {
         if let Ok(backed) = dataset.extract::<PyRef<ScxBackedSparseDataset>>() {
             let csc = backed.as_column_source_owned().ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "CSC requested but unavailable: file has no CSC sidecar, \
-                     or a row deletion vector is active",
+                crate::accel::csc_unavailable(
+                    backed.backed_csc.is_some(),
+                    backed.kept_to_global.is_some(),
                 )
             })?;
             let cols: Vec<u32> = match backed.col_projection() {
@@ -133,16 +133,18 @@ impl CscHandle {
         }
         if let Ok(lazy) = dataset.extract::<PyRef<ScxLazyTransformedDataset>>() {
             let src = lazy.as_column_source().ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "CSC requested but unavailable: file has no CSC sidecar, \
-                     the transform chain contains a non-column-local op, or a \
-                     row deletion vector is active",
+                crate::accel::csc_unavailable(
+                    lazy.backed_csc.is_some(),
+                    lazy.kept_to_global.is_some(),
                 )
             })?;
-            let cols: Vec<u32> = match lazy.col_projection() {
-                Some(c) => c.to_vec(),
-                None => (0..lazy.shape_val.1 as u32).collect(),
-            };
+            // Identity positions, NOT `lazy.col_projection()`: `src` already
+            // exposes the projected axis (`n_vars()` is the projected width,
+            // and `read_csc_columns` maps a requested range *through* the
+            // projection). Passing the global ids back in would apply the
+            // projection a second time — silently reading the wrong genes, or
+            // indexing past a short slab and panicking in `walk_csc_runs`.
+            let cols: Vec<u32> = (0..scx_format_io::ShardSource::n_vars(&src) as u32).collect();
             return Ok((CscHandle::Lazy(Box::new(src)), cols, lazy.shape_val.0));
         }
         Err(PyRuntimeError::new_err(
