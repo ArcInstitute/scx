@@ -276,16 +276,18 @@ Two reasons to split by column range rather than emitting one giant shard:
 1. **Column-range pushdown.** `BackedCscIndex::shards_for_col_range` binary-searches
    the sorted ranges and skips non-overlapping shards entirely. With 5000 cols/shard
    on a 36K-gene matrix, a single-gene DE query touches 1 shard out of 8.
-2. **Bounded transpose working set.** The streaming CSR→CSC transpose chunks by
-   column range, so the *transpose's own* working set scales with
-   `csc_cols_per_shard × n_obs × 8 bytes` rather than with the full matrix.
-   That is not the same as bounding `build-csc`, and `--memory-limit` does not
-   cap the op: it holds every decoded CSR shard resident while it transposes, so
-   its peak tracks the matrix. Measured against a declared 4 GiB budget
-   (`benchmarks/comprehensive/results/baselines/LATEST`, `scx_auto`): 2809 MB on
-   `tabula_sapiens_100k` (195M non-zeros), 8030 MB on `census_500k` (747M) and
-   14.7 GB on `census_1m` (1.40B) — 2.0x and 3.6x over the budget on the last
-   two. Bounding the op is a separate open item.
+2. **Bounded staging working set.** `CscBuilder` routes each nonzero into a
+   column bucket and spills past the budget's bucket share, so the staging is
+   bounded by a maintained counter rather than by a chunk-width estimate, and
+   the op holds one decoded source shard instead of all of them.
+
+   `--memory-limit` still does **not** cap the whole op. The source shard's
+   re-encode, the writer, and the buckets that are still resident during the
+   emit sit outside the bucket share. Measured before/after on one node against
+   a declared 4 GiB budget: `tabula_sapiens_100k` 3580 → 3775 MB (0.92x),
+   `census_500k` 8998 → 5512 MB (1.35x), `census_1m` 15411 → 7138 MB (3.76x →
+   **1.74x**). Closing the rest is a separate open item; the re-encode is the
+   next piece to go.
 
 Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
 
@@ -295,13 +297,13 @@ Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
                    CREATION                                    CONSUMPTION
  ─────────────────────────────────────────   ──────────────────────────────────────
 
- scx-sparse/src/transpose.rs                scx-format-io/src/backed/csc.rs
+ scx-sparse/src/csc_builder.rs              scx-format-io/src/backed/csc.rs
  ┌──────────────────────────────────┐        ┌─────────────────────────────────┐
- │ streaming_csr_to_csc_iter_with   │        │ BackedCscIndex                  │
- │ _cap()                           │        │   shard_ranges: Vec<(col_start, │
- │   - iterates CSR shards          │        │     col_end, sorted_idx)>       │
- │   - yields CscArrays per col     │        │   shards_for_col_range(lo,hi)   │
- │     chunk (memory-bounded)       │        │     → Vec<usize>  (binary srch) │
+ │ CscBuilder                       │        │ BackedCscIndex                  │
+ │   push_shard(row_start, &ScxCsr) │        │   shard_ranges: Vec<(col_start, │
+ │   - routes nnz into column       │        │     col_end, sorted_idx)>       │
+ │     buckets, spilling past the   │        │   shards_for_col_range(lo,hi)   │
+ │     budget; finish() emits       │        │     → Vec<usize>  (binary srch) │
  └────────────┬─────────────────────┘        └────────────┬────────────────────┘
               │                                           │
               ▼                                           ▼
@@ -365,15 +367,29 @@ unavailable. `"auto"` lives one level up, as a pyscx-side policy
 
 ### Creation pipeline
 
-CSC sidecars are created by a streaming CSR→CSC transpose in
-`scx-sparse/src/transpose.rs`:
+CSC sidecars are created by a one-pass bucketed transpose in
+`scx-sparse/src/csc_builder.rs`:
 
-1. All CSR shards for the matrix are decoded (or read from the existing file).
-2. `streaming_csr_to_csc_iter_with_cap()` iterates column chunks bounded by
-   `min(memory_budget, csc_cols_per_shard)` — each `next()` call transposes a
-   `[col_start, col_end)` slice across all CSR shards.
-3. Each yielded `CscArrays` is written via `ScxWriter::write_csc_shard()` as
+1. Each CSR shard is decoded and pushed into a `CscBuilder` **in row order**,
+   one at a time. The builder routes every nonzero into a contiguous column
+   bucket and drops the shard; buckets stay in RAM until they cross the
+   budget's bucket share, then spill whole blocks to a `SpillStore`.
+2. `finish()` returns a `CscEmitter` whose plan — the exact column range and
+   nnz of every shard it will produce — is known before a byte is read back,
+   because the per-column counts were maintained during the push.
+3. Each emitted shard is written via `ScxWriter::write_csc_shard()` as
    `section_type = CscShard(5)` with independent per-shard codec selection.
+
+Total work is `2 * nnz`, against the `2 * nnz * n_chunks` of the chunked
+transpose this replaced (which rescanned every nonzero of every shard, twice,
+per column chunk). Shard **boundaries** are unchanged: `shard_cols` still comes
+from `compute_chunk_cols_with_cap`, so the emitted layout is byte-identical and
+only the cost of producing it moved.
+
+A caller that already holds the whole CSR — the eager h5ad/h5mu/`from_anndata`
+ingest paths — uses `ResidentCscSource` instead, which scatters straight out of
+the resident shards rather than making a second copy of them in buckets. Both
+sources feed one `csc_sidecar::emit_csc_shards` writer loop.
 
 Entry points:
 
@@ -389,13 +405,17 @@ baseline (`benchmarks/comprehensive/results/baselines/LATEST`, `scx_auto`,
 `--memory-limit 4G`): 0.22 s on `pbmc3k` (2.3M non-zeros), 2.6 s on `pbmc10k`
 (24.8M), 19.4 s on `smartseq2` (131M), 29.3 s on `tabula_sapiens_100k` (195M),
 201 s on `census_500k` (747M) and **1308 s on `census_1m`** (1.40B). Cost tracks
-non-zeros, not cells. Encoding and the transpose dominate: removing one of the
-two full CSR decode passes the op used to perform, together with `n + 1`
-standalone 76-byte shard-header reads, took roughly a tenth off the wall — a
-branch A/B, so deliberately not quoted as a figure here (see
+non-zeros, not cells.
+
+Those are the figures for the **chunked transpose** `CscBuilder` replaced, which
+rescanned every nonzero of every shard twice per column chunk. The saving
+therefore grows with the chunk count, and a branch A/B measured 1.40x on
+`pbmc10k` (7 CSC shards) up to 9.36x on `census_1m` (173). Those ratios are not
+quoted as baseline figures here — see
 [benchmark_manifest.md](benchmark_manifest.md): a number in a user-visible doc
 needs a capture whose `git_sha` is an ancestor of `main`, which a PR-branch
-capture never becomes).
+capture never becomes — so this table keeps the last promoted capture until the
+next one lands.
 
 ### Multimodal support
 

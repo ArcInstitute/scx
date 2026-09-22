@@ -1116,11 +1116,17 @@ per shard**. Pass `0` for no cap (single CSC shard, memory permitting
 
 To add a CSC sidecar to a file you already have, use the standalone
 `pyscx.build_csc(input, output=None, memory_limit="4G", force=False,
-csc_cols_per_shard=5000)` — the Python equivalent of `scx build-csc`. It reads
+csc_cols_per_shard=5000, temp_dir=None)` — the Python equivalent of
+`scx build-csc`. It reads
 `input`'s CSR shards and re-emits them alongside the new CSC sidecar.
 `output=None` (the default) does that **in place** via a temp file + atomic
 rename; passing a path writes a copy and leaves `input` alone. `force` applies
 only to the copy-out form. Either form preserves the input's row-group framing.
+`temp_dir` (`--temp-dir` on the CLI) is the root for the builder's column-bucket
+spill files, used only when the buckets exceed the `--memory-limit` share; it
+defaults to the **output file's own directory**, where the rewrite already
+stages a whole copy, rather than to the platform temp dir that
+`scx sort --temp-dir` and `scx convert --temp-dir` default to.
 To emit the sidecar at write time use `pyscx.from_anndata(..., csc="always")`.
 
 ### Why multi-shard CSC
@@ -1129,7 +1135,7 @@ Two reasons to split CSC by column range rather than emitting one
 giant shard:
 
 1. **Column-range pushdown.** `BackedCscReader::read_csc_columns(c_lo..c_hi)` consults `BackedCscIndex::shards_for_col_range(c_lo, c_hi)` and skips non-overlapping shards entirely; partial-overlap shards are sliced post-decode. With 5000 cols/shard on a 36K-gene matrix, a single-gene DE query touches one shard out of eight — a 7/8 I/O reduction even before catalog-level pushdown via `ShardStats.col_range`.
-2. **Bounded transpose working set.** The streaming CSR→CSC transpose chunks emitted shards by column range, so the *transpose's own* working set scales with `csc_cols_per_shard × n_obs × 8 bytes` rather than with the full matrix. That is not the same as bounding the op — see [Cost](#cost-write-time-transpose-equal-storage) below.
+2. **Bounded emit working set.** The builder materialises one *bucket's* shards at a time — `shards_per_bucket`, three at the census layout — so the emit's working set scales with a bucket's non-zeros rather than with the full matrix. Buckets it has not drained yet are still resident alongside them, which is why `scx_convert::budget` sums the bucket share with the emit share instead of treating the emit as succeeding the push.
 
 ### Cost: write-time transpose, ~equal storage
 
@@ -1138,22 +1144,33 @@ and the CSC shards add roughly the same compressed bytes (the same
 nnz, just laid out column-major; codec compression ratios are similar
 under Scx1 / Zstd / Pcodec).
 
-Write-time cost is one full-matrix transpose. The streaming transpose
-in `scx-sparse::transpose::streaming_csr_to_csc_iter_with_cap` keeps
-its own working set inside the `--memory-limit` budget (default 4G) —
-but the op holds every decoded CSR shard resident alongside it, so the
-**process** peak is not bounded by that budget: measured at 2.0x the
-declared 4 GiB on `census_500k` and 3.6x on `census_1m`.
+Write-time cost is one full-matrix transpose. `--memory-limit` (default
+4G) bounds the **column-bucket staging**, not the whole op — see the
+table below. `scx-sparse::CscBuilder` is fed one decoded
+CSR shard at a time and spills its column buckets against the budget's
+bucket share, so the op holds one source shard plus the buckets rather
+than every decoded shard at once. It **refuses** a budget that cannot
+admit its largest source shard, naming the figure to raise it to,
+instead of accepting one and overshooting.
+
+That refusal is a behaviour change: a `--memory-limit` far below the
+matrix now errors where it used to be accepted and ignored. Before it,
+a declared 512 MiB produced a 2,233 MB allocation on
+`tabula_sapiens_100k` — 4.4x over, silently.
 
 Measured throughput, from the `build_csc` rows of
 `benchmarks/comprehensive/results/baselines/LATEST` (`scx_auto`,
 `--memory-limit 4G`): 0.22 s on `pbmc3k` (2.3M non-zeros), 19.4 s on
 `smartseq2` (131M), 29.3 s on `tabula_sapiens_100k` (195M), 201 s on
 `census_500k` (747M) and 1308 s on `census_1m` (1.40B). Cost tracks
-non-zeros, not cells. Encoding and the transpose dominate — removing one of
-the two full CSR decode passes the op used to perform, plus `n + 1` standalone
-shard-header reads, took roughly a tenth off the wall. That split comes from a
-branch A/B rather than a promoted capture, so it is not quoted as a figure; see
+non-zeros, not cells.
+
+Those are the **pre-builder** figures. The one-pass builder replaced a
+transpose that rescanned every nonzero of every shard twice per column
+chunk, so the saving grows with the chunk count. Measured before/after on
+one node, median of three: 1.40x on `pbmc10k` (7 CSC shards), 2.05x on
+`tabula_sapiens_100k` (18), 5.66x on `census_500k` (87) and **9.36x on
+`census_1m`** (173 — 966 s to 103 s). See
 [CSC Sidecar Architecture](architecture.md#csc-sidecar-architecture).
 
 ### Inspecting the CSC layout
@@ -1179,9 +1196,18 @@ The sidecar moves through four stages over a file's life:
 1. **Creation.** At conversion time via the `csc` policy (`auto` / `always`
    on `pyscx.from_anndata` / `from_h5ad` / `from_10x` / `scx convert`), or
    after the fact with `scx build-csc input.scx` (in place) or
-   `scx build-csc input.scx output.scx` (copy out). All paths run the
-   memory-bounded streaming CSR→CSC transpose and set the `has_csc` header
-   flag.
+   `scx build-csc input.scx output.scx` (copy out). Both routes set the
+   `has_csc` header flag and produce the same bytes, but they transpose
+   differently, because they start from different places. `scx build-csc`
+   streams: it decodes one CSR shard at a time, pushes it into a
+   `CscBuilder` that routes each nonzero into a column bucket and spills
+   whole blocks to `--temp-dir` when the buckets exceed their share of
+   `--memory-limit`, then emits the CSC shards from those buckets. Nothing
+   holds the whole matrix. Conversion-time creation goes through
+   `write_csc_sidecar`, whose caller is already holding the matrix as one
+   in-memory CSR: there bucketing would be a *second* copy of it, so that
+   path scatters straight out of the resident CSR (one counting pass, then
+   one range-filtered scatter per shard) and its peak is the caller's.
 2. **Consumption.** Column algorithms opt into the sidecar with
    `prefer_format="csc"` (CPU) or, for GPU `pdex_ref` / `rank_genes_groups`,
    the `gpu_csc_v3` route (the default GPU DE route when a CSC sidecar is

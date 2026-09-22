@@ -57,6 +57,9 @@ pub fn rebuild_csc_inplace(
     csc_cols_per_shard: usize,
     memory_limit: &str,
     framing: Option<FramingConfig>,
+    // `temp_dir`: root for the CSC builder's spill files; `None` uses the
+    // target's own directory, which is where the staged rewrite already goes.
+    temp_dir: Option<&Path>,
 ) -> Result<BuildCscOutcome, Box<dyn std::error::Error>> {
     // An empty matrix without a sidecar has nothing to rebuild and nothing to
     // drop: answer without staging a copy of the file only to rename it back.
@@ -96,6 +99,7 @@ pub fn rebuild_csc_inplace(
             false,
             csc_cols_per_shard,
             framing,
+            temp_dir,
         )?;
         std::fs::rename(&tmp_path, target)?;
         Ok(outcome)

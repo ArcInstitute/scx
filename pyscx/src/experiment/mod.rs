@@ -849,6 +849,18 @@ impl PyExperiment {
         Ok(self.reader()?.header().has_csc())
     }
 
+    /// How many CSC sidecar shards the file carries (0 when it has none).
+    ///
+    /// Header-only, so it costs no I/O beyond the open. It is the layout
+    /// number `has_csc` cannot express: a sidecar's column-shard count is what
+    /// decides how much a gene-chunk read has to decode, and it is set by the
+    /// interaction of `csc_cols_per_shard` with the build's memory budget
+    /// rather than by either alone.
+    #[getter]
+    fn n_csc_shards(&self) -> PyResult<u32> {
+        Ok(self.reader()?.header().n_csc_shards)
+    }
+
     /// `True` when the file carries logical deletion vectors — i.e. some
     /// rows are marked deleted and will be dropped (row count shrinks) on
     /// `to_anndata` / `to_h5ad` export.

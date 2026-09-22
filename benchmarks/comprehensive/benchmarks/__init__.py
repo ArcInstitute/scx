@@ -66,11 +66,12 @@ ALL_BENCHMARKS: list[str] = [
     # SCX-only fragment / manifest operations
     "fragment_ops",
     # SCX-only CSC sidecar build. The one operation in the suite with a
-    # *declared* memory contract — `build_csc(memory_limit=...)` — and no
-    # measurement of whether it holds. Emits
-    # `peak_over_memory_limit__build_csc`; the contract threshold is deferred
-    # (see thresholds.yaml) because the op is expected to breach any sane
-    # bound until the sidecar writer streams.
+    # *declared* memory contract — `build_csc(memory_limit=...)`. It used to
+    # breach it by 3.6x at census_1m and the threshold was deferred for that
+    # reason; the streaming builder closed it, and
+    # `peak_over_memory_limit__build_csc` is floored in thresholds.yaml now.
+    # Also emits `n_csc_shards__build_csc`, because a memory bound can be met
+    # by regressing to narrow shards and that would fix nothing.
     "build_csc",
     # SCX-only MatrixMarket export + ingest (`pyscx.to_mtx` / `from_mtx`).
     # Neither direction had a benchmark. Also carries the `mtx_header_integer`

@@ -279,7 +279,17 @@ pub fn run_subset(
     // is the one correct source here — see its contract.
     if rebuild_csc {
         let csc_framing = crate::cli_utils::framing_for_file(output);
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, csc_framing)?;
+        // No `--temp-dir` on this op: the CSC builder's spill root defaults to the
+        // output's own directory, which is already where the rewrite staged a whole
+        // copy of it, and the spill only happens at all on an undersized
+        // `--csc-memory-limit`.
+        scx_ops::rebuild_csc_inplace(
+            output,
+            csc_cols_per_shard,
+            csc_memory_limit,
+            csc_framing,
+            None,
+        )?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 
@@ -839,7 +849,17 @@ fn extract_modality(
         // See the note on the sibling site above: the rewrite framing would
         // re-authorise codec selection on the sidecar.
         let csc_framing = crate::cli_utils::framing_for_file(output);
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, csc_framing)?;
+        // No `--temp-dir` on this op: the CSC builder's spill root defaults to the
+        // output's own directory, which is already where the rewrite staged a whole
+        // copy of it, and the spill only happens at all on an undersized
+        // `--csc-memory-limit`.
+        scx_ops::rebuild_csc_inplace(
+            output,
+            csc_cols_per_shard,
+            csc_memory_limit,
+            csc_framing,
+            None,
+        )?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
     Ok(())

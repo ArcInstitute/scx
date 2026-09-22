@@ -2975,8 +2975,8 @@ fn test_phase_b_per_modality_csc() {
 /// auto-emit transpose pass at finish() time. After finish(), the
 /// modality's `n_csc_shards >= 1` and `flags.has_csc() == true`,
 /// even though the caller never invoked `write_csc_shard_for` —
-/// the writer read the CSR shards back from its temp file and
-/// streamed them through `streaming_csr_to_csc_iter_with_cap`.
+/// the writer read the CSR shards back from its temp file and pushed
+/// them one at a time into a `scx_sparse::CscBuilder`.
 #[test]
 fn test_phase_b3_auto_emit_csc() {
     use crate::modality::ModalityType;

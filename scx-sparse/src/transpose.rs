@@ -89,193 +89,27 @@ pub fn csr_to_csc(csr: &ScxCsr) -> CscArrays {
     }
 }
 
-/// Streaming CSR → CSC transpose, bounded by `max_memory_bytes`.
-///
-/// For large matrices where full in-memory transpose exceeds available RAM.
-/// Takes a slice of ScxCsr shards (each shard covers a range of rows) rather
-/// than a file reader, since scx-sparse is standalone and cannot depend on
-/// scx-format. The caller (scx-cli) reads shards from the file and passes
-/// them here.
-///
-/// **Algorithm** — multi-pass column-chunked approach:
-///   1. Determine `chunk_cols = max_memory_bytes / (n_rows × 12)` columns per pass
-///      (a conservative worst-case bound; see `compute_chunk_cols`)
-///   2. For each chunk of columns `[col_start..col_end)`, transpose via an
-///      O(nnz) two-pass counting scatter (same algorithm as the in-memory
-///      `csr_to_csc`), restricted to that column range:
-///      a. Count per-column nnz for entries where `col_start <= col_idx < col_end`
-///      b. Prefix-sum the counts into the chunk's CSC indptr
-///      c. Scatter entries into column positions via a per-column write cursor
-///      (no sort — scan order already yields ascending row order)
-///   3. Concatenate chunk results into final CSC arrays
-///
-/// **Memory usage**: O(chunk_cols × avg_nnz_per_col) per pass, bounded by
-/// `max_memory_bytes`.
-/// **Passes**: ceil(n_cols / chunk_cols). More memory → fewer passes → faster.
-///
-/// **Example**: 30K-gene × 100K-cell matrix, 4GB limit:
-///   chunk_cols ≈ 4GB / (100K × 12) ≈ 3,333 columns per pass → ~9 passes
-pub fn streaming_csr_to_csc(
-    shards: &[ScxCsr],
-    n_rows_total: usize,
-    n_cols: usize,
-    max_memory_bytes: usize,
-) -> Result<CscArrays, TransposeError> {
-    // Validate shard shapes
-    for shard in shards {
-        if shard.n_cols() != n_cols {
-            return Err(TransposeError::ShapeMismatch {
-                shard_cols: shard.n_cols(),
-                expected_cols: n_cols,
-            });
-        }
-    }
-
-    let chunk_cols = compute_chunk_cols(n_rows_total, max_memory_bytes)?;
-
-    // Accumulate results across all column chunks
-    let mut final_indptr = Vec::with_capacity(n_cols + 1);
-    final_indptr.push(0i64);
-    let mut final_indices = Vec::new();
-    let mut final_data = Vec::new();
-
-    let mut col_start = 0usize;
-    while col_start < n_cols {
-        // CLI9: saturating add — `chunk_cols` is `usize::MAX` (the "all
-        // columns in one pass" sentinel) for the empty / unbounded case, so a
-        // plain `col_start + chunk_cols` would overflow-panic in debug.
-        let col_end = col_start.saturating_add(chunk_cols).min(n_cols);
-        let chunk_n_cols = col_end - col_start;
-
-        let chunk = transpose_column_chunk(shards, n_rows_total, col_start, col_end);
-
-        // Append indptr (skip the leading 0 since we already have a running total)
-        let base = *final_indptr.last().unwrap();
-        for i in 1..=chunk_n_cols {
-            final_indptr.push(base + chunk.indptr[i]);
-        }
-
-        final_indices.extend_from_slice(&chunk.indices);
-        final_data.extend_from_slice(&chunk.data);
-
-        col_start = col_end;
-    }
-
-    Ok(CscArrays {
-        shape: (n_rows_total, n_cols),
-        indptr: final_indptr,
-        indices: final_indices,
-        data: final_data,
-    })
-}
-
-/// Iterator variant for writing CSC shards incrementally.
-///
-/// Each `.next()` call returns CSC arrays for the next chunk of columns,
-/// suitable for streaming into ScxWriter without holding the full CSC in memory.
-/// Takes the same shard-slice input as `streaming_csr_to_csc`.
-pub fn streaming_csr_to_csc_iter<'a>(
-    shards: &'a [ScxCsr],
-    n_rows_total: usize,
-    n_cols: usize,
-    max_memory_bytes: usize,
-) -> Result<CscShardIterator<'a>, TransposeError> {
-    // Validate shard shapes
-    for shard in shards {
-        if shard.n_cols() != n_cols {
-            return Err(TransposeError::ShapeMismatch {
-                shard_cols: shard.n_cols(),
-                expected_cols: n_cols,
-            });
-        }
-    }
-
-    let chunk_cols = compute_chunk_cols(n_rows_total, max_memory_bytes)?;
-
-    Ok(CscShardIterator {
-        shards,
-        n_rows_total,
-        n_cols,
-        chunk_cols,
-        current_col: 0,
-    })
-}
-
-pub struct CscShardIterator<'a> {
-    shards: &'a [ScxCsr],
-    n_rows_total: usize,
-    n_cols: usize,
-    chunk_cols: usize,
-    current_col: usize,
-}
-
-impl<'a> CscShardIterator<'a> {
-    /// Global column index where the *next* emitted chunk will start.
-    ///
-    /// Callers (e.g., `scx build-csc` writing one CSC shard per chunk)
-    /// use this to label each chunk with the correct `col_start`
-    /// before invoking `next()` — the iterator advances `current_col`
-    /// during `next()`, so reading after the call gives the *following*
-    /// chunk's start.
-    pub fn current_col_start(&self) -> usize {
-        self.current_col
-    }
-}
-
-impl<'a> Iterator for CscShardIterator<'a> {
-    type Item = Result<CscArrays, TransposeError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_col >= self.n_cols {
-            return None;
-        }
-
-        let col_start = self.current_col;
-        // CLI9: saturating add against the `usize::MAX` chunk_cols sentinel.
-        let col_end = col_start.saturating_add(self.chunk_cols).min(self.n_cols);
-
-        let chunk = transpose_column_chunk(self.shards, self.n_rows_total, col_start, col_end);
-        self.current_col = col_end;
-
-        Some(Ok(chunk))
-    }
-}
-
-/// Streaming CSR → CSC iterator with both a memory bound *and* a hard
-/// cap on columns per chunk.
-///
-/// Mirrors [`streaming_csr_to_csc_iter`] but the resulting chunk size is
-/// `min(memory_bound, max_cols)`. Used by `scx build-csc
-/// --csc-cols-per-shard <N>`: the user-facing knob is "at most N cols
-/// per shard" while still respecting the memory bound. Pass
-/// `usize::MAX` (or `u32::MAX as usize`) as `max_cols` to disable the
-/// cap and behave exactly like `streaming_csr_to_csc_iter`.
-pub fn streaming_csr_to_csc_iter_with_cap<'a>(
-    shards: &'a [ScxCsr],
-    n_rows_total: usize,
-    n_cols: usize,
-    max_memory_bytes: usize,
-    max_cols: usize,
-) -> Result<CscShardIterator<'a>, TransposeError> {
-    for shard in shards {
-        if shard.n_cols() != n_cols {
-            return Err(TransposeError::ShapeMismatch {
-                shard_cols: shard.n_cols(),
-                expected_cols: n_cols,
-            });
-        }
-    }
-
-    let chunk_cols = compute_chunk_cols_with_cap(n_rows_total, max_memory_bytes, max_cols)?;
-
-    Ok(CscShardIterator {
-        shards,
-        n_rows_total,
-        n_cols,
-        chunk_cols,
-        current_col: 0,
-    })
-}
+// `streaming_csr_to_csc`, `streaming_csr_to_csc_iter`,
+// `streaming_csr_to_csc_iter_with_cap` and `CscShardIterator` lived here.
+//
+// They answered one column chunk at a time by rescanning every nonzero of
+// every shard twice, per chunk — `2 * nnz * n_chunks`, which is 4.8e11 index
+// comparisons on census_1m — and they borrowed `&[ScxCsr]` for the iterator's
+// whole lifetime, which forced every caller to hold the entire decoded CSR.
+// `csc_builder::CscBuilder` replaces them: pushed shards, one pass, and a
+// resident set the caller's budget bounds.
+//
+// Deleted rather than deprecated. A `#[deprecated]` `pub fn` still compiles,
+// and what is left here is an algorithm that is asymptotically worse in the
+// one dimension that matters, sitting in a published crate for the next
+// caller to reach for. `compute_chunk_cols_with_cap` below stays, and is the
+// one piece that did not go: it is still the shard-WIDTH rule, and keeping it
+// byte for byte is why the emitted layout is unchanged.
+//
+// `transpose_column_chunk` survives as `pub(crate)` for tests only — it is the
+// oracle `csc_builder`'s proptests compare against element for element, which
+// is the executable form of the claim that the replacement emits the same
+// bytes.
 
 /// Compute chunk size as `min(compute_chunk_cols(...), max_cols)`.
 ///
@@ -308,7 +142,8 @@ pub fn compute_chunk_cols_with_cap(
 /// is now 8 bytes (i32 index + f32 value) plus small `chunk_n_cols`-sized
 /// `col_counts`/`cursor` workspaces — so the 12 is a conservative over-estimate
 /// that keeps chunking on the safe (smaller-chunk) side.
-fn compute_chunk_cols(
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn compute_chunk_cols(
     n_rows_total: usize,
     max_memory_bytes: usize,
 ) -> Result<usize, TransposeError> {
@@ -339,7 +174,8 @@ fn compute_chunk_cols(
 ///
 /// Returns a `CscArrays` where `shape = (n_rows_total, col_end - col_start)`,
 /// and `indptr` has length `chunk_n_cols + 1`.
-fn transpose_column_chunk(
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn transpose_column_chunk(
     shards: &[ScxCsr],
     n_rows_total: usize,
     col_start: usize,
@@ -409,6 +245,71 @@ fn transpose_column_chunk(
         indices,
         data,
     }
+}
+
+/// Drive [`transpose_column_chunk`] over every chunk, the way the deleted
+/// `streaming_csr_to_csc_iter_with_cap` did, and concatenate the result.
+///
+/// Test-only, and the **oracle**: `csc_builder`'s proptests compare the
+/// builder's output against this chunk for chunk, which is the executable form
+/// of the claim that the replacement emits the same bytes. It is kept as a
+/// reference implementation rather than production code precisely because it
+/// is the `2 * nnz * n_chunks` algorithm — correct, and the wrong thing to
+/// call.
+#[cfg(test)]
+pub(crate) fn reference_chunks(
+    shards: &[ScxCsr],
+    n_rows_total: usize,
+    n_cols: usize,
+    max_memory_bytes: usize,
+    max_cols: usize,
+) -> Result<Vec<(usize, CscArrays)>, TransposeError> {
+    for shard in shards {
+        if shard.shape.1 != n_cols {
+            return Err(TransposeError::ShapeMismatch {
+                shard_cols: shard.shape.1,
+                expected_cols: n_cols,
+            });
+        }
+    }
+    let chunk_cols = compute_chunk_cols_with_cap(n_rows_total, max_memory_bytes, max_cols)?;
+    let mut out = Vec::new();
+    let mut col_start = 0usize;
+    while col_start < n_cols {
+        let col_end = col_start.saturating_add(chunk_cols).min(n_cols);
+        out.push((
+            col_start,
+            transpose_column_chunk(shards, n_rows_total, col_start, col_end),
+        ));
+        col_start = col_end;
+    }
+    Ok(out)
+}
+
+/// The same, concatenated into one whole-matrix `CscArrays`.
+#[cfg(test)]
+pub(crate) fn reference_whole(
+    shards: &[ScxCsr],
+    n_rows_total: usize,
+    n_cols: usize,
+    max_memory_bytes: usize,
+) -> Result<CscArrays, TransposeError> {
+    let chunks = reference_chunks(shards, n_rows_total, n_cols, max_memory_bytes, 0)?;
+    let mut indptr = vec![0i64];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    for (_, chunk) in chunks {
+        let base = *indptr.last().expect("seeded");
+        indptr.extend(chunk.indptr[1..].iter().map(|v| v + base));
+        indices.extend_from_slice(&chunk.indices);
+        data.extend_from_slice(&chunk.data);
+    }
+    Ok(CscArrays {
+        shape: (n_rows_total, n_cols),
+        indptr,
+        indices,
+        data,
+    })
 }
 
 #[cfg(test)]
@@ -510,7 +411,7 @@ mod tests {
 
         // Streaming with small memory limit — force multiple passes
         // 4 rows × 12 bytes = 48 bytes/col. Use 100 bytes → ~2 cols per chunk → 3 passes
-        let csc_streamed = streaming_csr_to_csc(std::slice::from_ref(&csr), 4, 6, 100).unwrap();
+        let csc_streamed = reference_whole(std::slice::from_ref(&csr), 4, 6, 100).unwrap();
         let dense_streamed = csc_to_dense(&csc_streamed);
         assert_eq!(dense_streamed, dense);
 
@@ -542,11 +443,11 @@ mod tests {
 
         // Streaming multi-shard (generous memory)
         let csc_streamed =
-            streaming_csr_to_csc(&[shard0.clone(), shard1.clone()], 4, 4, 1_000_000).unwrap();
+            reference_whole(&[shard0.clone(), shard1.clone()], 4, 4, 1_000_000).unwrap();
         assert_eq!(csc_to_dense(&csc_streamed), dense);
 
         // Streaming multi-shard (tiny memory → 1 col per pass)
-        let csc_tiny = streaming_csr_to_csc(&[shard0, shard1], 4, 4, 48).unwrap();
+        let csc_tiny = reference_whole(&[shard0, shard1], 4, 4, 48).unwrap();
         assert_eq!(csc_to_dense(&csc_tiny), dense);
     }
 
@@ -554,7 +455,7 @@ mod tests {
     fn test_transpose_memory_limit_too_small() {
         let csr = dense_to_csr(&[1.0, 2.0, 3.0, 4.0], 2, 2);
         // 2 rows × 12 = 24 bytes per col. Budget of 10 → not enough for 1 col.
-        let err = streaming_csr_to_csc(&[csr], 2, 2, 10).unwrap_err();
+        let err = reference_whole(&[csr], 2, 2, 10).unwrap_err();
         assert!(matches!(err, TransposeError::MemoryLimitTooSmall { .. }));
     }
 
@@ -562,7 +463,7 @@ mod tests {
     fn test_transpose_shape_mismatch() {
         let shard_a = dense_to_csr(&[1.0, 2.0], 1, 2);
         let shard_b = dense_to_csr(&[1.0, 2.0, 3.0], 1, 3);
-        let err = streaming_csr_to_csc(&[shard_a, shard_b], 2, 2, 1_000_000).unwrap_err();
+        let err = reference_whole(&[shard_a, shard_b], 2, 2, 1_000_000).unwrap_err();
         assert!(matches!(err, TransposeError::ShapeMismatch { .. }));
     }
 
@@ -571,7 +472,7 @@ mod tests {
     // overflow-panic. Transposing a 0×3 matrix yields an empty CSC.
     #[test]
     fn test_transpose_empty_matrix_no_overflow() {
-        let csc = streaming_csr_to_csc(&[], 0, 3, 1_000_000).unwrap();
+        let csc = reference_whole(&[], 0, 3, 1_000_000).unwrap();
         assert_eq!(csc.indptr, vec![0i64; 4]);
         assert!(csc.indices.is_empty());
         assert!(csc.data.is_empty());
@@ -583,8 +484,8 @@ mod tests {
     fn test_transpose_single_column_budget() {
         // 2×3 matrix; 2 rows × 12 = 24 bytes/col → budget 24 → 1 col/pass.
         let shard = dense_to_csr(&[1.0, 0.0, 2.0, 0.0, 3.0, 0.0], 2, 3);
-        let csc = streaming_csr_to_csc(&[shard], 2, 3, 24).unwrap();
-        let reference = streaming_csr_to_csc(
+        let csc = reference_whole(&[shard], 2, 3, 24).unwrap();
+        let reference = reference_whole(
             &[dense_to_csr(&[1.0, 0.0, 2.0, 0.0, 3.0, 0.0], 2, 3)],
             2,
             3,
@@ -633,26 +534,17 @@ mod tests {
         let shards = [csr];
 
         // Generous memory bound — cap should drive the chunking.
-        let mut iter = streaming_csr_to_csc_iter_with_cap(&shards, 4, 6, 1_000_000, 3).unwrap();
-
-        // Before next(): col_start == 0.
-        assert_eq!(iter.current_col_start(), 0);
-
-        let chunk0 = iter.next().unwrap().unwrap();
-        assert_eq!(chunk0.shape, (4, 3));
-        // After first chunk: col_start advanced to 3.
-        assert_eq!(iter.current_col_start(), 3);
-
-        let chunk1 = iter.next().unwrap().unwrap();
-        assert_eq!(chunk1.shape, (4, 3));
-        // After second chunk: col_start at 6 (== n_cols).
-        assert_eq!(iter.current_col_start(), 6);
-
-        assert!(iter.next().is_none());
+        let chunks = reference_chunks(&shards, 4, 6, 1_000_000, 3).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].0, 0);
+        assert_eq!(chunks[0].1.shape, (4, 3));
+        assert_eq!(chunks[1].0, 3);
+        assert_eq!(chunks[1].1.shape, (4, 3));
+        let (chunk0, chunk1) = (&chunks[0].1, &chunks[1].1);
 
         // Reconstruct and verify.
         let mut reconstructed = vec![0.0f32; 24]; // 4×6
-        for (chunk_idx, chunk) in [&chunk0, &chunk1].iter().enumerate() {
+        for (chunk_idx, chunk) in [chunk0, chunk1].iter().enumerate() {
             let col_offset = chunk_idx * 3;
             for col in 0..chunk.shape.1 {
                 let s = chunk.indptr[col] as usize;
@@ -675,18 +567,17 @@ mod tests {
         let csr = dense_to_csr(&dense, 2, 7);
         let shards = [csr];
 
-        let mut iter = streaming_csr_to_csc_iter_with_cap(&shards, 2, 7, 1_000_000, 3).unwrap();
-        let mut starts = Vec::new();
-        let mut sizes = Vec::new();
-        starts.push(iter.current_col_start());
-        while let Some(chunk) = iter.next() {
-            sizes.push(chunk.unwrap().shape.1);
-            starts.push(iter.current_col_start());
-        }
-        // Three chunks of sizes 3, 3, 1 starting at 0, 3, 6 (with final
-        // current_col_start == 7 reflecting EOF).
-        assert_eq!(sizes, vec![3, 3, 1]);
-        assert_eq!(starts, vec![0, 3, 6, 7]);
+        let chunks = reference_chunks(&shards, 2, 7, 1_000_000, 3).unwrap();
+        // Three chunks of sizes 3, 3, 1 starting at 0, 3, 6 — the short last
+        // chunk is the boundary an off-by-one lands on.
+        assert_eq!(
+            chunks.iter().map(|(_, c)| c.shape.1).collect::<Vec<_>>(),
+            vec![3, 3, 1]
+        );
+        assert_eq!(
+            chunks.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![0, 3, 6]
+        );
     }
 
     #[test]
@@ -703,8 +594,11 @@ mod tests {
         // Force 2 cols per chunk → 2 iterations
         // 3 rows × 12 = 36 bytes/col → budget 72 → 2 cols per chunk
         let shards = [csr];
-        let iter = streaming_csr_to_csc_iter(&shards, 3, 4, 72).unwrap();
-        let chunks: Vec<CscArrays> = iter.map(|r| r.unwrap()).collect();
+        let chunks: Vec<CscArrays> = reference_chunks(&shards, 3, 4, 72, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect();
 
         assert_eq!(chunks.len(), 2);
 

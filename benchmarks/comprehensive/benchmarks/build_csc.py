@@ -6,14 +6,37 @@
 metric** before this module. That matters more than an ordinary coverage gap:
 this is the only operation in the suite with a *declared* memory budget —
 `build_csc(memory_limit=…)`, default `"4G"` — and nothing measured the gap
-between what a caller asks for and what the op takes. `write_csc_sidecar` takes
-`&[ScxCsr]` by value and has no streaming path, so the cost is dominated by
-holding the CSR and its column-major transpose at once.
+between what a caller asks for and what the op takes.
 
-Two things are measured, both written up in `thresholds.yaml`'s Deferred
-floors, item 14.
+**The budget is now partly honoured, and this module is what said so.** The
+streaming `CscBuilder` replaced a transpose that rescanned every nonzero of
+every shard twice per column chunk while `run_build_csc` held every decoded
+shard in a `Vec<ScxCsr>`. Before/after on one node, median of three:
 
-**The budget cannot be honoured.** Sweeping it over a 128x range on
+    dataset               before MB   after MB   before/bud  after/bud   wall x
+    pbmc10k                     967        990         0.24       0.24     1.40
+    tabula_sapiens_100k        3580       3775         0.87       0.92     2.05
+    census_500k                8998       5512         2.20       1.35     5.66
+    census_1m                 15411       7138         3.76       1.74     9.36
+
+Read that carefully before quoting it. The wall is 9.4x at census scale and the
+peak fell by half, but **1.74x is not 1.0** — the bucket staging is bounded by
+an asserted counter, while the source shard's re-encode, the writer and the
+interpreter baseline are not. And the two small datasets got slightly *worse*:
+below the spill threshold every bucket stays resident. `thresholds.yaml`'s
+floors are set ~1.25x above the measured values for that reason: they are
+regression floors on an improvement, not contract floors.
+
+This module also earned its keep twice over during that change. The first
+capture came back at 1.92x with tabula 10 % worse than the code being replaced,
+which is how a capacity-vs-length accounting bug in the builder's own bound was
+found — the Rust suite was green throughout, because nothing asserted the
+number the change was about.
+
+The pre-fix budget sweep below is kept because it is the evidence for what
+"declared but ignored" meant, and `thresholds.yaml` item 14 cites it.
+
+**The budget could not be honoured at all, before.** Sweeping it over a 128x range on
 tabula_sapiens_100k (194.9M nnz) moves the op's own allocation by 26% and halves
 the wall — so the knob buys throughput for memory rather than doing nothing — but
 even the smallest setting overshoots by 4.4x:
@@ -56,11 +79,12 @@ Per run, into `runs[].extra`:
   — context. The premise (a sidecar was actually built) is enforced by raising,
   not recorded as a metric.
 
-The ratio is deliberately **not** floored in `thresholds.yaml` yet. A
-`<= 1.25` row would pass on tabula (0.73x) and fail on census_500k (1.99x), so
-until the sidecar writer streams a live floor would fail every gate run that
-reaches census scale. The measurements, the crossover, and the activation recipe
-are in that file's "Deferred floors" block, item 14.
+The ratio **is** floored in `thresholds.yaml` now, on both census tiers, at
+~1.25x the measured value rather than at the contract's 1.0 — see item 14 of
+that file's "Deferred floors" block for the capture and for what is still
+outside the bound. `n_csc_shards__build_csc` is pinned there too, from both
+directions: a memory ratio can be met by narrowing shards, which would fix
+nothing.
 
 ## In-place, one copy per run
 
@@ -185,6 +209,20 @@ def run(
             built = pyscx.open(str(target))
             try:
                 has_csc = bool(built.has_csc)
+                # Same already-open reader, same header, no extra I/O. The
+                # shard count is the layout number `has_csc` cannot express,
+                # and the one a memory bound can be met by regressing: narrow
+                # shards are individually cheap, so a build that fell back to
+                # chunk-width sharding would pass a peak floor while fixing
+                # nothing.
+                #
+                # Read directly. A `getattr(..., 0)` fallback carried the
+                # before/after capture against an older pyscx, but that capture
+                # is done and the fallback is now worse than useless: a rename
+                # would record `0` and fail the `min: 173` floor for the wrong
+                # reason, looking like a layout regression instead of a missing
+                # attribute.
+                n_csc_shards = int(built.n_csc_shards)
             finally:
                 _close = getattr(built, "close", None)
                 if _close is not None:
@@ -222,6 +260,9 @@ def run(
                     "delta_over_memory_limit__build_csc": round(
                         (peak - entry_rss) / _MEMORY_LIMIT_MB, 4
                     ),
+                    # Emitted unconditionally, like the ratios above, so a
+                    # threshold on it can never be a missing-metric violation.
+                    "n_csc_shards__build_csc": n_csc_shards,
                     "memory_limit_mb": _MEMORY_LIMIT_MB,
                     "input_bytes": input_bytes,
                     "output_bytes": output_bytes,
@@ -250,11 +291,15 @@ def run(
     result.metadata["median_delta_over_memory_limit"] = round(
         statistics.median(deltas) / _MEMORY_LIMIT_MB, 4
     )
+    shard_counts = [r.extra["n_csc_shards__build_csc"] for r in result.runs]
+    result.metadata["median_n_csc_shards"] = int(statistics.median(shard_counts))
     logger.info(
-        "build_csc done: %s — median peak %.1f MB = %.2fx the %s budget",
+        "build_csc done: %s — median peak %.1f MB = %.2fx the %s budget, "
+        "%d CSC shards",
         dataset.name,
         result.metadata["median_peak_rss_mb"],
         result.metadata["median_peak_over_memory_limit"],
         _MEMORY_LIMIT,
+        result.metadata["median_n_csc_shards"],
     )
     return result

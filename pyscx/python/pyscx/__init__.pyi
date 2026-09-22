@@ -929,6 +929,8 @@ class Experiment:
     @property
     def has_csc(self) -> bool: ...
     @property
+    def n_csc_shards(self) -> int: ...
+    @property
     def has_deletions(self) -> bool: ...
     @property
     def obs_metadata_shard_count(self) -> int: ...
@@ -1322,6 +1324,7 @@ def build_csc(
     memory_limit: str = ...,
     force: bool = ...,
     csc_cols_per_shard: int = ...,
+    temp_dir: str | None = ...,
 ) -> None:
     """Add a CSC (column-major) sidecar built from `input`'s CSR shards.
 

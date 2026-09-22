@@ -170,6 +170,39 @@ impl ValueEncoding {
         encs.iter().copied().max_by_key(|e| e.byte_width())
     }
 
+    /// The one encoding wide enough to **write** every input shard's values
+    /// into.
+    ///
+    /// Any float source forces `Float32` — even an all-`Float16` family, which
+    /// is where this differs from [`ValueEncoding::widest`]: a writer must not
+    /// narrow, and `Float16` is a storage form the encoders do not produce.
+    /// Otherwise the widest integer present, defaulting to `Uint8` for an empty
+    /// slice (no shards constrain the choice).
+    ///
+    /// Used wherever rows from several inputs or shards are re-packed into one
+    /// output shard — merge X/layers on both the sorted and concat paths, and
+    /// the CSC sidecar, whose encoding must cover every source shard (SCX-004):
+    /// a `Uint8` first shard followed by a `Float32` shard would otherwise
+    /// truncate the float values.
+    pub fn widest_for_write(encs: &[ValueEncoding]) -> ValueEncoding {
+        let mut any_float = false;
+        let mut max_int = ValueEncoding::Uint8;
+        for &e in encs {
+            if e.is_integer() {
+                if e.byte_width() > max_int.byte_width() {
+                    max_int = e;
+                }
+            } else {
+                any_float = true;
+            }
+        }
+        if any_float {
+            Self::Float32
+        } else {
+            max_int
+        }
+    }
+
     /// Encode a single f32 value to raw LE bytes, with range checking.
     ///
     /// This is the inverse of `values_raw_to_f32` for one element.

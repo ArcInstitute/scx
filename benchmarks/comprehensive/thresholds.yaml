@@ -3535,6 +3535,36 @@ absolute_floors:
     metric: query_peak_rss_mb
     max: 200.0            # measured 50 MB
 
+  # CSC sidecar build: memory, and the layout that memory could be bought
+  # with. Authored from the before/after capture in "Deferred floors" item 14,
+  # which also says why these are ~1.25x the measured value rather than the
+  # contract's 1.0, and what is still outside the bound.
+  - benchmark: build_csc
+    format: scx_auto
+    dataset: census_500k
+    metric: peak_over_memory_limit__build_csc
+    max: 1.70             # measured 1.35 after, 2.20 before
+  - benchmark: build_csc
+    format: scx_auto
+    dataset: census_1m
+    metric: peak_over_memory_limit__build_csc
+    max: 2.20             # measured 1.74 after, 3.76 before
+  # Layout-unchanged pins, both directions. A ratio floor above can be
+  # satisfied by *narrowing* shards, which would fix nothing; and widening
+  # them (173 -> 13) is a deferred decision needing its own read-side
+  # measurement, not something to arrive at by accident. One row carries one
+  # direction — a row with both `min` and `max` silently honours only `min`.
+  - benchmark: build_csc
+    format: scx_auto
+    dataset: census_1m
+    metric: n_csc_shards__build_csc
+    min: 173.0
+  - benchmark: build_csc
+    format: scx_auto
+    dataset: census_1m
+    metric: n_csc_shards__build_csc
+    max: 173.0
+
 
 # ---------------------------------------------------------------------------
 # Deferred floors — known gaps tracked here so operators can see what's
@@ -3872,74 +3902,59 @@ absolute_floors:
 #    whole (OPT-CONVERT-4) and peak RSS over a multi-matrix export is not the
 #    max of independent peaks.
 #
-# 14. build_csc's declared memory budget cannot be honoured; not yet floored
+# 14. build_csc's memory budget: partly closed, floored where it landed
 #    `pyscx.build_csc(input, memory_limit=...)` is the only operation in the
-#    suite with a *declared* memory budget, and the `build_csc` benchmark now
-#    measures what it actually takes.
+#    suite with a *declared* memory budget. This item used to say the budget
+#    "cannot be honoured" and deferred the floor until `write_csc_sidecar`
+#    streamed. It streams now (`scx_sparse::CscBuilder`), and the floors are
+#    live below -- but the budget still does not bound the whole op, so read
+#    what they gate before tightening them.
 #
-#    (a) Does the budget bound anything? Measured directly on
-#    tabula_sapiens_100k (194,891,401 nnz), one run per budget:
+#    Before/after on one node, `memory_limit=4G`, median of three runs, both
+#    arms on the same partition:
 #
-#      memory_limit    peak (MB)   op's own delta (MB)   wall (s)
-#      512MiB             2683.6                2232.8      536.0
-#      1G                 2676.9                2189.8      374.6
-#      4G                 2973.0                2454.8      262.0
-#      64G                3272.7                2759.1      250.1
+#      dataset               before MB   after MB   before/bud  after/bud   wall x
+#      pbmc10k                     967        990         0.24       0.24     1.40
+#      tabula_sapiens_100k        3580       3775         0.87       0.92     2.05
+#      census_500k                8998       5512         2.20       1.35     5.66
+#      census_1m                 15411       7138         3.76       1.74     9.36
 #
-#    Across a **128x range of declared budgets** the op's own allocation moves by
-#    26% (2190 -> 2759 MB) and the wall halves. So the knob is not inert — it
-#    buys throughput for memory, which is a sane trade — but the ~2.2 GB floor
-#    sits outside its control, because `write_csc_sidecar` takes `&[ScxCsr]` by
-#    value and holds the CSR and its column-major transpose at once. **At
-#    512 MiB declared the op still uses 2233 MB, 4.4x over, and does not raise.**
-#    On a matrix this size the budget cannot be honoured at any setting.
+#    What closed: the op no longer holds every decoded CSR shard at once, and
+#    the column-bucket staging is bounded by an asserted counter
+#    (`staged_bytes_never_exceed_the_declared_bound`) rather than by an
+#    estimate. census_1m's ratio fell 3.76x -> 1.74x and its wall 966 s ->
+#    103 s.
 #
-#    (b) How it scales. Same 4 GiB budget, three datasets:
+#    What did not: the source shard's re-encode, the writer, and the ~0.4-1.1
+#    GB interpreter baseline the sampler measures within all sit outside that
+#    bound. PR-D deletes the re-encode. So the contract figure -- 1.0 -- is
+#    still not met at census scale, and a floor there would fail today.
 #
-#      dataset          nnz        peak (MB)         B/nnz   peak/budget
-#      pbmc3k          2.3M    524 / 527 / 526       241.2      0.13
-#      tabula_100k   194.9M   2970 / 2970 / 2970      16.0      0.73
-#      census_500k   747.0M   8171 / 8103             11.4      1.99
+#    The two small datasets got slightly *worse* (0.87 -> 0.92 on tabula).
+#    Below the spill threshold every bucket stays resident, costing about what
+#    holding the decoded CSR used to, plus block slack. That is a real trade
+#    for the 2.05x wall, not noise, and the floors leave room for it.
 #
-#    Read B/nnz, not the ratio: pbmc3k's 241 is almost entirely the 450-520 MB
-#    interpreter baseline that `PeakRssSampler` seeds itself with, and the two
-#    real points sit at 11-16 B per non-zero.
+#    The floors below are therefore **regression floors on a measured
+#    improvement**, not contract floors. Each is ~1.25x the measured value, so
+#    it passes today with margin and fails at the pre-change number (census_1m
+#    2.20 against 3.76 measured before; census_500k 1.70 against 2.20). Do not
+#    tighten them toward 1.0 without a capture showing the op got there.
 #
-#    Those three rows came from one process running the datasets in sequence,
-#    and `PeakRssSampler` seeds at entry RSS — so they were re-measured in fresh
-#    processes to check for inherited heap. There is none worth noting: tabula
-#    at a 4 GiB budget gives 2973 MB fresh against 2970 in the sequence, and
-#    census_500k gives **8189.8 MB fresh (entry 450.8, delta 7738.9, wall
-#    1628 s) against a sequence median of 8137** — 0.6%. Both ratios breach at
-#    census: 2.00 on the raw peak and **1.89 with the baseline removed**, so the
-#    breach does not depend on which convention the threshold picks.
+#    Use `peak_over_memory_limit__build_csc`, not the delta: at census scale
+#    the interpreter baseline the delta removes is a fifth of the budget, and
+#    the delta flatters the op. Both are emitted.
 #
-#    ⚠️ It is NOT exactly 16 B/nnz. tabula's 2970 MB lands within 0.13% of
-#    `2 x nnz x 8 B` = 2973.8 MB, which is a coincidence of that shape *and* that
-#    budget: census_500k's 747M non-zeros would predict 11,399 MB and measure
-#    8137. A two-point fit over the two real scales gives
-#
-#      peak_MB ~= 9.36 * (nnz in millions) + 1146
-#
-#    crossing the 4 GiB budget at **~315M non-zeros**, about 162,000 cells at
-#    tabula's ~1,949 nnz/cell, and putting census_1m (1.40B nnz) at ~3.5x. Two
-#    points is an ordering claim, not a model.
-#
-#    Consequences for anyone authoring the threshold:
-#
-#      * The breach is scale-dependent. tabula sits *under* at 0.73x;
-#        census_500k is at 1.99x. A `peak_over_memory_limit__build_csc <= 1.25`
-#        row would pass at tabula and fail at census, so pick the dataset
-#        deliberately rather than assuming "expected to fail today" everywhere.
-#      * Two ratios are emitted and they differ by the interpreter baseline. Use
-#        `delta_over_memory_limit__build_csc` if the budget means "what this op
-#        may allocate", `peak_over_memory_limit__build_csc` if it means "what the
-#        process may reach". Below ~50M non-zeros only the first says anything.
-#
-#    Blocker: this is a bound violation, not a measurement artefact, so a live
-#    floor would fail every gate run that reaches census scale until
-#    `write_csc_sidecar` streams. Author the row in the change that fixes the
-#    writer, using the crossover above to choose the scale to gate.
+#    The shard-count pins are the non-vacuity half. A memory bound can be met
+#    by narrowing shards -- `compute_chunk_cols` budgeted a dense 12 B x n_rows
+#    per column, giving 173 CSC shards on census_1m against the 13 that
+#    `csc_cols_per_shard=5000` implies -- and narrow shards are individually
+#    cheap, so a silent fall-back would pass the ratio floors while fixing
+#    nothing. This change deliberately keeps today's boundaries (the 173 -> 13
+#    question is deferred with the read-side measurement it needs), so the
+#    count is pinned from *both* sides and a change either way has to
+#    re-baseline on purpose. Two rows, because one row carries one direction:
+#    a row with both `min` and `max` silently honours only `min`.
 #
 # 15. cellset_gather / collate throughput (`collate_rust`)
 #     The arm exists as of PR-02c; the floors need PR-03's recapture because

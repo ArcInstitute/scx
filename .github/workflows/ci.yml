@@ -2807,15 +2807,26 @@ jobs:
       # guard weaker than its own comment survives review. Test modules are exempt (they assert on
       # the numbers); a justified standalone use marks itself
       # `ORG-11.16-5-ALLOW` with a reason.
-      - name: Budget arithmetic lives only in scx-convert/src/budget.rs
+      #
+      # Scoped to three crates, not just scx-convert. The CSC streaming builder
+      # put budget-derived sizing in `scx-format-io` (where the code that
+      # claims against it lives, below `scx-convert`), so a guard that still
+      # looked only at `scx-convert/src` would have watched the arithmetic
+      # *move out from under it* — the same class of miss the sidecar-budget
+      # guard below already records having made once.
+      - name: Budget arithmetic lives only in the budget modules
         run: |
           if grep -rEn --include='*.rs' \
-               '[a-z_]*budget[a-z_]*[[:space:]]*(/|\*)[[:space:]]*[0-9]' scx-convert/src \
+               '[a-z_]*budget[a-z_]*[[:space:]]*(/|\*)[[:space:]]*[0-9]' \
+               scx-convert/src scx-format-io/src scx-ops/src \
                | grep -vE 'scx-convert/src/budget(_tests)?\.rs' \
+               | grep -vE 'scx-format-io/src/csc_budget\.rs' \
+               | grep -vE 'scx-ops/src/encode_budget\.rs' \
                | grep -vE 'scx-convert/src/convert_tests_' \
+               | grep -vE '_tests\.rs:' \
                | grep -vE 'ORG-11\.16-5-ALLOW' \
                | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
-            echo "::error::budget arithmetic outside scx-convert/src/budget.rs — add a Reservation row and ask the table for a Share instead of dividing the budget inline (ORG-11.16-5)."
+            echo "::error::budget arithmetic outside a budget module — add a Reservation row and ask the table for a Share instead of dividing the budget inline (ORG-11.16-5)."
             exit 1
           fi
       # The arithmetic grep above cannot see a budget bypassed as a CONSTANT or a
@@ -2834,8 +2845,10 @@ jobs:
         run: |
           set -e
           if grep -rEn --include='*.rs' 'DEFAULT_CSC_MEMORY_BYTES' \
-               scx-convert/src pyscx/src scx-ops/src \
+               scx-convert/src pyscx/src scx-ops/src scx-format-io/src \
                | grep -vE 'scx-convert/src/budget\.rs' \
+               | grep -vE 'scx-format-io/src/csc_sidecar\.rs' \
+               | grep -vE 'scx-format-io/src/lib\.rs' \
                | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
             echo "::error::a scx-convert call site passes DEFAULT_CSC_MEMORY_BYTES directly — route it through budget::csc_sidecar_bytes so --memory-budget reaches the sidecar (ORG-11.16-5)."
             exit 1
@@ -2843,6 +2856,21 @@ jobs:
           if grep -rEn --include='*.rs' '"[0-9]+[KMGT]"' scx-convert/src \
                | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
             echo "::error::a scx-convert call site hard-codes a byte-size string (e.g. \"4G\") — pass a resolved budget instead (ORG-11.16-5)."
+            exit 1
+          fi
+          # `ScxWriter::finish`'s auto-emit used to carry its own
+          # `4 * 1024 * 1024 * 1024`, a second sidecar budget beside
+          # `DEFAULT_CSC_MEMORY_BYTES` that neither grep above could see: not a
+          # division, not that identifier, not a string. It now goes through
+          # `CscSidecarOptions::default()`.
+          # The leading `(^|[^0-9A-Za-z_])` is load-bearing and was found by
+          # running this guard against a clean tree: without it, `mem.rs`'s
+          # `8u64 * 1024 * 1024 * 1024` matches, because `u64` ends in a `4`.
+          if grep -rEn --include='*.rs' '(^|[^0-9A-Za-z_])4[[:space:]]*\*[[:space:]]*1024[[:space:]]*\*[[:space:]]*1024[[:space:]]*\*[[:space:]]*1024' \
+               scx-format-io/src \
+               | grep -vE 'scx-format-io/src/csc_sidecar\.rs' \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::scx-format-io hard-codes a 4 GiB sidecar budget — take it from CscSidecarOptions::default() (ORG-11.16-5)."
             exit 1
           fi
       # Positive half: deleting the table outright leaves the grep above nothing

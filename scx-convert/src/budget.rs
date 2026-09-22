@@ -24,14 +24,18 @@
 //!
 //! ⚠️ **What the table does not bound.** Read `enforced` before quoting a row
 //! as a guarantee; the flag is the difference between "we sized this" and
-//! "nothing exceeds this". **Every row here is still `enforced: false` except
-//! none** — all seven are unenforced, and this change does not alter that.
-//! What it changes is the *estimate*: the two **ingest** rows now size the
-//! whole worker phase (payload, the encoder's value copy and the framed
-//! encode's buffers, via [`WORKER_PHASE_BYTES_PER_NNZ`]) instead of the reader
-//! stage alone, and the **export** row is sized from its own decode model
-//! rather than borrowing the ingest one. Widening a cost model is not proving
-//! a ceiling; each row names what it still does not bound.
+//! "nothing exceeds this". **Eight of the ten rows are `enforced: false`**, and
+//! `unenforced_reservations_are_declared_not_silent` pins that count so a ninth
+//! cannot arrive unannounced. The two that are enforced are the CSC builder's
+//! bucket rows, in both of its phases: the builder keeps a running total of
+//! staged bucket bytes and spills whenever a push takes it past its share, so
+//! that row is a ceiling the code maintains rather than an estimate it hopes
+//! for. Every other row is an estimate, and each names what it does not bound —
+//! the two **ingest** rows size the whole worker phase (payload, the encoder's
+//! value copy and the framed encode's buffers, via
+//! [`WORKER_PHASE_BYTES_PER_NNZ`]) rather than the reader stage alone, and the
+//! **export** row is sized from its own decode model rather than borrowing the
+//! ingest one. Widening a cost model is not proving a ceiling.
 //!
 //! # Why the encode term is charged, and how it is derived
 //!
@@ -120,58 +124,12 @@
 //! production callers *are* hdf5-gated, so at default features the items here
 //! are dead by construction while the tests still exercise them.
 
-/// An exact rational share of a memory budget.
+/// The exact rational share type, re-exported from `scx-format-io`.
 ///
-/// Integer, not `f64`: the invariant in [`ALLOCATION_TABLE`] must be exact, and
-/// a design in which three phases each take a third must sum to exactly one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Share {
-    num: u64,
-    den: u64,
-}
-
-impl Share {
-    pub(crate) const fn new(num: u64, den: u64) -> Self {
-        assert!(num > 0 && den > 0 && num <= den, "share must be in (0, 1]");
-        Self { num, den }
-    }
-
-    /// Bytes of `budget` this share may claim.
-    pub(crate) const fn of(self, budget: u64) -> u64 {
-        budget / self.den * self.num
-    }
-
-    /// The smallest budget admitting one whole `unit` under this share.
-    ///
-    /// The refusal predicate and the "need at least N bytes" message must come
-    /// from this one function. They used to be written separately, and drifted:
-    /// the guard tested `budget / row_bytes == 0` while the message advertised
-    /// `4 x row_bytes`, so a budget of twice a row passed a check that claimed
-    /// to require four.
-    pub(crate) const fn min_budget_for(self, unit: u64) -> u64 {
-        // Smallest `b` with `self.of(b) >= unit`. Since `of` floors the
-        // division, that is `ceil(unit / num) * den` -- rounding *up*, not
-        // `unit * den / num`, which truncates and can report a budget whose
-        // own share is smaller than the unit it was supposed to admit.
-        // `Share(3,4).min_budget_for(1)` was the case that caught it.
-        let units = unit.saturating_add(self.num - 1) / self.num;
-        units.saturating_mul(self.den)
-    }
-
-    pub(crate) const fn numerator(self) -> u64 {
-        self.num
-    }
-
-    pub(crate) const fn denominator(self) -> u64 {
-        self.den
-    }
-
-    /// How many units of this share fit in a budget — the ceiling the worker
-    /// derate solves against.
-    pub(crate) const fn max_concurrent(self) -> u64 {
-        self.den / self.num
-    }
-}
+/// It lives there so `scx-format-io` and `scx-ops` — both *below* this crate —
+/// can make a budget refusal from the same `min_budget_for` this table's shares
+/// are checked against. The shares and cost models below stay here.
+pub(crate) use scx_format_io::mem::Share;
 
 // ---------------------------------------------------------------------------
 // Cost models — bytes actually held, per element or per nonzero.
@@ -526,8 +484,12 @@ pub(crate) enum Phase {
     CscExternalColumnScan,
     /// CSC external transpose, pass 2: load one bucket, emit shards.
     CscExternalBucketDrain,
-    /// CSC sidecar generation, after X is written.
-    CscSidecar,
+    /// CSC sidecar build, push phase: source shards routed into column
+    /// buckets.
+    CscBuilderPush,
+    /// CSC sidecar build, emit phase: one shard materialised and encoded.
+    /// Not concurrent with the push — the buckets are drained by then.
+    CscBuilderEmit,
 }
 
 /// One declared claim on the budget.
@@ -659,23 +621,106 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         enforced: false,
     },
     Reservation {
-        name: "CSC sidecar transpose",
-        phase: Phase::CscSidecar,
-        share: Share::new(1, 1),
+        name: "CSC builder column buckets + spill blocks",
+        phase: Phase::CscBuilderPush,
+        share: scx_format_io::csc_budget::CSC_BUILD_BUCKET_SHARE,
         multiplicity: 1,
-        site: "pipeline/shards.rs + h5mu/pipeline.rs -> csc_sidecar::write_csc_sidecar",
-        // Whole budget rather than a share: the sidecar is built after X is
-        // written, not alongside it.
+        site: "scx_sparse::CscBuilder::push_shard, sized in \
+               scx-ops/src/build_csc.rs and \
+               ScxWriter::auto_emit_csc_for_marked_modalities",
+        // ENFORCED — as is the emit-phase row below that re-declares these
+        // same bytes. The other two CSC rows are not, and say why.
         //
-        // NOT enforced, and the first version of this row wrongly said it was.
-        // The parameter sizes the transpose CHUNK only: `compute_chunk_cols`
-        // reserves 12 B per potential entry while the chunk it returns is
-        // 8 B/entry, and `write_csc_sidecar` then builds full-length
-        // `csc_indptr_u64` / `csc_indices_u32` / raw value copies while that
-        // chunk is still live, before the writer allocates encoded streams.
-        // `scx-ops/src/build_csc.rs` is worse: it collects every source shard
-        // into a `Vec<ScxCsr>` and holds it across the transpose loop. So the
-        // budget controls column/shard sizing, not a memory ceiling.
+        // Only the two *builder* callers are sized here.
+        // `csc_sidecar::write_csc_sidecar` is deliberately not one of them:
+        // its caller is already holding the whole matrix as a resident
+        // `ScxCsr`, so it scatters straight out of that through
+        // `ResidentCscSource` and never allocates a bucket. Bucketing there
+        // would be a second copy of the caller's matrix, which is why that
+        // path has no row in this table at all — its peak is the caller's.
+        //
+        // The builder keeps one running total of staged bucket bytes and
+        // spills the largest bucket whenever a push takes it past exactly this
+        // share, so the resident set is bounded by construction rather than by
+        // an estimate. The realized bound is that share plus
+        // `2 * n_buckets * block_capacity` of block slack, declared on
+        // `CscBuilderConfig` and asserted by
+        // `staged_bytes_never_exceed_the_declared_bound` rather than hidden.
+        // (The factor of two is real: sealing sweeps every bucket a pushed row
+        // touched before the spill loop runs.)
+        //
+        // What this replaces, so the change is legible: the single "CSC
+        // sidecar transpose" row this splits from was `enforced: false`
+        // because the budget sized only the transpose CHUNK.
+        // `compute_chunk_cols` reserved 12 B per *potential* dense entry for a
+        // chunk that held 8 B/entry, `write_csc_sidecar` then built
+        // full-length `csc_indptr_u64` / `csc_indices_u32` / raw value copies
+        // beside the live chunk, and `scx-ops/src/build_csc.rs` was worse
+        // still -- it collected every source shard into a `Vec<ScxCsr>` and
+        // held it across the whole loop. All three are gone.
+        enforced: true,
+    },
+    Reservation {
+        name: "source CSR shard decode + re-encode, one in flight",
+        phase: Phase::CscBuilderPush,
+        share: scx_format_io::csc_budget::CSC_BUILD_INPUT_SHARE,
+        multiplicity: 1,
+        site: "scx-ops/src/build_csc.rs (the merged CSR re-emit + push_shard walk)",
+        // NOT enforced, and the gap is narrow enough to name exactly.
+        //
+        // The *decode* half is bounded and refused: `run_build_csc` folds
+        // `ShardHeader.nnz` and `.n_major` from every shard in its header
+        // pre-pass and refuses a budget that cannot admit the largest, with
+        // the byte figure from `Share::min_budget_for`. The header, not
+        // `ShardStats` — stats are format-permitted to be absent, and reading
+        // them here let a stats-less shard drop out of the maximum. The *re-encode* half shares the
+        // SparseIngest row's open terms verbatim -- frame expansion, the
+        // intra-codec planes, the encoded indptr, two candidates under
+        // `rayon::join` -- so see that row rather than a second copy of the
+        // list here. PR-D deletes the re-encode, at which point this row can
+        // flip.
+        enforced: false,
+    },
+    Reservation {
+        name: "CSC builder buckets still resident during emit",
+        phase: Phase::CscBuilderEmit,
+        share: scx_format_io::csc_budget::CSC_BUILD_BUCKET_SHARE,
+        multiplicity: 1,
+        site: "scx_sparse::CscEmitter (owns every bucket it has not drained)",
+        // The same bytes as the push-phase bucket row, still held. Declared
+        // again here because they are concurrent with the emitted arrays
+        // below, which the first version of this table denied.
+        enforced: true,
+    },
+    Reservation {
+        name: "CSC emitted shard arrays + raw values + encoder streams",
+        phase: Phase::CscBuilderEmit,
+        share: scx_format_io::csc_budget::CSC_EMIT_SHARE,
+        multiplicity: 1,
+        site: "csc_sidecar::emit_csc_shards -> ScxWriter::write_csc_shard{,_for}",
+        // A quarter, and the phase carries the bucket share alongside it --
+        // a correction from review. An earlier version of this row claimed
+        // the whole budget on the grounds that "the emit runs after the last
+        // push, so the buckets are gone by the time a shard is materialised".
+        // That is false: `CscEmitter` owns every bucket it has not drained,
+        // and `build_bucket` materialises all the shards one bucket owns
+        // (three at the 173-shard census layout) before yielding the first.
+        // So the buckets ARE concurrent with the emitted arrays, and the two
+        // shares must sum.
+        //
+        // What genuinely is not concurrent is the source shard: the last
+        // `push_shard` has returned and its decode/re-encode buffers are
+        // dropped before `finish()`. That is the only reason this is a
+        // separate phase at all.
+        //
+        // NOT enforced. Two of the three full-length copies the old row named
+        // are gone -- `next_shard_into` fills on-disk widths directly, so
+        // nothing rebuilds `csc_indptr_u64` / `csc_indices_u32`, and the
+        // raw-value buffer is reused across shards -- but the encoder's own
+        // streams past that point are the SparseIngest row's open terms again.
+        // Claiming otherwise would be the third time this table said
+        // `enforced` and was wrong; see the two comments above that record the
+        // first two.
         enforced: false,
     },
     Reservation {

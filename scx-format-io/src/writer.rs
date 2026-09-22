@@ -2201,24 +2201,41 @@ impl ScxWriter {
             })
     }
 
-    /// Phase B.3: streaming CSR→CSC transpose pass for modalities
-    /// registered with `add_modality(..., build_csc=true)`.
-    ///
-    /// Reads each modality's CSR shards back from the writer's own
-    /// temp file (decoded via `scx_codec::decode_shard_scipy`), runs
-    /// `streaming_csr_to_csc_iter_with_cap`, and emits CSC sidecars
-    /// via `write_csc_shard_for`. The latter increments
-    /// `info.n_csc_shards` and sets `ModalityFlags::HAS_CSC` so the
-    /// modality table emitted just after this pass records CSC
-    /// presence correctly.
-    ///
-    /// Memory cap matches `scx-cli/src/build_csc.rs`'s 4 GiB default.
-    /// CSC sharding granularity matches the CLI's
-    /// `csc_cols_per_shard = 5000`.
-    fn auto_emit_csc_for_marked_modalities(&mut self) -> Result<()> {
-        const FINISH_TIME_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
-        const DEFAULT_CSC_COLS_PER_SHARD: usize = 5000;
+    /// The directory the finished file will land in, or `None` for a writer
+    /// that adopted an existing file in place (`final_path` is empty there by
+    /// design, and defaulting a spill root to the process CWD would be worse
+    /// than defaulting it to the platform temp dir).
+    pub fn output_dir(&self) -> Option<&Path> {
+        if self.final_path.as_os_str().is_empty() {
+            None
+        } else {
+            self.final_path.parent()
+        }
+    }
 
+    /// Phase B.3: CSR→CSC transpose pass for modalities registered with
+    /// `add_modality(..., build_csc=true)`.
+    ///
+    /// Reads each modality's CSR shards back from the writer's own temp file
+    /// (decoded via `scx_codec::decode_shard_scipy`), pushes them into a
+    /// `scx_sparse::CscBuilder` one at a time, and drains it through
+    /// `csc_sidecar::emit_csc_shards`. That emit increments
+    /// `info.n_csc_shards` and sets `ModalityFlags::HAS_CSC`, so the modality
+    /// table written just after this pass records CSC presence correctly.
+    ///
+    /// **No production caller reaches this today**: every
+    /// `add_modality(..., build_csc)` in the tree passes `false` (pyscx's
+    /// `from_mudata`, rscx, the h5mu pipeline and `scx-mtx` all build their
+    /// sidecars through `write_csc_sidecar` instead), and the only `true` is
+    /// in this crate's own tests. It is kept, rather than deleted with its
+    /// parameter, because the rewrite ops want exactly this hook — a sidecar
+    /// built in the pass that is already emitting the shards.
+    ///
+    /// Budget and shard width come from `CscSidecarOptions::default()`; this
+    /// used to carry a second, independent pair of constants. The spill root
+    /// is the output's own directory. There is no way for a caller to
+    /// override either yet, which is the residual to close when one exists.
+    fn auto_emit_csc_for_marked_modalities(&mut self) -> Result<()> {
         if self.modality_build_csc.iter().all(|&b| !b) {
             return Ok(());
         }
@@ -2254,38 +2271,90 @@ impl ScxWriter {
         // underlying File before we read them back.
         self.writer()?.flush()?;
 
+        // Defaults rather than named constants: this used to hard-code its own
+        // 4 GiB and 5000, a second set beside `CscSidecarOptions`'s. Going
+        // through `Default` also keeps `DEFAULT_CSC_MEMORY_BYTES` unnamed in
+        // this file, which the CI guard against hard-coded sidecar budgets
+        // wants.
+        let opts = crate::csc_sidecar::CscSidecarOptions::default();
+        let spill_root = self.output_dir().map(Path::to_path_buf);
+
         for (modality_id, csr_entries, n_vars) in work {
-            // Decode each CSR shard back to ScxCsr by reading from the
-            // open temp file. Mirrors the `read_shard_from_entry` flow
-            // in `scx-format-io/src/reader/matrix.rs::read_shard_from_entry_inner`,
-            // adapted to a `File` (no mmap).
-            let mut csr_shards: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(csr_entries.len());
+            // The row extent is the modality's own, taken from its entries'
+            // stats — NOT `header.n_obs`. A modality's CSR shards are supposed
+            // to tile `[0, n_obs)`, but a writer can legitimately be mid-build
+            // and this path also serves fixtures that write a few rows against
+            // a wider declared axis. `shape.0` never reaches disk anyway
+            // (`write_shard_inner` takes `n_minor` from `header.n_obs`), so
+            // using the real count costs nothing and keeps `finish()`'s
+            // pushed-vs-declared check meaningful instead of forcing it off.
+            let n_rows_modality = csr_entries
+                .iter()
+                .filter_map(|e| e.stats.as_ref().map(|s| s.row_end))
+                .max()
+                .map_or(n_obs, |r| r as usize);
+
+            // ONE pass. Each shard is decoded, pushed into the builder and
+            // dropped; the encoding inputs — the shard's declared encoding and
+            // the catalog's `value_max` — come from the same decode, and the
+            // encoding itself is not needed until the emit below. The
+            // predecessor collected every decoded shard into a `Vec<ScxCsr>`
+            // first, for a transpose that borrowed the slice.
+            let store = crate::csc_spill::TempDirSpillStore::new(spill_root.as_deref())?;
+            let mut builder = scx_sparse::CscBuilder::new(
+                n_rows_modality,
+                n_vars,
+                scx_sparse::CscBuilderConfig {
+                    cols_per_shard: opts.cols_per_shard,
+                    memory_bytes: opts.memory_budget_bytes,
+                    spill_after_bytes: crate::csc_budget::CSC_BUILD_BUCKET_SHARE
+                        .of(opts.memory_budget_bytes as u64)
+                        as usize,
+                    ..Default::default()
+                },
+                Box::new(store),
+            )
+            .map_err(|e| ScxError::CscTranspose(e.to_string()))?;
+
             // The CSC sidecar encoding must cover EVERY shard, not just the
-            // first (SCX-004): a Uint8 first shard followed by a Float32 shard
-            // would truncate the float values. Scan all shards for the
-            // float/integer kind; float ⇒ Float32 + Pcodec (float-safe codec),
-            // else widen the integer width to fit the max value.
-            let mut any_float = false;
+            // first (SCX-004). The rule is `csc_sidecar::pick_csc_encoding`,
+            // shared with `scx-ops`' `run_build_csc`; this loop only collects
+            // its two inputs — every shard's *declared* encoding (so a wide
+            // integer shard that lacks stats is not under-picked as Uint8) and
+            // the largest integer value the catalog reports.
+            let mut declared_encs: Vec<ValueEncoding> = Vec::with_capacity(csr_entries.len());
             let mut max_int_val: u32 = 0;
             let mut first_codec: Option<CodecId> = None;
-            // Floor the integer width on each shard's declared encoding too, so
-            // a wide integer shard that lacks stats is not under-picked as
-            // Uint8 (see build_csc.rs for the same guard).
-            let mut header_int_enc = ValueEncoding::Uint8;
-            let enc_width = |e: ValueEncoding| match e {
-                ValueEncoding::Uint8 => 1u8,
-                ValueEncoding::Uint16 => 2,
-                _ => 4,
-            };
+            // Checked against the running count on the SAME predicate
+            // `run_build_csc` uses: `ShardHeader.global_offset`, the CSR
+            // shard's own first row. The entries come from a catalog scan in
+            // *catalog* order and `finish()` checks only the row *count*, so
+            // two shards covering [0, n) recorded out of order sum to the
+            // same total, pass, and emit a sidecar shifted by the swap. This
+            // is the hook the rewrite ops will use, so it needs the guard
+            // before they arrive.
+            //
+            // The first version sorted on `ShardStats::row_start` and
+            // substituted `rows_pushed` where stats were absent, which made
+            // it unfalsifiable on exactly the stats-less files it was meant
+            // to protect — while the ops-side twin substituted `0` for that
+            // case and *rejected* valid ones. The header carries the number
+            // on every shard, so neither substitution is needed.
+            let mut rows_pushed: u64 = 0;
             for entry in &csr_entries {
                 let (sh, indptr, indices, data) = self.decode_csr_entry(entry, n_vars)?;
-                let enc = ValueEncoding::from_u8(sh.value_encoding)
-                    .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
-                if matches!(enc, ValueEncoding::Float32 | ValueEncoding::Float16) {
-                    any_float = true;
-                } else if enc_width(enc) > enc_width(header_int_enc) {
-                    header_int_enc = enc;
+                if sh.global_offset != rows_pushed {
+                    return Err(ScxError::InvalidCatalog(format!(
+                        "auto_emit_csc: modality {modality_id} CSR shard declares row_start \
+                         {}, but {rows_pushed} rows precede it; the shards do not tile \
+                         [0, {n_rows_modality}) in order",
+                        sh.global_offset
+                    )));
                 }
+                declared_encs.push(
+                    ValueEncoding::from_u8(sh.value_encoding)
+                        .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?,
+                );
                 if first_codec.is_none() {
                     first_codec = Some(
                         CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?,
@@ -2295,67 +2364,42 @@ impl ScxWriter {
                     max_int_val = max_int_val.max(stats.value_max);
                 }
                 let n_shard_rows = indptr.len() - 1;
-                csr_shards.push(scx_sparse::ScxCsr::new_unchecked(
+                let shard = scx_sparse::ScxCsr::new_unchecked(
                     (n_shard_rows, n_vars),
                     indptr,
                     indices,
                     data,
-                ));
-            }
-
-            let (value_encoding, codec) = if any_float {
-                (ValueEncoding::Float32, CodecId::Pcodec)
-            } else {
-                let by_value = if max_int_val <= u8::MAX as u32 {
-                    ValueEncoding::Uint8
-                } else if max_int_val <= u16::MAX as u32 {
-                    ValueEncoding::Uint16
-                } else {
-                    ValueEncoding::Uint32
-                };
-                let enc = if enc_width(header_int_enc) > enc_width(by_value) {
-                    header_int_enc
-                } else {
-                    by_value
-                };
-                (enc, first_codec.expect("at least one CSR entry processed"))
-            };
-
-            // Streaming CSR→CSC transpose. Mirrors
-            // `scx-cli/src/build_csc.rs:159`.
-            let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
-                &csr_shards,
-                n_obs,
-                n_vars,
-                FINISH_TIME_CSC_MEMORY_BYTES,
-                DEFAULT_CSC_COLS_PER_SHARD,
-            )
-            .map_err(|e| {
-                ScxError::InvalidCatalog(format!("auto_emit_csc transpose failed: {e}"))
-            })?;
-
-            loop {
-                let col_start = iter.current_col_start() as u64;
-                let chunk = match iter.next() {
-                    Some(c) => c.map_err(|e| {
-                        ScxError::InvalidCatalog(format!("auto_emit_csc chunk decode failed: {e}"))
-                    })?,
-                    None => break,
-                };
-                let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
-                let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-                let csc_raw_values = value_encoding.encode_f32_batch(&chunk.data).map_err(|e| {
-                    ScxError::InvalidCatalog(format!("auto_emit_csc encode_f32_batch failed: {e}"))
-                })?;
-                let shard = ShardBuffers::new(
-                    &csc_indptr_u64,
-                    &csc_indices_u32,
-                    &csc_raw_values,
-                    codec,
-                    value_encoding,
                 );
-                self.write_csc_shard_for(modality_id, col_start, shard)?;
+                builder
+                    .push_shard(rows_pushed, &shard)
+                    .map_err(|e| ScxError::CscTranspose(e.to_string()))?;
+                rows_pushed += n_shard_rows as u64;
             }
+
+            // `None` is the integer path with no source shard to take a codec
+            // from, which `work` having a non-empty entry list already rules
+            // out; report it rather than panicking.
+            let (value_encoding, codec) =
+                crate::csc_sidecar::pick_csc_encoding(&declared_encs, max_int_val, first_codec)
+                    .ok_or_else(|| {
+                        ScxError::InvalidCatalog(
+                            "auto_emit_csc: modality marked for CSC has no CSR shards".to_string(),
+                        )
+                    })?;
+
+            let mut emitter = builder
+                .finish()
+                .map_err(|e| ScxError::CscTranspose(e.to_string()))?;
+            crate::csc_sidecar::emit_csc_shards(
+                self,
+                &mut emitter,
+                &crate::csc_sidecar::CscEmitOptions {
+                    value_encoding,
+                    codec_id: codec,
+                    modality_id: Some(modality_id),
+                },
+                |_, _, _| {},
+            )?;
         }
         // `csc_build_generation` is recorded inside `write_shard_inner`
         // for every CSC shard emitted above (single chokepoint), so no

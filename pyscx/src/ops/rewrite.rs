@@ -317,6 +317,11 @@ fn run_sort_engine(
     csc_cols_per_shard: usize,
     csc_memory_limit: &str,
 ) -> PyResult<()> {
+    // The sort's own spill root serves the CSC rebuild's too. Before this,
+    // `pyscx.sort(temp_dir=...)` governed the sort spill and *not* the CSC
+    // rebuild that follows it, which is the kind of split a caller pointing
+    // both at fast scratch would not expect.
+    let csc_temp_dir = opts.temp_dir.clone();
     py.detach(|| scx_ops::sort(input_path, output_path, opts))
         .map_err(ops_to_pyerr)?;
     if rebuild_csc {
@@ -333,6 +338,7 @@ fn run_sort_engine(
                 csc_cols_per_shard,
                 csc_memory_limit,
                 csc_framing,
+                csc_temp_dir.as_deref(),
             )
             .map_err(|e| e.to_string())
         })
@@ -594,12 +600,18 @@ pub fn shuffle(
 ///                        with `output=None`, which always rewrites `input`.
 ///   csc_cols_per_shard — max columns per emitted CSC shard (0 = single
 ///                        shard, memory permitting). Default 5000.
+///   temp_dir           — root for the CSC builder's column-bucket spill
+///                        files, used only when the buckets exceed the
+///                        `memory_limit` share. `None` (default) uses the
+///                        output file's own directory, where the rewrite
+///                        already stages a copy — not the platform temp dir.
 ///
 /// Example:
 ///     pyscx.build_csc("counts.scx")                      # in place
 ///     pyscx.build_csc("counts.scx", "counts_csc.scx")    # copy out
 #[pyfunction]
-#[pyo3(signature = (input, output=None, memory_limit="4G".to_string(), force=false, csc_cols_per_shard=5000))]
+#[pyo3(signature = (input, output=None, memory_limit="4G".to_string(), force=false,
+                    csc_cols_per_shard=5000, temp_dir=None))]
 pub fn build_csc(
     py: Python<'_>,
     input: &str,
@@ -607,12 +619,14 @@ pub fn build_csc(
     memory_limit: String,
     force: bool,
     csc_cols_per_shard: usize,
+    temp_dir: Option<String>,
 ) -> PyResult<()> {
     // Fail fast with a clean ValueError on a malformed size string;
     // run_build_csc re-parses it internally with the same parser, so the
     // two cannot drift.
     scx_format_io::MemoryBudget::parse(&memory_limit).map_err(PyValueError::new_err)?;
     let input_path = PathBuf::from(input);
+    let temp_dir = temp_dir.map(PathBuf::from);
 
     // `output=None` is now the in-place spelling, so an `output` that aliases
     // `input` is a mistake with an obvious fix rather than an unsupported
@@ -682,12 +696,14 @@ pub fn build_csc(
                 force,
                 csc_cols_per_shard,
                 framing,
+                temp_dir.as_deref(),
             ),
             None => scx_ops::rebuild_csc_inplace(
                 &input_path,
                 csc_cols_per_shard,
                 &memory_limit,
                 framing,
+                temp_dir.as_deref(),
             ),
         }
         .map_err(|e| e.to_string())

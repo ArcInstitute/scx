@@ -159,7 +159,11 @@ pub fn run_merge(
     // (a v4 merged output must not be downgraded to unframed v3 by the rebuild).
     if rebuild_csc {
         let framing = crate::cli_utils::framing_for_file(output);
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
+        // No `--temp-dir` on this op: the CSC builder's spill root defaults to the
+        // output's own directory, which is already where the rewrite staged a whole
+        // copy of it, and the spill only happens at all on an undersized
+        // `--csc-memory-limit`.
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing, None)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 

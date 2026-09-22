@@ -967,6 +967,17 @@ enum Commands {
         /// shard, memory permitting).
         #[arg(long, default_value_t = 5000)]
         csc_cols_per_shard: usize,
+        /// Directory for the CSC builder's column-bucket spill files
+        /// (`<DIR>/scx-csc-<random>/`), used only when the buckets exceed the
+        /// `--memory-limit` share.
+        ///
+        /// Defaults to the **output file's own directory**, not the platform
+        /// temp dir that `scx sort --temp-dir` and `scx convert --temp-dir`
+        /// default to: the rewrite already stages a whole copy of the output
+        /// there, so it is proven writable and sized for far more than a
+        /// spill, whereas a small `/tmp` would fail an atlas-scale rebuild.
+        #[arg(long, value_name = "DIR")]
+        temp_dir: Option<PathBuf>,
     },
     /// Extract a subset of cells and/or genes into a new SCX file
     Subset {
@@ -1886,6 +1897,7 @@ fn main() {
             memory_limit,
             force,
             csc_cols_per_shard,
+            temp_dir,
         } => {
             // Framing must come from `framing_for_csc_rebuild` on BOTH arms.
             // Both ends of the range are wrong (see its contract): `None`
@@ -1915,6 +1927,7 @@ fn main() {
                     force,
                     csc_cols_per_shard,
                     framing,
+                    temp_dir.as_deref(),
                 )
                 .map(|outcome| {
                     if outcome == scx_ops::BuildCscOutcome::NoSidecar {
@@ -1927,15 +1940,19 @@ fn main() {
                 None if force => Err("--force applies only when writing to an <OUTPUT>; the \
                                       in-place form (no <OUTPUT>) always rewrites <INPUT>"
                     .into()),
-                None => {
-                    scx_ops::rebuild_csc_inplace(&input, csc_cols_per_shard, &memory_limit, framing)
-                        .map(|outcome| match outcome {
-                            scx_ops::BuildCscOutcome::Built => {
-                                println!("Built CSC sidecar on {} (in place)", input.display())
-                            }
-                            scx_ops::BuildCscOutcome::NoSidecar => no_sidecar(" (in place)"),
-                        })
-                }
+                None => scx_ops::rebuild_csc_inplace(
+                    &input,
+                    csc_cols_per_shard,
+                    &memory_limit,
+                    framing,
+                    temp_dir.as_deref(),
+                )
+                .map(|outcome| match outcome {
+                    scx_ops::BuildCscOutcome::Built => {
+                        println!("Built CSC sidecar on {} (in place)", input.display())
+                    }
+                    scx_ops::BuildCscOutcome::NoSidecar => no_sidecar(" (in place)"),
+                }),
             }
         }
         Commands::Subset {
@@ -2781,7 +2798,7 @@ fn dispatch_mtx_to_scx(
     if build_csc {
         let tmp = output.with_extension("scx.csc.tmp");
         let _ = std::fs::remove_file(&tmp);
-        scx_ops::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard, None)?;
+        scx_ops::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard, None, None)?;
         std::fs::rename(&tmp, output)?;
     }
 

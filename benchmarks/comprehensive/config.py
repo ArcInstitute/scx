@@ -1337,10 +1337,18 @@ def estimate_memory_gb(
         # as the reason its materialize cap had to exist at all.
         peak_mb = max(base_mb * 1.5, 8 * 1024)
     elif benchmark == "build_csc":
-        # `write_csc_sidecar` takes the whole CSR by value and builds the
-        # column-major transpose beside it, so the working set tracks the sparse
-        # footprint and not the `memory_limit` the caller passes — the gap this
-        # benchmark exists to measure.
+        # The working set tracks the sparse footprint more than the
+        # `memory_limit` the caller passes — the gap this benchmark exists to
+        # measure. The streaming `CscBuilder` narrowed it (census_1m 15.4 GB ->
+        # 7.1 GB, 3.76x -> 1.74x of a declared 4 GiB) without closing it: the
+        # bucket staging is bounded, the source shard's re-encode and the
+        # writer are not.
+        #
+        # The figures below are pre-builder and so now over-ask, which is the
+        # safe direction for a scheduler request — under-asking costs an OOM
+        # mid-capture, over-asking costs queue time. Retuning wants its own
+        # measurement across tiers rather than a division on one capture, the
+        # same reasoning the `export_streaming` branch above records.
         #
         # Sized from the measurement rather than from `dense_mb`: peak was
         # 2970 MB at tabula_sapiens_100k and 8137 MB at census_500k, against

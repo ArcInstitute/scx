@@ -171,6 +171,115 @@ pub fn mixed_codec_file_with(path: &Path, opts: &FixtureOpts) -> Result<PathBuf>
     Ok(path.to_path_buf())
 }
 
+/// A fixture for the CSC sidecar's **multi-shard** emission.
+///
+/// `mixed_codec_file` cannot cover it, and not by a small margin: at
+/// `cols_per_shard = 1024` against 40 columns it produces exactly **one** CSC
+/// shard in **one** column chunk, so `build_csc`'s golden arms say nothing
+/// about `col_start` stamping, chunk boundaries or the concatenation between
+/// them. Its geometry is also uniform in the three ways that hide an
+/// arithmetic slip — equal 8-row shards, exactly 3 nonzeros per row, and
+/// values that repeat across rows.
+///
+/// So every dimension here is deliberately irregular, and each irregularity
+/// buys one specific failure:
+///
+/// * **17 obs in shards of 5, 1 and 11 rows.** Unequal, and one of size 1: a
+///   `row_offset` advanced by the wrong amount is invisible when every shard
+///   is the same height, and a one-row shard is its sharpest detector.
+/// * **Per-row nnz of 0, 1, 2, 3 and 7 (fully dense), with empty rows at the
+///   start, the middle and the end of a shard.** An empty row contributes no
+///   record to any column bucket, so a builder that inferred the row from a
+///   record's *position* would drift by exactly the number of empty rows —
+///   and drift in all three positions is what makes the direction visible.
+/// * **Column 0 and column 4 empty** — the first column of the first emitted
+///   shard, and one in the interior of the second. A `indptr` that skipped
+///   empty columns, or a plan that skipped an all-zero shard, lands here.
+/// * **Column 2 touched by all three shards, column 5 by exactly one.** The
+///   first is the multi-shard interleave within a single column; the second
+///   is the degenerate case that a concatenation bug leaves passing.
+/// * **`value = 1 + row * 8 + col`, distinct per cell.** `mixed_codec_file`'s
+///   `1 + ((row + k) % 250)` repeats across rows, so two swapped nonzeros can
+///   carry the same value; here a permutation shows up in `data` and not only
+///   in `indices`.
+///
+/// All three shards are integer-encoded, so this exercises the sidecar's
+/// integer path; the float path (`Float32` + `Pcodec`) stays covered by the
+/// existing `build_csc` arm over `mixed_codec_file`.
+pub fn csc_multi_shard_file(path: &Path) -> Result<PathBuf> {
+    const N_OBS: usize = 17;
+    const N_VARS: usize = 7;
+    // (row, cols). Columns 0 and 4 appear nowhere; column 5 only in row 9.
+    let row_cols: [&[usize]; N_OBS] = [
+        &[], // shard 0, first row empty
+        &[1, 2],
+        &[3],
+        &[], // shard 0, interior empty
+        &[2, 3, 6],
+        &[1, 2, 3, 5, 6], // shard 1, its only row (nnz 5)
+        &[],              // shard 2, first row empty
+        &[6],
+        &[1, 2, 3, 6],
+        &[1, 2, 3, 5, 6],
+        &[2],
+        &[3, 6],
+        &[1, 2, 3, 6],
+        &[6],
+        &[1, 3],
+        &[1, 2, 3, 5, 6],
+        &[], // shard 2, last row empty
+    ];
+
+    let mut header = FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, 10_000, 0, 0);
+    header.format_version = header.format_version.max(4);
+    let mut writer = ScxWriter::new(path, header)?;
+    writer.write_obs(&obs(N_OBS))?;
+    writer.write_var(&var(N_VARS))?;
+
+    // 5 / 1 / 11, and the middle one framed at G = 2 so the CSR side is not
+    // uniform either.
+    let shards: [(usize, usize, CodecId, ValueEncoding, Option<u32>); 3] = [
+        (0, 5, CodecId::None, ValueEncoding::Uint8, None),
+        (5, 6, CodecId::Scx1, ValueEncoding::Uint32, Some(2)),
+        (6, 17, CodecId::None, ValueEncoding::Uint8, None),
+    ];
+    for (lo, hi, codec, encoding, framed) in shards {
+        writer.set_framing(framed.map(|g| FramingConfig {
+            row_group_rows: g,
+            ..Default::default()
+        }));
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for (row, cols) in row_cols.iter().enumerate().take(hi).skip(lo) {
+            for &col in *cols {
+                indices.push(col as u32);
+                // Distinct per (row, col), and strictly positive: `Scx1`'s
+                // Rice stage rejects a zero outright.
+                let v = 1 + row * 8 + col;
+                match encoding {
+                    ValueEncoding::Uint8 => values.push(v as u8),
+                    ValueEncoding::Uint32 => values.extend_from_slice(&(v as u32).to_le_bytes()),
+                    other => panic!("fixture does not encode {other:?}"),
+                }
+            }
+            indptr.push(indices.len() as u64);
+        }
+        writer.write_csr_shard(&indptr, &indices, &values, codec, encoding, lo as u64)?;
+    }
+    writer.set_framing(None);
+
+    writer.write_provenance(vec![ProvenanceEntry {
+        timestamp: 1_700_000_000,
+        action: "scx-testkit fixture".to_string(),
+        tool: "scx-testkit".to_string(),
+        params_json: "{}".to_string(),
+        input_checksums: Vec::new(),
+    }])?;
+    writer.finish()?;
+    Ok(path.to_path_buf())
+}
+
 /// Deterministic 3-nnz-per-row CSR for one shard, encoded per its spec.
 fn rows(spec: ShardSpec, n_vars: usize, perturb_float: bool) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
     let (start, end) = spec.rows;

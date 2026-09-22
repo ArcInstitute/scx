@@ -1419,6 +1419,163 @@
         }
       ]
     },
+    "build_csc_multi_shard": {
+      "strictness": "Content",
+      "excluded_section_types": [
+        11
+      ],
+      "header": {
+        "format_version": 3,
+        "flags": 1,
+        "n_obs": 17,
+        "n_vars": 7,
+        "nnz": 36,
+        "n_csr_shards": 3,
+        "n_csc_shards": 3,
+        "shard_target_rows": 10000,
+        "codec_id": 0,
+        "index_dtype": 0,
+        "manifest_sequence": 2,
+        "n_modalities": 0
+      },
+      "catalog": {
+        "catalog_version": 4,
+        "manifest_sequence": 2,
+        "n_obs": 17,
+        "data_generation": 1,
+        "csc_build_generation": 1
+      },
+      "sections": [
+        {
+          "name": "X_csc_shard_0",
+          "section_type": 5,
+          "modality_id": 0,
+          "length": 224,
+          "blake3": "dd056a078d915973aed7abf880fbe1333d69485323f1ba3c14eb9216a84115f6",
+          "stats": {
+            "row_start": 0,
+            "row_end": 17,
+            "col_start": 0,
+            "col_end": 3,
+            "nnz": 15,
+            "value_min": 10,
+            "value_max": 123,
+            "value_sum": 1062,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "X_csc_shard_1",
+          "section_type": 5,
+          "modality_id": 0,
+          "length": 206,
+          "blake3": "142c55cf9caa90431ea6951fe9b7ba1a746a432ade746a190bb2ec922f0d8891",
+          "stats": {
+            "row_start": 0,
+            "row_end": 17,
+            "col_start": 3,
+            "col_end": 6,
+            "nnz": 12,
+            "value_min": 20,
+            "value_max": 126,
+            "value_sum": 926,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "X_csc_shard_2",
+          "section_type": 5,
+          "modality_id": 0,
+          "length": 172,
+          "blake3": "7e4f1879a11956196702cac5ac4bf4c4efba8dfe82938b4b865d6e7c101b59a4",
+          "stats": {
+            "row_start": 0,
+            "row_end": 17,
+            "col_start": 6,
+            "col_end": 7,
+            "nnz": 9,
+            "value_min": 39,
+            "value_max": 127,
+            "value_sum": 735,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "X_shard_0",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 168,
+          "blake3": "5defd108b32567056a88ed471cdc94546d03f347a67a34217242236465ab7d22",
+          "stats": {
+            "row_start": 0,
+            "row_end": 5,
+            "col_start": 0,
+            "col_end": 7,
+            "nnz": 6,
+            "value_min": 10,
+            "value_max": 39,
+            "value_sum": 151,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "X_shard_1",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 130,
+          "blake3": "207646dbf8c8757f48a94cffdc15edb3cdbfed3e6dbcd69644ea85cbc8f9e123",
+          "stats": {
+            "row_start": 5,
+            "row_end": 6,
+            "col_start": 0,
+            "col_end": 7,
+            "nnz": 5,
+            "value_min": 42,
+            "value_max": 47,
+            "value_sum": 222,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "X_shard_2",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 273,
+          "blake3": "a1218027915643c2e934a10d2f5e9583d34ead24d16014bdb73f1cca2cf25e5b",
+          "stats": {
+            "row_start": 6,
+            "row_end": 17,
+            "col_start": 0,
+            "col_end": 7,
+            "nnz": 25,
+            "value_min": 63,
+            "value_max": 127,
+            "value_sum": 2350,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "obs",
+          "section_type": 0,
+          "modality_id": 0,
+          "length": 1522,
+          "blake3": "7cc80352a94faac286b5318d77190b74c0e43b5671db64633f22dc5db9ea1e78"
+        },
+        {
+          "name": "var",
+          "section_type": 2,
+          "modality_id": 0,
+          "length": 754,
+          "blake3": "558180fbb4955f342f9a1409b0e2076f7718aab74116e811e82d9e8ae1d9e552"
+        }
+      ]
+    },
     "compact": {
       "strictness": "Content",
       "excluded_section_types": [
