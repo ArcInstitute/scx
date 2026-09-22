@@ -120,12 +120,14 @@ fn unenforced_reservations_are_declared_not_silent() {
     //     the originals on its masked one.
     //
     // **Seven became eight by closing a gap, not opening one.** The single
-    // "CSC sidecar transpose" row split into three — buckets, source shard,
-    // emit — and the bucket row is `enforced: true`, the first CSC row that
-    // can say so: the builder spills against exactly that `Share` with a
-    // declared `n_buckets * block_bytes` of slack, and `run_build_csc`
-    // refuses a budget too small for its largest input shard. The other two
-    // are gaps that the old lumped row hid rather than new ones.
+    // "CSC sidecar transpose" row split into four — buckets during push, the
+    // source shard, those same buckets still resident during emit, and the
+    // emitted arrays — of which the two bucket rows are `enforced: true`, the
+    // first CSC rows that can say so: the builder spills against exactly that
+    // `Share` with a declared `2 * n_buckets * block_capacity` of slack, and
+    // `run_build_csc` refuses a budget too small for its largest input shard.
+    // Only two of the four are unenforced, and both are gaps the old lumped
+    // row hid rather than new ones.
     //
     // The count went *up* while coverage improved, which is why this comment
     // exists: a bare number would read as a regression.

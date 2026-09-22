@@ -600,6 +600,11 @@ pub fn shuffle(
 ///                        with `output=None`, which always rewrites `input`.
 ///   csc_cols_per_shard — max columns per emitted CSC shard (0 = single
 ///                        shard, memory permitting). Default 5000.
+///   temp_dir           — root for the CSC builder's column-bucket spill
+///                        files, used only when the buckets exceed the
+///                        `memory_limit` share. `None` (default) uses the
+///                        output file's own directory, where the rewrite
+///                        already stages a copy — not the platform temp dir.
 ///
 /// Example:
 ///     pyscx.build_csc("counts.scx")                      # in place

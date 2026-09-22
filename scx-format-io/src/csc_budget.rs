@@ -65,21 +65,15 @@ pub fn decoded_csr_shard_bytes(nnz: u64, n_rows: u64) -> u64 {
         .saturating_add(n_rows.saturating_add(1).saturating_mul(8))
 }
 
-/// Bytes one emitted CSC shard of `nnz` nonzeros over `n_cols` columns
-/// occupies before the encoder runs.
-pub fn emitted_shard_bytes(nnz: u64, n_cols: u64) -> u64 {
-    nnz.saturating_mul(CSC_PAYLOAD_BYTES_PER_NNZ)
-        .saturating_add(n_cols.saturating_add(1).saturating_mul(8))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The push phase holds the buckets and one in-flight source shard at the
-    /// same time, so their shares must fit together. (The emit phase is not
-    /// concurrent with either — that is why it is a separate phase in the
-    /// allocation table rather than a third row summed with these.)
+    /// same time, so their shares must fit together. The emit phase is
+    /// separate because the *source shard* is gone by then — but the buckets
+    /// are NOT, so the allocation table sums this bucket share into the emit
+    /// phase as well.
     #[test]
     fn the_two_push_phase_shares_fit_together() {
         let budget = 1 << 30;

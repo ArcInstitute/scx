@@ -491,20 +491,36 @@ fn duplicate_heavy_rows_do_not_break_the_staging_accounting() {
         vec![0; n],
         (0..n).map(|k| (k + 1) as f32).collect(),
     )];
+    // A real spill budget, not `usize::MAX`: the point is that the declared
+    // bound HOLDS for this input, not merely that the overshoot is measured
+    // after it has happened.
+    let block_bytes = 64usize;
+    let spill_after = 256usize;
     let c = CscBuilderConfig {
-        block_bytes: 64,
-        ..cfg(1, 1 << 20, usize::MAX)
+        block_bytes,
+        ..cfg(1, 1 << 20, spill_after)
     };
     let (got, stats) = run_with(&shards, 1, 1, c, Box::new(MemSpillStore::new())).expect("builder");
 
     assert_same(&got, &reference(&shards, 1, 1, 1 << 20, 1));
     assert_eq!(got[0].1.indices.len(), n);
     assert_eq!(stats.first_non_strict_column, Some(0));
+
+    // 32 kB of payload in ONE row against a 256-byte staging budget. Without
+    // the mid-row cut in `Bucket::push`, the whole row is appended before the
+    // seal/spill loop can run, so the bound is unbounded in `n`.
+    let block_capacity = block_bytes + 8 + SPILL_BYTES_PER_NNZ;
+    let bound = spill_after + 2 * stats.n_buckets * block_capacity;
     assert!(
-        stats.peak_in_memory_bytes >= (n * SPILL_BYTES_PER_NNZ) as u64,
-        "peak {} must account for the {} bytes the grown block really holds",
+        stats.peak_in_memory_bytes <= bound as u64,
+        "peak {} exceeds the declared bound {bound} on duplicate-heavy input \
+         ({} bytes of payload in a single row)",
         stats.peak_in_memory_bytes,
         n * SPILL_BYTES_PER_NNZ,
+    );
+    assert!(
+        stats.spilled_bytes > 0,
+        "premise: the row must have spilled rather than staying resident"
     );
 }
 
@@ -872,17 +888,14 @@ fn every_allocated_bucket_is_reachable() {
         let (got, stats) =
             run_with(&shards, 4, n_cols, c, Box::new(MemSpillStore::new())).expect("builder");
 
-        // Every bucket must have received at least one record, i.e. spilled or
-        // staged something. With `spill_after_bytes = 0` and every column
-        // non-empty, a reachable bucket always spills.
-        for b in 0..stats.n_buckets {
-            assert!(
-                stats.spilled_bytes > 0,
-                "n_cols={n_cols} target={target}: nothing spilled at all"
-            );
-            let _ = b;
-        }
-        // The decisive assertion: buckets are exactly ceil(n_shards / spb).
+        // Buckets are exactly ceil(n_shards / spb) — which is the assertion
+        // that matters, because a phantom bucket is one the layout allocates
+        // and no column can route to.
+        //
+        // (An earlier draft looped `for b in 0..n_buckets` asserting the
+        // *global* `spilled_bytes > 0` and discarding `b`, which passes if
+        // bucket 0 spills and every other bucket is empty — the exact
+        // condition it claimed to rule out.)
         let n_shards = n_cols; // cols_per_shard = 1
         let want = target.min(n_shards);
         let spb = n_shards.div_ceil(want);

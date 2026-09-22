@@ -69,8 +69,10 @@ pub const DEFAULT_TARGET_BUCKETS: usize = 64;
 
 /// Hard ceiling on the bucket count.
 ///
-/// Bounded by header overhead and per-bucket block slack (`n_buckets *
-/// block_bytes`), **not** by `RLIMIT_NOFILE` — see [`DEFAULT_BLOCK_BYTES`].
+/// Bounded by header overhead and per-bucket block slack
+/// (`2 * n_buckets * block_capacity`, the expression `CscBuilderConfig`
+/// documents and `staged_bytes_never_exceed_the_declared_bound` asserts),
+/// **not** by `RLIMIT_NOFILE` — see [`DEFAULT_BLOCK_BYTES`].
 /// It is a compile-time constant on purpose: a probed descriptor limit would
 /// make the emitted layout host-dependent, and the layout is pinned by a
 /// golden.
@@ -389,6 +391,18 @@ impl Bucket {
         }
     }
 
+    /// Append one nonzero to the open row block, starting one if needed.
+    ///
+    /// A row may span several blocks: `seal_bucket` calls `close_row`, so the
+    /// next push after a seal opens a fresh block even mid-row. That is what
+    /// bounds a **duplicate-bearing** row — `block_capacity` reserves one
+    /// record per column the bucket owns, which is exact for canonical input,
+    /// but `ScxCsr::new` does not reject duplicate coordinates and
+    /// `run_build_csc` deliberately accepts non-canonical pre-v3 input.
+    ///
+    /// Two row blocks carrying the same `row` are fine: the reader walks them
+    /// in append order, which is still scan order, so the per-column scatter
+    /// order is unchanged.
     #[inline]
     fn push(&mut self, row: u32, col: u32, value: f32) {
         if self.open.is_none() || self.last_row != Some(row) {
@@ -541,6 +555,7 @@ impl CscBuilder {
         // a validated `ScxCsr`, but `new_unchecked` does not check it and a
         // panic in a reader is against the conventions.
         let base = self.rows_pushed;
+        let block_bytes = self.cfg.block_bytes.max(1);
         for row in 0..n_shard_rows {
             let global_row = (base + row as u64) as u32;
             let start = csr.indptr[row] as usize;
@@ -566,6 +581,16 @@ impl CscBuilder {
                     self.touched.push(b);
                 }
                 self.buckets[b].push(global_row, col as u32, csr.data[j]);
+                // Seal AND SPILL inside the row, not only at its end.
+                // Sealing alone just moves bytes from `cur` into `sealed`; a
+                // duplicate-heavy row sealed hundreds of blocks and held every
+                // one until the row ended, measured at 45,760 bytes against a
+                // 416-byte bound. `close_row` inside `seal_bucket` is what
+                // splits the row block.
+                if self.buckets[b].cur.len() >= block_bytes {
+                    self.seal_bucket(b);
+                    self.spill_until_under_budget()?;
+                }
             }
             self.seal_and_maybe_spill()?;
         }
@@ -577,38 +602,48 @@ impl CscBuilder {
     /// Seal any bucket whose open block has reached `block_bytes`, then spill
     /// the largest buckets until the staged total is back under
     /// `spill_after_bytes`.
+    /// Seal a bucket's open block, closing the row block first so every byte
+    /// handed to the store holds whole row blocks and no count field is
+    /// patched after it has left.
+    fn seal_bucket(&mut self, i: usize) {
+        let bucket = &mut self.buckets[i];
+        bucket.close_row();
+        let sealed = std::mem::take(&mut bucket.cur);
+        // Charge what was actually allocated, not `block_capacity`. The two
+        // are equal for canonical input, and `push`'s mid-row cut keeps them
+        // close even for duplicate-bearing input, but a single row block whose
+        // header-plus-payload exceeds the reserve can still grow the vec once.
+        let grew = sealed.capacity();
+        bucket.sealed_bytes += grew;
+        bucket.sealed.push(sealed);
+        bucket.cur = Vec::with_capacity(self.block_capacity);
+        // The retained block keeps its real capacity and a fresh one replaces
+        // it, so the bucket's cost rises by exactly the retained block.
+        self.in_memory_bytes += grew;
+    }
+
     fn seal_and_maybe_spill(&mut self) -> Result<(), CscBuilderError> {
         let block_bytes = self.cfg.block_bytes.max(1);
         for idx in 0..self.touched.len() {
             let i = self.touched[idx];
-            let bucket = &mut self.buckets[i];
-            if bucket.cur.len() >= block_bytes {
-                // Seal only at a row-block boundary: close the open row first,
-                // so every byte handed to the store holds whole row blocks and
-                // the count field is never patched after it has left.
-                bucket.close_row();
-                let sealed = std::mem::take(&mut bucket.cur);
-                // Charge what was actually allocated, not `block_capacity`.
-                // The two are equal for canonical input — `block_capacity`
-                // reserves one nonzero per column the bucket owns, so no row
-                // can overflow it — but a source row carrying DUPLICATE
-                // coordinates contributes more than one record per column and
-                // makes the block grow. `ScxCsr::new` does not reject
-                // duplicates (its own docs say so), and `run_build_csc`
-                // deliberately accepts non-canonical pre-v3 input, so this is
-                // reachable. Asserting the capacity instead would panic in
-                // debug on data the op is documented to accept.
-                bucket.sealed_bytes += sealed.capacity();
-                let grew = sealed.capacity();
-                bucket.sealed.push(sealed);
-                bucket.cur = Vec::with_capacity(self.block_capacity);
-                // The block that was already charged at `block_capacity` is
-                // retained at its real capacity and a fresh one replaces it,
-                // so the bucket's cost rises by exactly the retained block.
-                self.in_memory_bytes += grew;
+            if self.buckets[i].cur.len() >= block_bytes {
+                self.seal_bucket(i);
             }
         }
         self.touched.clear();
+        self.spill_until_under_budget()
+    }
+
+    /// Spill sealed blocks, largest bucket first, until the staged total is
+    /// back under `spill_after_bytes`.
+    ///
+    /// Called from the per-row sweep *and* from `push_shard`'s mid-row cut.
+    /// The mid-row call is what bounds a duplicate-heavy row: sealing alone
+    /// only moves bytes from `cur` into `sealed`, so a single row with
+    /// thousands of copies of one coordinate sealed hundreds of blocks and
+    /// held every one of them until the row ended — measured at 45,760 bytes
+    /// against a 416-byte bound before this split.
+    fn spill_until_under_budget(&mut self) -> Result<(), CscBuilderError> {
         self.peak_in_memory_bytes = self.peak_in_memory_bytes.max(self.in_memory_bytes);
 
         while self.in_memory_bytes > self.cfg.spill_after_bytes {
@@ -650,15 +685,6 @@ impl CscBuilder {
 
     pub fn rows_pushed(&self) -> u64 {
         self.rows_pushed
-    }
-
-    pub fn nnz_pushed(&self) -> u64 {
-        self.nnz
-    }
-
-    /// Exact per-column nnz so far.
-    pub fn column_counts(&self) -> &[u64] {
-        &self.col_counts
     }
 
     pub fn finish(mut self) -> Result<CscEmitter, CscBuilderError> {

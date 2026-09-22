@@ -244,7 +244,13 @@ pub fn run_build_csc(
     // `stats.value_max`: a shard may lack stats (format-permitted), so
     // `value_max` would contribute nothing and a wide integer shard could be
     // under-picked as Uint8.
-    let mut per_shard: Vec<(CodecId, ValueEncoding)> = Vec::with_capacity(csr_entries.len());
+    // `(codec, encoding, row_start)`. The row start is `ShardHeader.global_offset`,
+    // which the format defines as the CSR shard's first row — exact, and present
+    // on every shard. `ShardStats` is format-permitted to be absent, so deriving
+    // the row axis from it means choosing between a fabricated 0 (which rejects
+    // valid stats-less multi-shard files) and a fabricated "whatever we expected"
+    // (which makes the tiling check unfalsifiable). The header needs neither.
+    let mut per_shard: Vec<(CodecId, ValueEncoding, u64)> = Vec::with_capacity(csr_entries.len());
     let mut declared_encs: Vec<ValueEncoding> = Vec::with_capacity(csr_entries.len());
     let mut max_int_val: u32 = 0;
     let mut worst_decoded_bytes: u64 = 0;
@@ -255,7 +261,7 @@ pub fn run_build_csc(
         )?;
         let ci = CodecId::from_u8(sh.codec_id)
             .ok_or(crate::error::OpsError::UnknownCodec(sh.codec_id))?;
-        per_shard.push((ci, ve));
+        per_shard.push((ci, ve, sh.global_offset));
         declared_encs.push(ve);
         // The exact decoded cost of THIS shard, from the header that is
         // already in hand. `ShardHeader` carries both `nnz` and `n_major`, so
@@ -278,7 +284,7 @@ pub fn run_build_csc(
     let (csc_value_encoding, csc_codec) = scx_format_io::pick_csc_encoding(
         &declared_encs,
         max_int_val,
-        per_shard.first().map(|&(codec, _)| codec),
+        per_shard.first().map(|&(codec, _, _)| codec),
     )
     .ok_or_else(|| "Input file has no CSR shards".to_string())?;
 
@@ -399,8 +405,7 @@ pub fn run_build_csc(
     pb.set_message("Re-writing CSR shards and routing them into the CSC builder...");
     let mut rows_pushed: u64 = 0;
     for (i, shard_entry) in csr_entries.iter().enumerate() {
-        let (ci, ve) = per_shard[i];
-        let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+        let (ci, ve, shard_row_start) = per_shard[i];
 
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
         let n_shard_rows = indptr.len() - 1;
@@ -421,12 +426,13 @@ pub fn run_build_csc(
         drop((indptr_u64, indices_u32, raw_values));
 
         // Consumer 2: the CSC builder. The row axis it is fed is the walk's
-        // own running count, and `push_shard` checks it against the entry's
-        // declared `row_start`, so a catalog whose shards do not tile
-        // `[0, n_obs)` in order is an error rather than a silently shifted
-        // sidecar. (`csr_shards_sorted` sorts by `major_start`, but an entry
-        // with no stats sorts last at `u64::MAX` and keeps catalog order, so
-        // the two can genuinely disagree.)
+        // own running count, checked against the shard header's own
+        // `global_offset`, so a catalog whose shards do not tile `[0, n_obs)`
+        // in order is an error rather than a silently shifted sidecar.
+        // (`csr_shards_sorted` sorts by `major_start`, but an entry with no
+        // stats sorts last at `u64::MAX` and keeps catalog order, so the two
+        // can genuinely disagree — and the header is what settles it, since
+        // it is present whether or not `ShardStats` is.)
         if shard_row_start != rows_pushed {
             return Err(format!(
                 "build-csc: CSR shard {i} declares row_start {shard_row_start}, but \

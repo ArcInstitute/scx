@@ -654,10 +654,12 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         site: "scx-ops/src/build_csc.rs (the merged CSR re-emit + push_shard walk)",
         // NOT enforced, and the gap is narrow enough to name exactly.
         //
-        // The *decode* half is bounded and refused: `run_build_csc` reads
-        // every shard's `stats.nnz` in its header pre-pass and refuses a
-        // budget that cannot admit the largest, with the byte figure from
-        // `Share::min_budget_for`. The *re-encode* half shares the
+        // The *decode* half is bounded and refused: `run_build_csc` folds
+        // `ShardHeader.nnz` and `.n_major` from every shard in its header
+        // pre-pass and refuses a budget that cannot admit the largest, with
+        // the byte figure from `Share::min_budget_for`. The header, not
+        // `ShardStats` — stats are format-permitted to be absent, and reading
+        // them here let a stats-less shard drop out of the maximum. The *re-encode* half shares the
         // SparseIngest row's open terms verbatim -- frame expansion, the
         // intra-codec planes, the encoded indptr, two candidates under
         // `rayon::join` -- so see that row rather than a second copy of the

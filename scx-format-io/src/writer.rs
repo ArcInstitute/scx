@@ -2325,26 +2325,32 @@ impl ScxWriter {
             let mut declared_encs: Vec<ValueEncoding> = Vec::with_capacity(csr_entries.len());
             let mut max_int_val: u32 = 0;
             let mut first_codec: Option<CodecId> = None;
-            // Sorted by `row_start`, and checked against the running count —
-            // the same guard `run_build_csc` grew, for the same reason. The
-            // entries come from a catalog scan in *catalog* order, and
-            // `finish()` only checks the row *count*: two shards covering
-            // [0, n) but recorded out of order sum to the same `max(row_end)`,
-            // pass that check, and emit a sidecar whose rows are shifted by
-            // the swap. This is the hook the rewrite ops will use, so it needs
-            // the check before they arrive, not after.
-            let mut csr_entries = csr_entries;
-            csr_entries.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
-
+            // Checked against the running count on the SAME predicate
+            // `run_build_csc` uses: `ShardHeader.global_offset`, the CSR
+            // shard's own first row. The entries come from a catalog scan in
+            // *catalog* order and `finish()` checks only the row *count*, so
+            // two shards covering [0, n) recorded out of order sum to the
+            // same total, pass, and emit a sidecar shifted by the swap. This
+            // is the hook the rewrite ops will use, so it needs the guard
+            // before they arrive.
+            //
+            // The first version sorted on `ShardStats::row_start` and
+            // substituted `rows_pushed` where stats were absent, which made
+            // it unfalsifiable on exactly the stats-less files it was meant
+            // to protect — while the ops-side twin substituted `0` for that
+            // case and *rejected* valid ones. The header carries the number
+            // on every shard, so neither substitution is needed.
             let mut rows_pushed: u64 = 0;
             for entry in &csr_entries {
-                let declared = entry.stats.as_ref().map_or(rows_pushed, |s| s.row_start);
-                if declared != rows_pushed {
+                let (sh, indptr, indices, data) = self.decode_csr_entry(entry, n_vars)?;
+                if sh.global_offset != rows_pushed {
                     return Err(ScxError::InvalidCatalog(format!(
-                        "auto_emit_csc: modality {modality_id} CSR shard declares row_start                          {declared}, but {rows_pushed} rows precede it; the shards do not                          tile [0, {n_rows_modality}) in order"
+                        "auto_emit_csc: modality {modality_id} CSR shard declares row_start \
+                         {}, but {rows_pushed} rows precede it; the shards do not tile \
+                         [0, {n_rows_modality}) in order",
+                        sh.global_offset
                     )));
                 }
-                let (sh, indptr, indices, data) = self.decode_csr_entry(entry, n_vars)?;
                 declared_encs.push(
                     ValueEncoding::from_u8(sh.value_encoding)
                         .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?,
