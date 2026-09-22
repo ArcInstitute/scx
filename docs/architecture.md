@@ -295,13 +295,13 @@ Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
                    CREATION                                    CONSUMPTION
  ─────────────────────────────────────────   ──────────────────────────────────────
 
- scx-sparse/src/transpose.rs                scx-format-io/src/backed/csc.rs
+ scx-sparse/src/csc_builder.rs              scx-format-io/src/backed/csc.rs
  ┌──────────────────────────────────┐        ┌─────────────────────────────────┐
- │ streaming_csr_to_csc_iter_with   │        │ BackedCscIndex                  │
- │ _cap()                           │        │   shard_ranges: Vec<(col_start, │
- │   - iterates CSR shards          │        │     col_end, sorted_idx)>       │
- │   - yields CscArrays per col     │        │   shards_for_col_range(lo,hi)   │
- │     chunk (memory-bounded)       │        │     → Vec<usize>  (binary srch) │
+ │ CscBuilder                       │        │ BackedCscIndex                  │
+ │   push_shard(row_start, &ScxCsr) │        │   shard_ranges: Vec<(col_start, │
+ │   - routes nnz into column       │        │     col_end, sorted_idx)>       │
+ │     buckets, spilling past the   │        │   shards_for_col_range(lo,hi)   │
+ │     budget; finish() emits       │        │     → Vec<usize>  (binary srch) │
  └────────────┬─────────────────────┘        └────────────┬────────────────────┘
               │                                           │
               ▼                                           ▼
@@ -365,15 +365,29 @@ unavailable. `"auto"` lives one level up, as a pyscx-side policy
 
 ### Creation pipeline
 
-CSC sidecars are created by a streaming CSR→CSC transpose in
-`scx-sparse/src/transpose.rs`:
+CSC sidecars are created by a one-pass bucketed transpose in
+`scx-sparse/src/csc_builder.rs`:
 
-1. All CSR shards for the matrix are decoded (or read from the existing file).
-2. `streaming_csr_to_csc_iter_with_cap()` iterates column chunks bounded by
-   `min(memory_budget, csc_cols_per_shard)` — each `next()` call transposes a
-   `[col_start, col_end)` slice across all CSR shards.
-3. Each yielded `CscArrays` is written via `ScxWriter::write_csc_shard()` as
+1. Each CSR shard is decoded and pushed into a `CscBuilder` **in row order**,
+   one at a time. The builder routes every nonzero into a contiguous column
+   bucket and drops the shard; buckets stay in RAM until they cross the
+   budget's bucket share, then spill whole blocks to a `SpillStore`.
+2. `finish()` returns a `CscEmitter` whose plan — the exact column range and
+   nnz of every shard it will produce — is known before a byte is read back,
+   because the per-column counts were maintained during the push.
+3. Each emitted shard is written via `ScxWriter::write_csc_shard()` as
    `section_type = CscShard(5)` with independent per-shard codec selection.
+
+Total work is `2 * nnz`, against the `2 * nnz * n_chunks` of the chunked
+transpose this replaced (which rescanned every nonzero of every shard, twice,
+per column chunk). Shard **boundaries** are unchanged: `shard_cols` still comes
+from `compute_chunk_cols_with_cap`, so the emitted layout is byte-identical and
+only the cost of producing it moved.
+
+A caller that already holds the whole CSR — the eager h5ad/h5mu/`from_anndata`
+ingest paths — uses `ResidentCscSource` instead, which scatters straight out of
+the resident shards rather than making a second copy of them in buckets. Both
+sources feed one `csc_sidecar::emit_csc_shards` writer loop.
 
 Entry points:
 
