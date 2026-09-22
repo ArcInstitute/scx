@@ -884,4 +884,4 @@ For technical details, see [`docs/architecture.md`](docs/architecture.md), [`doc
 
 ## License
 
-MIT
+This project is licensed under the [MIT License](LICENSE).

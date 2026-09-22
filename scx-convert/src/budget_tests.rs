@@ -33,7 +33,8 @@ fn allocation_table_shares_sum_to_at_most_one_per_phase() {
                 | Phase::Export
                 | Phase::CscExternalColumnScan
                 | Phase::CscExternalBucketDrain
-                | Phase::CscSidecar => p,
+                | Phase::CscBuilderPush
+                | Phase::CscBuilderEmit => p,
             }
         };
         [
@@ -42,7 +43,8 @@ fn allocation_table_shares_sum_to_at_most_one_per_phase() {
             Phase::Export,
             Phase::CscExternalColumnScan,
             Phase::CscExternalBucketDrain,
-            Phase::CscSidecar,
+            Phase::CscBuilderPush,
+            Phase::CscBuilderEmit,
         ]
         .into_iter()
         .map(every)
@@ -88,46 +90,86 @@ fn unenforced_reservations_are_declared_not_silent() {
         .filter(|r| !r.enforced)
         .map(|r| r.name)
         .collect();
-    // Seven, and the count is pinned so an eighth cannot arrive unannounced:
+    // Eight, and the count is pinned so a ninth cannot arrive unannounced:
     //
-    //   * the two §11.4 CSC bucket rows — bucket count and bucket record
-    //     buffer are sized from the *mean* nnz/row, so a right-skewed depth
-    //     distribution overshoots them;
-    //   * the CSC sidecar row — the budget sizes the transpose chunk, while the
-    //     writer's full-length index/value copies and the encoder's streams are
-    //     live alongside it (and `build_csc.rs` additionally retains every
-    //     source shard). It controls shard sizing, not a ceiling;
-    //   * the CSC column-chunk row — the scan always reads the first column
-    //     whole before testing the budget, so one wide column exceeds the
-    //     share, and the floor exceeds it for budgets under 128 bytes.
+    //   * the two §11.4 CSC **external transpose** bucket rows — bucket count
+    //     and bucket record buffer are sized from the *mean* nnz/row, so a
+    //     right-skewed depth distribution overshoots them. (That is the
+    //     CSC-on-disk h5ad *ingest* transpose, the opposite direction from
+    //     the sidecar builder, and this PR does not touch it.);
+    //   * the CSC external column-chunk row — the scan always reads the first
+    //     column whole before testing the budget, so one wide column exceeds
+    //     the share, and the floor exceeds it for budgets under 128 bytes.
     //
-    //   * the two **ingest** rows (sparse and dense) — now sized from the
-    //     whole worker phase rather than the reader stage, 48 B/nnz against
-    //     the 16 they used to claim, but `encoded <= payload` is an estimate
-    //     and not a codec guarantee. The sparse row enumerates exactly what
-    //     it does not bound: frame expansion, intra-codec planes, the encoded
-    //     indptr, the bitmap, and readers on the density guess.
+    //   * the CSC builder's **source shard** row — its decode half *is*
+    //     bounded and refused, but the re-encode beside it carries the
+    //     SparseIngest row's open terms; and its **emit** row — two of the
+    //     three full-length copies are gone, but the encoder's streams are
+    //     those same open terms.
+    //
+    //   * the two **ingest** rows (sparse and dense) — sized from the whole
+    //     worker phase rather than the reader stage, 48 B/nnz against the 16
+    //     they used to claim, but `encoded <= payload` is an estimate and not
+    //     a codec guarantee. The sparse row enumerates exactly what it does
+    //     not bound: frame expansion, intra-codec planes, the encoded indptr,
+    //     the bitmap, and readers on the density guess.
     //
     //   * the **export** row — no encode term (that path decodes) and sized
     //     from the catalog's exact nnz, but `filter_shard` holds two indptrs
     //     on its no-filter path and doubling-grown output buffers alongside
     //     the originals on its masked one.
     //
-    // **Still seven.** An intermediate revision of this PR flipped all three
-    // per-shard rows to `enforced: true` and then, on review, flipped two back
-    // and finally the third. What this PR changes is the *estimate* — 3x
-    // better on sparse ingest, 3.7x on dense, and no longer blind to the
-    // encoder — not any row's flag. The share did not move either, which is
-    // why `allocation_table_shares_sum_to_at_most_one_per_phase` is
-    // unaffected. Widening a cost model is not the same as proving a ceiling,
-    // and this count is what keeps the two from being confused.
+    // **Seven became eight by closing a gap, not opening one.** The single
+    // "CSC sidecar transpose" row split into three — buckets, source shard,
+    // emit — and the bucket row is `enforced: true`, the first CSC row that
+    // can say so: the builder spills against exactly that `Share` with a
+    // declared `n_buckets * block_bytes` of slack, and `run_build_csc`
+    // refuses a budget too small for its largest input shard. The other two
+    // are gaps that the old lumped row hid rather than new ones.
+    //
+    // The count went *up* while coverage improved, which is why this comment
+    // exists: a bare number would read as a regression.
     assert_eq!(
         unenforced.len(),
-        7,
-        "expected all four CSC rows plus the three per-shard rows to be \
+        8,
+        "expected the three CSC external-transpose rows, the CSC builder's \
+         source-shard and emit rows, and the three per-shard rows to be \
          unenforced, got {unenforced:?}. Adding an unenforced row without \
          updating this count lets a known gap enter the table unannounced; \
          removing one means a gap actually closed and this test should say so."
+    );
+}
+
+/// The CSC builder's rows must cite the constants production reads, not copies
+/// of their values.
+///
+/// `enforced: true` on the bucket row is a claim that the builder spills
+/// against *this* share. A literal `Share::new(1, 2)` here would keep saying
+/// so after someone changed `CSC_BUILD_BUCKET_SHARE`, which is precisely the
+/// drift the declaration exists to prevent — and the reason those constants
+/// live in `scx-format-io` (where the builder can reach them) rather than
+/// beside this table.
+#[test]
+fn the_csc_builder_rows_cite_the_shared_constants() {
+    let of = |phase: Phase| -> Vec<Share> {
+        ALLOCATION_TABLE
+            .iter()
+            .filter(|r| r.phase == phase)
+            .map(|r| r.share)
+            .collect()
+    };
+    let push = of(Phase::CscBuilderPush);
+    assert!(
+        push.contains(&scx_format_io::csc_budget::CSC_BUILD_BUCKET_SHARE),
+        "the bucket row must cite CSC_BUILD_BUCKET_SHARE, got {push:?}"
+    );
+    assert!(
+        push.contains(&scx_format_io::csc_budget::CSC_BUILD_INPUT_SHARE),
+        "the source-shard row must cite CSC_BUILD_INPUT_SHARE, got {push:?}"
+    );
+    assert_eq!(
+        of(Phase::CscBuilderEmit),
+        vec![scx_format_io::csc_budget::CSC_EMIT_SHARE],
     );
 }
 
