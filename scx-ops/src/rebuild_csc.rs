@@ -9,6 +9,10 @@
 
 use std::path::Path;
 
+/// Kept at its old path (`scx_ops::rebuild_csc::rebuild_csc_inplace`) as well
+/// as the crate root, now that the implementation lives in `build_csc.rs`.
+pub use crate::build_csc::rebuild_csc_inplace;
+
 use scx_format_io::FramingConfig;
 
 /// Framing for a CSC-sidecar build on `path`: the file's existing layout, with

@@ -23,9 +23,20 @@ Read that carefully before quoting it. The wall is 9.4x at census scale and the
 peak fell by half, but **1.74x is not 1.0** — the bucket staging is bounded by
 an asserted counter, while the source shard's re-encode, the writer and the
 interpreter baseline are not. And the two small datasets got slightly *worse*:
-below the spill threshold every bucket stays resident. `thresholds.yaml`'s
-floors are set ~1.25x above the measured values for that reason: they are
-regression floors on an improvement, not contract floors.
+below the spill threshold every bucket stays resident.
+
+The re-encode has since gone: build-csc is now an in-place append that writes
+no CSR shard. Measured the same way (f1f9604c vs the append, one job):
+
+    dataset               before MB   after MB   before/bud  after/bud   wall x
+    pbmc10k                     988        910         0.24       0.22     1.11
+    tabula_sapiens_100k        3819       3713         0.93       0.91     1.24
+    census_500k                5547       5122         1.35       1.25     1.29
+    census_1m                  7216       5879         1.76       1.44     1.22
+
+Still not 1.0: the decode, the writer and the interpreter baseline remain
+outside the bound. `thresholds.yaml`'s floors are regression floors on an
+improvement, not contract floors.
 
 This module also earned its keep twice over during that change. The first
 capture came back at 1.92x with tabula 10 % worse than the code being replaced,
@@ -79,8 +90,9 @@ Per run, into `runs[].extra`:
   — context. The premise (a sidecar was actually built) is enforced by raising,
   not recorded as a metric.
 
-The ratio **is** floored in `thresholds.yaml` now, on both census tiers, at
-~1.25x the measured value rather than at the contract's 1.0 — see item 14 of
+The ratio **is** floored in `thresholds.yaml` now, on both census tiers, between
+the append's measured value and the rewrite's (1.30 / 1.60) rather than at the
+contract's 1.0 — see item 14 of
 that file's "Deferred floors" block for the capture and for what is still
 outside the bound. `n_csc_shards__build_csc` is pinned there too, from both
 directions: a memory ratio can be met by narrowing shards, which would fix

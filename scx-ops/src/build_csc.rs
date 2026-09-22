@@ -97,8 +97,13 @@ fn plan<'r>(
         .entries
         .iter()
         .any(|e| e.section_type == SectionType::CscShard);
-    // An empty matrix without a sidecar is answered before anything else: it
-    // is a no-op on any file, multimodal included.
+    // An empty matrix without a sidecar is answered before anything else,
+    // including the multimodal and framing refusals below: there is nothing to
+    // build and nothing to drop, so the op is a no-op (the copy-out form copies
+    // the input verbatim) whatever the file's layout. Ahead of the framing
+    // refusal on purpose: refusing to frame a sidecar that will not be written
+    // would fail a caller — an `--csc` post-pass over an empty output, say — for
+    // no benefit.
     let empty_matrix = header.n_obs == 0 || header.n_vars == 0;
     if empty_matrix && !has_csc {
         return Ok(Plan::Empty { has_csc });
@@ -422,9 +427,17 @@ pub fn rebuild_csc_inplace(
                 .iter()
                 .any(|e| e.section_type == SectionType::LayerCscShard);
         if stale_layer_csc {
+            let bytes: u64 = prep
+                .old_catalog
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::LayerCscShard)
+                .map(|e| e.length)
+                .sum();
             log::warn!(
                 "build-csc: dropping the stale layer CSC sidecar on {} (built at generation \
-                 {}, file is at {}); nothing rebuilds a layer sidecar",
+                 {}, file is at {}); nothing rebuilds a layer sidecar, and its {bytes} bytes \
+                 stay unreferenced until `scx compact`",
                 path.display(),
                 prep.old_catalog.csc_build_generation,
                 prep.old_catalog.data_generation
@@ -1033,11 +1046,11 @@ mod tests {
 
     /// build-csc adds a sidecar; it must not un-delete anything on the way.
     ///
-    /// The in-place form is the dangerous one: it renames a wholly new file
-    /// over the target carrying no prior catalog, so `scx rollback` cannot
-    /// recover a deletion it dropped. And it is the documented way to restore a
-    /// sidecar another op dropped, which puts `mark_deleted` → `build-csc`
-    /// directly on the happy path.
+    /// It is the documented way to restore a sidecar another op dropped, which
+    /// puts `mark_deleted` → `build-csc` directly on the happy path. (While the
+    /// in-place form renamed a wholly new file over the target, a deletion it
+    /// dropped was unrecoverable; it is an append now, and rollback-able, but a
+    /// silently un-deleted cell would still be wrong.)
     #[test]
     fn build_csc_carries_deletion_vectors() {
         for in_place in [false, true] {
@@ -1145,12 +1158,10 @@ mod tests {
     /// every read of the new sidecar would raise `StaleCscSidecar`. That is
     /// what this half pins; note it cannot see a *bumped* generation, because
     /// the stamp is taken from `data_generation` and the two move together.
-    /// And all CSR writes must still precede all CSC
-    /// writes: the walk interleaves a `write_csr_shard` with each
-    /// `push_shard`, and only the `finish()` drain afterwards emits CSC — if
-    /// anyone later moves the drain inside the walk, the two families
-    /// interleave and `carry_csr_shard_column_stats_from` stops lining up
-    /// with the input's entries.
+    /// And every CSR section must still precede every CSC section: the append
+    /// leaves the CSR entries where they were and writes the CSC sidecar after
+    /// the file's old end, so a CSC section before a CSR one would mean
+    /// something rewrote CSR.
     #[test]
     fn build_csc_keeps_the_sidecar_fresh_and_the_sections_ordered() {
         let dir = tempfile::tempdir().unwrap();
@@ -1416,8 +1427,8 @@ mod tests {
     }
 
     /// A 0-column matrix with rows and no sidecar is copied verbatim (CSR
-    /// shards included); with a stale sidecar it takes the normal path, which
-    /// re-emits its CSR shards and writes zero CSC shards.
+    /// shards included); with a stale sidecar, the append drops the old CSC
+    /// entries and writes none, leaving its CSR shards untouched.
     #[test]
     fn test_build_csc_zero_columns_writes_no_sidecar() {
         let dir = tempfile::tempdir().unwrap();

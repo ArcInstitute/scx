@@ -2,7 +2,7 @@
 //!
 //! Before this module the question was encoded four times in four incompatible
 //! shapes — an allowlist of copy calls
-//! ([`crate::rewrite_helpers::copy_auxiliary_sections`]), an inline `matches!`
+//! ([`crate::rewrite_helpers::copy_auxiliary_sections_canonicalizing`]), an inline `matches!`
 //! over eight variants (`optimize`), per-type read/filter/write blocks
 //! (`compact`), and two `should_drop_old_entry` denylists (`external_obs`,
 //! `external_layer`). Nothing connected them, so `SectionType::DeletionVectors`
@@ -1015,8 +1015,11 @@ pub fn audit_staged(
 /// type, modality, offset, length, checksum and stats — because its bytes were
 /// never moved. So on top of [`audit`]'s presence rules, every input entry whose
 /// family this op declares `Verbatim` must appear in `new` unchanged. A
-/// rewrite that snuck into an in-place op (a re-encoded shard written to EOF,
-/// say) would keep its family present and pass [`audit`]; it fails here.
+/// rewrite that snuck into an in-place op — an old entry replaced by a
+/// re-encoded copy at EOF, or its stats cleared — keeps its family present and
+/// passes [`audit`]; it fails here. What this does **not** catch is an *extra*
+/// entry of a `Verbatim` family added beside the unchanged originals: the check
+/// is that every old entry survives, not that nothing new appeared.
 ///
 /// Call it before `commit_in_place`, for the reason [`audit_staged`] runs
 /// before `finish()`: an error then leaves the file on its old catalog.

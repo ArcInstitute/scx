@@ -319,8 +319,9 @@ log::warn!("append dropped 1 CSC shards from experiment.scx: rerun `scx build-cs
 To restore:
 
 ```bash
-# Standalone rebuild, in place — omit <OUTPUT>. Staged via a temp file +
-# atomic rename, so a failure leaves experiment.scx untouched.
+# Standalone build, in place — omit <OUTPUT>. Appends the sidecar and repoints
+# the catalog; a failure before the commit leaves experiment.scx as it was, and
+# `scx rollback experiment.scx` removes the sidecar again.
 scx build-csc experiment.scx
 
 # Or write a copy, leaving the input alone

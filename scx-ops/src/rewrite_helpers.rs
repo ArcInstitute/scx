@@ -404,12 +404,11 @@ pub(crate) fn dropped_section_labels(reader: &ScxReader) -> Vec<&'static str> {
 /// `Experiment.detection_counts` answers from it with nothing to notice by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerCanonicalization {
-    /// Re-emit layers exactly as they are.
+    /// Re-emit layers exactly as they are. Nothing under the bitmaps moves, so
+    /// they carry.
     ///
-    /// `build_csc`'s case: it deliberately clamps its output version to the
-    /// source's (SCX-005) precisely so it does not have to canonicalize, and
-    /// canonicalizing would change the nnz of a file it promises to re-emit
-    /// unchanged. Nothing under the bitmaps moves, so they carry.
+    /// No in-tree caller passes this since `build-csc` — whose case it was —
+    /// became an append that rewrites nothing; `scx upgrade` passes `On`.
     Off,
     /// Re-sort, dedup-sum and zero-drop every layer CSR shard before
     /// re-encoding, widening the value encoding if the sums need it
@@ -563,10 +562,9 @@ fn copy_dense_and_pairwise(
 /// against. Dropping the canonicalization would let `upgrade` stamp v3 over a
 /// shard that violates it (see [`copy_dense_and_pairwise`]).
 ///
-/// `build_csc` passes [`LayerCanonicalization::Off`] and therefore always takes
-/// the verbatim arm — which is correct there, because it clamps its output
-/// version to the source's (SCX-005) and so never claims an invariant the
-/// source did not already hold.
+/// [`LayerCanonicalization::Off`] always takes the verbatim arm, which is
+/// correct only for a rewrite that does not raise the output's format version
+/// above the source's and so claims no invariant the source did not hold.
 fn copy_csr_class_aux(
     reader: &ScxReader,
     writer: &mut ScxWriter,

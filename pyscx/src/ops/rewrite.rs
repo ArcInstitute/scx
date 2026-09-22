@@ -632,8 +632,10 @@ pub fn build_csc(
 
     // `output=None` is now the in-place spelling, so an `output` that aliases
     // `input` is a mistake with an obvious fix rather than an unsupported
-    // operation. (Still an error: `run_build_csc` removes `output` when `force`
-    // before opening `input`, so an aliased path would delete the source.)
+    // operation. (Still an error: `run_build_csc` copies `input` onto a staging
+    // file and renames it over `output`, so an aliased path would replace the
+    // source with its own copy — and `std::fs::copy` onto the source itself
+    // would truncate it first.)
     let output_path = match output {
         Some(out) => {
             let output_path = PathBuf::from(out);
@@ -678,12 +680,9 @@ pub fn build_csc(
     }
     drop(input_reader);
 
-    // Framing must come from `framing_for_csc_rebuild` on BOTH arms. Both ends
-    // of the range are wrong (see its contract): `None` strips row-group
-    // framing off a v4 input — via `rewrite_output_format_version(&[4], 1) == 3`
-    // — and a `FramingConfig` carrying `decode_target: Some(_)` would
-    // re-authorise per-shard codec re-selection, the opposite of what a sidecar
-    // rebuild needs.
+    // Framing from `framing_for_csc_rebuild` on both arms: `Some` iff the
+    // input is v4, which is exactly what the in-place append admits (it refuses
+    // `Some` on a <= v3 file, and frames the sidecar on v4 either way).
     let framing = scx_ops::framing_for_csc_rebuild(&input_path);
 
     // Both entry points return `Box<dyn Error>` (not `Send`), so stringify the

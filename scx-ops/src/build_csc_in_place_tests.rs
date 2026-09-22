@@ -454,10 +454,15 @@ fn a_legacy_obs_index_section_is_carried() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_input(&dir.path().join("legacy.scx"), 20, 6, 2, false);
     graft_entry(&path, SectionType::ObsIndex, "obs_index", 1, 0);
-    let before = entries_of(&path, SectionType::ObsIndex);
-    assert_eq!(before.len(), 1);
+    graft_entry(&path, SectionType::VarIndex, "var_index", 1, 0);
+    let before = (
+        entries_of(&path, SectionType::ObsIndex),
+        entries_of(&path, SectionType::VarIndex),
+    );
+    assert_eq!((before.0.len(), before.1.len()), (1, 1));
     rebuild_csc_inplace(&path, 5, "1G", None, None).unwrap();
-    assert_eq!(entries_of(&path, SectionType::ObsIndex), before);
+    assert_eq!(entries_of(&path, SectionType::ObsIndex), before.0);
+    assert_eq!(entries_of(&path, SectionType::VarIndex), before.1);
     assert!(has(&path, SectionType::CscShard));
 }
 

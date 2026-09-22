@@ -1849,8 +1849,10 @@ impl ScxWriter {
     /// [`Self::finish`] does. `finish` consumes `self` and ends with an atomic
     /// rename over the final path, so anything checked after it returns is a
     /// post-mortem: on an in-place rewrite (`scx optimize --output == input`,
-    /// `scx build-csc` with no `<OUTPUT>`) the original is already gone by then
-    /// and an error can only report the loss, not prevent it.
+    /// `scx upgrade --in-place`) the original is already gone by then and an
+    /// error can only report the loss, not prevent it. (`scx build-csc` was
+    /// one until it became an append; it audits its catalog before
+    /// `commit_in_place` instead.)
     ///
     /// **Two sections are written by `finish` itself and are therefore absent
     /// here**: the `ModalityTable`, and any CSC sidecar auto-emitted for a
@@ -3029,7 +3031,8 @@ pub fn assign_csr_shard_column_stats(
 /// received stats.
 ///
 /// For an op that **re-encodes** every CSR shard while preserving the row
-/// partition 1:1 — `build-csc` and `optimize` — this is what keeps Level-1
+/// partition 1:1 — `optimize` and `scx upgrade` (and `build-csc`, until it
+/// became an append that never writes a CSR entry) — this is what keeps Level-1
 /// pruning alive. `compute_shard_stats` produces no `column_stats`, so a
 /// re-encoded shard comes out bare even though the `ObsPredicateIndex` section
 /// was copied through verbatim; the index survives and the pruning silently

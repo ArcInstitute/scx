@@ -322,9 +322,10 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     // matrix produces them**: `write_csr_shard` computes shard stats without
     // column stats, and neither `fixture_all_families` nor `mixed_codec_file`
     // goes through an index pass. Without these two arms the `column_stats`
-    // half of the digest is dead weight here, and build-csc's
-    // `carry_csr_shard_column_stats_from` — the exact call PR-07's diff sits
-    // next to — could be deleted with the golden unmoved.
+    // half of the digest is dead weight here. For build-csc the arm now pins
+    // that the append leaves every CSR entry's stats exactly as they were (it
+    // used to pin `carry_csr_shard_column_stats_from`, which the rewrite needed
+    // and the append does not).
     let indexed = dir.join("indexed.scx");
     scx_ops::compact_with_options(
         &src,
