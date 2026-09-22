@@ -271,13 +271,17 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     // — those six are all `Carry::Verbatim` (`scx_ops::carry::build_csc`), and
     // `section_carry.rs::build_csc_carries_what_optimize_carries` pins it.
     //
-    // The reason that survives is what build-csc's diff actually touches: its
-    // per-shard CSR re-emit loop. `mixed_codec_file` is the only fixture in the
-    // tree that exercises all three encoder paths (unframed integer,
-    // row-group-framed integer, float). `build_csc_indexed` below covers the
-    // rich families — all but `.raw`, the bitmaps and the group index, which
-    // its input loses to the `compact` it is laundered through, not to
-    // build-csc.
+    // build-csc is an in-place append (a copy, then an append, in this
+    // copy-out form), so what this arm pins is that the CSR it never writes
+    // comes through untouched and the sidecar follows the file's layout.
+    // `mixed_codec_file` is a v4 file carrying all three encoder paths
+    // (unframed integer, row-group-framed integer, float), which makes it the
+    // fixture that can show both: its framed shard stays framed, and the CSC
+    // shard is framed because the file is v4. Until the append, this arm
+    // pinned the opposite — a rewrite that re-encoded the framed shard
+    // unframed and stamped v3. `build_csc_indexed` below covers the rich
+    // families — all but `.raw`, the bitmaps and the group index, which its
+    // input loses to the `compact` it is laundered through, not to build-csc.
     let csc_src = mixed_codec_file(&dir.join("csc_src.scx")).unwrap();
     let out = dir.join("build_csc.scx");
     scx_ops::run_build_csc(&csc_src, &out, "1G", false, 1024, None, None).unwrap();
@@ -299,8 +303,10 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     // one specific failure that uniform geometry hides.
     //
     // The budget is generous on purpose, so the boundaries come from
-    // `cols_per_shard` alone and this arm is byte-identical across the
-    // streaming-builder change rather than needing a bless.
+    // `cols_per_shard` alone. This arm was byte-identical across the
+    // streaming-builder change; it moved once, deliberately, when build-csc
+    // became an append — the fixture is v4, so its framed CSR shard now
+    // survives and its three CSC shards are framed (decoded content unchanged).
     let csc_multi = csc_multi_shard_file(&dir.join("csc_multi_src.scx")).unwrap();
     let out = dir.join("build_csc_multi_shard.scx");
     scx_ops::run_build_csc(&csc_multi, &out, "1G", false, 3, None, None).unwrap();
@@ -316,9 +322,10 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     // matrix produces them**: `write_csr_shard` computes shard stats without
     // column stats, and neither `fixture_all_families` nor `mixed_codec_file`
     // goes through an index pass. Without these two arms the `column_stats`
-    // half of the digest is dead weight here, and build-csc's
-    // `carry_csr_shard_column_stats_from` — the exact call PR-07's diff sits
-    // next to — could be deleted with the golden unmoved.
+    // half of the digest is dead weight here. For build-csc the arm now pins
+    // that the append leaves every CSR entry's stats exactly as they were (it
+    // used to pin `carry_csr_shard_column_stats_from`, which the rewrite needed
+    // and the append does not).
     let indexed = dir.join("indexed.scx");
     scx_ops::compact_with_options(
         &src,
@@ -424,8 +431,9 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     // Every arm above writes **unframed** shards, and not by accident:
     // `fixture_all_families` never calls `ScxWriter::set_framing`, so
     // `framing_for_rewrite` sees an unframed input and hands the writer
-    // `None`; and `mixed_codec_file`'s one framed shard is re-encoded
-    // unframed by `run_build_csc(.., None)` above. So before this arm,
+    // `None`; and `mixed_codec_file`'s one framed shard is carried verbatim
+    // by `run_build_csc` above, which frames only its single-group CSC shard.
+    // (It used to be re-encoded unframed.) So before this arm,
     // `scx_format_io::encode_shard_framed` — the function every framed write
     // in the workspace funnels through — was pinned by nothing here.
     //

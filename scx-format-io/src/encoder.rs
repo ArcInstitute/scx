@@ -360,10 +360,11 @@ pub fn encode_one_shard_from_bytes(
 ///
 /// Callers that mean to **preserve** a source shard's codec (rather than pick a
 /// new one) MUST therefore pass `decode_target: None` — i.e.
-/// `FramingConfig::default()`. `scx_ops::build_csc` and
-/// `scx_ops::rewrite_helpers::copy_layers` both rely on this: they re-write
-/// shards at the codec read off the source header, and re-selection would
-/// silently defeat that.
+/// `FramingConfig::default()`. `scx_ops::rewrite_helpers::copy_layers` relies
+/// on this: it re-writes shards at the codec read off the source header, and
+/// re-selection would silently defeat that. (`scx_ops::build_csc` did too
+/// while it rewrote the CSR; it now appends only the sidecar, and clears
+/// `decode_target` itself.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramingConfig {
     pub row_group_rows: u32,

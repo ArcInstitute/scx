@@ -1328,9 +1328,10 @@ def build_csc(
 ) -> None:
     """Add a CSC (column-major) sidecar built from `input`'s CSR shards.
 
-    ``output=None`` (the default) rebuilds `input` **in place** via temp file +
-    atomic rename; pass a path to write a copy instead. ``force`` applies only
-    to the copy-out form and is rejected with ``output=None``.
+    ``output=None`` (the default) appends the sidecar to `input` **in place** —
+    nothing else in the file is rewritten, and ``pyscx.rollback(input)`` removes
+    it again; pass a path to write a copy instead. ``force`` applies only to the
+    copy-out form and is rejected with ``output=None``.
     """
     ...
 

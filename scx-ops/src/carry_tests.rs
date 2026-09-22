@@ -178,7 +178,7 @@ build-csc
   X                            verbatim
   X CSC sidecar                rebuilt
   layers                       verbatim
-  layer CSC sidecars           dropped(warns)
+  layer CSC sidecars           conditional
   obsm                         verbatim
   varm                         verbatim
   obsp                         verbatim
@@ -193,7 +193,7 @@ build-csc
   modality table               refuse
   adata.raw                    verbatim
   grouped-sort group index     verbatim
-  unwritten legacy index section dropped(SILENT)
+  unwritten legacy index section verbatim
 upgrade
   obs                          verbatim
   var                          verbatim
@@ -220,46 +220,67 @@ upgrade
     assert_eq!(render_table(), expected);
 }
 
-/// `upgrade` delegates to `build_csc` through an `other =>` arm, so it is the
-/// one policy a new `SectionFamily` reaches without a compile error.
+/// `upgrade` and `build-csc` agree on every family except four, and this pins
+/// which four.
 ///
-/// Pin the relationship the delegation asserts — identical everywhere except
-/// the CSC sidecar — so the two cannot drift silently, which is the only thing
-/// the missing compile error would have caught.
+/// They no longer share a mechanism — `upgrade` rewrites through an allowlist,
+/// `build-csc` appends in place — so agreement elsewhere is a fact about the
+/// two ops today, not a delegation. Pinned anyway, because a divergence that
+/// appears without a line here is exactly the kind of drift the table exists
+/// to make visible.
 #[test]
-fn upgrade_matches_build_csc_except_the_csc_sidecar() {
+fn upgrade_matches_build_csc_except_four_families() {
     for &f in SectionFamily::ALL {
-        if f == SectionFamily::XCsc {
+        match f {
             // build-csc *creates* the sidecar; upgrade re-emits the input's,
             // and only when canonicalising did not change the matrix under it.
-            assert_eq!(policy(RewriteOp::BuildCsc, f), Carry::Rebuilt);
-            assert!(matches!(
+            SectionFamily::XCsc => {
+                assert_eq!(policy(RewriteOp::BuildCsc, f), Carry::Rebuilt);
+                assert!(matches!(
+                    policy(RewriteOp::Upgrade, f),
+                    Carry::Conditional { .. }
+                ));
+            }
+            // Only `upgrade` canonicalises, and canonicalisation drops explicit
+            // zeros, which changes which genes a row *stores* and therefore
+            // what the bitmap should say.
+            SectionFamily::Bitmap => {
+                assert_eq!(policy(RewriteOp::BuildCsc, f), Carry::Verbatim);
+                assert!(matches!(
+                    policy(RewriteOp::Upgrade, f),
+                    Carry::Conditional { .. }
+                ));
+            }
+            // An append keeps a fresh layer sidecar by never touching it (and
+            // drops a stale one its new stamp would bless); a rewrite through
+            // the allowlist has no way to bring it along at all.
+            SectionFamily::LayerCsc => {
+                assert!(matches!(
+                    policy(RewriteOp::BuildCsc, f),
+                    Carry::Conditional { .. }
+                ));
+                assert!(matches!(
+                    policy(RewriteOp::Upgrade, f),
+                    Carry::Dropped { .. }
+                ));
+            }
+            // The legacy `obs_index` / `var_index`: an append carries whatever
+            // is there, a rewrite drops it.
+            SectionFamily::Unwritten => {
+                assert_eq!(policy(RewriteOp::BuildCsc, f), Carry::Verbatim);
+                assert!(matches!(
+                    policy(RewriteOp::Upgrade, f),
+                    Carry::Dropped { .. }
+                ));
+            }
+            _ => assert_eq!(
                 policy(RewriteOp::Upgrade, f),
-                Carry::Conditional { .. }
-            ));
-            continue;
+                policy(RewriteOp::BuildCsc, f),
+                "{}: a new divergence between upgrade and build-csc; if it is \
+                 intended, give it an arm in this test",
+                f.label()
+            ),
         }
-        if f == SectionFamily::Bitmap {
-            // The second exception, added in Phase 5b. Both ops carry the
-            // sidecar, but only `upgrade` canonicalises — and canonicalisation
-            // drops explicit zeros, which changes which genes a row *stores*
-            // and therefore what the bitmap should say. `build_csc` clamps its
-            // output version so it never canonicalises (SCX-005), so nothing
-            // moves under its bitmaps.
-            assert_eq!(policy(RewriteOp::BuildCsc, f), Carry::Verbatim);
-            assert!(matches!(
-                policy(RewriteOp::Upgrade, f),
-                Carry::Conditional { .. }
-            ));
-            continue;
-        }
-        assert_eq!(
-            policy(RewriteOp::Upgrade, f),
-            policy(RewriteOp::BuildCsc, f),
-            "{}: upgrade and build-csc share one carry implementation, so their \
-             policies must agree",
-            f.label()
-        );
     }
 }
 
@@ -334,4 +355,84 @@ fn finish_writes_only_non_asserting_families() {
             );
         }
     }
+}
+
+/// `audit_in_place` asserts what only an append can promise: a `Verbatim`
+/// family is the same catalog entry, not merely present. Each mutation below
+/// keeps the family present — so `audit` alone passes it — and must fail here.
+#[test]
+fn audit_in_place_rejects_a_moved_or_rewritten_verbatim_entry() {
+    use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
+    let entry = |name: &str, t: SectionType, offset: u64| FullCatalogEntry {
+        name: name.to_string(),
+        offset,
+        length: 100,
+        section_type: t,
+        checksum: [offset as u8; 32],
+        modality_id: 0,
+        stats: None,
+    };
+    let old = FullCatalog {
+        catalog_version: scx_format_io::CURRENT_CATALOG_VERSION,
+        manifest_sequence: 1,
+        prev_catalog_offset: 0,
+        n_obs: 10,
+        entries: vec![
+            entry("obs", SectionType::ObsMetadata, 4352),
+            entry("X_shard_0", SectionType::CsrShard, 4456),
+        ],
+        data_generation: 1,
+        csc_build_generation: 0,
+    };
+    let mut good = old.clone();
+    good.entries
+        .push(entry("X_csc_shard_0", SectionType::CscShard, 9000));
+    assert!(audit_in_place(RewriteOp::BuildCsc, &old, &good).is_ok());
+
+    let mut moved = good.clone();
+    moved.entries[1].offset = 20_000;
+    assert!(audit(RewriteOp::BuildCsc, &[&old], &moved.entries, 10).is_ok());
+    let err = audit_in_place(RewriteOp::BuildCsc, &old, &moved).unwrap_err();
+    assert!(err.to_string().contains("X_shard_0"), "{err}");
+
+    let mut rewritten = good.clone();
+    rewritten.entries[1].checksum = [0xff; 32];
+    assert!(audit_in_place(RewriteOp::BuildCsc, &old, &rewritten).is_err());
+
+    let mut renamed = good;
+    renamed.entries[0].name = "obs_metadata/shard_0".to_string();
+    assert!(audit_in_place(RewriteOp::BuildCsc, &old, &renamed).is_err());
+
+    // Same bytes, same place, stats gone: the Level-1 pruning loss the table
+    // exists for. `audit` cannot see it; this must.
+    let mut with_stats = old.clone();
+    with_stats.entries[1].stats = Some(scx_format_io::catalog::ShardStats {
+        row_start: 0,
+        row_end: 10,
+        col_start: 0,
+        col_end: 5,
+        nnz: 7,
+        value_min: 1,
+        value_max: 3,
+        value_sum: 9,
+        n_indexed_columns: 0,
+        column_stats: Vec::new(),
+    });
+    let mut cleared = with_stats.clone();
+    cleared.entries[1].stats = None;
+    assert!(audit(RewriteOp::BuildCsc, &[&with_stats], &cleared.entries, 10).is_ok());
+    assert!(audit_in_place(RewriteOp::BuildCsc, &with_stats, &with_stats).is_ok());
+    assert!(audit_in_place(RewriteOp::BuildCsc, &with_stats, &cleared).is_err());
+
+    // A legacy `obs_index` section is carried, not refused: an append cannot
+    // drop it without rewriting something.
+    let mut legacy = old.clone();
+    legacy
+        .entries
+        .push(entry("obs_index", SectionType::ObsIndex, 12_000));
+    let mut legacy_new = legacy.clone();
+    legacy_new
+        .entries
+        .push(entry("X_csc_shard_0", SectionType::CscShard, 20_000));
+    assert!(audit_in_place(RewriteOp::BuildCsc, &legacy, &legacy_new).is_ok());
 }

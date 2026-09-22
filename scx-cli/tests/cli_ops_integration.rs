@@ -1505,8 +1505,9 @@ fn test_build_csc_in_place_adds_sidecar_to_input() {
     assert_eq!(reader.header().n_obs, 8, "obs axis must be unchanged");
     assert_eq!(reader.header().n_vars, 6, "var axis must be unchanged");
 
-    // No stray staging file: `rebuild_csc_inplace` writes `*.rebuild_csc.tmp`
-    // beside the target and must always clean it up.
+    // No stray staging file. The in-place form is an append and stages
+    // nothing; it used to write `*.rebuild_csc.tmp` beside the target, and a
+    // leak of that is what this still guards against.
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
@@ -1574,43 +1575,60 @@ fn test_build_csc_rejects_multimodal_on_both_forms() {
     );
 }
 
-/// In place does **not** imply undoable, and `docs/operations.md` now says so —
-/// pin it so the claim cannot silently go stale in either direction.
+/// In-place `build-csc` is undoable, and `docs/operations.md` says so — pin it
+/// so the claim cannot silently go stale in either direction.
 ///
-/// `rebuild_csc_inplace` stages a wholly new file via `run_build_csc` and renames
-/// it over the target, so it carries no prior catalog and does not go through the
-/// `prepare_in_place` / `commit_in_place` manifest chain the import ops use.
+/// It used to be the opposite: `rebuild_csc_inplace` staged a wholly new file
+/// and renamed it over the target, which left no prior catalog, and this test
+/// asserted that rollback failed. The build is now an append through
+/// `prepare_in_place` / `commit_in_place`, so the pre-build catalog is the
+/// previous one, and rolling back to it removes the sidecar and nothing else.
 #[test]
-fn test_build_csc_in_place_is_not_rollback_able() {
+fn test_build_csc_in_place_is_rollback_able() {
     let dir = tempfile::tempdir().unwrap();
-    let input = write_test_file(&dir, "no_rollback.scx", 8, 6);
+    let input = write_test_file(&dir, "rollback.scx", 8, 6);
+    let before = ScxReader::open(&input).unwrap();
+    let before_csr = before.read_all_csr_shards().unwrap();
+    let before_seq = before.header().manifest_sequence;
+    drop(before);
 
     let out = scx_cli()
         .args(["build-csc", input.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(ScxReader::open(&input).unwrap().header().has_csc());
+    let built = ScxReader::open(&input).unwrap();
+    assert!(built.header().has_csc());
+    assert_eq!(built.header().manifest_sequence, before_seq + 1);
+    drop(built);
 
     let rb = scx_cli()
         .args(["rollback", input.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
-        !rb.status.success(),
-        "an in-place build-csc leaves no prior catalog, so rollback must fail \
-         loudly rather than appear to succeed and change nothing"
+        rb.status.success(),
+        "an in-place build-csc keeps the prior catalog, so rollback must succeed: {}",
+        String::from_utf8_lossy(&rb.stderr)
     );
-    let stderr = String::from_utf8_lossy(&rb.stderr);
+    let back = ScxReader::open(&input).unwrap();
+    assert!(!back.header().has_csc(), "rollback must remove the sidecar");
+    assert_eq!(back.header().n_csc_shards, 0);
     assert!(
-        stderr.contains("no previous catalog"),
-        "the failure must say why, got: {stderr}"
+        !back
+            .catalog()
+            .entries
+            .iter()
+            .any(|e| e.section_type == SectionType::CscShard),
+        "and its catalog entries"
     );
-    // And the file is unchanged by the refused rollback.
-    assert!(
-        ScxReader::open(&input).unwrap().header().has_csc(),
-        "a refused rollback must not have modified the file"
+    let csr = back.read_all_csr_shards().unwrap();
+    assert_eq!(
+        csr.indptr, before_csr.indptr,
+        "the CSR is untouched throughout"
     );
+    assert_eq!(csr.indices, before_csr.indices);
+    assert_eq!(csr.data, before_csr.data);
 }
 
 /// Both forms must preserve row-group framing. The copy-out arm used to pass
@@ -2249,6 +2267,9 @@ fn test_query_no_filter_gets_no_category_note() {
 /// `CategoryBitset`. So the section was there and the pruning was gone — a full
 /// scan returning the right rows, which is why nothing caught it.
 ///
+/// (`build-csc` has since become an in-place append that never writes a CSR entry,
+/// so it now keeps both by construction; the test stays as the end-to-end pin.)
+///
 /// That gap was pinned here rather than fixed, with a note saying the fix was to
 /// wire the stats into the re-emit as `merge` does. Phase 5c did that, and found
 /// `optimize` — the only other op declaring `Carry::Verbatim` for this family —
@@ -2391,9 +2412,9 @@ fn build_csc_carries_predicate_index_and_pushdown() {
     let (after_elim, after_matched) = pruned(&copied);
     assert_eq!(
         after_elim, before_elim,
-        "build-csc re-encodes every CSR shard, so it must re-derive the per-shard \
-         column stats Level-1 pruning reads from the index it carried. Carrying \
-         the section bytes alone leaves pruning off."
+        "build-csc must leave the per-shard column stats Level-1 pruning reads \
+         intact. It is an append now and never rewrites a CSR entry; when it \
+         re-encoded every shard, carrying the section bytes alone left pruning off."
     );
     assert_eq!(
         before_matched, after_matched,

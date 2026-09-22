@@ -1340,9 +1340,9 @@ def estimate_memory_gb(
         # The working set tracks the sparse footprint more than the
         # `memory_limit` the caller passes — the gap this benchmark exists to
         # measure. The streaming `CscBuilder` narrowed it (census_1m 15.4 GB ->
-        # 7.1 GB, 3.76x -> 1.74x of a declared 4 GiB) without closing it: the
-        # bucket staging is bounded, the source shard's re-encode and the
-        # writer are not.
+        # 7.1 GB, 3.76x -> 1.74x of a declared 4 GiB) and the in-place append
+        # narrowed it again (-> 5.9 GB, 1.44x) without closing it: the bucket
+        # staging is bounded, the decode and the writer are not.
         #
         # The figures below are pre-builder and so now over-ask, which is the
         # safe direction for a scheduler request — under-asking costs an OOM

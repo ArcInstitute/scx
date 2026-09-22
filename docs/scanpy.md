@@ -284,9 +284,9 @@ pyscx.from_h5ad("very_large.h5ad", "very_large.scx",
 ```
 
 `csc="always"` performs a two-pass write: the streaming path emits CSR
-shards, then `scx_ops::rebuild_csc_inplace` regenerates the CSC sidecar
-over the just-written file. Peak disk briefly reaches ~2× the output
-size during the rebuild.
+shards, then `scx_ops::rebuild_csc_inplace` appends the CSC sidecar to the
+just-written file in place — one extra read pass over the CSR, and no second
+copy of the file on disk.
 
 Limitations:
 

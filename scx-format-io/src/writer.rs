@@ -380,13 +380,11 @@ impl ScxWriter {
     /// Override the CSR-data generation stamped into the output catalog.
     ///
     /// Defaults to `1` for a fresh write. CSR-mutating ops (`compact`,
-    /// `merge`) call this with `source + 1`; CSC-only rewrites
-    /// (`build-csc`) call it with the *unchanged* source generation so the
-    /// freshly-emitted sidecar reads as fresh
-    /// (`csc_build_generation == data_generation`). (`append` builds its
-    /// catalog manually rather than via `finish()`, so it bumps the
-    /// generation there, not through this setter; `subset` writes a fresh
-    /// file at the default generation.)
+    /// `merge`) call this with `source + 1`. (`append` and `build-csc` build
+    /// their catalogs manually rather than via `finish()` — `append` bumps the
+    /// generation there, and `build-csc`, an in-place append of the sidecar,
+    /// keeps it and stamps `csc_build_generation` to match; `subset` writes a
+    /// fresh file at the default generation.)
     pub fn with_data_generation(mut self, data_generation: u64) -> Self {
         self.data_generation = data_generation;
         self
@@ -1771,8 +1769,9 @@ impl ScxWriter {
     /// Carry obs `column_stats` from a source catalog's CSR entries onto this
     /// writer's, matching by `row_start`. Returns how many shards received them.
     ///
-    /// For `build-csc` / `optimize`, which re-encode every CSR shard while
-    /// preserving the row partition 1:1. See
+    /// For `optimize` / `scx upgrade`, which re-encode every CSR shard while
+    /// preserving the row partition 1:1. (`build-csc` used to be a third; it
+    /// now appends in place and never rewrites a CSR entry.) See
     /// [`carry_csr_shard_column_stats`] for why this copies rather than
     /// re-deriving from the carried index.
     pub fn carry_csr_shard_column_stats_from(&mut self, source: &[FullCatalogEntry]) -> usize {
@@ -1848,8 +1847,10 @@ impl ScxWriter {
     /// [`Self::finish`] does. `finish` consumes `self` and ends with an atomic
     /// rename over the final path, so anything checked after it returns is a
     /// post-mortem: on an in-place rewrite (`scx optimize --output == input`,
-    /// `scx build-csc` with no `<OUTPUT>`) the original is already gone by then
-    /// and an error can only report the loss, not prevent it.
+    /// `scx upgrade --in-place`) the original is already gone by then and an
+    /// error can only report the loss, not prevent it. (`scx build-csc` was
+    /// one until it became an append; it audits its catalog before
+    /// `commit_in_place` instead.)
     ///
     /// **Two sections are written by `finish` itself and are therefore absent
     /// here**: the `ModalityTable`, and any CSC sidecar auto-emitted for a
@@ -3028,7 +3029,8 @@ pub fn assign_csr_shard_column_stats(
 /// received stats.
 ///
 /// For an op that **re-encodes** every CSR shard while preserving the row
-/// partition 1:1 — `build-csc` and `optimize` — this is what keeps Level-1
+/// partition 1:1 — `optimize` and `scx upgrade` (and `build-csc`, until it
+/// became an append that never writes a CSR entry) — this is what keeps Level-1
 /// pruning alive. `compute_shard_stats` produces no `column_stats`, so a
 /// re-encoded shard comes out bare even though the `ObsPredicateIndex` section
 /// was copied through verbatim; the index survives and the pruning silently

@@ -3543,12 +3543,12 @@ absolute_floors:
     format: scx_auto
     dataset: census_500k
     metric: peak_over_memory_limit__build_csc
-    max: 1.70             # measured 1.35 after, 2.20 before
+    max: 1.30             # measured 1.25 (in-place append), 1.35 (PR-C rewrite), 2.20 (pre-builder)
   - benchmark: build_csc
     format: scx_auto
     dataset: census_1m
     metric: peak_over_memory_limit__build_csc
-    max: 2.20             # measured 1.74 after, 3.76 before
+    max: 1.60             # measured 1.44 (in-place append), 1.76 (PR-C rewrite), 3.76 (pre-builder)
   # Layout-unchanged pins, both directions. A ratio floor above can be
   # satisfied by *narrowing* shards, which would fix nothing; and widening
   # them (173 -> 13) is a deferred decision needing its own read-side
@@ -3925,21 +3925,41 @@ absolute_floors:
 #    estimate. census_1m's ratio fell 3.76x -> 1.74x and its wall 966 s ->
 #    103 s.
 #
+#    In that (builder) capture the two small datasets got slightly *worse*
+#    (0.87 -> 0.92 on tabula). Below the spill threshold every bucket stays
+#    resident, costing about what holding the decoded CSR used to, plus block
+#    slack. That is a real trade for the 2.05x wall, not noise.
+#
 #    What did not: the source shard's re-encode, the writer, and the ~0.4-1.1
 #    GB interpreter baseline the sampler measures within all sit outside that
-#    bound. PR-D deletes the re-encode. So the contract figure -- 1.0 -- is
-#    still not met at census scale, and a floor there would fail today.
+#    bound. So the contract figure -- 1.0 -- is still not met at census scale,
+#    and a floor there would fail today.
 #
-#    The two small datasets got slightly *worse* (0.87 -> 0.92 on tabula).
-#    Below the spill threshold every bucket stays resident, costing about what
-#    holding the decoded CSR used to, plus block slack. That is a real trade
-#    for the 2.05x wall, not noise, and the floors leave room for it.
+#    The re-encode has since gone: build-csc became an in-place append that
+#    writes no CSR shard (and no longer re-reads obs/var or copies the aux
+#    sections). Before/after on one node (CPUDFDC84), `memory_limit=4G`,
+#    median of three, both arms in one job:
 #
-#    The floors below are therefore **regression floors on a measured
-#    improvement**, not contract floors. Each is ~1.25x the measured value, so
-#    it passes today with margin and fails at the pre-change number (census_1m
-#    2.20 against 3.76 measured before; census_500k 1.70 against 2.20). Do not
-#    tighten them toward 1.0 without a capture showing the op got there.
+#      dataset               before MB   after MB   before/bud  after/bud   wall x
+#      pbmc10k                     988        910         0.24       0.22     1.11
+#      tabula_sapiens_100k        3819       3713         0.93       0.91     1.24
+#      census_500k                5547       5122         1.35       1.25     1.29
+#      census_1m                  7216       5879         1.76       1.44     1.22
+#
+#    The before arm reproduced the capture above within ~1% (7138 -> 7216 on
+#    census_1m, 5512 -> 5547 on census_500k), which is what licenses floors
+#    closer to the measured value than 1.25x: they now sit between the
+#    after and before figures (1.30 against 1.25 / 1.35; 1.60 against 1.44 /
+#    1.76), so a return to the rewrite fails them. census_500k's margin is the
+#    thin one, ~4% over its median: the three runs spanned 1.238-1.251 and the
+#    cross-capture movement was ~1%, and it cannot be wider without admitting
+#    the rewrite's 1.35. Still not 1.0: the decode, the writer and the
+#    interpreter baseline remain outside the bound.
+#
+#    The floors are therefore **regression floors on a measured
+#    improvement**, not contract floors. They were first set at ~1.25x the
+#    PR-C value (1.70 / 2.20) and tightened with the in-place capture above.
+#    Do not tighten them toward 1.0 without a capture showing the op got there.
 #
 #    Use `peak_over_memory_limit__build_csc`, not the delta: at census scale
 #    the interpreter baseline the delta removes is a fifth of the budget, and

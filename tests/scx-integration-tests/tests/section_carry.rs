@@ -362,10 +362,11 @@ fn merge_carries_the_graph_it_used_to_drop() {
 /// §6.3, from the user's side: `build-csc` no longer loses what `optimize`
 /// keeps.
 ///
-/// The other half of the inversion. `build-csc --in-place` renames a wholly new
-/// file over the target carrying no prior catalog, so `scx rollback` could not
+/// The other half of the inversion. While `build-csc --in-place` renamed a wholly
+/// new file over the target carrying no prior catalog, `scx rollback` could not
 /// recover any of this — which is what made the narrowest carry allowlist in the
-/// crate the most dangerous one.
+/// crate the most dangerous one. It is an append now and carries everything by
+/// construction; this stays as the end-to-end pin.
 #[test]
 fn build_csc_carries_what_optimize_carries() {
     let dir = tempfile::tempdir().unwrap();

@@ -937,16 +937,18 @@ enum Commands {
     },
     /// Build CSC (column-major) shards from existing CSR data
     ///
-    /// Omit <OUTPUT> to add the sidecar to <INPUT> **in place** (staged via a
-    /// temp file + atomic rename, so a failure leaves the input untouched) —
-    /// the CSC store is a sidecar *on* a file, and the neighbouring
-    /// `obs-import` / `doublet-import` / `cellbender-import` all mutate in
-    /// place. Pass <OUTPUT> to leave the input alone and write a copy.
+    /// Omit <OUTPUT> to add the sidecar to <INPUT> **in place**: the CSC shards
+    /// are appended and the catalog repointed, so nothing else in the file is
+    /// rewritten, no second copy is staged, a failure leaves the file as it
+    /// was, and `scx rollback` removes the sidecar again — the same contract
+    /// as `obs-import` / `doublet-import` / `cellbender-import`. Pass <OUTPUT>
+    /// to leave the input alone and write a copy (the input's bytes, then the
+    /// same append).
     BuildCsc {
         /// Input SCX file (must have CSR shards)
         input: PathBuf,
-        /// Output SCX file (gets both CSR and CSC shards). Omit to add the
-        /// CSC sidecar to <INPUT> in place.
+        /// Output SCX file (a copy of <INPUT> plus the CSC sidecar). Omit to
+        /// add the CSC sidecar to <INPUT> in place.
         output: Option<PathBuf>,
         /// Maximum memory for the transpose working set (default: 4G).
         /// Accepts a bare byte count or a binary-prefixed size —
@@ -955,7 +957,7 @@ enum Commands {
         #[arg(long, default_value = "4G")]
         memory_limit: String,
         /// Overwrite output if it exists. Not applicable to the in-place form
-        /// (no <OUTPUT>), which always rewrites <INPUT>.
+        /// (no <OUTPUT>), which always modifies <INPUT>.
         #[arg(long)]
         force: bool,
         /// Maximum columns per emitted CSC shard (default: 5000).
@@ -973,9 +975,10 @@ enum Commands {
         ///
         /// Defaults to the **output file's own directory**, not the platform
         /// temp dir that `scx sort --temp-dir` and `scx convert --temp-dir`
-        /// default to: the rewrite already stages a whole copy of the output
-        /// there, so it is proven writable and sized for far more than a
-        /// spill, whereas a small `/tmp` would fail an atlas-scale rebuild.
+        /// default to: the sidecar is written to that filesystem anyway (the
+        /// spill is at most about its size), whereas a small `/tmp` would fail
+        /// an atlas-scale build — and a tmpfs `/tmp` would count the spill
+        /// against RAM, defeating `--memory-limit`.
         #[arg(long, value_name = "DIR")]
         temp_dir: Option<PathBuf>,
     },
@@ -1899,14 +1902,10 @@ fn main() {
             csc_cols_per_shard,
             temp_dir,
         } => {
-            // Framing must come from `framing_for_csc_rebuild` on BOTH arms.
-            // Both ends of the range are wrong (see its contract): `None`
-            // strips row-group framing off a v4 input — via
-            // `rewrite_output_format_version(&[4], 1) == 3`, which is what the
-            // copy-out arm used to do, silently downgrading a framed file — and
-            // a `FramingConfig` carrying `decode_target: Some(_)` would
-            // re-authorise per-shard codec re-selection, the opposite of what a
-            // sidecar rebuild needs.
+            // Framing from `framing_for_csc_rebuild` on both arms: `Some` iff
+            // the input is v4, which is exactly what the in-place append admits
+            // (it refuses `Some` on a <= v3 file, and frames the sidecar on v4
+            // either way).
             let framing = scx_ops::framing_for_csc_rebuild(&input);
             // `run_build_csc` says whether it built anything: an empty matrix
             // (0 rows or 0 columns) gets no sidecar, and "Built" would be a lie.
@@ -1915,7 +1914,8 @@ fn main() {
             // keeps the one line it has always printed.
             let no_sidecar = |what: &str| {
                 println!(
-                    "{} is an empty matrix (0 rows or 0 columns); no CSC sidecar to build{what}",
+                    "{} is an empty matrix (0 rows or 0 columns); no CSC sidecar to build \
+                     (a stale one, if present, is dropped){what}",
                     input.display()
                 )
             };
@@ -1938,7 +1938,7 @@ fn main() {
                 // `--force` rather than ignore it: silently accepting it would
                 // imply a guard that does not exist.
                 None if force => Err("--force applies only when writing to an <OUTPUT>; the \
-                                      in-place form (no <OUTPUT>) always rewrites <INPUT>"
+                                      in-place form (no <OUTPUT>) always modifies <INPUT>"
                     .into()),
                 None => scx_ops::rebuild_csc_inplace(
                     &input,
@@ -2781,11 +2781,10 @@ fn dispatch_mtx_to_scx(
 
     // MTX conversion is delegated to the standalone `scx-mtx` crate,
     // which doesn't know about CSC. When the policy resolves to build,
-    // post-process the just-written file with the existing build-csc
-    // machinery: write to `<output>.csc.tmp`, then atomically rename onto
-    // the final path. Costs an extra read pass but adds the CSC sidecar
-    // without modifying scx-mtx. `Auto` reads back the just-written
-    // header for the shape (scx-mtx doesn't return it to the caller).
+    // append the sidecar to the just-written file in place — one extra read
+    // pass, no second copy of the file, and without modifying scx-mtx. `Auto`
+    // reads back the just-written header for the shape (scx-mtx doesn't
+    // return it to the caller).
     let build_csc = match csc_policy {
         convert::CscPolicy::Off => false,
         convert::CscPolicy::Always => true,
@@ -2796,10 +2795,13 @@ fn dispatch_mtx_to_scx(
         }
     };
     if build_csc {
-        let tmp = output.with_extension("scx.csc.tmp");
-        let _ = std::fs::remove_file(&tmp);
-        scx_ops::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard, None, None)?;
-        std::fs::rename(&tmp, output)?;
+        scx_ops::rebuild_csc_inplace(
+            output,
+            csc_cols_per_shard,
+            "4G",
+            scx_ops::framing_for_csc_rebuild(output),
+            None,
+        )?;
     }
 
     println!("Converted {} -> {}", input.display(), output.display());
