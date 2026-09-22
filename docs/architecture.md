@@ -1114,8 +1114,8 @@ path detects per-section mutation via top-level key comparison
 against the source h5ad; clean sections route through the disk
 streamer, mutated sections are extracted from Python and partitioned
 into the same sharded layout on the way out. `csc="always"` triggers a
-post-`finish()` `scx_ops::rebuild_csc_inplace` pass (transient disk
-~2× the output size during the rebuild).
+post-`finish()` `scx_ops::rebuild_csc_inplace` pass, which appends the
+sidecar in place (one extra read pass; no second copy of the file).
 
 **Streaming export** (`scx convert --to h5ad/h5mu`, `pyscx.to_h5ad`,
 `pyscx.to_h5mu`): the inverse path. `scx_convert::

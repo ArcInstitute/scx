@@ -664,13 +664,12 @@ pub fn h5ad_to_scx_streaming(
     writer.finish()?;
 
     // CSC sidecar (opt-in). Two-pass: streaming write produces CSR
-    // shards only; if requested, rebuild the CSC sidecar in place
-    // over the just-finished file. Peak disk briefly reaches ~2×
-    // output size for the duration of the rebuild (writes to a
-    // sibling `.rebuild_csc.tmp` and renames).
+    // shards only; if requested, append the CSC sidecar to the
+    // just-finished file in place (one extra read pass over the CSR, no
+    // second copy of the file).
     if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
-        // Pass framing so `--csc <policy> --row-group-rows N` produces a framed
-        // CSC sidecar (and keeps X framed) instead of silently downgrading to v3.
+        // Pass framing so `--csc <policy> --row-group-rows N` frames the
+        // sidecar at the same G as X.
         scx_ops::rebuild_csc_inplace(
             output,
             opts.csc_cols_per_shard,

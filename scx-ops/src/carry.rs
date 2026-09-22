@@ -34,9 +34,9 @@
 //!   The tripwire's job is to make that assignment *mandatory*, not to force
 //!   six edits for one.
 //! * A new **`SectionFamily`** — a genuinely new thing to decide about —
-//!   produces **six** errors: [`SectionFamily::label`] plus the five explicit
-//!   policies. The private `upgrade` policy is the deliberate exception; see
-//!   its doc comment.
+//!   produces **seven** errors: [`SectionFamily::label`] plus the six
+//!   policies. (It was six while `upgrade` delegated to `build_csc` through an
+//!   `other =>` arm; see `upgrade`'s doc comment for why that went.)
 //!
 //! So the accurate claim is not "adding a section type breaks six matches". It
 //! is that nothing can reach an op without a declared family, and no new
@@ -50,6 +50,8 @@
 //! rewrite ops here and maps onto the same table — but it is a separate
 //! adoption and is deliberately not attempted here. Until it lands, "the single
 //! truth" is true of the six ops in [`RewriteOp`] and of nothing else.
+//! `build-csc` is the one in-place op in that list: it appends a sidecar and
+//! is checked by [`audit_in_place`], which asserts more than [`audit`] can.
 //!
 //! **Whether a rebuild actually happened.** See [`Carry::Rebuilt`].
 
@@ -300,11 +302,13 @@ pub enum Carry {
     /// re-derived the per-shard `column_stats` those bytes' Level-1 pushdown
     /// reads, so the section survived and the pruning did not. `optimize`, the
     /// only other op declaring `Verbatim` for that family in its own match arm,
-    /// had it too — and so did `upgrade`, which reaches that arm through
-    /// `other => build_csc(other)` and re-emits every CSR shard as well. Three
-    /// ops, not two: an earlier version of this note said two, because it counted
-    /// the explicit match arms and missed the delegation. Found by review
-    /// (Cursor Agent - Grok 4.6 High) on PR #451.
+    /// had it too — and so did `upgrade`, which then reached that arm through an
+    /// `other => build_csc(other)` delegation and re-emits every CSR shard as
+    /// well. Three ops, not two: an earlier version of this note said two,
+    /// because it counted the explicit match arms and missed the delegation.
+    /// Found by review (Cursor Agent - Grok 4.6 High) on PR #451. (`build-csc`
+    /// has since become an in-place append that never rewrites a CSR entry, so
+    /// its half of this is moot; `upgrade` now spells its arms out.)
     ///
     /// All three are fixed (Phase 5c,
     /// `scx_format_io::carry_csr_shard_column_stats`, which copies the input's
@@ -368,7 +372,9 @@ impl Carry {
     }
 }
 
-/// The ops that rewrite a whole file through an `ScxWriter`.
+/// The ops whose carry is declared here. All but [`RewriteOp::BuildCsc`]
+/// rewrite a whole file through an `ScxWriter`; `build-csc` appends in place
+/// and is audited by [`audit_in_place`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RewriteOp {
     Compact,
@@ -715,59 +721,43 @@ fn sort(family: SectionFamily) -> Carry {
     }
 }
 
-/// `build-csc` rewrites the file 1:1 and appends a column-major sidecar. Its
-/// carry set is [`crate::rewrite_helpers::copy_auxiliary_sections`]'s allowlist,
-/// which used to be the narrowest of any op here — Phase 5b widened it to
-/// everything `optimize` carries plus `adata.raw`, leaving only a layer's CSC
-/// sidecar. Its output still renames over the input with no prior catalog, so
-/// `scx rollback` cannot recover what it does drop, which is why the allowlist
-/// being narrow mattered so much.
+/// `build-csc` appends a column-major sidecar **in place**: it writes CSC
+/// sections at EOF and repoints the catalog, so every other section keeps its
+/// exact bytes at its exact offset and `scx rollback` undoes it. The copy-out
+/// form copies the input verbatim and then does the same to the copy.
+///
+/// So every family but the sidecar itself is `Verbatim` in the strongest sense
+/// the table has — not "re-serialised with identical content" but the same
+/// catalog entry — and [`audit_in_place`] checks exactly that. It used to be a
+/// whole-file rewrite whose carry set was `copy_auxiliary_sections`' allowlist;
+/// `upgrade` still is one, which is why it now spells out the one cell where
+/// the two differ rather than inheriting it.
 fn build_csc(family: SectionFamily) -> Carry {
     use SectionFamily as F;
     match family {
         F::ObsMetadata | F::VarMetadata => Carry::Verbatim,
         F::X | F::Layer | F::Obsm | F::Uns => Carry::Verbatim,
         F::DeletionVectors => Carry::Verbatim,
-        // Copied through, so presence *is* asserted — but presence is the only
-        // thing asserted, and it is not the whole property that matters here.
-        // Level-1 pushdown reads the per-shard `column_stats`, not this section,
-        // and build-csc re-encodes every CSR shard; 5c carries them over from the
-        // input instead (`scx_format_io::carry_csr_shard_column_stats`, keyed by
-        // `row_start`). No `Carry` variant expresses that half and none pretends
-        // to — see `Carry::Rebuilt`'s doc, and the tests it names.
+        // Untouched, and so are the CSR entries' per-shard `column_stats` that
+        // Level-1 pushdown actually reads: an append never rewrites a CSR
+        // entry. (While build-csc re-encoded every CSR shard it had to carry
+        // those stats over by hand; `upgrade` still does — see its arm.)
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Verbatim,
         // The whole point of the op.
         F::XCsc => Carry::Rebuilt,
         F::Provenance => Carry::Rebuilt,
         // Rejected up front, pointing at `scx subset --modality`.
         F::ModalityTable => Carry::Refuse,
-        // Was §6.3, all seven below. The rewrite preserves the global obs row
-        // space and the CSR shard boundaries 1:1, which is what makes a
-        // verbatim copy of each of these sound — and the reason `optimize`
-        // could already carry all but `.raw`. `build-csc --in-place` renames
-        // over the target with no prior catalog, so every one of these was an
-        // unrecoverable loss.
         F::Varm | F::Obsp | F::Varp => Carry::Verbatim,
-        // Carried verbatim here, unlike in `optimize`, which re-encodes it in
-        // its own CSR shard loop. `build_csc`'s loop filters to `CsrShard`, so
-        // the graph never passes through it and is copied as an aux section.
         F::ObspCsr => Carry::Verbatim,
-        // Raw shares the obs axis, which is 1:1, and brings its own `var` with
-        // it. The one family where `build-csc` now carries more than
-        // `optimize`, whose raw drop is a separate open item.
         F::Raw => Carry::Verbatim,
-        // Shard-local row keys, valid because the shard boundaries are. For
-        // `upgrade`, whose canonicalisation can change which genes a row
-        // stores, the answer is conditional instead — see `upgrade`.
+        // Shard-local row keys; the CSR shards they key are untouched.
         F::Bitmap => Carry::Verbatim,
-        // Global output-row ranges plus shard indices, both preserved.
         F::GroupIndex => Carry::Verbatim,
-        // The one thing genuinely still dropped: a column-major view of a
-        // layer, which nothing in this path rebuilds.
-        F::LayerCsc => Carry::Dropped {
-            why: "no rebuild path in this op (rebuild: scx build-csc)",
-            warns: true,
-        },
+        // A layer's column-major view. Nothing here rebuilds it, and nothing
+        // needs to: `data_generation` is unchanged, so it is as fresh after the
+        // append as before. It was `Dropped` while build-csc rewrote the file.
+        F::LayerCsc => Carry::Verbatim,
         F::Unwritten => Carry::Dropped {
             why: "no writer in this workspace produces it",
             warns: false,
@@ -775,23 +765,29 @@ fn build_csc(family: SectionFamily) -> Carry {
     }
 }
 
-/// `scx upgrade` shares `build_csc`'s copy allowlist, with layers canonicalised
-/// on the way through. It emits no CSC sidecar, which is the only difference
-/// the table can see.
+/// `scx upgrade` decodes, canonicalises and re-emits every CSR shard, and
+/// carries the rest through `copy_auxiliary_sections_canonicalizing`'s
+/// allowlist. It emits no CSC sidecar of its own.
 ///
-/// **The `other =>` arm is deliberate, and it is the one place the compile-time
-/// tripwire does not fire.** A new [`SectionFamily`] reaches `upgrade` carrying
-/// `build_csc`'s answer rather than a compile error. That is sound *because the
-/// two ops share one implementation* —
-/// [`crate::rewrite_helpers::copy_auxiliary_sections_canonicalizing`] is the
-/// carry for both, and it differs only in whether layers are canonicalised,
-/// which is not a carry decision. Writing nineteen `F::X => build_csc(family)`
-/// arms to buy the error back would state the delegation less clearly and would
-/// let the two drift, which is the disease. `upgrade_matches_build_csc` pins the
-/// relationship instead.
+/// **Every arm is written out.** This used to be three arms and an
+/// `other => build_csc(other)` delegation, justified by the two ops sharing
+/// one carry implementation. That stopped being true when `build-csc` became
+/// an in-place append — it now carries everything by never rewriting it — so
+/// the delegation would have handed a new [`SectionFamily`] an answer derived
+/// from a different mechanism, with no compile error to say so.
 fn upgrade(family: SectionFamily) -> Carry {
     use SectionFamily as F;
     match family {
+        F::ObsMetadata | F::VarMetadata => Carry::Verbatim,
+        F::X | F::Layer | F::Obsm | F::Uns => Carry::Verbatim,
+        F::DeletionVectors => Carry::Verbatim,
+        // Copied through, so presence *is* asserted — but presence is the only
+        // thing asserted. Level-1 pushdown reads the per-shard `column_stats`,
+        // not this section, and upgrade re-encodes every CSR shard, so they are
+        // carried over from the input by `row_start`
+        // (`scx_format_io::carry_csr_shard_column_stats`). No `Carry` variant
+        // expresses that half and none pretends to — see `Carry::Rebuilt`'s doc.
+        F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Verbatim,
         // Re-emitted from the input's own CSC shards — but only when
         // canonicalising left the CSR matrix alone. If it summed a duplicate
         // coordinate or dropped an explicit zero, the sidecar built against the
@@ -802,20 +798,34 @@ fn upgrade(family: SectionFamily) -> Carry {
         F::XCsc => Carry::Conditional {
             on: "carried unless canonicalisation changed the CSR matrix",
         },
-        // The **same** condition, for a reason that took a Phase 5b test to
-        // surface rather than a reading: a detection bitmap records the genes a
-        // row *stores*, not the genes with a nonzero value there, and
-        // `canonicalize_csr` drops explicit zeros. So a bitmap carried across a
-        // canonicalising rewrite of a non-canonical input claims genes the
-        // output no longer has, and `detection_counts` answers from it.
-        //
-        // `build_csc` does not canonicalise (SCX-005 clamps its output version
-        // precisely so it does not have to), so its cell stays `Verbatim` —
-        // which is why this is one of the two arms that does not delegate.
+        F::Provenance => Carry::Rebuilt,
+        F::ModalityTable => Carry::Refuse,
+        // The rewrite preserves the global obs row space and the CSR shard
+        // boundaries 1:1, which is what makes a verbatim copy of each sound.
+        F::Varm | F::Obsp | F::Varp => Carry::Verbatim,
+        F::ObspCsr => Carry::Verbatim,
+        F::Raw => Carry::Verbatim,
+        // The **same** condition as the sidecar, for a reason that took a
+        // Phase 5b test to surface rather than a reading: a detection bitmap
+        // records the genes a row *stores*, not the genes with a nonzero value
+        // there, and `canonicalize_csr` drops explicit zeros. So a bitmap
+        // carried across a canonicalising rewrite of a non-canonical input
+        // claims genes the output no longer has, and `detection_counts` answers
+        // from it.
         F::Bitmap => Carry::Conditional {
             on: "carried unless canonicalisation changed which genes a row stores",
         },
-        other => build_csc(other),
+        F::GroupIndex => Carry::Verbatim,
+        // The allowlist has no layer-CSC rebuild path. `build-csc` keeps one
+        // only because it never rewrites anything.
+        F::LayerCsc => Carry::Dropped {
+            why: "no rebuild path in this op (rebuild: scx build-csc)",
+            warns: true,
+        },
+        F::Unwritten => Carry::Dropped {
+            why: "no writer in this workspace produces it",
+            warns: false,
+        },
     }
 }
 
@@ -965,10 +975,11 @@ pub fn audit(
 /// point, and it was not the first design: auditing the finished file was
 /// simpler (no `scx-format-io` API to widen, and it checks the artifact rather
 /// than the writer's intent) but it can only ever be a post-mortem. `finish()`
-/// ends with an atomic rename over the final path, and both `optimize` and
-/// `build-csc` support an in-place form where that path *is* the input — so a
-/// violation found afterwards reports a loss that has already happened and that
-/// `scx rollback` cannot undo, since neither op leaves a prior catalog. Checking
+/// ends with an atomic rename over the final path, and `optimize` supports an
+/// in-place form where that path *is* the input — so a violation found
+/// afterwards reports a loss that has already happened and that `scx rollback`
+/// cannot undo, since the op leaves no prior catalog. (`build-csc` had the same
+/// shape until it became an append; it is checked by [`audit_in_place`].) Checking
 /// first means the error propagates, `finish()` is never called, the staged
 /// tempfile is dropped, and the original is still there.
 ///
@@ -987,6 +998,59 @@ pub fn audit_staged(
 ) -> OpsResult<CarryReport> {
     let (entries, n_obs) = writer.staged_catalog();
     audit(op, inputs, entries, n_obs)
+}
+
+/// [`audit`] for an op that mutates a file **in place** by appending sections
+/// and repointing its catalog, checked against the catalog it is about to
+/// commit.
+///
+/// An append can promise something no rewrite can: a `Verbatim` family is not
+/// merely present in the output but is the **same catalog entry** — same name,
+/// type, modality, offset, length and checksum — because its bytes were never
+/// moved. So on top of [`audit`]'s presence rules, every input entry whose
+/// family this op declares `Verbatim` must appear in `new` unchanged. A
+/// rewrite that snuck into an in-place op (a re-encoded shard written to EOF,
+/// say) would keep its family present and pass [`audit`]; it fails here.
+///
+/// Call it before `commit_in_place`, for the reason [`audit_staged`] runs
+/// before `finish()`: an error then leaves the file on its old catalog.
+pub fn audit_in_place(
+    op: RewriteOp,
+    old: &FullCatalog,
+    new: &FullCatalog,
+) -> OpsResult<CarryReport> {
+    let report = audit(op, &[old], &new.entries, new.n_obs)?;
+    let same = |a: &FullCatalogEntry, b: &FullCatalogEntry| {
+        a.name == b.name
+            && a.section_type == b.section_type
+            && a.modality_id == b.modality_id
+            && a.offset == b.offset
+            && a.length == b.length
+            && a.checksum == b.checksum
+    };
+    for e in &old.entries {
+        let scope = if e.modality_id == 0 {
+            SectionScope::Global
+        } else {
+            SectionScope::PerModality
+        };
+        let f = family(e.section_type);
+        if policy_scoped(op, f, scope) != Carry::Verbatim {
+            continue;
+        }
+        if !new.entries.iter().any(|n| same(e, n)) {
+            return Err(OpsError::SectionCarryViolation {
+                op: op.label(),
+                family: f.label(),
+                detail: format!(
+                    "declared verbatim for an in-place op, but entry `{}` (offset {}, {} \
+                     bytes) is not in the new catalog unchanged",
+                    e.name, e.offset, e.length
+                ),
+            });
+        }
+    }
+    Ok(report)
 }
 
 /// Render the whole table as text, one line per (op, family) with a non-default

@@ -463,10 +463,9 @@ fn sort_explicit_codec_is_honoured() {
 
 #[test]
 fn build_csc_preserves_per_shard_csr_codec() {
-    // `build_csc` re-writes every CSR shard at the codec read off the source
-    // header. `framing_for_file()` therefore passes `decode_target: None` on
-    // purpose — see its doc comment. If someone "makes it consistent" with the
-    // derived-file ops, the writer starts re-selecting and this fails.
+    // `build_csc` appends a sidecar and never writes a CSR shard, so every
+    // shard keeps the codec (and bytes) it had. This used to hold only because
+    // `framing_for_file()` passed `decode_target: None` into a rewrite.
     let d = tmp();
     let inp = d.path().join("in.scx");
     write_input(&inp, true);
@@ -492,22 +491,24 @@ fn build_csc_preserves_per_shard_csr_codec() {
     );
 }
 
-/// The hazard `framing_for_file()` exists to prevent — pinned so the
-/// preservation test above is not vacuous.
+/// The hazard `framing_for_file()` was written to prevent, and why it can no
+/// longer happen.
 ///
-/// If a caller hands the *rewrite* framing to a CSC rebuild, the writer
-/// re-selects each shard's codec instead of honouring the source header. Both
-/// `scx subset --rebuild-csc` and `scx convert --csc` did exactly that until it
-/// was caught in review: harmless while `write_shard_inner` ignored
-/// `decode_target`, a silent override once it honoured it. This test asserts the
-/// override is real, so "preserve" and "re-select" cannot quietly become the
-/// same thing.
+/// While build-csc rewrote the file, a caller handing it the *rewrite* framing
+/// (`decode_target: Some(_)`) made the writer re-select every CSR shard's codec
+/// — `scx subset --rebuild-csc` and `scx convert --csc` both did, until review
+/// caught it, and this test used to assert that the override was real. The
+/// build is now an in-place append that never writes a CSR shard, so the same
+/// call leaves every CSR shard's codec and bytes alone, and it clears
+/// `decode_target` for the sidecar too, whose codec `pick_csc_encoding` has
+/// already decided. Both halves are pinned: the CSR is untouched, and the
+/// sidecar comes out exactly as it does under the preserving framing.
 #[test]
-fn a_csc_rebuild_carrying_decode_target_does_override_the_codec() {
+fn a_csc_rebuild_carrying_decode_target_can_no_longer_reselect_a_codec() {
     let d = tmp();
     let inp = d.path().join("in.scx");
     write_input(&inp, true);
-    let (before, _) = x_codecs_and_bytes(&inp);
+    let (before, before_bytes) = x_codecs_and_bytes(&inp);
     assert_eq!(
         before[0],
         CodecId::Zstd as u8,
@@ -523,33 +524,54 @@ fn a_csc_rebuild_carrying_decode_target_does_override_the_codec() {
         "the whole point of this fixture is that the rewrite framing carries it"
     );
 
-    let out = d.path().join("csc_overridden.scx");
+    let out = d.path().join("csc_rewrite_framing.scx");
     scx_ops::build_csc::run_build_csc(&inp, &out, "4G", false, 5000, Some(rewrite_framing), None)
         .unwrap();
-
-    let (after, _) = x_codecs_and_bytes(&out);
-    assert_ne!(
-        before, after,
-        "a CSC rebuild given `decode_target: Some(_)` re-selects the CSR codec — \
-         which is why every `rebuild_csc_inplace` caller must route through \
-         `framing_for_file()` / `framing_preserving_codec()` instead"
-    );
+    let (after, after_bytes) = x_codecs_and_bytes(&out);
     assert_eq!(
-        after[0],
-        CodecId::ShufDeltaZstd as u8,
-        "and it adopts the adaptive pick"
+        before, after,
+        "no CSR shard is re-encoded, so none can be re-selected"
+    );
+    assert_eq!(before_bytes, after_bytes);
+
+    let control = d.path().join("csc_preserving.scx");
+    scx_ops::build_csc::run_build_csc(
+        &inp,
+        &control,
+        "4G",
+        false,
+        5000,
+        scx_ops::framing_for_csc_rebuild(&inp),
+        None,
+    )
+    .unwrap();
+    let csc_codecs = |p: &Path| -> Vec<u8> {
+        let r = ScxReader::open(p).unwrap();
+        r.catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .map(|e| r.read_shard_header(e).unwrap().codec_id)
+            .collect()
+    };
+    assert!(!csc_codecs(&control).is_empty());
+    assert_eq!(
+        csc_codecs(&out),
+        csc_codecs(&control),
+        "and the sidecar's codec is pick_csc_encoding's, not the encoder's re-pick"
     );
 }
 
-/// The *other* way a CSC rebuild can damage the file it is extending: passing
-/// `None`, which rewrites CSR + CSC unframed and strips row-group framing from
-/// the X that was just written.
+/// The *other* way a CSC rebuild used to damage the file it was extending:
+/// passing `None`, which rewrote CSR + CSC unframed and stripped row-group
+/// framing from the X that was just written.
 ///
-/// `framing_for_csc_rebuild` exists because this rule has been got wrong in both
+/// `framing_for_csc_rebuild` exists because this rule was got wrong in both
 /// directions — `subset`/`convert --csc` passed the rewrite framing (codec
-/// override, pinned above), and pyscx's `sort`/`shuffle`/`from_anndata` passed
-/// `None` (this downgrade). Asserting both halves keeps the helper from being
-/// "simplified" back into either mistake.
+/// override, above), and pyscx's `sort`/`shuffle`/`from_anndata` passed `None`
+/// (this downgrade). Since build-csc became an append neither can damage the
+/// CSR; the helper still returns the value that frames the *sidecar* to match
+/// the file, and `None` on a v4 file now does the same rather than stripping.
 #[test]
 fn framing_for_csc_rebuild_preserves_v4_and_re_selects_nothing() {
     let d = tmp();
@@ -572,10 +594,31 @@ fn framing_for_csc_rebuild_preserves_v4_and_re_selects_nothing() {
     assert_eq!(
         reader.header().format_version,
         CURRENT_FORMAT_VERSION,
-        "passing `None` here is what silently downgraded a framed file to v3"
+        "a framed file stays v4"
     );
     let (after, _) = x_codecs_and_bytes(&out);
     assert_eq!(before, after, "and the CSR codecs are untouched");
+
+    // `None` on a v4 file used to strip it to v3. It can no longer touch the
+    // CSR, and the sidecar is framed regardless — v4 promises sub-shard random
+    // access on every sparse shard.
+    let out_none = d.path().join("csc_none.scx");
+    scx_ops::build_csc::run_build_csc(&framed, &out_none, "4G", false, 5000, None, None).unwrap();
+    let reader = ScxReader::open(&out_none).unwrap();
+    assert_eq!(reader.header().format_version, CURRENT_FORMAT_VERSION);
+    let csc: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CscShard)
+        .collect();
+    assert!(!csc.is_empty());
+    for e in csc {
+        assert!(
+            reader.read_shard_header(e).unwrap().shard_format_version >= 2,
+            "a sidecar in a v4 file must be framed"
+        );
+    }
 
     // An unframed input has nothing to preserve, so `None` is right there.
     let unframed = d.path().join("v3.scx");

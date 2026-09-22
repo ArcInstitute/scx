@@ -582,29 +582,32 @@ pub fn shuffle(
 /// the column-major substrate for DE / HVG / per-gene QC / pseudobulk and the
 /// GPU `pdex_ref` CSC-direct route.
 ///
-/// `output=None` (the default) adds the sidecar to `input` **in place**, staged
-/// via a temp file + atomic rename so a failure leaves `input` untouched — the
-/// CSC store is a sidecar *on* a file, which is how the rest of the API
-/// describes it. Pass an `output` path to leave `input` alone and write a copy
-/// carrying CSR + the new CSC shards.
+/// `output=None` (the default) adds the sidecar to `input` **in place**: the CSC
+/// shards are appended and the catalog repointed, so nothing else in the file
+/// is rewritten, no second copy is staged, a failure leaves `input` as it was,
+/// and `pyscx.rollback(input)` removes the sidecar again. An open `Experiment`
+/// on `input` raises on its next read (its catalog moved); `reload()` it. Pass
+/// an `output` path to leave `input` alone and write a copy — `input`'s bytes,
+/// then the same append.
 ///
 /// To emit a sidecar at write time use `pyscx.from_anndata(..., csc="always")`.
 ///
 /// Parameters:
 ///   input              — SCX file containing CSR shards.
-///   output             — destination file (gets CSR + the new CSC shards).
-///                        `None` (default) rebuilds `input` in place.
+///   output             — destination file (a copy of `input` plus the
+///                        sidecar). `None` (default) adds it to `input` in place.
 ///   memory_limit       — transpose working-set budget; accepts binary-
 ///                        prefixed sizes (`"4G"`, `"512MiB"`). Default "4G".
 ///   force              — overwrite `output` if it already exists. Rejected
-///                        with `output=None`, which always rewrites `input`.
+///                        with `output=None`, which always modifies `input`.
 ///   csc_cols_per_shard — max columns per emitted CSC shard (0 = single
 ///                        shard, memory permitting). Default 5000.
 ///   temp_dir           — root for the CSC builder's column-bucket spill
 ///                        files, used only when the buckets exceed the
 ///                        `memory_limit` share. `None` (default) uses the
-///                        output file's own directory, where the rewrite
-///                        already stages a copy — not the platform temp dir.
+///                        output file's own directory, where the sidecar is
+///                        written anyway — not the platform temp dir, which
+///                        may be small or a tmpfs counted against RAM.
 ///
 /// Example:
 ///     pyscx.build_csc("counts.scx")                      # in place
@@ -657,7 +660,7 @@ pub fn build_csc(
         None if force => {
             return Err(PyValueError::new_err(
                 "force=True applies only when writing to an `output` path; \
-                 output=None always rewrites `input`",
+                 output=None always modifies `input`",
             ));
         }
         None => None,

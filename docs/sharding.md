@@ -1118,15 +1118,20 @@ To add a CSC sidecar to a file you already have, use the standalone
 `pyscx.build_csc(input, output=None, memory_limit="4G", force=False,
 csc_cols_per_shard=5000, temp_dir=None)` — the Python equivalent of
 `scx build-csc`. It reads
-`input`'s CSR shards and re-emits them alongside the new CSC sidecar.
-`output=None` (the default) does that **in place** via a temp file + atomic
-rename; passing a path writes a copy and leaves `input` alone. `force` applies
-only to the copy-out form. Either form preserves the input's row-group framing.
-`temp_dir` (`--temp-dir` on the CLI) is the root for the builder's column-bucket
-spill files, used only when the buckets exceed the `--memory-limit` share; it
-defaults to the **output file's own directory**, where the rewrite already
-stages a whole copy, rather than to the platform temp dir that
-`scx sort --temp-dir` and `scx convert --temp-dir` default to.
+`input`'s CSR shards and **appends** the new CSC sidecar: `output=None` (the
+default) does that **in place** — nothing else in the file is rewritten, no
+second copy is staged, and `scx rollback` / `pyscx.rollback` removes the sidecar
+again — while passing a path copies `input` and appends to the copy, leaving
+`input` alone. `force` applies only to the copy-out form. Neither form touches a
+CSR shard, so row-group framing, per-shard codecs and per-shard statistics are
+exactly the input's; the sidecar is framed iff the file is v4. Rebuilding over
+an existing sidecar replaces it and leaves its bytes unreferenced until
+`scx compact` reclaims them. `temp_dir` (`--temp-dir` on the CLI) is the root
+for the builder's column-bucket spill files, used only when the buckets exceed
+the `--memory-limit` share; it defaults to the **output file's own directory**,
+the filesystem the sidecar lands on anyway, rather than to the platform temp dir
+that `scx sort --temp-dir` and `scx convert --temp-dir` default to (which may be
+small, or a tmpfs that counts the spill against RAM).
 To emit the sidecar at write time use `pyscx.from_anndata(..., csc="always")`.
 
 ### Why multi-shard CSC
@@ -1186,8 +1191,8 @@ array with `name`, `col_start`, `col_end`, `nnz` per shard.
 row layout (or the column index space, in subset's case), so the
 existing CSC `indices` arrays would silently reference stale rows /
 columns. Each op therefore drops the CSC sidecar by default and emits
-a `log::warn!` message. Pass `--rebuild-csc` to re-emit the sidecar
-against the post-op output via `scx build-csc` + atomic rename.
+a `log::warn!` message. Pass `--rebuild-csc` to append a fresh sidecar to
+the post-op output in place, as `scx build-csc` does.
 
 ### CSC lifecycle
 
@@ -1219,5 +1224,6 @@ The sidecar moves through four stages over a file's life:
    its `indices` would otherwise reference stale rows/columns.
 4. **Rebuild.** Re-emit with `--rebuild-csc` on the mutating op, or run
    `scx build-csc` against the post-op file. The rebuild reads the current
-   CSR shards, transposes, and writes a fresh CSC sidecar + updated catalog
-   to a temp file that is atomically renamed.
+   CSR shards, transposes, and appends a fresh CSC sidecar plus an updated
+   catalog to the file itself; the previous catalog stays in the file, so
+   `scx rollback` undoes it.

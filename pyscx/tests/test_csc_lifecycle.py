@@ -292,6 +292,39 @@ def test_build_csc_in_place_default(small_adata, tmp_path):
     )
 
 
+def test_build_csc_in_place_is_an_append_that_rollback_undoes(small_adata, tmp_path):
+    """In-place `build_csc` appends the sidecar through the manifest chain.
+
+    Three consequences, each pinned: an `Experiment` already open on the file
+    raises on its next read (the catalog moved; same inode, so this is the
+    header-pointer half of the staleness check), `reload()` sees the sidecar,
+    and `pyscx.rollback` removes it again with the CSR untouched. The last used
+    to be impossible — the build staged a wholly new file and renamed it over
+    the target, leaving no previous catalog.
+    """
+    import pyscx
+
+    src = tmp_path / "csr_only.scx"
+    pyscx.from_anndata(small_adata, str(src))
+    exp = pyscx.open(str(src))
+    assert exp.has_csc is False
+    before = exp.to_anndata().X.toarray()
+    inode = src.stat().st_ino
+
+    pyscx.build_csc(str(src), csc_cols_per_shard=4)
+    assert src.stat().st_ino == inode, "an append, not a rename"
+
+    with pytest.raises(RuntimeError, match=r"changed on disk|replaced on disk"):
+        exp.read_obs()
+    exp.reload()
+    assert exp.has_csc is True
+
+    pyscx.rollback(str(src))
+    back = pyscx.open(str(src))
+    assert back.has_csc is False
+    np.testing.assert_array_equal(back.to_anndata().X.toarray(), before)
+
+
 def test_build_csc_in_place_rejects_force(small_adata, tmp_path):
     """`force` overwrites an `output`; there is none in the in-place form.
 

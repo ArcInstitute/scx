@@ -88,7 +88,7 @@ nothing.
 
 ## In-place, one copy per run
 
-`build_csc(input, output=None)` mutates `input` (temp file + atomic rename), and
+`build_csc(input, output=None)` mutates `input` (appends the sidecar), and
 `force=True` with `output=None` raises. So each run copies the Phase-A `.scx`
 to a fresh path first; the copy is outside the timed region and outside the
 sampler.

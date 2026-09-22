@@ -57,9 +57,8 @@ pub const CSC_EMIT_SHARE: Share = Share::new(1, 4);
 /// Bytes one decoded CSR shard of `nnz` nonzeros over `n_rows` rows occupies.
 ///
 /// `indices` + `data` at [`CSC_PAYLOAD_BYTES_PER_NNZ`], plus an `i64` indptr
-/// entry per row. It does **not** charge the re-encode that `run_build_csc`
-/// performs beside it; see the allocation table's row, which says so and points
-/// at the `SparseIngest` row for the terms.
+/// entry per row. It does **not** charge the decoder's scratch on the way to
+/// those arrays; see the allocation table's row, which says so.
 pub fn decoded_csr_shard_bytes(nnz: u64, n_rows: u64) -> u64 {
     nnz.saturating_mul(CSC_PAYLOAD_BYTES_PER_NNZ)
         .saturating_add(n_rows.saturating_add(1).saturating_mul(8))

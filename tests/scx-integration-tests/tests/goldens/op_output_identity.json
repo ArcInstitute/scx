@@ -1094,7 +1094,7 @@
         11
       ],
       "header": {
-        "format_version": 3,
+        "format_version": 4,
         "flags": 1,
         "n_obs": 24,
         "n_vars": 40,
@@ -1120,7 +1120,7 @@
           "section_type": 5,
           "modality_id": 0,
           "length": 371,
-          "blake3": "503e18da7fc830b22b037607cc1f027c56aa383df3171655bf823f2635a60f7b",
+          "blake3": "9f867c57e697b169b83b55d8e98ddb4fc5dc8bfef1fc5cde4a8dfee0cea73292",
           "stats": {
             "row_start": 0,
             "row_end": 24,
@@ -1157,8 +1157,8 @@
           "name": "X_shard_1",
           "section_type": 4,
           "modality_id": 0,
-          "length": 181,
-          "blake3": "9d79cf5b2e22e5c0948893d0f8aa7df2780549dec3b22953f0e6a86b3a0a63ea",
+          "length": 220,
+          "blake3": "60a353efa7bde5d54d9ba3dd17b2d6b52e14203fbe9b21053fef08bd809e5d02",
           "stats": {
             "row_start": 8,
             "row_end": 16,
@@ -1425,7 +1425,7 @@
         11
       ],
       "header": {
-        "format_version": 3,
+        "format_version": 4,
         "flags": 1,
         "n_obs": 17,
         "n_vars": 7,
@@ -1451,7 +1451,7 @@
           "section_type": 5,
           "modality_id": 0,
           "length": 224,
-          "blake3": "dd056a078d915973aed7abf880fbe1333d69485323f1ba3c14eb9216a84115f6",
+          "blake3": "00d8123733faabcc0535f9fc1ecb0c5bf919e7fe69af575261a495263fd797a5",
           "stats": {
             "row_start": 0,
             "row_end": 17,
@@ -1470,7 +1470,7 @@
           "section_type": 5,
           "modality_id": 0,
           "length": 206,
-          "blake3": "142c55cf9caa90431ea6951fe9b7ba1a746a432ade746a190bb2ec922f0d8891",
+          "blake3": "d5d1ffa7d31e330f4f6f7eb5e16d7c5060aa63582ae9d39df1232f2522aced33",
           "stats": {
             "row_start": 0,
             "row_end": 17,
@@ -1489,7 +1489,7 @@
           "section_type": 5,
           "modality_id": 0,
           "length": 172,
-          "blake3": "7e4f1879a11956196702cac5ac4bf4c4efba8dfe82938b4b865d6e7c101b59a4",
+          "blake3": "1af0019a193bf7deb3119ab14168301fb8f886ab7846bcc645359f8aa0b1cb2b",
           "stats": {
             "row_start": 0,
             "row_end": 17,
@@ -1527,7 +1527,7 @@
           "section_type": 4,
           "modality_id": 0,
           "length": 130,
-          "blake3": "207646dbf8c8757f48a94cffdc15edb3cdbfed3e6dbcd69644ea85cbc8f9e123",
+          "blake3": "5508445a785c1e3c6cc7c27ae04eed2419a4c238c9815f0a82f6104a273d653d",
           "stats": {
             "row_start": 5,
             "row_end": 6,

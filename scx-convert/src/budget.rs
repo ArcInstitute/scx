@@ -661,24 +661,26 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         enforced: true,
     },
     Reservation {
-        name: "source CSR shard decode + re-encode, one in flight",
+        name: "source CSR shard decode, one in flight",
         phase: Phase::CscBuilderPush,
         share: scx_format_io::csc_budget::CSC_BUILD_INPUT_SHARE,
         multiplicity: 1,
-        site: "scx-ops/src/build_csc.rs (the merged CSR re-emit + push_shard walk)",
+        site: "scx-ops/src/build_csc.rs (the decode + push_shard walk)",
         // NOT enforced, and the gap is narrow enough to name exactly.
         //
-        // The *decode* half is bounded and refused: `run_build_csc` folds
+        // The decoded arrays are bounded and refused: build-csc folds
         // `ShardHeader.nnz` and `.n_major` from every shard in its header
         // pre-pass and refuses a budget that cannot admit the largest, with
         // the byte figure from `Share::min_budget_for`. The header, not
         // `ShardStats` — stats are format-permitted to be absent, and reading
-        // them here let a stats-less shard drop out of the maximum. The *re-encode* half shares the
-        // SparseIngest row's open terms verbatim -- frame expansion, the
-        // intra-codec planes, the encoded indptr, two candidates under
-        // `rayon::join` -- so see that row rather than a second copy of the
-        // list here. PR-D deletes the re-encode, at which point this row can
-        // flip.
+        // them here let a stats-less shard drop out of the maximum. What the
+        // figure does not charge is the decoder's own scratch on the way to
+        // those arrays (decompression buffers, value bytes before widening to
+        // `f32`), which nothing counts. This row used to be "decode +
+        // re-encode": build-csc re-encoded every CSR shard it had just
+        // decoded, sharing the SparseIngest row's open terms. It is now an
+        // in-place append that writes no CSR shard, so that half is gone
+        // rather than bounded.
         enforced: false,
     },
     Reservation {
@@ -709,7 +711,7 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         // shares must sum.
         //
         // What genuinely is not concurrent is the source shard: the last
-        // `push_shard` has returned and its decode/re-encode buffers are
+        // `push_shard` has returned and its decode buffers are
         // dropped before `finish()`. That is the only reason this is a
         // separate phase at all.
         //

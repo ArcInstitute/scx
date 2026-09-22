@@ -1,27 +1,26 @@
-// scx build-csc — Build CSC (column-major) shards from existing CSR data.
+// scx build-csc — add a CSC (column-major) sidecar to an SCX file by appending
+// it in place.
 
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use scx_codec::{CodecId, ValueEncoding};
+use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
+use scx_format_io::checksum::blake3_hash;
 use scx_format_io::csc_budget;
-use scx_format_io::header::FileHeader;
+use scx_format_io::provenance::{Provenance, ProvenanceEntry};
+use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::FramingConfig;
 use scx_format_io::MemoryBudget;
 use scx_format_io::ScxReader;
 
-use crate::rewrite_helpers;
+use crate::flock::FileLock;
+use crate::in_place::{commit_in_place, prepare_in_place, read_provenance_ops};
 
-/// Build CSC (column-major) shards from an existing file's CSR data, rewriting
-/// the whole file (CSR is decoded and re-encoded, then the CSC sidecar appended).
-///
-/// `framing`: when `Some`, both the re-written CSR shards and the emitted CSC
-/// shards are row-group-framed (shard v2) and the output header is v4. When
-/// `None`, the output is unframed (v1 shards, v3 header) — note this **strips
-/// framing from a source that was already framed**; the framing-preserving entry
-/// point for arbitrary files is `scx optimize`, so mutating-op callers that don't
-/// thread framing pass `None` deliberately.
+type BoxError = Box<dyn std::error::Error>;
+
 /// What `build-csc` did, so callers print the truth rather than "Built".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildCscOutcome {
@@ -44,214 +43,126 @@ fn same_file(input: &Path, output: &Path) -> bool {
     }
 }
 
-pub fn run_build_csc(
-    input: &Path,
-    output: &Path,
+/// Everything decided before a byte is written: the refusals, and the header
+/// pre-pass the builder and the emit need.
+///
+/// Split out so the copy-out form can run it against the *input* and refuse
+/// before paying for a copy of a multi-gigabyte file, and the in-place form can
+/// run it again under the lock against the file it will actually append to.
+enum Plan<'r> {
+    /// 0 rows or 0 columns. Nothing to transpose; `has_csc` says whether there
+    /// is a stale sidecar to drop.
+    Empty {
+        has_csc: bool,
+    },
+    Build(BuildPlan<'r>),
+}
+
+struct BuildPlan<'r> {
+    /// CSR shards in row order, by `ShardHeader.global_offset`.
+    csr_entries: Vec<&'r FullCatalogEntry>,
+    /// Each shard's first row, parallel to `csr_entries`.
+    row_starts: Vec<u64>,
+    csc_value_encoding: ValueEncoding,
+    csc_codec: CodecId,
+    /// `Some` iff the file is v4: a sidecar follows the file's layout and
+    /// never changes it.
+    csc_framing: Option<FramingConfig>,
+    max_bytes: usize,
+    n_rows: usize,
+    n_cols: usize,
+}
+
+fn plan<'r>(
+    reader: &'r ScxReader,
+    path: &Path,
     memory_limit: &str,
-    force: bool,
-    csc_cols_per_shard: usize,
     framing: Option<FramingConfig>,
-    // `temp_dir`: root for the CSC builder's column-bucket spill files. `None`
-    // uses the output file's own directory — see `TempDirSpillStore` for why
-    // that, rather than the platform temp dir the other spilling ops default
-    // to.
-    temp_dir: Option<&Path>,
-) -> Result<BuildCscOutcome, Box<dyn std::error::Error>> {
-    // 1. Parse memory limit string ("4G" → 4 * 1024^3 bytes). Shares the
-    //    workspace parser so --memory-limit accepts the same forms as
-    //    `scx convert --memory-budget` (K/M/G/T, KiB/MiB/GiB/TiB; decimals
-    //    rejected).
+) -> Result<Plan<'r>, BoxError> {
+    // Shares the workspace parser so --memory-limit accepts the same forms as
+    // `scx convert --memory-budget` (K/M/G/T, KiB/MiB/GiB/TiB; decimals
+    // rejected).
     let max_bytes = usize::try_from(MemoryBudget::parse(memory_limit)?)?;
+    let header = reader.header();
 
-    // 2. Validate input exists
-    if !input.exists() {
-        return Err(format!("input file does not exist: {}", input.display()).into());
-    }
-
-    // 3. `output` must be a different file from `input`, by canonical path.
-    //    An alias (`a.scx` vs `./a.scx`) would otherwise have the rewrite
-    //    write over its own source. The in-place form (no `<OUTPUT>`) is
-    //    `rebuild_csc_inplace`,
-    //    which stages a temp file; the pyscx wrapper has refused this alias
-    //    since it was written — the guard belongs here so every caller gets it.
-    if same_file(input, output) {
-        return Err(format!(
-            "input and output must be different files ({} names the input); omit <OUTPUT> \
-             to add the CSC sidecar in place, or give a distinct output path",
-            output.display()
-        )
-        .into());
-    }
-
-    // 3b. Check output doesn't exist (unless --force)
-    // `symlink_metadata`, not `exists()`: the latter follows the link and
-    // answers `false` for a dangling symlink, which would let an unforced
-    // rewrite replace it.
-    if std::fs::symlink_metadata(output).is_ok() && !force {
-        return Err(format!(
-            "{} already exists (use --force to overwrite)",
-            output.display()
-        )
-        .into());
-    }
-    // Deliberately no `remove_file`: `ScxWriter::finish` persists with
-    // `rename(2)`, which replaces the output atomically, so unlinking first
-    // would only widen a window in which neither the old nor the new file
-    // exists. Same-path is already refused above.
-
-    // 4. Open input file
-    let reader = ScxReader::open(input)?;
-    let in_header = reader.header();
-
-    // 5. An empty matrix (0 rows or 0 columns) has nothing for a sidecar to
-    //    index, but the requested output must still exist — `rebuild_csc_inplace`
-    //    and the convert / sort / subset `--rebuild-csc` callers rename it into
-    //    place, and a rewrite that yielded zero rows must not fail after the
-    //    fact. An input without a sidecar is copied verbatim (its CSR shards,
-    //    if a 0-column file has any, come along). An input that still carries
-    //    one (written under the pre-0.17 `CscPolicy::Always`, which emitted a
-    //    CSC shard of empty columns) is rewritten without it, so "an empty
-    //    matrix has no sidecar" does not depend on how the file was made: a
-    //    0-row file has no CSR shards, so its rewrite is obs / var plus the
-    //    auxiliary sections; a 0-column file with rows falls through to the
-    //    normal path, which re-emits its CSR shards and writes zero CSC shards.
-    //    A header that *claims* rows but has no CSR shards is malformed and
-    //    stays an error (below).
     // A header that claims rows but carries no CSR shards is malformed, and
-    // must be refused before the empty-matrix fast path can copy it through as
-    // a success. (A 0-row file legitimately has none: the format forbids framed
-    // zero-row shards, so that case is exempt.)
-    if in_header.n_obs > 0 && in_header.n_csr_shards == 0 {
+    // must be refused before the empty-matrix path can report it as a success.
+    // (A 0-row file legitimately has none: the format forbids framed zero-row
+    // shards, so that case is exempt.)
+    if header.n_obs > 0 && header.n_csr_shards == 0 {
         return Err("Input file has no CSR shards".into());
     }
-    let empty_matrix = in_header.n_obs == 0 || in_header.n_vars == 0;
     let has_csc = reader
         .catalog()
         .entries
         .iter()
-        .any(|e| e.section_type == scx_format_io::section::SectionType::CscShard);
+        .any(|e| e.section_type == SectionType::CscShard);
+    // An empty matrix without a sidecar is answered before anything else: it
+    // is a no-op on any file, multimodal included.
+    let empty_matrix = header.n_obs == 0 || header.n_vars == 0;
     if empty_matrix && !has_csc {
-        log::info!(
-            "build-csc: {} is an empty matrix ({} x {}); no CSC sidecar to build",
-            input.display(),
-            in_header.n_obs,
-            in_header.n_vars
-        );
-        std::fs::copy(input, output)?;
-        return Ok(BuildCscOutcome::NoSidecar);
-    }
-    if in_header.n_obs == 0 {
-        log::info!(
-            "build-csc: {} has no rows; dropping its stale CSC sidecar",
-            input.display()
-        );
-        let out_header = FileHeader {
-            manifest_sequence: in_header.manifest_sequence + 1,
-            ..in_header.clone()
-        };
-        let mut writer = ScxWriter::new(output, out_header)?
-            .with_data_generation(reader.catalog().data_generation);
-        rewrite_helpers::copy_obs_var_preserving_layout(&reader, &mut writer)?;
-        let params_json = format!(
-            "{{\"memory_limit\":\"{memory_limit}\",\"csc_cols_per_shard\":{csc_cols_per_shard},\
-          \"temp_dir\":{}}}",
-            temp_dir.map_or_else(
-                || "null".to_string(),
-                |p| format!("{:?}", p.display().to_string())
-            )
-        );
-        rewrite_helpers::copy_auxiliary_sections(&reader, &mut writer, "build-csc", &params_json)?;
-        crate::carry::audit_staged(
-            crate::carry::RewriteOp::BuildCsc,
-            &[reader.catalog()],
-            &writer,
-        )?;
-        writer.finish()?;
-        return Ok(BuildCscOutcome::NoSidecar);
+        return Ok(Plan::Empty { has_csc });
     }
 
-    // This function is not modality-aware — it flattens every CSR shard against
-    // the single top-level n_obs × n_vars shape, which would corrupt the sidecar
-    // on a multimodal input. `pyscx.build_csc` has guarded this since it was
-    // written; the CLI did not, and reached `reader.read_var()` to fail with an
-    // opaque `section not found: var`. The guard belongs here so every caller —
-    // `scx build-csc` in both its forms, `rebuild_csc_inplace`, and the pyscx
-    // wrapper — gets the same actionable message.
+    // Not modality-aware — it flattens every CSR shard against the single
+    // top-level n_obs × n_vars shape, which would corrupt the sidecar on a
+    // multimodal input. The guard lives here so every caller — `scx build-csc`
+    // in both its forms, `rebuild_csc_inplace`, and the pyscx wrapper — gets
+    // the same actionable message.
     if reader.is_multimodal() {
         return Err(format!(
             "build-csc does not support multimodal files ({} has {} modalities); \
              extract a single modality first with \
              `scx subset {} out.scx --modality NAME`",
-            input.display(),
-            in_header.n_modalities,
-            input.display(),
+            path.display(),
+            header.n_modalities,
+            path.display(),
         )
         .into());
     }
 
-    // SCX-005: build-csc re-emits CSR shards without re-canonicalizing them, so
-    // it must not *raise* the format version's canonicality claim above what
-    // the input already guarantees. Framing (v4) structurally requires the v3
-    // canonical-CSR invariant; refuse to frame a pre-v3 input rather than stamp
-    // a v4 file whose shards may be unsorted/duplicated. Run `scx optimize`
-    // first (which canonicalizes) for such inputs.
-    let in_version = in_header.format_version;
-    if framing.is_some() && in_version < scx_format_io::header::DEFAULT_WRITE_FORMAT_VERSION {
+    // The sidecar is framed iff the file is v4, because an append cannot change
+    // the CSR's layout and v4 promises sub-shard random access on every sparse
+    // shard. `Some(framing)` on a ≤ v3 file used to mean "re-frame the whole
+    // file", which only a rewrite can do — `scx optimize` is that rewrite.
+    // `decode_target` and `trial` are cleared rather than trusted: they
+    // authorise the encoder to re-select a codec, and the sidecar's codec is
+    // `pick_csc_encoding`'s decision.
+    let file_v4 = header.format_version >= scx_format_io::CURRENT_FORMAT_VERSION;
+    if !file_v4 && framing.is_some() {
         return Err(format!(
-            "build-csc cannot row-group-frame a format v{in_version} input (framing implies the \
-             v3 canonical-CSR invariant, which build-csc does not re-establish); run \
-             `scx optimize` first to canonicalize, then build-csc"
+            "build-csc cannot row-group-frame a sidecar on a format v{} file: framing is \
+             a property of the whole file, and build-csc appends without touching the CSR. \
+             Run `scx optimize` first to frame it, then build-csc",
+            header.format_version
         )
         .into());
     }
+    let csc_framing = file_v4.then(|| FramingConfig {
+        trial: false,
+        decode_target: None,
+        ..framing.unwrap_or_default()
+    });
 
-    let n_rows = in_header.n_obs as usize;
-    let n_cols = in_header.n_vars as usize;
+    if empty_matrix {
+        return Ok(Plan::Empty { has_csc });
+    }
 
-    // Show progress
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .expect("valid template"),
-    );
-    pb.set_message(format!(
-        "Building CSC shards ({} rows × {} cols)...",
-        n_rows, n_cols
-    ));
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    // 6. Read CSR shard entries and pick a CSC value encoding wide enough to
-    //    cover EVERY shard. The CSC sidecar transposes all shards into shared
-    //    columns, so a first-shard-only encoding can truncate later shards
-    //    (SCX-004): a `Uint8` first shard followed by a `Float32` shard would
-    //    otherwise encode `1.5` as integer `1`. Scan every header for the
-    //    float/integer kind; if any is float the CSC must be Float32 (+ a
-    //    float-safe codec), else use the widest integer width across shards.
-    let csr_entries = reader.catalog().csr_shards_sorted();
-    // One *standalone* `read_shard_header` per shard, not two plus one: this
-    // scan, the CSC codec/encoding pick below and the per-shard CSR re-emit at
-    // step 11 all want the same two bytes, and the re-emit used to read them
-    // again (as did a third call for shard 0's codec). `decode_shard_bytes`
-    // still parses the header out of the section it already fetched on the one
-    // surviving decode, so total header *parses* go 4n+1 -> 2n; what this loop
-    // removes is n+1 standalone reads, and with them the second decode pass.
+    // Pick a CSC value encoding wide enough to cover EVERY shard. The sidecar
+    // transposes all shards into shared columns, so a first-shard-only
+    // encoding can truncate later shards (SCX-004): a `Uint8` first shard
+    // followed by a `Float32` shard would otherwise encode `1.5` as `1`. The
+    // rule is `scx_format_io::pick_csc_encoding`, shared with `ScxWriter`'s
+    // finish-time sidecar emit; this loop only collects its inputs. Flooring on
+    // each shard's *declared* encoding matters beyond `stats.value_max`: a
+    // shard may lack stats (format-permitted), so `value_max` would contribute
+    // nothing and a wide integer shard could be under-picked as Uint8.
     //
-    // The rule itself is `scx_format_io::pick_csc_encoding`, shared with
-    // `ScxWriter`'s finish-time sidecar emit, which used to carry a
-    // hand-rolled copy of it. This loop's job is only to collect its two
-    // inputs. Flooring on each shard's *declared* encoding matters beyond
-    // `stats.value_max`: a shard may lack stats (format-permitted), so
-    // `value_max` would contribute nothing and a wide integer shard could be
-    // under-picked as Uint8.
-    // `(codec, encoding, row_start)`. The row start is `ShardHeader.global_offset`,
-    // which the format defines as the CSR shard's first row — exact, and present
-    // on every shard. `ShardStats` is format-permitted to be absent, so deriving
-    // the row axis from it means choosing between a fabricated 0 (which rejects
-    // valid stats-less multi-shard files) and a fabricated "whatever we expected"
-    // (which makes the tiling check unfalsifiable). The header needs neither.
+    // The row start is `ShardHeader.global_offset`, which the format defines as
+    // the CSR shard's first row — exact, and present on every shard, where
+    // `ShardStats` is format-permitted to be absent.
+    let csr_entries = reader.catalog().csr_shards_sorted();
     let mut per_shard: Vec<(CodecId, ValueEncoding, u64)> = Vec::with_capacity(csr_entries.len());
-    let mut declared_encs: Vec<ValueEncoding> = Vec::with_capacity(csr_entries.len());
     let mut max_int_val: u32 = 0;
     let mut worst_decoded_bytes: u64 = 0;
     for entry in &csr_entries {
@@ -262,12 +173,9 @@ pub fn run_build_csc(
         let ci = CodecId::from_u8(sh.codec_id)
             .ok_or(crate::error::OpsError::UnknownCodec(sh.codec_id))?;
         per_shard.push((ci, ve, sh.global_offset));
-        declared_encs.push(ve);
-        // The exact decoded cost of THIS shard, from the header that is
-        // already in hand. `ShardHeader` carries both `nnz` and `n_major`, so
-        // neither term needs `ShardStats` — which is format-permitted to be
-        // absent, and whose absence would otherwise let a shard contribute
-        // nothing to the refusal below.
+        // The exact decoded cost of THIS shard, from the header in hand — both
+        // `nnz` and `n_major` are header fields, so a stats-less shard still
+        // counts toward the refusal below.
         worst_decoded_bytes = worst_decoded_bytes.max(csc_budget::decoded_csr_shard_bytes(
             sh.nnz,
             sh.n_major as u64,
@@ -282,24 +190,15 @@ pub fn run_build_csc(
     // stats-less entry to `u64::MAX`. That is fine when every shard has stats
     // or none does, but the format permits a stats-less entry *beside* a
     // stats-bearing one — and then an early stats-less shard sorts last, the
-    // walk below sees a non-zero `global_offset` first, and the tiling guard
-    // rejects a perfectly valid file. `ShardHeader.global_offset` is present
-    // on every shard, so once the headers are read there is a total order
-    // that does not depend on optional metadata.
-    //
-    // A stable sort, so shards that genuinely share an offset keep catalog
-    // order and the guard reports the duplicate rather than a shuffle.
+    // walk sees a non-zero `global_offset` first, and the tiling guard rejects
+    // a perfectly valid file. A stable sort, so shards that genuinely share an
+    // offset keep catalog order and the guard reports the duplicate.
     let mut order: Vec<usize> = (0..csr_entries.len()).collect();
     order.sort_by_key(|&i| per_shard[i].2);
     let csr_entries: Vec<_> = order.iter().map(|&i| csr_entries[i]).collect();
     let per_shard: Vec<_> = order.iter().map(|&i| per_shard[i]).collect();
-    let declared_encs: Vec<_> = order.iter().map(|&i| declared_encs[i]).collect();
 
-    // One spelling of the SCX-004 widening rule, shared with
-    // `ScxWriter`'s finish-time sidecar emit. `None` means the integer path
-    // found no source shard to take a codec from; the guard above means a file
-    // with rows always has shards, so this reports that same condition instead
-    // of panicking.
+    let declared_encs: Vec<ValueEncoding> = per_shard.iter().map(|&(_, ve, _)| ve).collect();
     let (csc_value_encoding, csc_codec) = scx_format_io::pick_csc_encoding(
         &declared_encs,
         max_int_val,
@@ -307,23 +206,15 @@ pub fn run_build_csc(
     )
     .ok_or_else(|| "Input file has no CSR shards".to_string())?;
 
-    // 7. Refuse a budget that cannot admit one decoded source shard.
+    // Refuse a budget that cannot admit one decoded source shard.
     //
-    // This is what makes the push-phase budget row enforceable rather than
-    // aspirational: the walk below holds exactly one decoded shard at a time,
-    // so if the largest one does not fit its share, no amount of spilling
-    // helps and the op should say so before writing anything. The byte figure
-    // comes from `Share::min_budget_for`, which exists so a refusal and its
-    // "raise it to at least N" message cannot drift apart.
-    //
-    // `worst_decoded_bytes` is folded from each `ShardHeader` above, not from
-    // `ShardStats`, and both of its terms are per-shard. The first version of
-    // this guard got both halves wrong: it took `nnz` from `entry.stats` — so
-    // a stats-less shard contributed nothing, and a file whose shards all lack
-    // stats skipped the check entirely — and it charged `n_obs` for the indptr
-    // instead of the shard's own `n_major`, which on a 1M-row file with 20k-row
-    // shards is ~8 MB of phantom indptr per shard and refuses budgets that
-    // actually fit. The header carries both numbers exactly.
+    // The walk holds exactly one decoded shard at a time, so if the largest
+    // does not fit its share no amount of spilling helps, and the op should
+    // say so before writing anything. The figure comes from
+    // `Share::min_budget_for`, so the refusal and its "raise it to at least N"
+    // message cannot drift apart. Both terms of `worst_decoded_bytes` are
+    // per-shard header fields: charging the file's `n_obs` for the indptr, or
+    // reading `nnz` from optional stats, were both wrong in a first version.
     if worst_decoded_bytes > 0 {
         let need = csc_budget::CSC_BUILD_INPUT_SHARE.min_budget_for(worst_decoded_bytes);
         if (max_bytes as u64) < need {
@@ -331,161 +222,383 @@ pub fn run_build_csc(
                 "build-csc: --memory-limit {memory_limit} is too small for {}: decoding its \
                  largest CSR shard needs ~{worst_decoded_bytes} bytes; raise --memory-limit \
                  to at least {need}",
-                input.display()
+                path.display()
             )
             .into());
         }
     }
 
-    // 9. Set up output header (preserve flags/codec/index dtype, bump manifest;
-    // writer fills nnz + shard counts).
-    let out_header = FileHeader {
-        flags: in_header.flags,
-        n_obs: in_header.n_obs,
-        n_vars: in_header.n_vars,
-        shard_target_rows: in_header.shard_target_rows,
-        codec_id: in_header.codec_id,
-        index_dtype: in_header.index_dtype,
-        manifest_sequence: in_header.manifest_sequence + 1,
-        // Row-group framing produces a v4 file (guarded above so the input is
-        // already ≥ v3 canonical). Otherwise clamp the unframed version to what
-        // the input guarantees — build-csc does not canonicalize, so it must
-        // not claim v3 for a pre-v3 input (SCX-005).
-        format_version: if framing.is_some() {
-            scx_format_io::header::CURRENT_FORMAT_VERSION
-        } else {
-            scx_format_io::header::rewrite_output_format_version(&[in_version], 1)
-        },
-        ..Default::default()
+    Ok(Plan::Build(BuildPlan {
+        csr_entries,
+        row_starts: per_shard.iter().map(|&(_, _, r)| r).collect(),
+        csc_value_encoding,
+        csc_codec,
+        csc_framing,
+        max_bytes,
+        n_rows: header.n_obs as usize,
+        n_cols: header.n_vars as usize,
+    }))
+}
+
+/// Run `f`, and if it fails, cut the file back to `len`.
+///
+/// For the stretch of an in-place op between its first append and
+/// `commit_in_place`: nothing references those bytes until the header write
+/// repoints the catalog, so dropping them is safe, and a failed census-scale
+/// build would otherwise leave a gigabyte of orphan tail that only `scx
+/// compact` could reclaim.
+fn truncate_on_error<T>(
+    lock: &mut FileLock,
+    len: u64,
+    f: impl FnOnce(&mut FileLock) -> Result<T, BoxError>,
+) -> Result<T, BoxError> {
+    let result = f(lock);
+    if result.is_err() {
+        // The original error is the one worth reporting; a failed truncation
+        // leaves orphan bytes, which is exactly the pre-existing behaviour of
+        // every other in-place op.
+        if let Err(e) = lock.file().set_len(len) {
+            log::warn!("build-csc: could not truncate the failed append back to {len} bytes: {e}");
+        }
+    }
+    result
+}
+
+/// Add a CSC sidecar to `path` in place: the CSC shards are appended at EOF
+/// and the catalog repointed with `prepare_in_place` / `commit_in_place`, the
+/// harness `append` and the attach ops use.
+///
+/// Nothing else in the file moves. Every CSR shard, layer, obs/var section,
+/// index and bitmap keeps its bytes at its offset — [`crate::carry::audit_in_place`]
+/// checks that before committing — so `data_generation` is unchanged, a
+/// pre-existing *layer* sidecar stays fresh, and `scx rollback` undoes the
+/// build. A sidecar already on the file is replaced; its bytes become orphans
+/// that `scx compact --rebuild-csc` reclaims, as with every in-place op.
+///
+/// `framing`: `None` or `Some` on a v4 file (the sidecar is framed with it, or
+/// with the default when `None`); must be `None` on a ≤ v3 file, which an
+/// append cannot frame. [`crate::framing_for_csc_rebuild`] returns exactly the
+/// admissible value, and the streaming convert path passes its own so a custom
+/// `--row-group-rows` reaches the sidecar.
+///
+/// `temp_dir`: root for the CSC builder's column-bucket spill files. `None`
+/// uses the file's own directory — see `TempDirSpillStore` for why that,
+/// rather than the platform temp dir the other spilling ops default to.
+pub(crate) fn build_csc_in_place(
+    path: &Path,
+    memory_limit: &str,
+    csc_cols_per_shard: usize,
+    framing: Option<FramingConfig>,
+    temp_dir: Option<&Path>,
+) -> Result<Built, BoxError> {
+    if !path.exists() {
+        return Err(format!("input file does not exist: {}", path.display()).into());
+    }
+    let (mut lock, mut prep) = prepare_in_place(path, 0)?;
+    // Opened after the lock, as the attach ops do. The reader takes no lock of
+    // its own, and this op only ever appends, so its mapping stays valid.
+    let reader = ScxReader::open(path)?;
+
+    let plan = plan(&reader, path, memory_limit, framing)?;
+    let (build, had_csc) = match plan {
+        Plan::Empty { has_csc: false } => {
+            log::info!(
+                "build-csc: {} is an empty matrix ({} x {}); no CSC sidecar to build",
+                path.display(),
+                prep.header.n_obs,
+                prep.header.n_vars
+            );
+            return Ok(Built::none());
+        }
+        Plan::Empty { has_csc: true } => {
+            log::info!(
+                "build-csc: {} is an empty matrix; dropping its stale CSC sidecar",
+                path.display()
+            );
+            (None, true)
+        }
+        Plan::Build(b) => {
+            let had = prep
+                .old_catalog
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::CscShard);
+            (Some(b), had)
+        }
     };
 
-    // 10. Create writer and write metadata
-    pb.set_message("Writing output file...");
-    // build-csc does NOT change the CSR data — it only adds the column-major
-    // sidecar. Preserve the source data generation (no bump) so the freshly
-    // emitted CSC sidecar reads as fresh: `write_shard_inner` records
-    // `csc_build_generation = data_generation` for each CSC shard written,
-    // yielding `csc_build_generation == data_generation`.
-    let mut writer =
-        ScxWriter::new(output, out_header)?.with_data_generation(reader.catalog().data_generation);
-    // F5-b: frame the re-written CSR shards and the CSC sidecar (both go through
-    // `write_shard_inner`, which consults the writer's framing). No-op when None.
-    writer.set_framing(framing);
-    // obs/var pass through 1:1, so a row-sharded input must come out
-    // row-sharded — see `copy_obs_var_preserving_layout` for what collapsing it
-    // would cost. build-csc never drops rows, so it takes no keep mask.
-    crate::rewrite_helpers::copy_obs_var_preserving_layout(&reader, &mut writer)?;
-
-    // 11 + 13. One walk: decode a shard, re-emit it as CSR, feed it to the CSC
-    // builder, drop it.
-    //
-    // These used to be two passes over a `Vec<ScxCsr>` holding every decoded
-    // shard at once — 11.2 GB of census_1m's 14.7 GB peak — because
-    // `streaming_csr_to_csc_iter_with_cap` borrowed `&[ScxCsr]` for its whole
-    // lifetime. A push sink removes the borrow, and then the only reason to
-    // keep the shards was that two consumers wanted each one. So both consume
-    // it in the same iteration and it is dropped at the end of the body: peak
-    // goes from every shard to one.
-    //
-    // Not a second decode pass instead: on census_1m that is roughly a third
-    // of the op's wall.
-    //
-    // `per_shard` stays a list beside `csr_entries` rather than being folded
-    // in, because the encoding scan at step 6 runs *before* this walk (it
-    // reads headers and catalog stats only, never a payload) and its answer is
-    // needed to construct the builder.
-    //
-    // One check, both directions. Indexing only catches `per_shard` being
-    // *longer* (a bounds panic); a shorter one would silently stop early and
-    // drop shards from the output with no error anywhere, the same hazard a
-    // truncating `zip` has.
-    assert_eq!(
-        per_shard.len(),
-        csr_entries.len(),
-        "one header scan per catalog entry"
+    let params_json = format!(
+        "{{\"memory_limit\":\"{memory_limit}\",\"csc_cols_per_shard\":{csc_cols_per_shard},\
+          \"temp_dir\":{}}}",
+        temp_dir.map_or_else(
+            || "null".to_string(),
+            |p| format!("{:?}", p.display().to_string())
+        )
     );
 
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .expect("valid template"),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let original_len = lock.seek(SeekFrom::End(0))?;
+    let old_catalog_offset = prep.old_catalog_offset;
     let spill_root = temp_dir
         .map(Path::to_path_buf)
-        .or_else(|| output.parent().map(Path::to_path_buf));
-    let store = scx_format_io::TempDirSpillStore::new(spill_root.as_deref())?;
+        .or_else(|| path.parent().map(Path::to_path_buf));
+
+    let new_catalog = truncate_on_error(&mut lock, original_len, |lock| {
+        let csc_entries = match &build {
+            None => Vec::new(),
+            Some(b) => append_csc_shards(
+                lock,
+                &prep,
+                &reader,
+                b,
+                csc_cols_per_shard,
+                spill_root.as_deref(),
+                &pb,
+            )?,
+        };
+
+        // Provenance: the existing chain plus one entry, written as a fresh
+        // section (the old one is dropped from the catalog below).
+        let mut prov_ops = read_provenance_ops(lock, &prep.old_catalog)?;
+        prov_ops.push(ProvenanceEntry {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            action: "build-csc".to_string(),
+            tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
+            params_json: params_json.clone(),
+            input_checksums: vec![],
+        });
+        let mut prov_bytes = Vec::new();
+        Provenance {
+            version: 1,
+            operations: prov_ops,
+        }
+        .write_to(&mut prov_bytes)?;
+        let mut woff = lock.seek(SeekFrom::End(0))?;
+        woff += write_alignment_padding(&mut *lock, woff)? as u64;
+        lock.write_all(&prov_bytes)?;
+
+        // Old entries minus the sidecar being replaced and the provenance being
+        // superseded; then the new sidecar and provenance. The adopted writer
+        // names CSC shards from `X_csc_shard_0`, which is sound only because
+        // every old CSC entry is dropped here — its duplicate guard sees only
+        // its own entries.
+        let orphaned: u64 = prep
+            .old_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .map(|e| e.length)
+            .sum();
+        if orphaned > 0 && build.is_some() {
+            log::warn!(
+                "build-csc: replacing the existing CSC sidecar on {} leaves {orphaned} bytes \
+                 unreferenced; `scx compact --rebuild-csc` reclaims them",
+                path.display()
+            );
+        }
+        let mut entries: Vec<FullCatalogEntry> = prep
+            .old_catalog
+            .entries
+            .iter()
+            .filter(|e| {
+                e.section_type != SectionType::CscShard && e.section_type != SectionType::Provenance
+            })
+            .cloned()
+            .collect();
+        entries.extend(csc_entries);
+        entries.push(FullCatalogEntry {
+            name: "provenance".to_string(),
+            offset: woff,
+            length: prov_bytes.len() as u64,
+            section_type: SectionType::Provenance,
+            checksum: blake3_hash(&prov_bytes),
+            modality_id: 0,
+            stats: None,
+        });
+
+        let has_sidecar = entries
+            .iter()
+            .any(|e| e.section_type == SectionType::CscShard);
+        let new_catalog = FullCatalog {
+            catalog_version: scx_format_io::CURRENT_CATALOG_VERSION,
+            manifest_sequence: prep.header.manifest_sequence + 1,
+            // What makes `scx rollback` undo the build.
+            prev_catalog_offset: old_catalog_offset,
+            n_obs: prep.old_n_obs,
+            entries,
+            // X is untouched, so its generation is too — and the sidecar is
+            // built against exactly that generation, which is what the reader's
+            // staleness guard checks. With no X sidecar written (an empty
+            // matrix dropping a stale one) the field is left as it was: it is
+            // also what keeps a carried *layer* sidecar fresh, and zeroing it
+            // would stale that for nothing.
+            data_generation: prep.old_catalog.data_generation,
+            csc_build_generation: if has_sidecar {
+                prep.old_catalog.data_generation
+            } else {
+                prep.old_catalog.csc_build_generation
+            },
+        };
+
+        // Checked before the commit, so a violation leaves the file on its old
+        // catalog (and `truncate_on_error` drops the appended bytes).
+        crate::carry::audit_in_place(
+            crate::carry::RewriteOp::BuildCsc,
+            &prep.old_catalog,
+            &new_catalog,
+        )?;
+        Ok(new_catalog)
+    })?;
+
+    // Header: the sidecar counters, set explicitly as `append` does — not
+    // `sync_from_catalog`, which would re-derive `nnz` from optional stats.
+    let n_csc_shards = new_catalog
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CscShard)
+        .count() as u32;
+    prep.header.n_csc_shards = n_csc_shards;
+    if n_csc_shards > 0 {
+        prep.header.set_csc();
+    } else {
+        prep.header.clear_csc();
+    }
+    let (mt_off, mt_len) = (
+        prep.header.modality_table_offset,
+        prep.header.modality_table_length,
+    );
+    commit_in_place(&mut lock, &mut prep.header, &new_catalog, mt_off, mt_len)?;
+    pb.finish_and_clear();
+
+    if n_csc_shards == 0 {
+        if had_csc {
+            log::info!(
+                "build-csc: dropped the stale CSC sidecar from {}",
+                path.display()
+            );
+        }
+        return Ok(Built::none());
+    }
+    Ok(Built {
+        outcome: BuildCscOutcome::Built,
+        n_rows: prep.header.n_obs,
+        n_cols: prep.header.n_vars,
+        n_csc_shards,
+        nnz: new_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CscShard)
+            .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
+            .sum(),
+    })
+}
+
+/// [`build_csc_in_place`]'s answer plus what the copy-out form prints.
+pub(crate) struct Built {
+    pub(crate) outcome: BuildCscOutcome,
+    n_rows: u64,
+    n_cols: u64,
+    n_csc_shards: u32,
+    nnz: u64,
+}
+
+impl Built {
+    fn none() -> Self {
+        Self {
+            outcome: BuildCscOutcome::NoSidecar,
+            n_rows: 0,
+            n_cols: 0,
+            n_csc_shards: 0,
+            nnz: 0,
+        }
+    }
+}
+
+/// Decode each CSR shard once, route it into the builder, then emit the CSC
+/// shards at EOF through an adopted writer. Returns their catalog entries.
+///
+/// No CSR shard is written. The rewrite this replaced decoded every shard to
+/// re-encode it — under `auto`, the framed encoder's two candidates per shard —
+/// to produce bytes that were, by the op's own contract, the input's.
+fn append_csc_shards(
+    lock: &mut FileLock,
+    prep: &crate::in_place::InPlacePrep,
+    reader: &ScxReader,
+    b: &BuildPlan<'_>,
+    csc_cols_per_shard: usize,
+    spill_root: Option<&Path>,
+    pb: &ProgressBar,
+) -> Result<Vec<FullCatalogEntry>, BoxError> {
+    let store = scx_format_io::TempDirSpillStore::new(spill_root)?;
     let mut builder = scx_sparse::CscBuilder::new(
-        n_rows,
-        n_cols,
+        b.n_rows,
+        b.n_cols,
         scx_sparse::CscBuilderConfig {
             cols_per_shard: csc_cols_per_shard,
-            memory_bytes: max_bytes,
-            spill_after_bytes: csc_budget::CSC_BUILD_BUCKET_SHARE.of(max_bytes as u64) as usize,
+            memory_bytes: b.max_bytes,
+            spill_after_bytes: csc_budget::CSC_BUILD_BUCKET_SHARE.of(b.max_bytes as u64) as usize,
             ..Default::default()
         },
         Box::new(store),
     )?;
 
-    pb.set_message("Re-writing CSR shards and routing them into the CSC builder...");
     let mut rows_pushed: u64 = 0;
-    for (i, shard_entry) in csr_entries.iter().enumerate() {
-        let (ci, ve, shard_row_start) = per_shard[i];
-
+    for (i, (shard_entry, &shard_row_start)) in b.csr_entries.iter().zip(&b.row_starts).enumerate()
+    {
         // The row axis this shard claims, checked against the walk's own
-        // running count **before** anything is read, decoded, re-encoded or
-        // written. A catalog whose shards do not tile `[0, n_obs)` in order is
-        // an error rather than a silently shifted sidecar, and it costs
-        // nothing to say so: `shard_row_start` is `ShardHeader.global_offset`,
-        // already in hand from the header pre-pass. Doing the read first meant
-        // an invalid file paid a full decode + re-encode + disk write per
-        // shard before the refusal. `ScxWriter::auto_emit_csc_for_marked_
-        // modalities` has always checked in this position.
-        //
-        // (`csr_shards_sorted` sorts by `major_start`, but an entry with no
-        // stats sorts last at `u64::MAX`, so the walk re-orders on
-        // `global_offset` above and this check is what confirms the result
-        // tiles.)
+        // running count before the shard is decoded. A catalog whose shards do
+        // not tile `[0, n_obs)` in order is an error rather than a silently
+        // shifted sidecar. (`row_starts` was built from the same list, so the
+        // `zip` cannot truncate.)
         if shard_row_start != rows_pushed {
             return Err(format!(
                 "build-csc: CSR shard {i} declares row_start {shard_row_start}, but \
-                 {rows_pushed} rows precede it; the shards do not tile [0, {n_rows}) in order"
+                 {rows_pushed} rows precede it; the shards do not tile [0, {}) in order",
+                b.n_rows
             )
             .into());
         }
-
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
         let n_shard_rows = indptr.len() - 1;
-        let shard = scx_sparse::ScxCsr::new((n_shard_rows, n_cols), indptr, indices, data)?;
-
-        // Consumer 1: the verbatim-intent CSR re-emit. Unchanged.
-        let indices_u32: Vec<u32> = shard.indices.iter().map(|&i| i as u32).collect();
-        let indptr_u64: Vec<u64> = shard.indptr.iter().map(|&v| v as u64).collect();
-        let raw_values = ve.encode_f32_batch(&shard.data)?;
-        writer.write_csr_shard(
-            &indptr_u64,
-            &indices_u32,
-            &raw_values,
-            ci,
-            ve,
-            shard_row_start,
-        )?;
-        drop((indptr_u64, indices_u32, raw_values));
-
-        // Consumer 2: the CSC builder, fed the walk's own running count —
-        // equal to `shard_row_start` by the check at the top of the loop.
+        let shard = scx_sparse::ScxCsr::new((n_shard_rows, b.n_cols), indptr, indices, data)?;
         builder.push_shard(rows_pushed, &shard)?;
         rows_pushed += n_shard_rows as u64;
-
-        pb.set_message(format!("shard {}/{} re-written", i + 1, csr_entries.len()));
+        pb.set_message(format!(
+            "shard {}/{} routed into the CSC builder",
+            i + 1,
+            b.csr_entries.len()
+        ));
     }
 
-    // 13. Drain the builder into CSC sections. The `on_shard` callback is what
-    //     let the inline twin of this loop be deleted; its NOTE said it stayed
-    //     inline "because it drives a progress bar per chunk".
-    pb.set_message("Emitting CSC shards...");
     let mut emitter = builder.finish()?;
     let n_planned = emitter.plan().len();
+
+    let write_offset = lock.seek(SeekFrom::End(0))?;
+    let mut writer = ScxWriter::adopt_in_place(
+        lock.file().try_clone()?,
+        prep.header.clone(),
+        write_offset,
+        Vec::new(),
+    )?;
+    // Framed iff the file is v4 (decided in `plan`). `adopt_in_place` defaults
+    // framing to `None`, which would put unframed shards in a v4 file.
+    writer.set_framing(b.csc_framing);
     let emit_opts = scx_format_io::CscEmitOptions {
-        value_encoding: csc_value_encoding,
-        codec_id: csc_codec,
+        value_encoding: b.csc_value_encoding,
+        codec_id: b.csc_codec,
         modality_id: None,
     };
-    let csc_stats = scx_format_io::emit_csc_shards(
+    let stats = scx_format_io::emit_csc_shards(
         &mut writer,
         &mut emitter,
         &emit_opts,
@@ -496,92 +609,113 @@ pub fn run_build_csc(
             ));
         },
     )?;
-    let total_csc_nnz = csc_stats.total_nnz as usize;
-    let n_csc_shards_written = csc_stats.n_shards;
-    if csc_stats.spill_bytes > 0 {
+    let (file, new_offset, entries) = writer.into_in_place_parts()?;
+    drop(file);
+    lock.seek(SeekFrom::Start(new_offset))?;
+
+    if stats.spill_bytes > 0 {
         log::info!(
-            "build-csc: spilled {} bytes of column buckets under a {max_bytes}-byte budget",
-            csc_stats.spill_bytes
+            "build-csc: spilled {} bytes of column buckets under a {}-byte budget",
+            stats.spill_bytes,
+            b.max_bytes
         );
     }
-    if let Some(col) = csc_stats.first_non_strict_column {
+    if let Some(col) = stats.first_non_strict_column {
         log::warn!(
             "build-csc: column {col} has a duplicate (row, col) in the source, so its CSC rows \
              are not strictly increasing; GPU routes validating `sorted` will reject this sidecar"
         );
     }
+    Ok(entries)
+}
 
-    // 14. Copy auxiliary sections (layers, obsm, uns, predicate indices, provenance)
-    let params_json = format!(
-        "{{\"memory_limit\":\"{memory_limit}\",\"csc_cols_per_shard\":{csc_cols_per_shard},\
-          \"temp_dir\":{}}}",
-        temp_dir.map_or_else(
-            || "null".to_string(),
-            |p| format!("{:?}", p.display().to_string())
+/// Write a copy of `input` carrying a CSC sidecar to `output`, leaving `input`
+/// untouched.
+///
+/// The copy is `input`'s bytes verbatim followed by the in-place append of
+/// [`build_csc_in_place`], staged beside `output` and renamed over it. So the
+/// output's previous catalog is the input's, and `scx rollback` on the output
+/// yields the input. Every refusal is checked against `input` first, so a
+/// refused build costs no copy.
+///
+/// `framing` and `temp_dir` are as for [`build_csc_in_place`]; `temp_dir`
+/// defaults to `output`'s directory.
+pub fn run_build_csc(
+    input: &Path,
+    output: &Path,
+    memory_limit: &str,
+    force: bool,
+    csc_cols_per_shard: usize,
+    framing: Option<FramingConfig>,
+    temp_dir: Option<&Path>,
+) -> Result<BuildCscOutcome, BoxError> {
+    if !input.exists() {
+        return Err(format!("input file does not exist: {}", input.display()).into());
+    }
+    // `output` must be a different file from `input`, by canonical path. The
+    // in-place form (no `<OUTPUT>`) is `rebuild_csc_inplace`.
+    if same_file(input, output) {
+        return Err(format!(
+            "input and output must be different files ({} names the input); omit <OUTPUT> \
+             to add the CSC sidecar in place, or give a distinct output path",
+            output.display()
         )
-    );
-    // The non-canonicalizing (four-argument) form: build-csc clamps its output
-    // `format_version` to the source's rather than claiming v3 (SCX-005),
-    // precisely so it does not have to canonicalize — and re-emitting a layer
-    // with different nnz would contradict its contract of leaving matrix data
-    // unchanged.
-    rewrite_helpers::copy_auxiliary_sections(&reader, &mut writer, "build-csc", &params_json)?;
+        .into());
+    }
+    // `symlink_metadata`, not `exists()`: the latter follows the link and
+    // answers `false` for a dangling symlink, which would let an unforced
+    // write replace it.
+    if std::fs::symlink_metadata(output).is_ok() && !force {
+        return Err(format!(
+            "{} already exists (use --force to overwrite)",
+            output.display()
+        )
+        .into());
+    }
 
-    // `copy_auxiliary_sections` carries the predicate-index bytes verbatim, which
-    // the carry policy requires — but step 11 above re-encoded every CSR shard
-    // through `write_csr_shard`, and `compute_shard_stats` emits no
-    // `column_stats`. Level-1 pruning reads *those*, not the section, so without
-    // this the index survived while the pruning silently stopped: `filter_obs`
-    // fell back to a full scan and still returned the right rows, which is why it
-    // went unnoticed long enough to be pinned as a documented gap.
-    //
-    // The stats are **carried from the input**, not re-derived from the index.
-    // Step 11 writes one output shard per input shard at the same `row_start`, so
-    // the input's statistics are already exactly right for the output's rows —
-    // and re-deriving would have to *infer* that the index is keyed to the CSR
-    // partition, which cannot be proven from the index bytes. See
-    // `scx_format_io::carry_csr_shard_column_stats`.
-    let carried_stats = writer.carry_csr_shard_column_stats_from(&reader.catalog().entries);
-    if carried_stats == 0 && reader.read_obs_predicate_index_bytes()?.is_some() {
-        log::debug!(
-            "build-csc: the input carries an obs predicate index but no per-shard column \
-             statistics, so there are none to carry forward. Level-1 shard pruning was \
-             already off on the input; rebuild the index with `scx sort`/`scx compact` plus \
-             --index-obs / --index-preset to enable it."
+    // Refuse against the input before copying it.
+    {
+        let reader = ScxReader::open(input)?;
+        if let Plan::Empty { has_csc: false } = plan(&reader, input, memory_limit, framing)? {
+            log::info!(
+                "build-csc: {} is an empty matrix; no CSC sidecar to build",
+                input.display()
+            );
+            std::fs::copy(input, output)?;
+            return Ok(BuildCscOutcome::NoSidecar);
+        }
+    }
+
+    // A sibling temp file, so the rename is atomic and a failure leaves no
+    // partial output (the `TempPath` deletes itself on drop). No `remove_file`
+    // of an existing `output` first: the rename replaces it, and unlinking
+    // would only widen a window in which neither exists.
+    let (file, staging) = scx_format_io::make_sibling_tempfile(output)?;
+    drop(file);
+    std::fs::copy(input, &staging)?;
+    // `temp_dir: None` spills beside the staging file, i.e. in `output`'s
+    // directory.
+    let built = build_csc_in_place(
+        &staging,
+        memory_limit,
+        csc_cols_per_shard,
+        framing,
+        temp_dir,
+    )?;
+    staging.persist(output)?;
+    if built.outcome == BuildCscOutcome::Built {
+        println!(
+            "Built CSC: {} → {} ({} rows × {} cols, {} nnz, {} CSC shard{})",
+            input.display(),
+            output.display(),
+            built.n_rows,
+            built.n_cols,
+            built.nnz,
+            built.n_csc_shards,
+            if built.n_csc_shards == 1 { "" } else { "s" },
         );
     }
-
-    // 15. Check the staged catalog against the declared carry policy, then
-    //     finalize. Before `finish()`, not after: `finish()` renames over the
-    //     target, and `scx build-csc` with no `<OUTPUT>` makes that target the
-    //     input — so an audit afterwards could only report a loss it was too
-    //     late to stop.
-    crate::carry::audit_staged(
-        crate::carry::RewriteOp::BuildCsc,
-        &[reader.catalog()],
-        &writer,
-    )?;
-    writer.finish()?;
-    pb.finish_and_clear();
-
-    if n_csc_shards_written == 0 {
-        // A 0-column matrix with a stale sidecar: the column loop had nothing
-        // to emit, and the CLI reports "no CSC sidecar to build" from the
-        // outcome — printing "Built CSC … 0 CSC shards" here would contradict it.
-        return Ok(BuildCscOutcome::NoSidecar);
-    }
-    println!(
-        "Built CSC: {} → {} ({} rows × {} cols, {} nnz, {} CSC shard{})",
-        input.display(),
-        output.display(),
-        n_rows,
-        n_cols,
-        total_csc_nnz,
-        n_csc_shards_written,
-        if n_csc_shards_written == 1 { "" } else { "s" },
-    );
-
-    Ok(BuildCscOutcome::Built)
+    Ok(built.outcome)
 }
 
 #[cfg(test)]
@@ -789,15 +923,28 @@ mod tests {
         assert_eq!(got_csc.indices, want_csc.indices);
         assert_eq!(got_csc.data, want_csc.data);
 
-        // And the re-emitted CSR is the input's, in input row order.
-        let src = ScxReader::open(&pristine)
-            .unwrap()
-            .read_all_csr_shards()
-            .unwrap();
-        let re = got.read_all_csr_shards().unwrap();
-        assert_eq!(re.indptr, src.indptr);
-        assert_eq!(re.indices, src.indices);
-        assert_eq!(re.data, src.data);
+        // And the CSR is the input's own entries, untouched — stats-less one
+        // included. (While build-csc re-encoded the CSR, this decoded it back
+        // and compared; the append never writes a CSR entry, so the entries
+        // themselves are the stronger check, and `read_all_csr_shards` refuses
+        // a stats-less entry anyway.)
+        let csr = |r: &ScxReader| -> Vec<(String, u64, u64, [u8; 32], bool)> {
+            r.catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CsrShard)
+                .map(|e| {
+                    (
+                        e.name.clone(),
+                        e.offset,
+                        e.length,
+                        e.checksum,
+                        e.stats.is_some(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(csr(&got), csr(&ScxReader::open(&mixed).unwrap()));
     }
 
     /// build-csc is documented as preserving obs metadata, and a row-sharded
@@ -1477,3 +1624,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "build_csc_in_place_tests.rs"]
+mod in_place_tests;

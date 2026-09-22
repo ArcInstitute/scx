@@ -510,12 +510,11 @@ pub fn optimize_with_budget(
     // re-encodes every CSR shard above, and `compute_shard_stats` emits no
     // `column_stats` — so without this the index section survived and Level-1
     // shard pruning silently stopped, turning every `filter_obs` into a full scan
-    // that still returned the right rows. `build-csc` had the same defect and the
-    // same fix, and so does `upgrade` — three ops, not two. `build-csc` and
-    // `optimize` declare `Carry::Verbatim` for this family in their own match
-    // arms; `upgrade` reaches the same arm through `other => build_csc(other)`
-    // and re-emits every CSR shard too. Counting only the explicit arms is how
-    // the first pass missed it.
+    // that still returned the right rows. `upgrade` has the same defect and the
+    // same fix, and `build-csc` did until it became an in-place append that
+    // never rewrites a CSR entry. `upgrade` used to reach its `Verbatim` cell
+    // through an `other => build_csc(other)` delegation, which is how the first
+    // pass, counting only explicit arms, missed it.
     //
     // Carried from the input rather than re-derived from the index: optimize
     // preserves row order and CSR shard boundaries 1:1, so the input's stats are

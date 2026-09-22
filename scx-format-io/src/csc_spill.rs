@@ -26,10 +26,9 @@ use crate::error::ScxError;
 ///
 /// The default root is deliberately **not** `std::env::temp_dir()`, which is
 /// what `scx sort` and `scx convert` use. It is the output file's own
-/// directory, because that is where `ScxWriter` already stages a whole copy of
-/// the output (`make_sibling_tempfile`) and where `rebuild_csc_inplace` already
-/// stages a second copy of the input — so it is proven writable and sized for
-/// far more than a spill, which is at most ~8 B/nnz. Defaulting to `/tmp` would
+/// directory, because that is the filesystem the sidecar itself lands on —
+/// appended in place, or staged beside the output by the copy-out form — so it
+/// must already hold about as much as the spill, which is at most ~8 B/nnz. Defaulting to `/tmp` would
 /// fail a census-scale rebuild on any host with a small tmpfs, and on a host
 /// where `/tmp` *is* tmpfs the spill would count against RAM and silently
 /// defeat the memory bound the spill exists to provide.
