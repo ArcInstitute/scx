@@ -24,7 +24,9 @@ pub mod backed;
 #[cfg(feature = "deletion-vectors")]
 pub mod bitmap;
 pub mod categorical;
+pub mod csc_budget;
 pub mod csc_sidecar;
+pub mod csc_spill;
 #[cfg(feature = "deletion-vectors")]
 pub mod deletion_vectors;
 pub mod distinct;
@@ -64,8 +66,10 @@ pub use categorical::filter_codes_by_keep_mask;
 #[cfg(feature = "deletion-vectors")]
 pub use categorical::GlobalCategoryAccum;
 pub use csc_sidecar::{
-    pick_csc_encoding, write_csc_sidecar, CscSidecarOptions, DEFAULT_CSC_MEMORY_BYTES,
+    emit_csc_shards, pick_csc_encoding, write_csc_sidecar, CscEmitOptions, CscSidecarOptions,
+    CscSidecarStats, DEFAULT_CSC_MEMORY_BYTES,
 };
+pub use csc_spill::TempDirSpillStore;
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::DeletionVectors;
 pub use distinct::DistinctAccumulator;

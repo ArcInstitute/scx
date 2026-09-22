@@ -1,19 +1,29 @@
 // Shared CSR→CSC sidecar writer.
 //
-// The streaming CSR→CSC transpose-and-write loop used to be reimplemented at
-// four call sites across three crates (`pyscx`, `scx-convert` ×2, `rscx`),
-// each wrapping the shared `scx_sparse::streaming_csr_to_csc_iter_with_cap`
-// iterator with the same encode + `write_csc_shard` loop. This is the single
-// definition; all four delegate here.
+// The transpose-and-write loop used to exist three times: here, inline in
+// `scx-ops`' `run_build_csc` (which kept its own copy to drive a progress bar,
+// with a NOTE asking the two be kept in sync), and again inside
+// `ScxWriter::finish`'s finish-time auto-emit. [`emit_csc_shards`] is now the
+// single definition, and it is written against
+// [`scx_sparse::CscShardSource`] so the three callers differ only in where
+// their records come from and what they want told about each shard.
 //
-// Callers build their canonical `ScxCsr` shard(s) (the casting /
-// canonicalization preamble differs per source — e.g. the eager convert path
-// canonicalizes, the multimodal path trusts already-canonical modality data —
-// so it stays caller-side) and call `write_csc_sidecar`.
+// Two sources, both used:
+//
+//   * [`scx_sparse::ResidentCscSource`] for a caller that already holds the
+//     whole CSR — the four `write_csc_sidecar` callers do, from an eager h5ad
+//     ingest, a modality copy, GIL-owned `from_anndata` buffers or decoded R
+//     values. Pushing those through the builder's buckets would be a *second*
+//     copy at 8 B/nnz, roughly doubling the peak of an ingest path nothing
+//     gates.
+//   * [`scx_sparse::CscBuilder`] for a caller that decodes shard by shard and
+//     must not hold them all, which is `run_build_csc`'s 14.7 GB.
+//
+// Callers still build their canonical `ScxCsr` shard(s) — the casting and
+// canonicalization preamble differs per source, so it stays caller-side.
 
-use scx_codec::value_encoding::values_to_raw_bytes;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_sparse::{streaming_csr_to_csc_iter_with_cap, ScxCsr};
+use scx_sparse::{CscShardSource, ResidentCscSource, ScxCsr};
 
 use crate::encoder::FramingConfig;
 use crate::error::ScxError;
@@ -99,9 +109,101 @@ impl Default for CscSidecarOptions {
     }
 }
 
-/// Stream a CSR→CSC transpose over `csr_shards` and write the result as a CSC
-/// sidecar, one shard per chunk, via the writer. See [`CscSidecarOptions`]
-/// for what each option controls.
+/// Where an emitted shard is written, and under which encoding.
+///
+/// Separate from [`CscSidecarOptions`] because the push side and the emit side
+/// have different owners on the `build-csc` path: there the caller drives the
+/// shard walk and this drives the writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CscEmitOptions {
+    pub value_encoding: ValueEncoding,
+    pub codec_id: CodecId,
+    /// - `None` → single-modality file; [`ScxWriter::write_csc_shard`].
+    /// - `Some(id)` → [`ScxWriter::write_csc_shard_for`] under modality `id`.
+    pub modality_id: Option<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CscSidecarStats {
+    pub n_shards: u32,
+    pub total_nnz: u64,
+    /// Bytes the source spilled. Zero for a resident source, and the signal
+    /// that separates "bounded" from "bounded by thrashing" for a streamed one.
+    pub spill_bytes: u64,
+    /// See [`scx_sparse::CscBuilderStats::first_non_strict_column`].
+    pub first_non_strict_column: Option<usize>,
+}
+
+/// Drain a [`CscShardSource`] into the writer, one CSC section per shard.
+///
+/// `on_shard(index, col_start, nnz)` fires after each write. That callback is
+/// the whole reason `run_build_csc` can stop carrying its own copy of this
+/// loop: its NOTE said the copy existed "because it drives a progress bar per
+/// chunk".
+///
+/// Framing is **not** scoped here. [`write_csc_sidecar`] scopes it around the
+/// whole call, and `run_build_csc` sets it once for both its CSR re-emit and
+/// its CSC shards; scoping it a second time inside the drain would restore the
+/// writer's previous framing part-way through.
+pub fn emit_csc_shards(
+    writer: &mut ScxWriter,
+    source: &mut dyn CscShardSource,
+    opts: &CscEmitOptions,
+    mut on_shard: impl FnMut(u32, u64, u64),
+) -> Result<CscSidecarStats, ScxError> {
+    let (mut indptr, mut indices, mut data) = (Vec::new(), Vec::new(), Vec::new());
+    // One raw-value buffer for the whole drain. The predecessor allocated a
+    // fresh one per chunk via `values_to_raw_bytes`.
+    let mut raw_values: Vec<u8> = Vec::new();
+    let mut stats = CscSidecarStats::default();
+
+    loop {
+        let Some(col_start) = source
+            .next_shard_into(&mut indptr, &mut indices, &mut data)
+            .map_err(|e| ScxError::CscTranspose(e.to_string()))?
+        else {
+            break;
+        };
+        raw_values.clear();
+        opts.value_encoding
+            .encode_f32_into(&mut raw_values, &data)?;
+
+        match opts.modality_id {
+            Some(mid) => {
+                let shard = crate::writer::ShardBuffers::new(
+                    &indptr,
+                    &indices,
+                    &raw_values,
+                    opts.codec_id,
+                    opts.value_encoding,
+                );
+                writer.write_csc_shard_for(mid, col_start, shard)?;
+            }
+            None => writer.write_csc_shard(
+                &indptr,
+                &indices,
+                &raw_values,
+                opts.codec_id,
+                opts.value_encoding,
+                col_start,
+            )?,
+        }
+        on_shard(stats.n_shards, col_start, data.len() as u64);
+        stats.n_shards += 1;
+        stats.total_nnz += data.len() as u64;
+    }
+
+    let src = source.stats();
+    stats.spill_bytes = src.spilled_bytes;
+    stats.first_non_strict_column = src.first_non_strict_column;
+    Ok(stats)
+}
+
+/// Transpose `csr_shards` and write the result as a CSC sidecar.
+///
+/// For a caller that already holds the whole CSR; see the module header for
+/// why that does not go through [`scx_sparse::CscBuilder`]. See
+/// [`CscSidecarOptions`] for what each option controls.
 ///
 /// `csr_shards` must already be canonical — this helper does not
 /// sort/dedup/drop-zeros (callers do so upstream when their source requires
@@ -129,7 +231,7 @@ pub fn write_csc_sidecar(
         &opts,
     );
     writer.set_framing(prev_framing);
-    result
+    result.map(|_| ())
 }
 
 fn write_csc_sidecar_inner(
@@ -140,66 +242,27 @@ fn write_csc_sidecar_inner(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     opts: &CscSidecarOptions,
-) -> Result<(), ScxError> {
-    let mut iter = streaming_csr_to_csc_iter_with_cap(
+) -> Result<CscSidecarStats, ScxError> {
+    let mut source = ResidentCscSource::new(
         csr_shards,
         n_obs,
         n_vars,
-        opts.memory_budget_bytes,
         opts.cols_per_shard,
+        opts.memory_budget_bytes,
     )
     .map_err(|e| ScxError::CscTranspose(e.to_string()))?;
-
-    let modality_id = opts.modality_id;
-
-    loop {
-        let col_start = iter.current_col_start() as u64;
-        let chunk = match iter.next() {
-            Some(c) => c.map_err(|e| ScxError::CscTranspose(e.to_string()))?,
-            None => break,
-        };
-
-        // The transpose yields non-negative offsets/row-indices for valid CSR;
-        // assert it in debug builds before the unchecked widening casts (a
-        // negative would silently wrap). Release builds trust the contract.
-        debug_assert!(
-            chunk.indptr.iter().all(|&v| v >= 0),
-            "CSC chunk indptr must be non-negative before u64 cast"
-        );
-        debug_assert!(
-            chunk.indices.iter().all(|&i| i >= 0),
-            "CSC chunk indices must be non-negative before u32 cast"
-        );
-        let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
-        let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-        let raw_values = values_to_raw_bytes(&chunk.data, value_encoding)?;
-
-        let shard = crate::writer::ShardBuffers::new(
-            &csc_indptr_u64,
-            &csc_indices_u32,
-            &raw_values,
-            codec_id,
-            value_encoding,
-        );
-
-        match modality_id {
-            Some(mid) => writer.write_csc_shard_for(mid, col_start, shard)?,
-            None => writer.write_csc_shard(
-                &csc_indptr_u64,
-                &csc_indices_u32,
-                &raw_values,
-                codec_id,
-                value_encoding,
-                col_start,
-            )?,
-        }
-    }
-    Ok(())
+    let emit = CscEmitOptions {
+        value_encoding,
+        codec_id,
+        modality_id: opts.modality_id,
+    };
+    emit_csc_shards(writer, &mut source, &emit, |_, _, _| {})
 }
 
 #[cfg(test)]
 mod tests {
     use super::pick_csc_encoding;
+    use scx_codec::value_encoding::values_to_raw_bytes;
     use scx_codec::{CodecId, ValueEncoding};
 
     /// SCX-004 itself: the encoding must cover every shard, so one float shard
@@ -272,6 +335,94 @@ mod tests {
 
     /// Round-trip a small 3×3 canonical CSR through `write_csc_sidecar` and
     /// read the CSC sidecar back, checking the column-major transpose.
+    /// Every column must be covered by exactly one emitted shard, including
+    /// columns no row touches.
+    ///
+    /// Two failure modes this guards, both silent. `BackedCscIndex`'s
+    /// `shard_for_col` and `shards_for_col_range` binary-search a tiling they
+    /// assume is sorted, contiguous and non-overlapping, so a skipped
+    /// zero-nnz shard makes those columns answer `None` — a read that quietly
+    /// returns nothing rather than erroring. And `from_catalog` **drops** any
+    /// entry whose `stats` is absent, so a shard that reached disk without
+    /// stats would be invisible to the reader while `n_csc_shards` still
+    /// counted it.
+    #[test]
+    fn all_zero_column_runs_still_get_their_own_shards() {
+        // 4 x 9. Columns 0-2 and 5-8 are entirely empty: a leading run, an
+        // interior run and a trailing one, so a shard can be skipped at either
+        // end or in the middle.
+        let csr = ScxCsr::new(
+            (4, 9),
+            vec![0, 1, 2, 3, 4],
+            vec![3, 4, 3, 4],
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse_cols.scx");
+        let header = FileHeader::new_single_modality(4, 9, 4, 16384, CodecId::None as u8, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        let raw = values_to_raw_bytes(&csr.data, ValueEncoding::Uint8).unwrap();
+        writer
+            .write_csr_shard(
+                &csr.indptr.iter().map(|&v| v as u64).collect::<Vec<_>>(),
+                &csr.indices.iter().map(|&v| v as u32).collect::<Vec<_>>(),
+                &raw,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        write_csc_sidecar(
+            &mut writer,
+            std::slice::from_ref(&csr),
+            4,
+            9,
+            ValueEncoding::Uint8,
+            CodecId::None,
+            CscSidecarOptions {
+                cols_per_shard: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let final_path = writer.finish().unwrap();
+
+        let reader = ScxReader::open(&final_path).unwrap();
+        // ceil(9 / 2) = 5 shards, three of which hold no nonzeros at all.
+        assert_eq!(reader.header().n_csc_shards, 5);
+        let index = crate::backed::BackedCscIndex::from_catalog(reader.catalog());
+        assert_eq!(
+            index.n_shards(),
+            reader.header().n_csc_shards as usize,
+            "a CSC entry without stats is dropped by from_catalog and would be \
+             invisible to every read"
+        );
+        for c in 0..9u64 {
+            assert!(
+                index.shard_for_col(c).is_some(),
+                "column {c} is in no shard's range"
+            );
+        }
+        // Contiguous, ascending, non-overlapping — what the binary searches
+        // above assume.
+        let mut expect_lo = 0u64;
+        for s in 0..index.n_shards() {
+            let (lo, hi) = index.shard_col_range(s).expect("range");
+            assert_eq!(
+                lo, expect_lo,
+                "shard {s} starts at {lo}, expected {expect_lo}"
+            );
+            assert!(hi > lo, "shard {s} is empty-width");
+            expect_lo = hi;
+        }
+        assert_eq!(expect_lo, 9);
+
+        let csc = reader.read_all_csc_shards_for(0).unwrap();
+        assert_eq!(csc.to_dense().unwrap(), csr.to_dense().unwrap());
+    }
+
     #[test]
     fn write_csc_sidecar_round_trips_single_modality() {
         // CSR (3 rows × 3 cols):

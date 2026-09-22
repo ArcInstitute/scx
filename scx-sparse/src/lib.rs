@@ -11,9 +11,9 @@ pub mod validate;
 pub use convert::{csr_to_dense, dense_to_csr};
 pub use csc::{CscError, ScxCsc};
 pub use csc_builder::{
-    CscBuilder, CscBuilderConfig, CscBuilderError, CscBuilderStats, CscEmitter, CscShardSpec,
-    MemSpillStore, NoSpillStore, SpillStore, DEFAULT_BLOCK_BYTES, DEFAULT_TARGET_BUCKETS,
-    MAX_BUCKETS, SPILL_BYTES_PER_NNZ,
+    CscBuilder, CscBuilderConfig, CscBuilderError, CscBuilderStats, CscEmitter, CscShardSource,
+    CscShardSpec, MemSpillStore, NoSpillStore, ResidentCscSource, SpillStore, DEFAULT_BLOCK_BYTES,
+    DEFAULT_TARGET_BUCKETS, MAX_BUCKETS, SPILL_BYTES_PER_NNZ,
 };
 pub use csr::{
     concatenate_csr, finalize_implicit_zero_variance, implicit_zero_count,

@@ -307,6 +307,35 @@ proptest! {
         prop_assert!(nnz == 0 || s_always.spilled_bytes > 0);
         prop_assert!(s_partial.spilled_bytes <= s_always.spilled_bytes);
     }
+
+    /// The resident source and the pushed one must be indistinguishable.
+    ///
+    /// They exist separately because an eager caller already holds the CSR and
+    /// bucketing it would be a second copy — but that is a *memory* argument,
+    /// and it buys nothing if the two can disagree about bytes. This is the
+    /// test that makes keeping both honest; without it they are two
+    /// implementations rather than two sources.
+    #[test]
+    fn the_resident_and_pushed_sources_agree(
+        (n_rows, n_cols, shards) in arb_shards(),
+        cols_per_shard in 1usize..=16,
+        budget_cols in 1usize..=20,
+    ) {
+        let memory_bytes = n_rows * 12 * budget_cols;
+        let pushed = run(
+            &shards, n_rows, n_cols,
+            CscBuilderConfig { block_bytes: 8, ..cfg(cols_per_shard, memory_bytes, 0) },
+        ).expect("pushed");
+
+        let mut src = ResidentCscSource::new(&shards, n_rows, n_cols, cols_per_shard, memory_bytes)
+            .expect("resident");
+        let (mut ip, mut ix, mut dt) = (Vec::new(), Vec::new(), Vec::new());
+        let mut resident = Vec::new();
+        while let Some(col_start) = src.next_shard_into(&mut ip, &mut ix, &mut dt).expect("emit") {
+            resident.push((col_start, to_csc_arrays(n_rows, &ip, &ix, &dt)));
+        }
+        assert_same(&resident, &pushed);
+    }
 }
 
 // ---------------------------------------------------------------------------

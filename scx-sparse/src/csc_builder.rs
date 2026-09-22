@@ -637,6 +637,195 @@ impl CscBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// The emit contract
+// ---------------------------------------------------------------------------
+
+/// Something that yields a file's CSC shards, left to right, at on-disk widths.
+///
+/// Two implementations, because a caller that already holds the whole CSR and
+/// one that can only be pushed to have genuinely different best answers:
+///
+/// * [`ResidentCscSource`] — the CSR is already in RAM (an eager h5ad ingest,
+///   a `from_anndata` handing over GIL-owned copies, an R data frame). Routing
+///   it through buckets would be a **second** copy at 8 B/nnz, roughly doubling
+///   the peak of an ingest path that nothing gates. It scatters straight out of
+///   the resident shards instead.
+/// * [`CscEmitter`] — the source is a stream. Buckets are what buy the single
+///   pass, and the spill is what bounds the memory.
+///
+/// One planner, one `indptr` construction and one writer loop above them; only
+/// the record source differs. A differential test pins the two equal.
+pub trait CscShardSource {
+    /// Every shard this source will produce, in order, with exact nnz.
+    fn plan(&self) -> &[CscShardSpec];
+
+    /// Rows every emitted shard spans.
+    fn n_rows(&self) -> usize;
+
+    /// Fill the buffers with the next shard at **on-disk** widths and return
+    /// its `col_start`, or `None` when the plan is drained.
+    ///
+    /// On-disk widths rather than [`CscArrays`]' `i64`/`i32`: the predecessor's
+    /// caller rebuilt `csc_indptr_u64` and `csc_indices_u32` from every chunk,
+    /// two full-length copies per shard that the allocation table names as a
+    /// reason the CSC budget row could not be enforced.
+    fn next_shard_into(
+        &mut self,
+        indptr: &mut Vec<u64>,
+        indices: &mut Vec<u32>,
+        data: &mut Vec<f32>,
+    ) -> Result<Option<u64>, CscBuilderError>;
+
+    fn stats(&self) -> CscBuilderStats;
+}
+
+/// Emit CSC shards from a CSR that is already entirely resident.
+///
+/// This is the predecessor's `transpose_column_chunk` with the count pass
+/// **hoisted out of the per-shard loop**: `nnz + n_shards * nnz` instead of
+/// `2 * n_shards * nnz`, same bytes, same peak. It keeps the eager callers off
+/// the bucket path, where their already-resident CSR would be copied a second
+/// time.
+pub struct ResidentCscSource<'a> {
+    shards: &'a [ScxCsr],
+    n_rows: usize,
+    col_counts: Vec<u64>,
+    plan: Vec<CscShardSpec>,
+    next: usize,
+    nnz: u64,
+}
+
+impl<'a> ResidentCscSource<'a> {
+    pub fn new(
+        shards: &'a [ScxCsr],
+        n_rows: usize,
+        n_cols: usize,
+        cols_per_shard: usize,
+        memory_bytes: usize,
+    ) -> Result<Self, CscBuilderError> {
+        if n_rows > i32::MAX as usize {
+            return Err(CscBuilderError::RowCountOverflow(n_rows));
+        }
+        for shard in shards {
+            if shard.shape.1 != n_cols {
+                return Err(CscBuilderError::ShapeMismatch {
+                    shard_cols: shard.shape.1,
+                    expected_cols: n_cols,
+                });
+            }
+        }
+        // Identical to the builder's, and to the predecessor's.
+        let shard_cols = compute_chunk_cols_with_cap(n_rows, memory_bytes, cols_per_shard)?;
+
+        // The one count pass. The predecessor ran this per chunk, range-testing
+        // every nonzero each time, which is half of its `2 * nnz * n_chunks`.
+        let mut col_counts = vec![0u64; n_cols];
+        let mut nnz = 0u64;
+        for shard in shards {
+            for &col in &shard.indices {
+                let col = col as usize;
+                if col >= n_cols {
+                    return Err(CscBuilderError::ColumnOutOfRange { col, n_cols });
+                }
+                col_counts[col] += 1;
+                nnz += 1;
+            }
+        }
+
+        let n_shards = n_cols.div_ceil(shard_cols);
+        let mut plan = Vec::with_capacity(n_shards);
+        for s in 0..n_shards {
+            let lo = s.saturating_mul(shard_cols).min(n_cols);
+            let hi = lo.saturating_add(shard_cols).min(n_cols);
+            plan.push(CscShardSpec {
+                col_start: lo,
+                col_end: hi,
+                nnz: col_counts[lo..hi].iter().sum(),
+            });
+        }
+        Ok(Self {
+            shards,
+            n_rows,
+            col_counts,
+            plan,
+            next: 0,
+            nnz,
+        })
+    }
+}
+
+impl CscShardSource for ResidentCscSource<'_> {
+    fn plan(&self) -> &[CscShardSpec] {
+        &self.plan
+    }
+
+    fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    fn next_shard_into(
+        &mut self,
+        indptr: &mut Vec<u64>,
+        indices: &mut Vec<u32>,
+        data: &mut Vec<f32>,
+    ) -> Result<Option<u64>, CscBuilderError> {
+        let Some(&spec) = self.plan.get(self.next) else {
+            return Ok(None);
+        };
+        self.next += 1;
+        let (c0, c1) = (spec.col_start, spec.col_end);
+
+        indptr.clear();
+        indptr.push(0u64);
+        let mut cumsum = 0u64;
+        for c in c0..c1 {
+            cumsum += self.col_counts[c];
+            indptr.push(cumsum);
+        }
+        let nnz = cumsum as usize;
+        indices.clear();
+        indices.resize(nnz, 0u32);
+        data.clear();
+        data.resize(nnz, 0.0f32);
+        let mut cursor = vec![0u64; c1 - c0];
+
+        // Shards in order, rows in order, positions in order — the scan order
+        // the predecessor's comment names, and the reason each column comes out
+        // strictly increasing in row without a sort.
+        let mut row_offset: usize = 0;
+        for shard in self.shards {
+            let shard_n_rows = shard.n_rows();
+            for row in 0..shard_n_rows {
+                let start = shard.indptr[row] as usize;
+                let end = shard.indptr[row + 1] as usize;
+                for j in start..end {
+                    let col = shard.indices[j] as usize;
+                    if col >= c0 && col < c1 {
+                        let lc = col - c0;
+                        let dest = (indptr[lc] + cursor[lc]) as usize;
+                        indices[dest] = (row_offset + row) as u32;
+                        data[dest] = shard.data[j];
+                        cursor[lc] += 1;
+                    }
+                }
+            }
+            row_offset += shard_n_rows;
+        }
+        Ok(Some(c0 as u64))
+    }
+
+    fn stats(&self) -> CscBuilderStats {
+        CscBuilderStats {
+            nnz: self.nnz,
+            n_buckets: 0,
+            peak_in_memory_bytes: 0,
+            spilled_bytes: 0,
+            first_non_strict_column: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Emitter
 // ---------------------------------------------------------------------------
 
@@ -671,17 +860,11 @@ impl CscEmitter {
         &self.stats
     }
 
-    /// Fill `indptr`/`indices`/`data` with the next shard at **on-disk**
-    /// widths, returning its `col_start`, or `None` when the plan is drained.
+    /// See [`CscShardSource::next_shard_into`].
     ///
-    /// On-disk widths rather than [`crate::CscArrays`]' `i64`/`i32`: the
-    /// predecessor's caller rebuilt `csc_indptr_u64` and `csc_indices_u32` from
-    /// every chunk, two full-length copies per shard that the allocation table
-    /// names as a reason the CSC budget row could not be enforced.
-    ///
-    /// The caller's buffers are swapped in, not appended to, so their previous
-    /// allocations are recycled rather than reused — the saving here is the
-    /// copy, not the allocation.
+    /// The caller's buffers are moved into, not appended to, so their previous
+    /// allocations are released rather than reused — what this saves is the
+    /// width conversion, not the allocation.
     pub fn next_shard_into(
         &mut self,
         indptr: &mut Vec<u64>,
@@ -814,6 +997,26 @@ impl CscEmitter {
     /// Total columns across the plan.
     pub fn n_cols(&self) -> usize {
         self.n_cols
+    }
+}
+
+impl CscShardSource for CscEmitter {
+    fn plan(&self) -> &[CscShardSpec] {
+        CscEmitter::plan(self)
+    }
+    fn n_rows(&self) -> usize {
+        CscEmitter::n_rows(self)
+    }
+    fn next_shard_into(
+        &mut self,
+        indptr: &mut Vec<u64>,
+        indices: &mut Vec<u32>,
+        data: &mut Vec<f32>,
+    ) -> Result<Option<u64>, CscBuilderError> {
+        CscEmitter::next_shard_into(self, indptr, indices, data)
+    }
+    fn stats(&self) -> CscBuilderStats {
+        CscEmitter::stats(self).clone()
     }
 }
 
