@@ -42,7 +42,8 @@ pub use append::{
     AppendOptions,
 };
 pub use build_csc::{
-    rebuild_csc_inplace, run_build_csc, BuildCscOutcome, DEFAULT_CSC_MEMORY_LIMIT,
+    build_csc_for_policy, rebuild_csc_inplace, run_build_csc, BuildCscOutcome,
+    DEFAULT_CSC_MEMORY_LIMIT,
 };
 pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
 pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};

@@ -1742,12 +1742,51 @@ impl DrainJob<'_> {
             }
             Ok(())
         };
+        // A spilled bucket's drain holds its store reader — a file, for the
+        // disk store — for the whole walk, and a parallel emit drains many
+        // buckets at once. The permit caps how many do so concurrently, so the
+        // descriptor count stays a constant rather than growing with the pool.
+        let _permit = (store.spilled_bytes(b) > 0).then(SpillReadPermit::acquire);
         drain_bucket(store, self.bucket, b, max_records, &mut scatter)?;
         debug_assert!(
             (col_lo..col_hi).all(|c| cursor[c - col_lo] == col_counts[c]),
             "bucket {b} left a column short of its counted slots"
         );
         Ok(())
+    }
+}
+
+/// Spilled buckets that may be read back at once, across every builder in the
+/// process. The serial drain read one at a time; the parallel one would read
+/// one per rayon worker, which on a large machine outgrows a small
+/// `ulimit -n` — the failure `TempDirSpillStore`'s one-descriptor design
+/// exists to rule out. Eight keeps the drains overlapped without that.
+pub const MAX_CONCURRENT_SPILL_READS: usize = 8;
+
+static SPILL_READS: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// One of [`MAX_CONCURRENT_SPILL_READS`] slots, released on drop.
+struct SpillReadPermit;
+
+impl SpillReadPermit {
+    fn acquire() -> Self {
+        let (lock, cvar) = &SPILL_READS;
+        let mut n = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while *n >= MAX_CONCURRENT_SPILL_READS {
+            n = cvar.wait(n).unwrap_or_else(|p| p.into_inner());
+        }
+        *n += 1;
+        SpillReadPermit
+    }
+}
+
+impl Drop for SpillReadPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &SPILL_READS;
+        let mut n = lock.lock().unwrap_or_else(|p| p.into_inner());
+        *n -= 1;
+        cvar.notify_one();
     }
 }
 

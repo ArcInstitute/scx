@@ -500,7 +500,7 @@ fn from_h5ad(
     }
     let csc = scx_engine::index::resolve_csc_policy(csc);
     let csc_policy =
-        scx_format_io::CscPolicy::parse(&csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        scx_format_io::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = convert::parse_uns_format(uns_format)?;
     let shard_target_rows =
         resolve_shard_size(shard_size, scx_format_io::DEFAULT_SHARD_TARGET_ROWS)?;
@@ -755,7 +755,7 @@ fn from_h5mu(
         codec,
         shard_size,
         shard_obs,
-        &csc,
+        csc,
         csc_cols_per_shard,
         stream,
         strict_uns,
@@ -1005,10 +1005,18 @@ fn from_mudata(
 /// rounding, with a warning, and is named after the read path's `allow_lossy`
 /// for the same reason.
 ///
+/// `csc` / `csc_cols_per_shard` as for `from_anndata`: `csc=None` is `"auto"`,
+/// a CSC sidecar when `n_obs >= 50000` and `n_vars >= 5000`, appended to the
+/// written file in place (the MTX reader writes CSR only); `"off"` opts out.
+///
 /// Example:
 ///     pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
 #[pyfunction]
-#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto", allow_lossy=false))]
+#[pyo3(signature = (
+    mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto", allow_lossy=false,
+    csc=None, csc_cols_per_shard=5000,
+))]
+#[allow(clippy::too_many_arguments)]
 fn from_mtx(
     py: Python<'_>,
     mtx_dir: &str,
@@ -1017,7 +1025,11 @@ fn from_mtx(
     shard_size: Option<u32>,
     shard_obs: &str,
     allow_lossy: bool,
+    csc: Option<&str>,
+    csc_cols_per_shard: usize,
 ) -> PyResult<()> {
+    let csc_policy = scx_format_io::CscPolicy::parse(scx_engine::index::resolve_csc_policy(csc))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let obs_shard_policy =
         scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
     let orientation = scx_mtx::mtx_to_scx(
@@ -1030,6 +1042,17 @@ fn from_mtx(
         allow_lossy,
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    py.detach(|| {
+        scx_ops::build_csc_for_policy(
+            std::path::Path::new(scx_path),
+            csc_policy,
+            csc_cols_per_shard,
+            None,
+            None,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .map_err(PyRuntimeError::new_err)?;
 
     if allow_lossy {
         crate::pyimport::import_module(py, "warnings")?.call_method1(

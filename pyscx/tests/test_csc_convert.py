@@ -162,13 +162,26 @@ def test_explicit_csc_off_overrides_preset(small_adata, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _csc_preset_entry_points():
-    """Every native pyscx function taking both `csc` and `index_preset`.
+# `from_mudata` keeps csc="off" on purpose: it cannot build per-modality
+# sidecars (it refuses "always" and degrades "auto"), so the ingest default
+# would buy nothing there. Named, so it is the one exclusion and not a gap.
+_CSC_OFF_BY_DESIGN = frozenset({"from_mudata"})
+
+_MISSING = object()
+
+
+def _ingest_entry_points():
+    """Every native pyscx `from_*` ingest function, mapped to its `csc` default
+    (`_MISSING` when it takes no `csc` at all).
+
+    Keyed on the `from_*` name rather than on the parameters an entry point
+    happens to take: an earlier version selected functions taking both `csc`
+    and `index_preset`, which by construction could not see an ingest function
+    missing `csc` — `from_mtx` was exactly that, CSR-only on any size.
 
     Introspects the extension module, NOT the `pyscx` package: `from_h5ad`
     and `from_h5mu` are re-wrapped in ``__init__.py`` as ``(path, out,
-    **kwargs)``, so at package level their real parameters are invisible and
-    this guard would silently cover 2 of 4.
+    **kwargs)``, so at package level their real parameters are invisible.
     """
     import inspect
 
@@ -176,17 +189,13 @@ def _csc_preset_entry_points():
 
     found = {}
     for name in dir(native):
-        if name.startswith("_"):
+        if not name.startswith("from_") or name in _CSC_OFF_BY_DESIGN:
             continue
         obj = getattr(native, name)
         if not callable(obj):
             continue
-        try:
-            params = inspect.signature(obj).parameters
-        except (TypeError, ValueError):
-            continue
-        if "csc" in params and "index_preset" in params and name not in _REWRITE_OPS:
-            found[name] = params["csc"].default
+        params = inspect.signature(obj).parameters
+        found[name] = params["csc"].default if "csc" in params else _MISSING
     return found
 
 
@@ -213,25 +222,28 @@ def test_the_rewrite_ops_excluded_above_are_the_carry_kind():
         assert params["csc"].default == expected, (name, params["csc"].default)
 
 
-def test_every_preset_aware_entry_point_defaults_csc_to_none():
+def test_every_ingest_entry_point_defaults_csc_to_none():
     """`csc` must default to None on every ingest entry point.
 
     A non-None default (e.g. `"off"`) is indistinguishable from a caller
     who explicitly asked for it, so `resolve_csc_policy` never supplies
     the shared "auto" default and the entry point diverges from its
-    siblings with no error. (The discovery keys on `index_preset` because
-    that is what marks the ingest entry points apart from the rewrite ops.)
+    siblings with no error. An entry point with no `csc` at all is the same
+    divergence with no way for the caller to fix it.
     """
-    entry_points = _csc_preset_entry_points()
+    entry_points = _ingest_entry_points()
 
-    # Guard the guard: if discovery finds nothing (module renamed, kwargs
-    # dropped), the assertion below would pass vacuously.
-    assert entry_points, (
-        "no native pyscx function takes both `csc` and `index_preset` — "
-        "discovery is broken, not the surface"
-    )
+    # Guard the guard: the five ingest entry points must all be discovered,
+    # or the assertion below passes over the ones it missed.
+    assert {"from_anndata", "from_h5ad", "from_h5mu", "from_10x", "from_mtx"} <= set(
+        entry_points
+    ), f"discovery is broken, not the surface: found {sorted(entry_points)}"
 
-    offenders = {n: d for n, d in entry_points.items() if d is not None}
+    offenders = {
+        n: ("<no csc parameter>" if d is _MISSING else d)
+        for n, d in entry_points.items()
+        if d is not None
+    }
     assert not offenders, (
         f"these ingest entry points pin a non-None `csc` default, so the "
         f"shared csc='auto' default can never apply: "
@@ -300,7 +312,7 @@ def _pyfunction_blocks():
     return blocks
 
 
-def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
+def test_every_ingest_entry_point_calls_resolve_csc_policy():
     """`csc=None` is necessary but not sufficient — resolution must run.
 
     Declaring `csc=None` only makes the shared default *possible*. An entry
@@ -308,17 +320,17 @@ def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
     a default of its own, would satisfy the signature guard above and
     silently opt out of the "auto" default its siblings have.
 
-    So assert the other half at the source: every `#[pyfunction]` whose
-    pyo3 signature carries both `csc` and `index_preset` must call
-    `resolve_csc_policy` in its body.
+    So assert the other half at the source: every `from_*` `#[pyfunction]`
+    except the `_CSC_OFF_BY_DESIGN` ones must call `resolve_csc_policy` in
+    its body.
 
     The body is brace-matched and comment-stripped, so a `resolve_csc_policy`
     mention in a neighbouring function's rustdoc or in a comment cannot
     stand in for a real call.
 
     Scope, stated so it is not over-trusted: this reads `src/lib.rs` only,
-    where all four conversion entry points live today. A preset-aware
-    entry point added in another module would escape *this* test — the
+    where all five ingest entry points live today. One added in another
+    module would escape *this* test — the
     runtime signature guard above is the one that covers any module,
     because it introspects the built extension rather than a file.
     """
@@ -332,18 +344,17 @@ def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
     overrun = [n for n, _, body in blocks if "#[pyfunction]" in body]
     assert not overrun, f"brace matching ran past the end of: {overrun}"
 
-    preset_aware = [
+    ingest = [
         (name, body)
-        for name, sig, body in blocks
-        if "csc=" in sig and "index_preset=" in sig
+        for name, _sig, body in blocks
+        if name.startswith("from_") and name not in _CSC_OFF_BY_DESIGN
     ]
-    assert preset_aware, (
-        "found no #[pyfunction] taking both `csc` and `index_preset` — "
-        "discovery is broken, not the surface"
-    )
+    assert {"from_anndata", "from_h5ad", "from_h5mu", "from_10x", "from_mtx"} <= {
+        n for n, _ in ingest
+    }, f"discovery is broken, not the surface: found {[n for n, _ in ingest]}"
 
     # `resolve_csc_policy(` — a call, not a bare mention.
-    missing = [n for n, body in preset_aware if "resolve_csc_policy(" not in body]
+    missing = [n for n, body in ingest if "resolve_csc_policy(" not in body]
     assert not missing, (
         f"these ingest entry points never call `resolve_csc_policy`, so an "
         f"unset `csc` does not get the shared 'auto' default: {missing}."

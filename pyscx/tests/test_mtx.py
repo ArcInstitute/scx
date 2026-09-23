@@ -285,3 +285,41 @@ def test_to_mtx_rejects_a_modality_on_a_single_modality_file(tmp_path):
     pyscx.from_mtx(str(mtx_dir), str(scx_path))
     with pytest.raises(RuntimeError, match="single-modality"):
         pyscx.to_mtx(str(scx_path), str(tmp_path / "out"), modality="rna")
+
+
+def _mtx_fixture(tmp_path):
+    mtx_dir = tmp_path / "mtx_csc"
+    mtx_body = (
+        "%%MatrixMarket matrix coordinate integer general\n"
+        "4 3 5\n"
+        "1 2 3\n"
+        "2 1 1\n"
+        "2 3 4\n"
+        "3 3 5\n"
+        "4 1 2\n"
+    )
+    barcodes = ["AAACCCAA-1", "BBBDDDBB-1", "CCCEEECC-1"]
+    features = [(f"ENSG00{i}", f"Gene{i}") for i in range(4)]
+    write_cellranger_mtx(mtx_dir, mtx_body, barcodes, features)
+    return mtx_dir
+
+
+@pytest.mark.parametrize("csc, expected", [(None, True), ("off", False), ("always", True)])
+def test_from_mtx_follows_the_ingest_csc_default(tmp_path, monkeypatch, csc, expected):
+    """`from_mtx` resolves `csc` like every other ingest entry point: unset
+    is "auto" (the thresholds lowered to 0 so the tiny fixture clears it),
+    "off" opts out, "always" builds regardless. It once took no `csc` at
+    all and was CSR-only on any size."""
+    monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
+    monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
+    out = str(tmp_path / f"out_{csc}.scx")
+    kwargs = {} if csc is None else {"csc": csc}
+    pyscx.from_mtx(str(_mtx_fixture(tmp_path)), out, csc_cols_per_shard=2, **kwargs)
+    assert pyscx.open(out).has_csc is expected
+
+
+def test_from_mtx_auto_skips_below_the_threshold(tmp_path):
+    """At the default thresholds a 3 x 4 matrix gets no sidecar."""
+    out = str(tmp_path / "out.scx")
+    pyscx.from_mtx(str(_mtx_fixture(tmp_path)), out)
+    assert pyscx.open(out).has_csc is False

@@ -2170,6 +2170,8 @@ fn run_convert(
                 csc_policy,
                 csc_cols_per_shard,
                 allow_lossy,
+                memory_budget,
+                temp_dir.as_deref(),
             );
         }
         "scx_to_mtx" => return dispatch_scx_to_mtx(input, output, modality, force),
@@ -2678,8 +2680,21 @@ fn dispatch_mtx_to_scx(
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
     allow_lossy: bool,
+    memory_budget: Option<&str>,
+    temp_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::mtx_pipeline;
+    // `--memory-budget` reaches the sidecar build as its memory limit, through
+    // the same `csc_sidecar_bytes` streaming ingest uses — so a budget bounds
+    // the emit here too, and the shard widths match what a streaming
+    // conversion under the same budget would write. Parsed before any I/O.
+    let csc_memory_limit = memory_budget
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| -> Result<String, Box<dyn std::error::Error>> {
+            let bytes = scx_format_io::MemoryBudget::parse(s)?;
+            Ok(convert::csc_sidecar_bytes(Some(bytes)).to_string())
+        })
+        .transpose()?;
     use indicatif::{ProgressBar, ProgressStyle};
 
     let pb = ProgressBar::new_spinner();
@@ -2717,30 +2732,17 @@ fn dispatch_mtx_to_scx(
         );
     }
 
-    // MTX conversion is delegated to the standalone `scx-mtx` crate,
-    // which doesn't know about CSC. When the policy resolves to build,
-    // append the sidecar to the just-written file in place — one extra read
-    // pass, no second copy of the file, and without modifying scx-mtx. `Auto`
-    // reads back the just-written header for the shape (scx-mtx doesn't
-    // return it to the caller).
-    let build_csc = match csc_policy {
-        convert::CscPolicy::Off => false,
-        convert::CscPolicy::Always => true,
-        convert::CscPolicy::Auto => {
-            let reader = scx_format_io::ScxReader::open(output)?;
-            let header = reader.header();
-            csc_policy.should_build_csc(header.n_obs, header.n_vars)
-        }
-    };
-    if build_csc {
-        scx_ops::rebuild_csc_inplace(
-            output,
-            csc_cols_per_shard,
-            None,
-            scx_ops::framing_for_csc_rebuild(output),
-            None,
-        )?;
-    }
+    // MTX conversion is delegated to the standalone `scx-mtx` crate, which
+    // doesn't know about CSC, so the sidecar is appended to the just-written
+    // file in place when the policy builds one — one extra read pass, no
+    // second copy of the file. Shared with `pyscx.from_mtx`.
+    scx_ops::build_csc_for_policy(
+        output,
+        csc_policy,
+        csc_cols_per_shard,
+        csc_memory_limit.as_deref(),
+        temp_dir,
+    )?;
 
     println!("Converted {} -> {}", input.display(), output.display());
     Ok(())

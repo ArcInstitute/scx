@@ -2,14 +2,21 @@
 //
 // The builder hands over whole blocks (1 MiB by default) in stream order and
 // reads each bucket back exactly once, sequentially, so this store keeps **one
-// file handle open at a time** and creates a bucket's file lazily on its first
-// append. Both matter:
+// file handle open per operation** — per append, and per bucket being read
+// back — and creates a bucket's file lazily on its first append. Both matter:
 //
-//   * One handle is why there is no descriptor cap here and no `RLIMIT_NOFILE`
-//     probe anywhere. `scx-convert/src/h5ad/csc_stream.rs` opens one
-//     `BufWriter<File>` per bucket and holds them all for a whole pass, which
-//     is 11,922 descriptors at 50M cells against a default `ulimit -n` of
-//     1024; that shape simply is not reachable from a blocked append.
+//   * One handle per *operation* is why there is no descriptor cap here and
+//     no `RLIMIT_NOFILE` probe anywhere. `scx-convert/src/h5ad/csc_stream.rs`
+//     opens one `BufWriter<File>` per bucket and holds them all for a whole
+//     pass, which is 11,922 descriptors at 50M cells against a default
+//     `ulimit -n` of 1024; that shape simply is not reachable from a blocked
+//     append. Appends are serialised (the parallel push holds the store behind
+//     a mutex), so the push opens one file at a time. The parallel emit drains
+//     buckets concurrently and each drain holds its bucket's reader, so the
+//     builder caps concurrent spill reads at
+//     `scx_sparse::MAX_CONCURRENT_SPILL_READS` (8): a constant, never the
+//     rayon pool's size or the bucket count. `csc_spill_parallel_fd_limit.rs`
+//     fails with EMFILE without the cap.
 //   * Lazy creation is what makes an all-in-memory build touch no disk at all.
 //     A bucket that never overflows must produce no file, so `reader` answers
 //     `Ok(None)` and the emit reads its RAM tail alone.

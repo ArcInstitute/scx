@@ -279,6 +279,34 @@ fn truncate_on_error<T>(
     result
 }
 
+/// Give a just-written CSR-only file the sidecar its ingest `policy` asks for:
+/// in place, iff the policy builds one for the file's shape.
+///
+/// The post-pass of the MTX ingest, which `scx-mtx` writes without knowing
+/// about CSC — shared by `scx convert --from mtx` and `pyscx.from_mtx` so the
+/// two apply the one default. Returns whether a sidecar was built.
+/// `memory_limit` and `temp_dir` are as for [`rebuild_csc_inplace`].
+pub fn build_csc_for_policy(
+    path: &Path,
+    policy: scx_format_io::CscPolicy,
+    csc_cols_per_shard: usize,
+    memory_limit: Option<&str>,
+    temp_dir: Option<&Path>,
+) -> Result<bool, BoxError> {
+    let header = ScxReader::open(path)?.header().clone();
+    if !policy.should_build_csc(header.n_obs, header.n_vars) {
+        return Ok(false);
+    }
+    rebuild_csc_inplace(
+        path,
+        csc_cols_per_shard,
+        memory_limit,
+        crate::framing_for_csc_rebuild(path),
+        temp_dir,
+    )?;
+    Ok(true)
+}
+
 /// Add a CSC sidecar to `path` in place — `scx build-csc` with no `<OUTPUT>`,
 /// and `scx append --rebuild-csc`. The CSC shards are appended at EOF
 /// and the catalog repointed with `prepare_in_place` / `commit_in_place`, the

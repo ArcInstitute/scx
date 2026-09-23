@@ -1134,7 +1134,7 @@ per shard**. Pass `0` for no cap (single CSC shard, memory permitting
 `--memory-limit` budget).
 
 To add a CSC sidecar to a file you already have, use the standalone
-`pyscx.build_csc(input, output=None, memory_limit="4G", force=False,
+`pyscx.build_csc(input, output=None, memory_limit=None, force=False,
 csc_cols_per_shard=5000, temp_dir=None)` — the Python equivalent of
 `scx build-csc`. It reads
 `input`'s CSR shards and **appends** the new CSC sidecar: `output=None` (the

@@ -125,14 +125,14 @@ def run(
 
     # The file-size benchmark measures the canonical SCX layout: CSR shards
     # only, no CSC sidecar. `SCX_BENCH_WITH_CSC=1` (used to exercise the GPU
-    # CSC-direct DE path) otherwise flips `with_csc=True` for *every*
+    # CSC-direct DE path) otherwise sets `csc="always"` for *every*
     # ScxRunner — inflating the shared converted file this benchmark measures
     # with a column-major sidecar. Force CSR-only here, and when the knob is
     # on, convert a fresh CSR-only file rather than trusting the (possibly
     # CSC-equipped) shared `converted_path`.
-    force_csr_only = bool(getattr(runner, "with_csc", False))
+    force_csr_only = getattr(runner, "csc", "off") != "off"
     if force_csr_only:
-        runner.with_csc = False
+        runner.csc = "off"
 
     log.info(
         "Compression benchmark: dataset=%s format=%s source=%.1f MB%s",

@@ -13,7 +13,8 @@ pub use csc::{CscError, ScxCsc};
 pub use csc_builder::{
     CscBuilder, CscBuilderConfig, CscBuilderError, CscBuilderStats, CscEmitter, CscShardArrays,
     CscShardSource, CscShardSpec, MemSpillStore, NoSpillStore, ResidentCscSource, SpillStore,
-    DEFAULT_BLOCK_BYTES, DEFAULT_TARGET_BUCKETS, MAX_BUCKETS, SPILL_BYTES_PER_NNZ,
+    DEFAULT_BLOCK_BYTES, DEFAULT_TARGET_BUCKETS, MAX_BUCKETS, MAX_CONCURRENT_SPILL_READS,
+    SPILL_BYTES_PER_NNZ,
 };
 pub use csr::{
     concatenate_csr, finalize_implicit_zero_variance, implicit_zero_count,

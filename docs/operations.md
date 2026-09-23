@@ -414,7 +414,7 @@ scx append experiment.scx more_cells.scx --rebuild-csc
 scx compact experiment.scx compacted.scx --csc always
 ```
 
-The Python API exposes `pyscx.build_csc(input, output=None, memory_limit="4G", force=False, csc_cols_per_shard=5000)`
+The Python API exposes `pyscx.build_csc(input, output=None, memory_limit=None, force=False, csc_cols_per_shard=5000)`
 for standalone builds — `output=None` (the default) appends the sidecar in
 place, and a path writes a copy. Alternatively, set `csc="always"` at conversion time
 via `pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
