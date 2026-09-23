@@ -383,8 +383,11 @@ enum Commands {
         /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
         /// Accepts a binary-prefixed size (`K`/`M`/`G`/`T` or `KiB`..`TiB`);
         /// decimal `KB`/`MB`/`GB` is rejected. Ignored without `--rebuild-csc`.
-        #[arg(long, default_value = "4G")]
-        csc_memory_limit: String,
+        /// Naming one also makes the sidecar's emit
+        /// encode a shard batch at a time against it, which is slower but
+        /// keeps the peak nearer the limit; unset (4G) encodes whole emit groups.
+        #[arg(long)]
+        csc_memory_limit: Option<String>,
         /// Comma-separated obs columns to force-index after appending.
         /// Mirrors `scx convert --index-obs`; without this flag, any
         /// pre-existing predicate-index sections remain in place but
@@ -918,8 +921,11 @@ enum Commands {
         /// Accepts a bare byte count or a binary-prefixed size —
         /// `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024);
         /// decimal `KB`/`MB`/`GB`/`TB` is rejected as ambiguous.
-        #[arg(long, default_value = "4G")]
-        memory_limit: String,
+        /// Naming one also makes the sidecar's emit
+        /// encode a shard batch at a time against it, which is slower but
+        /// keeps the peak nearer the limit; unset (4G) encodes whole emit groups.
+        #[arg(long)]
+        memory_limit: Option<String>,
         /// Overwrite output if it exists. Not applicable to the in-place form
         /// (no <OUTPUT>), which always modifies <INPUT>.
         #[arg(long)]
@@ -1602,7 +1608,7 @@ fn main() {
             shard_size,
             rebuild_csc,
             csc_cols_per_shard,
-            &csc_memory_limit,
+            csc_memory_limit.as_deref(),
             parse_index_columns(index_obs.as_deref()),
             parse_index_columns(index_var.as_deref()),
             index_preset.filter(|s| !s.trim().is_empty()),
@@ -1859,7 +1865,7 @@ fn main() {
                 Some(output) => scx_ops::run_build_csc(
                     &input,
                     &output,
-                    &memory_limit,
+                    memory_limit.as_deref(),
                     force,
                     csc_cols_per_shard,
                     framing,
@@ -1879,7 +1885,7 @@ fn main() {
                 None => scx_ops::rebuild_csc_inplace(
                     &input,
                     csc_cols_per_shard,
-                    &memory_limit,
+                    memory_limit.as_deref(),
                     framing,
                     temp_dir.as_deref(),
                 )
@@ -2730,7 +2736,7 @@ fn dispatch_mtx_to_scx(
         scx_ops::rebuild_csc_inplace(
             output,
             csc_cols_per_shard,
-            "4G",
+            None,
             scx_ops::framing_for_csc_rebuild(output),
             None,
         )?;

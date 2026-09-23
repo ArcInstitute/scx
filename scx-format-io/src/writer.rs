@@ -2688,6 +2688,7 @@ impl ScxWriter {
                     modality_id: Some(modality_id),
                     // Per-modality shards are written one at a time.
                     batch_nnz: 0,
+                    whole_groups: false,
                 },
                 |_, _, _| {},
             )?;

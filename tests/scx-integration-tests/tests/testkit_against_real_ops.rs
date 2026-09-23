@@ -146,7 +146,7 @@ fn optimize_over_every_family_is_clock_independent() {
 #[test]
 fn build_csc_over_every_family_is_clock_independent() {
     over_every_family("build_csc", |src, out| {
-        scx_ops::run_build_csc(src, out, "1G", false, 1024, None, None).unwrap();
+        scx_ops::run_build_csc(src, out, Some("1G"), false, 1024, None, None).unwrap();
     });
 }
 

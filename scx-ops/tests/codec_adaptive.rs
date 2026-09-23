@@ -475,7 +475,7 @@ fn build_csc_preserves_per_shard_csr_codec() {
     scx_ops::build_csc::run_build_csc(
         &inp,
         &out,
-        "4G",
+        None,
         false,
         5000,
         // Exactly what `scx-cli`'s `framing_for_file()` passes.
@@ -525,7 +525,7 @@ fn a_csc_rebuild_carrying_decode_target_can_no_longer_reselect_a_codec() {
     );
 
     let out = d.path().join("csc_rewrite_framing.scx");
-    scx_ops::build_csc::run_build_csc(&inp, &out, "4G", false, 5000, Some(rewrite_framing), None)
+    scx_ops::build_csc::run_build_csc(&inp, &out, None, false, 5000, Some(rewrite_framing), None)
         .unwrap();
     let (after, after_bytes) = x_codecs_and_bytes(&out);
     assert_eq!(
@@ -538,7 +538,7 @@ fn a_csc_rebuild_carrying_decode_target_can_no_longer_reselect_a_codec() {
     scx_ops::build_csc::run_build_csc(
         &inp,
         &control,
-        "4G",
+        None,
         false,
         5000,
         scx_ops::framing_for_csc_rebuild(&inp),
@@ -587,7 +587,7 @@ fn framing_for_csc_rebuild_preserves_v4_and_re_selects_nothing() {
     );
 
     let out = d.path().join("csc.scx");
-    scx_ops::build_csc::run_build_csc(&framed, &out, "4G", false, 5000, Some(chosen), None)
+    scx_ops::build_csc::run_build_csc(&framed, &out, None, false, 5000, Some(chosen), None)
         .unwrap();
 
     let reader = ScxReader::open(&out).unwrap();
@@ -603,7 +603,7 @@ fn framing_for_csc_rebuild_preserves_v4_and_re_selects_nothing() {
     // CSR, and the sidecar is framed regardless — v4 promises sub-shard random
     // access on every sparse shard.
     let out_none = d.path().join("csc_none.scx");
-    scx_ops::build_csc::run_build_csc(&framed, &out_none, "4G", false, 5000, None, None).unwrap();
+    scx_ops::build_csc::run_build_csc(&framed, &out_none, None, false, 5000, None, None).unwrap();
     let reader = ScxReader::open(&out_none).unwrap();
     assert_eq!(reader.header().format_version, CURRENT_FORMAT_VERSION);
     let csc: Vec<_> = reader
@@ -737,7 +737,7 @@ fn build_csc_widens_the_sidecar_to_the_widest_declared_shard_encoding() {
 
     // --- the op ------------------------------------------------------------
     let output = d.path().join("multi_int_csc.scx");
-    scx_ops::build_csc::run_build_csc(&input, &output, "4G", false, MS_CSC_COLS, None, None)
+    scx_ops::build_csc::run_build_csc(&input, &output, None, false, MS_CSC_COLS, None, None)
         .unwrap();
 
     // The sidecar: widest DECLARED integer encoding across shards — Uint16, from

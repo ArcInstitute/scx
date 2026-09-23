@@ -107,7 +107,7 @@ fn an_in_place_build_only_appends() {
     drop(before_reader);
     let csr_before = entries_of(&path, SectionType::CsrShard);
 
-    let outcome = rebuild_csc_inplace(&path, 4, "1G", None, None).unwrap();
+    let outcome = rebuild_csc_inplace(&path, 4, Some("1G"), None, None).unwrap();
     assert_eq!(outcome, BuildCscOutcome::Built);
 
     let after = std::fs::read(&path).unwrap();
@@ -159,7 +159,7 @@ fn the_sidecar_follows_the_files_framing() {
     assert_eq!(shard_versions(&v4, SectionType::CsrShard), vec![2, 2]);
     let csr_before = entries_of(&v4, SectionType::CsrShard);
     // `None`, which used to strip the framing off the whole file.
-    rebuild_csc_inplace(&v4, 5, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&v4, 5, Some("1G"), None, None).unwrap();
     let r = ScxReader::open(&v4).unwrap();
     assert_eq!(r.header().format_version, CURRENT_FORMAT_VERSION);
     assert_eq!(entries_of(&v4, SectionType::CsrShard), csr_before);
@@ -171,7 +171,7 @@ fn the_sidecar_follows_the_files_framing() {
     assert_csc_is_the_transpose(&v4);
 
     let v3 = write_input(&dir.path().join("v3.scx"), 60, 11, 2, false);
-    rebuild_csc_inplace(&v3, 5, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&v3, 5, Some("1G"), None, None).unwrap();
     assert_eq!(
         ScxReader::open(&v3).unwrap().header().format_version,
         DEFAULT_WRITE_FORMAT_VERSION
@@ -187,7 +187,7 @@ fn framing_an_unframed_file_is_refused_and_leaves_it_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let v3 = write_input(&dir.path().join("v3.scx"), 20, 6, 2, false);
     let before = std::fs::read(&v3).unwrap();
-    let err = rebuild_csc_inplace(&v3, 5, "1G", Some(FramingConfig::default()), None)
+    let err = rebuild_csc_inplace(&v3, 5, Some("1G"), Some(FramingConfig::default()), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("scx optimize"), "names the way out: {err}");
@@ -201,11 +201,11 @@ fn framing_an_unframed_file_is_refused_and_leaves_it_untouched() {
 fn a_rebuild_replaces_the_sidecar_and_rolls_back_to_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_input(&dir.path().join("in.scx"), 40, 12, 4, false);
-    rebuild_csc_inplace(&path, 6, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&path, 6, Some("1G"), None, None).unwrap();
     let first = entries_of(&path, SectionType::CscShard);
     assert_eq!(first.len(), 2);
 
-    rebuild_csc_inplace(&path, 4, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&path, 4, Some("1G"), None, None).unwrap();
     let second = entries_of(&path, SectionType::CscShard);
     assert_eq!(second.len(), 3);
     let names: std::collections::BTreeSet<_> = second.iter().map(|e| e.0.clone()).collect();
@@ -240,7 +240,7 @@ fn an_empty_matrix_drops_a_stale_sidecar_in_place() {
     writer.finish().unwrap();
     assert!(ScxReader::open(&path).unwrap().header().has_csc());
 
-    let outcome = rebuild_csc_inplace(&path, 5000, "1G", None, None).unwrap();
+    let outcome = rebuild_csc_inplace(&path, 5000, Some("1G"), None, None).unwrap();
     assert_eq!(outcome, BuildCscOutcome::NoSidecar);
     let r = ScxReader::open(&path).unwrap();
     assert!(!r.header().has_csc());
@@ -267,7 +267,7 @@ fn an_empty_matrix_without_a_sidecar_is_not_touched() {
     writer.write_var(&sample_var(3)).unwrap();
     writer.finish().unwrap();
     let before = std::fs::read(&path).unwrap();
-    let outcome = rebuild_csc_inplace(&path, 5000, "1G", None, None).unwrap();
+    let outcome = rebuild_csc_inplace(&path, 5000, Some("1G"), None, None).unwrap();
     assert_eq!(outcome, BuildCscOutcome::NoSidecar);
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
@@ -281,7 +281,7 @@ fn copy_out_is_a_copy_then_an_append() {
     let input = write_input(&dir.path().join("in.scx"), 30, 8, 3, false);
     let before = std::fs::read(&input).unwrap();
     let output = dir.path().join("out.scx");
-    run_build_csc(&input, &output, "1G", false, 3, None, None).unwrap();
+    run_build_csc(&input, &output, Some("1G"), false, 3, None, None).unwrap();
 
     assert_eq!(std::fs::read(&input).unwrap(), before, "input untouched");
     let out = std::fs::read(&output).unwrap();
@@ -295,8 +295,8 @@ fn copy_out_is_a_copy_then_an_append() {
     assert_eq!(names.len(), 2, "no staging file survives: {names:?}");
 
     // An existing output is refused without `force`, and replaced with it.
-    assert!(run_build_csc(&input, &output, "1G", false, 3, None, None).is_err());
-    run_build_csc(&input, &output, "1G", true, 3, None, None).unwrap();
+    assert!(run_build_csc(&input, &output, Some("1G"), false, 3, None, None).is_err());
+    run_build_csc(&input, &output, Some("1G"), true, 3, None, None).unwrap();
 
     crate::rollback(&output).unwrap();
     assert!(!ScxReader::open(&output).unwrap().header().has_csc());
@@ -311,7 +311,7 @@ fn a_refused_copy_out_writes_nothing() {
     let err = run_build_csc(
         &input,
         &output,
-        "1G",
+        Some("1G"),
         false,
         3,
         Some(FramingConfig::default()),
@@ -419,7 +419,7 @@ fn a_layer_sidecar_is_kept_when_fresh_and_dropped_when_stale() {
         3,
     );
     let layer_before = entries_of(&fresh, SectionType::LayerCscShard);
-    rebuild_csc_inplace(&fresh, 5, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&fresh, 5, Some("1G"), None, None).unwrap();
     assert_eq!(entries_of(&fresh, SectionType::LayerCscShard), layer_before);
     assert_eq!(
         ScxReader::open(&fresh)
@@ -437,7 +437,7 @@ fn a_layer_sidecar_is_kept_when_fresh_and_dropped_when_stale() {
         3,
         0,
     );
-    rebuild_csc_inplace(&stale, 5, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&stale, 5, Some("1G"), None, None).unwrap();
     let r = ScxReader::open(&stale).unwrap();
     assert!(
         !has(&stale, SectionType::LayerCscShard),
@@ -460,7 +460,7 @@ fn a_legacy_obs_index_section_is_carried() {
         entries_of(&path, SectionType::VarIndex),
     );
     assert_eq!((before.0.len(), before.1.len()), (1, 1));
-    rebuild_csc_inplace(&path, 5, "1G", None, None).unwrap();
+    rebuild_csc_inplace(&path, 5, Some("1G"), None, None).unwrap();
     assert_eq!(entries_of(&path, SectionType::ObsIndex), before.0);
     assert_eq!(entries_of(&path, SectionType::VarIndex), before.1);
     assert!(has(&path, SectionType::CscShard));
@@ -490,7 +490,7 @@ fn copy_out_replaces_a_symlinked_output_rather_than_writing_through_it() {
         std::fs::write(&victim, b"do not touch").unwrap();
         let link = dir.path().join(format!("out_{name}.scx"));
         std::os::unix::fs::symlink(&victim, &link).unwrap();
-        run_build_csc(&input, &link, "1G", true, 5000, None, None).unwrap();
+        run_build_csc(&input, &link, Some("1G"), true, 5000, None, None).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch", "{name}");
         assert!(
             !std::fs::symlink_metadata(&link)

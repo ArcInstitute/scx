@@ -118,7 +118,8 @@ fn run_mode(
     let mut out = Vec::new();
     if let Some(n) = batch_nnz {
         loop {
-            let batch = em.next_batch(n)?;
+            // Shard-granular, so a batch can split a group.
+            let batch = em.next_batch(n, false)?;
             if batch.is_empty() {
                 break;
             }
@@ -410,7 +411,7 @@ proptest! {
             .expect("resident");
         let mut batched = Vec::new();
         loop {
-            let batch = src.next_batch(5).expect("batch");
+            let batch = src.next_batch(5, false).expect("batch");
             if batch.is_empty() {
                 break;
             }

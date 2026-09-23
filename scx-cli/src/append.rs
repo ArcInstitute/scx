@@ -18,7 +18,7 @@ pub fn run_append(
     shard_size: NonZeroU32,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc_memory_limit: Option<&str>,
     index_obs: Vec<String>,
     index_var: Vec<String>,
     index_preset: Option<String>,

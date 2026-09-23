@@ -228,12 +228,12 @@ fn every_op_preserves_the_live_cell_count() {
     type Op = (&'static str, Policy, fn(&Path, &Path) -> PathBuf);
     let ops: Vec<Op> = vec![
         ("build_csc", Policy::Carry, |src, out| {
-            scx_ops::run_build_csc(src, out, "4G", false, 5000, None, None).unwrap();
+            scx_ops::run_build_csc(src, out, None, false, 5000, None, None).unwrap();
             out.to_path_buf()
         }),
         ("build_csc_in_place", Policy::Carry, |src, out| {
             std::fs::copy(src, out).unwrap();
-            scx_ops::rebuild_csc_inplace(out, 5000, "4G", None, None).unwrap();
+            scx_ops::rebuild_csc_inplace(out, 5000, None, None, None).unwrap();
             out.to_path_buf()
         }),
         ("optimize", Policy::Carry, |src, out| {
@@ -411,7 +411,7 @@ fn the_surviving_cells_are_the_ones_that_were_not_deleted() {
     assert_eq!(read_ids(&src), expected, "fixture");
 
     let carried = dir.join("ids_csc.scx");
-    scx_ops::run_build_csc(&src, &carried, "4G", false, 5000, None, None).unwrap();
+    scx_ops::run_build_csc(&src, &carried, None, false, 5000, None, None).unwrap();
     assert_eq!(read_ids(&carried), expected, "build-csc (carry)");
 
     let applied = dir.join("ids_compact.scx");

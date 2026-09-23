@@ -39,8 +39,11 @@ pub struct CscCarryOptions {
     /// The sidecar budget (`--csc-memory-limit`), in the forms
     /// `scx convert --memory-budget` accepts. It sizes the sidecar's shard
     /// widths as well as the builder's resident buckets, exactly as
-    /// `scx build-csc --memory-limit` does.
-    pub memory_limit: String,
+    /// `scx build-csc --memory-limit` does. `None` is
+    /// [`crate::DEFAULT_CSC_MEMORY_LIMIT`] with the emit at full speed; a named
+    /// limit also batches the emit against it (see
+    /// `scx_format_io::CscBuildOptions::bounded_emit`).
+    pub memory_limit: Option<String>,
     /// Where the builder spills; `None` is the output's own directory.
     pub temp_dir: Option<PathBuf>,
     /// Row-group framing for a sidecar on a v4 output; `None` is the default
@@ -54,7 +57,7 @@ impl Default for CscCarryOptions {
         Self {
             mode: CscOutput::Carry,
             cols_per_shard: 5000,
-            memory_limit: "4G".to_string(),
+            memory_limit: None,
             temp_dir: None,
             framing: None,
         }
@@ -107,18 +110,22 @@ impl CscCarryOptions {
             );
             return Ok(None);
         }
-        let memory_bytes = MemoryBudget::parse(&self.memory_limit)
+        let memory_limit = self
+            .memory_limit
+            .as_deref()
+            .unwrap_or(crate::DEFAULT_CSC_MEMORY_LIMIT);
+        let memory_bytes = MemoryBudget::parse(memory_limit)
             .map_err(|e| OpsError::InvalidInput(format!("--csc-memory-limit: {e}")))?;
         Ok(Some(CscBuildOptions {
             cols_per_shard: self.cols_per_shard,
             memory_bytes: usize::try_from(memory_bytes).map_err(|_| {
                 OpsError::InvalidInput(format!(
-                    "--csc-memory-limit {} exceeds this platform's address space",
-                    self.memory_limit
+                    "--csc-memory-limit {memory_limit} exceeds this platform's address space"
                 ))
             })?,
             spill_root: self.temp_dir.clone(),
             framing: self.framing,
+            bounded_emit: self.memory_limit.is_some(),
             ..Default::default()
         }))
     }

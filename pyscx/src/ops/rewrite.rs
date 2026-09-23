@@ -53,7 +53,7 @@ use crate::convert;
     input, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     reshape_obs=false, codec="auto",
-    csc="carry", csc_cols_per_shard=5000, csc_memory_limit="4G",
+    csc="carry", csc_cols_per_shard=5000, csc_memory_limit=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn compact(
@@ -68,7 +68,7 @@ pub fn compact(
     codec: &str,
     csc: &str,
     csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc_memory_limit: Option<&str>,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -205,7 +205,7 @@ pub fn compact(
 #[pyfunction]
 #[pyo3(signature = (
     input, output, codec="auto", shard_obs="auto", memory_budget=None,
-    csc="carry", csc_cols_per_shard=5000, csc_memory_limit="4G",
+    csc="carry", csc_cols_per_shard=5000, csc_memory_limit=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn optimize(
@@ -222,7 +222,7 @@ pub fn optimize(
     memory_budget: Option<&Bound<'_, PyAny>>,
     csc: &str,
     csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc_memory_limit: Option<&str>,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -290,7 +290,7 @@ pub fn optimize(
 pub(crate) fn csc_carry_options(
     csc: &str,
     csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc_memory_limit: Option<&str>,
     temp_dir: Option<PathBuf>,
 ) -> PyResult<scx_ops::CscCarryOptions> {
     let mode = match csc {
@@ -306,7 +306,7 @@ pub(crate) fn csc_carry_options(
     Ok(scx_ops::CscCarryOptions {
         mode,
         cols_per_shard: csc_cols_per_shard,
-        memory_limit: csc_memory_limit.to_string(),
+        memory_limit: csc_memory_limit.map(str::to_string),
         temp_dir,
         framing: None,
     })
@@ -410,7 +410,7 @@ fn sort_csc_mode(py: Python<'_>, csc: Option<&str>, rebuild_csc: Option<bool>) -
     input, output, by, reverse=false, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=None,
-    csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
+    csc_cols_per_shard=5000, csc_memory_limit=None,
     group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None,
     group_write_block_bytes=None, csc=None,
 ))]
@@ -432,7 +432,7 @@ pub fn sort(
     bitmap: String,
     rebuild_csc: Option<bool>,
     csc_cols_per_shard: usize,
-    csc_memory_limit: String,
+    csc_memory_limit: Option<String>,
     group_by: Option<String>,
     reference: Option<Bound<'_, PyAny>>,
     group_target_bytes: Option<Bound<'_, PyAny>>,
@@ -471,7 +471,7 @@ pub fn sort(
     let csc = csc_carry_options(
         &sort_csc_mode(py, csc, rebuild_csc)?,
         csc_cols_per_shard,
-        &csc_memory_limit,
+        csc_memory_limit.as_deref(),
         temp_dir.clone(),
     )?;
     let opts = scx_ops::SortOptions {
@@ -554,7 +554,7 @@ pub fn sort(
     input, output, seed=42, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=None,
-    csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(), csc=None,
+    csc_cols_per_shard=5000, csc_memory_limit=None, csc=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn shuffle(
@@ -573,7 +573,7 @@ pub fn shuffle(
     bitmap: String,
     rebuild_csc: Option<bool>,
     csc_cols_per_shard: usize,
-    csc_memory_limit: String,
+    csc_memory_limit: Option<String>,
     csc: Option<&str>,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
@@ -588,7 +588,7 @@ pub fn shuffle(
     let csc = csc_carry_options(
         &sort_csc_mode(py, csc, rebuild_csc)?,
         csc_cols_per_shard,
-        &csc_memory_limit,
+        csc_memory_limit.as_deref(),
         temp_dir.clone(),
     )?;
     let opts = scx_ops::SortOptions {
@@ -646,7 +646,11 @@ pub fn shuffle(
 ///   output             — destination file (a copy of `input` plus the
 ///                        sidecar). `None` (default) adds it to `input` in place.
 ///   memory_limit       — transpose working-set budget; accepts binary-
-///                        prefixed sizes (`"4G"`, `"512MiB"`). Default "4G".
+///                        prefixed sizes (`"4G"`, `"512MiB"`). `None`
+///                        (default) is 4G with the emit at full speed; a
+///                        named limit also makes the emit encode a shard
+///                        batch at a time against it (slower, with the peak
+///                        nearer the limit).
 ///   force              — overwrite `output` if it already exists. Rejected
 ///                        with `output=None`, which always modifies `input`.
 ///   csc_cols_per_shard — max columns per emitted CSC shard (0 = single
@@ -662,13 +666,13 @@ pub fn shuffle(
 ///     pyscx.build_csc("counts.scx")                      # in place
 ///     pyscx.build_csc("counts.scx", "counts_csc.scx")    # copy out
 #[pyfunction]
-#[pyo3(signature = (input, output=None, memory_limit="4G".to_string(), force=false,
+#[pyo3(signature = (input, output=None, memory_limit=None, force=false,
                     csc_cols_per_shard=5000, temp_dir=None))]
 pub fn build_csc(
     py: Python<'_>,
     input: &str,
     output: Option<&str>,
-    memory_limit: String,
+    memory_limit: Option<String>,
     force: bool,
     csc_cols_per_shard: usize,
     temp_dir: Option<String>,
@@ -676,7 +680,9 @@ pub fn build_csc(
     // Fail fast with a clean ValueError on a malformed size string;
     // run_build_csc re-parses it internally with the same parser, so the
     // two cannot drift.
-    scx_format_io::MemoryBudget::parse(&memory_limit).map_err(PyValueError::new_err)?;
+    if let Some(limit) = memory_limit.as_deref() {
+        scx_format_io::MemoryBudget::parse(limit).map_err(PyValueError::new_err)?;
+    }
     let input_path = PathBuf::from(input);
     let temp_dir = temp_dir.map(PathBuf::from);
 
@@ -743,7 +749,7 @@ pub fn build_csc(
             Some(output_path) => scx_ops::run_build_csc(
                 &input_path,
                 &output_path,
-                &memory_limit,
+                memory_limit.as_deref(),
                 force,
                 csc_cols_per_shard,
                 framing,
@@ -752,7 +758,7 @@ pub fn build_csc(
             None => scx_ops::rebuild_csc_inplace(
                 &input_path,
                 csc_cols_per_shard,
-                &memory_limit,
+                memory_limit.as_deref(),
                 framing,
                 temp_dir.as_deref(),
             ),
@@ -854,7 +860,7 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     assume_identical_var=false, assume_identical_obs=false, uns_policy=None,
     sort_by=None, reverse=false, codec="auto",
-    csc="carry", csc_cols_per_shard=5000, csc_memory_limit="4G",
+    csc="carry", csc_cols_per_shard=5000, csc_memory_limit=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn merge(
@@ -873,7 +879,7 @@ pub fn merge(
     codec: &str,
     csc: &str,
     csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc_memory_limit: Option<&str>,
 ) -> PyResult<()> {
     let resolved_codec = parse_codec_intent(codec)?;
     let csc = csc_carry_options(csc, csc_cols_per_shard, csc_memory_limit, None)?;

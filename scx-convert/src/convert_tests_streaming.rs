@@ -2319,7 +2319,7 @@ fn streaming_csc_is_built_in_the_same_pass_as_x() {
         scx_ops::rebuild_csc_inplace(
             &two,
             off.csc_cols_per_shard,
-            &crate::budget::csc_sidecar_bytes(off.memory_budget).to_string(),
+            Some(&crate::budget::csc_sidecar_bytes(off.memory_budget).to_string()),
             off.framing_preserving_codec(),
             None,
         )

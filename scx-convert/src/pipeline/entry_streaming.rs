@@ -768,7 +768,11 @@ fn convert_then_sort_grouped(
                 scx_ops::CscOutput::Off
             },
             cols_per_shard: opts.csc_cols_per_shard,
-            memory_limit: crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
+            // A named budget also bounds the emit; without one the sort
+            // builds at the 4 GiB default, as `csc_sidecar_bytes(None)` is.
+            memory_limit: opts
+                .memory_budget
+                .map(|b| crate::budget::csc_sidecar_bytes(Some(b)).to_string()),
             temp_dir: opts.temp_dir.clone(),
             framing: opts.framing_preserving_codec(),
         },
@@ -944,6 +948,7 @@ fn begin_same_pass_csc(
         spill_root: opts.temp_dir.clone(),
         // So `--csc <policy> --row-group-rows N` frames the sidecar at X's G.
         framing: opts.framing_preserving_codec(),
+        bounded_emit: opts.memory_budget.is_some(),
     })?;
     Ok(
         (ingest_budget != opts.memory_budget).then(|| IngestOptions {

@@ -41,7 +41,9 @@ pub use append::{
     append, append_from_reader, append_from_reader_with_index_options, append_with_index_options,
     AppendOptions,
 };
-pub use build_csc::{rebuild_csc_inplace, run_build_csc, BuildCscOutcome};
+pub use build_csc::{
+    rebuild_csc_inplace, run_build_csc, BuildCscOutcome, DEFAULT_CSC_MEMORY_LIMIT,
+};
 pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
 pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};
 pub use csc_carry::{CscCarryOptions, CscOutput};

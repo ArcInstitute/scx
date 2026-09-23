@@ -1060,10 +1060,17 @@ pub trait CscShardSource {
     ) -> Result<Option<u64>, CscBuilderError>;
 
     /// The next shards, up to `max_nnz` nonzeros of them — always at least
-    /// one while any remain, empty once drained. A source that cannot build
-    /// ahead cheaply yields one at a time, which is this default.
-    fn next_batch(&mut self, max_nnz: u64) -> Result<Vec<CscShardArrays>, CscBuilderError> {
-        let _ = max_nnz;
+    /// one while any remain, empty once drained. `whole_groups` lets a source
+    /// that builds shards in groups hand out every shard of the groups it
+    /// built, even past `max_nnz`: faster, since more shards encode at once,
+    /// and bounded only by the group size. A source that cannot build ahead
+    /// cheaply yields one at a time, which is this default.
+    fn next_batch(
+        &mut self,
+        max_nnz: u64,
+        whole_groups: bool,
+    ) -> Result<Vec<CscShardArrays>, CscBuilderError> {
+        let _ = (max_nnz, whole_groups);
         let mut a = CscShardArrays::default();
         Ok(
             match self.next_shard_into(&mut a.indptr, &mut a.indices, &mut a.data)? {
@@ -1245,8 +1252,13 @@ impl CscShardSource for ResidentCscSource<'_> {
     }
 
     /// Shards are independent reads of the resident CSR, so a batch fills them
-    /// in parallel with `parallel`.
-    fn next_batch(&mut self, max_nnz: u64) -> Result<Vec<CscShardArrays>, CscBuilderError> {
+    /// in parallel with `parallel`. A resident source has no groups, so
+    /// `whole_groups` changes nothing.
+    fn next_batch(
+        &mut self,
+        max_nnz: u64,
+        _whole_groups: bool,
+    ) -> Result<Vec<CscShardArrays>, CscBuilderError> {
         let (mut n, mut nnz) = (0usize, 0u64);
         while let Some(spec) = self.plan.get(self.next + n) {
             if n > 0 && nnz + spec.nnz > max_nnz {
@@ -1344,7 +1356,11 @@ impl CscEmitter {
     /// Whole emit groups (see [`Layout::group`]) are taken while their exact
     /// planned nnz fits. Groups own disjoint buckets, so they build
     /// concurrently; the shards come back in column order.
-    pub fn next_batch(&mut self, max_nnz: u64) -> Result<Vec<CscShardArrays>, CscBuilderError> {
+    pub fn next_batch(
+        &mut self,
+        max_nnz: u64,
+        whole_groups: bool,
+    ) -> Result<Vec<CscShardArrays>, CscBuilderError> {
         if self.pending.is_empty() {
             let n_groups = self.layout.n_groups();
             let (mut n, mut nnz) = (0usize, 0u64);
@@ -1362,7 +1378,24 @@ impl CscEmitter {
             }
             self.build_groups(n)?;
         }
-        Ok(self.pending.drain(..).collect())
+        if whole_groups {
+            return Ok(self.pending.drain(..).collect());
+        }
+        // Hand out whole shards up to `max_nnz` (at least one), not the whole
+        // of what was built: a coarse group is several shards, and a batch
+        // that could not be smaller than a group would make `max_nnz` a
+        // floor-of-a-group rather than a cap. The rest wait in `pending`.
+        let mut take = 0usize;
+        let mut nnz = 0u64;
+        for a in &self.pending {
+            let n = a.indices.len() as u64;
+            if take > 0 && nnz + n > max_nnz {
+                break;
+            }
+            nnz += n;
+            take += 1;
+        }
+        Ok(self.pending.drain(..take).collect())
     }
 
     /// Build the next `n` groups into `pending`, concurrently with `parallel`.
@@ -1613,8 +1646,12 @@ impl CscShardSource for CscEmitter {
     ) -> Result<Option<u64>, CscBuilderError> {
         CscEmitter::next_shard_into(self, indptr, indices, data)
     }
-    fn next_batch(&mut self, max_nnz: u64) -> Result<Vec<CscShardArrays>, CscBuilderError> {
-        CscEmitter::next_batch(self, max_nnz)
+    fn next_batch(
+        &mut self,
+        max_nnz: u64,
+        whole_groups: bool,
+    ) -> Result<Vec<CscShardArrays>, CscBuilderError> {
+        CscEmitter::next_batch(self, max_nnz, whole_groups)
     }
     fn stats(&self) -> CscBuilderStats {
         CscEmitter::stats(self).clone()

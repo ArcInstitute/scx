@@ -290,7 +290,7 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     // input loses to the `compact` it is laundered through, not to build-csc.
     let csc_src = mixed_codec_file(&dir.join("csc_src.scx")).unwrap();
     let out = dir.join("build_csc.scx");
-    scx_ops::run_build_csc(&csc_src, &out, "1G", false, 1024, None, None).unwrap();
+    scx_ops::run_build_csc(&csc_src, &out, Some("1G"), false, 1024, None, None).unwrap();
     m.record("build_csc", &out, Strictness::Content).unwrap();
 
     // --- build-csc emitting SEVERAL CSC shards ----------------------------
@@ -315,7 +315,7 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     // survives and its three CSC shards are framed (decoded content unchanged).
     let csc_multi = csc_multi_shard_file(&dir.join("csc_multi_src.scx")).unwrap();
     let out = dir.join("build_csc_multi_shard.scx");
-    scx_ops::run_build_csc(&csc_multi, &out, "1G", false, 3, None, None).unwrap();
+    scx_ops::run_build_csc(&csc_multi, &out, Some("1G"), false, 3, None, None).unwrap();
     m.record("build_csc_multi_shard", &out, Strictness::Content)
         .unwrap();
 
@@ -399,7 +399,7 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
         .unwrap();
 
     let out = dir.join("build_csc_indexed.scx");
-    scx_ops::run_build_csc(&indexed, &out, "1G", false, 1024, None, None).unwrap();
+    scx_ops::run_build_csc(&indexed, &out, Some("1G"), false, 1024, None, None).unwrap();
     m.record("build_csc_indexed", &out, Strictness::Content)
         .unwrap();
 

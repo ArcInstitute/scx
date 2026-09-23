@@ -56,6 +56,12 @@ pub struct CscBuildOptions {
     /// sidecar's codec follows its source; it is not re-selected). Passing
     /// `Some` for a ≤ v3 output is an error, as it is for `build-csc`.
     pub framing: Option<FramingConfig>,
+    /// The caller named a memory budget, so the emit batches whole shards
+    /// against [`crate::csc_budget::csc_emit_batch_nnz`] rather than handing
+    /// out whole emit groups. See [`crate::csc_sidecar::CscEmitOptions::whole_groups`]
+    /// for what that trades. A `spill_after_bytes` counts as a budget too:
+    /// only a budgeted caller passes one.
+    pub bounded_emit: bool,
 }
 
 impl Default for CscBuildOptions {
@@ -67,6 +73,7 @@ impl Default for CscBuildOptions {
             spill_after_bytes: None,
             spill_root: None,
             framing: None,
+            bounded_emit: false,
         }
     }
 }
@@ -82,6 +89,8 @@ pub(crate) struct CscSink {
     framing: Option<FramingConfig>,
     /// The builder's `memory_bytes`, which also sizes the emit's batches.
     memory_bytes: usize,
+    /// See [`CscBuildOptions::bounded_emit`].
+    bounded_emit: bool,
 }
 
 impl CscSink {
@@ -117,6 +126,7 @@ impl CscSink {
             first_codec: None,
             framing: opts.framing,
             memory_bytes: opts.memory_bytes,
+            bounded_emit: opts.bounded_emit || opts.spill_after_bytes.is_some(),
         })
     }
 
@@ -271,6 +281,7 @@ impl CscSink {
                 codec_id,
                 modality_id: None,
                 batch_nnz: crate::csc_budget::csc_emit_batch_nnz(self.memory_bytes as u64),
+                whole_groups: !self.bounded_emit,
             },
             framing,
         )))

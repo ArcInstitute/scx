@@ -59,7 +59,9 @@ pub const CSC_EMIT_SHARE: Share = Share::new(1, 4);
 ///
 /// The encoder's own streams are **not** in it — they are the open term the
 /// allocation table already names on this row — so a batch sized from it is an
-/// estimate, not a bound.
+/// estimate, not a bound. Measured at census_1m `build-csc` with shard-granular
+/// batches (the budgeted mode), the emit's peak sits 0.5 GB above encoding one
+/// shard at a time; with whole-group batches (the default) 1.65 GB above.
 pub const CSC_EMIT_ARRAY_BYTES_PER_NNZ: u64 = 12;
 
 /// How many nonzeros of built CSC shards one emit batch holds, for an emit

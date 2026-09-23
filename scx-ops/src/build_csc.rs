@@ -12,6 +12,11 @@ use scx_format_io::csc_budget;
 use scx_format_io::provenance::{Provenance, ProvenanceEntry};
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::writer::ScxWriter;
+
+/// `--memory-limit` when none is given: sizes the sidecar's shard widths and
+/// the builder's buckets exactly as an explicit `4G` does. What an explicit
+/// limit changes besides is the emit: see `CscEmitOptions::whole_groups`.
+pub const DEFAULT_CSC_MEMORY_LIMIT: &str = "4G";
 use scx_format_io::FramingConfig;
 use scx_format_io::MemoryBudget;
 use scx_format_io::ScxReader;
@@ -69,6 +74,8 @@ struct BuildPlan<'r> {
     /// never changes it.
     csc_framing: Option<FramingConfig>,
     max_bytes: usize,
+    /// The caller named `memory_limit`; see `CscEmitOptions::whole_groups`.
+    bounded_emit: bool,
     n_rows: usize,
     n_cols: usize,
 }
@@ -76,9 +83,11 @@ struct BuildPlan<'r> {
 fn plan<'r>(
     reader: &'r ScxReader,
     path: &Path,
-    memory_limit: &str,
+    memory_limit: Option<&str>,
     framing: Option<FramingConfig>,
 ) -> Result<Plan<'r>, BoxError> {
+    let bounded_emit = memory_limit.is_some();
+    let memory_limit = memory_limit.unwrap_or(DEFAULT_CSC_MEMORY_LIMIT);
     // Shares the workspace parser so --memory-limit accepts the same forms as
     // `scx convert --memory-budget` (K/M/G/T, KiB/MiB/GiB/TiB; decimals
     // rejected).
@@ -240,6 +249,7 @@ fn plan<'r>(
         csc_codec,
         csc_framing,
         max_bytes,
+        bounded_emit,
         n_rows: header.n_obs as usize,
         n_cols: header.n_vars as usize,
     }))
@@ -293,10 +303,16 @@ fn truncate_on_error<T>(
 /// `temp_dir`: root for the CSC builder's column-bucket spill files. `None`
 /// uses the file's own directory — see `TempDirSpillStore` for why that,
 /// rather than the platform temp dir the other spilling ops default to.
+///
+/// `memory_limit`: `None` is [`DEFAULT_CSC_MEMORY_LIMIT`] with the emit at full
+/// speed (whole emit groups encoded together); `Some` is that limit with the
+/// emit batching whole shards against its emit share, which costs time and
+/// keeps the peak closer to the limit. The shard layout, and so the bytes, are
+/// the same either way for the same limit.
 pub fn rebuild_csc_inplace(
     path: &Path,
     csc_cols_per_shard: usize,
-    memory_limit: &str,
+    memory_limit: Option<&str>,
     framing: Option<FramingConfig>,
     temp_dir: Option<&Path>,
 ) -> Result<BuildCscOutcome, BoxError> {
@@ -336,8 +352,9 @@ pub fn rebuild_csc_inplace(
         }
     };
 
+    let memory_limit_str = memory_limit.unwrap_or(DEFAULT_CSC_MEMORY_LIMIT);
     let params_json = format!(
-        "{{\"memory_limit\":\"{memory_limit}\",\"csc_cols_per_shard\":{csc_cols_per_shard},\
+        "{{\"memory_limit\":\"{memory_limit_str}\",\"csc_cols_per_shard\":{csc_cols_per_shard},\
           \"temp_dir\":{}}}",
         temp_dir.map_or_else(
             || "null".to_string(),
@@ -610,6 +627,7 @@ fn append_csc_shards(
         codec_id: b.csc_codec,
         modality_id: None,
         batch_nnz: scx_format_io::csc_budget::csc_emit_batch_nnz(b.max_bytes as u64),
+        whole_groups: !b.bounded_emit,
     };
     let stats = scx_format_io::emit_csc_shards(
         &mut writer,
@@ -656,7 +674,7 @@ fn append_csc_shards(
 pub fn run_build_csc(
     input: &Path,
     output: &Path,
-    memory_limit: &str,
+    memory_limit: Option<&str>,
     force: bool,
     csc_cols_per_shard: usize,
     framing: Option<FramingConfig>,
@@ -799,6 +817,67 @@ mod tests {
         path
     }
 
+    /// A named `--memory-limit` changes how the emit batches — whole shards
+    /// against the emit share instead of whole emit groups — and never the
+    /// bytes: the same limit, named or defaulted, gives the same sidecar.
+    ///
+    /// Shaped so the two modes really differ: 150 two-column shards over a
+    /// dense 2,000-row matrix put three shards in each coarse emit group
+    /// (150 shards over at most 64 buckets), while the 1 MiB limit's emit
+    /// batch (`csc_emit_batch_nnz`, 10,922 nnz) holds only two of those
+    /// 4,000-nnz shards. The 1 MiB
+    /// limit still leaves the shard width at `cols_per_shard`'s 2, so the
+    /// layout matches the 4 GiB default's.
+    #[test]
+    fn a_named_limit_changes_the_emit_not_the_bytes() {
+        let (n_obs, n_vars) = (2000usize, 300usize);
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dense.scx");
+        {
+            let mut w = ScxWriter::new(&input, sample_header(n_obs as u64, n_vars as u64)).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            // 40 source shards of 50 rows, so decoding the largest fits the
+            // 1 MiB limit, which `plan` checks first.
+            for lo in (0..n_obs).step_by(50) {
+                let mut indptr = vec![0u64];
+                let (mut indices, mut values) = (Vec::new(), Vec::new());
+                for row in lo..lo + 50 {
+                    for col in 0..n_vars {
+                        indices.push(col as u32);
+                        values.push(((row * 7 + col) % 250 + 1) as u8);
+                    }
+                    indptr.push(indices.len() as u64);
+                }
+                w.write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    lo as u64,
+                )
+                .unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let csc_entries = |limit: Option<&str>, name: &str| {
+            let out = dir.path().join(name);
+            run_build_csc(&input, &out, limit, false, 2, None, None).unwrap();
+            let reader = ScxReader::open(&out).unwrap();
+            reader
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CscShard)
+                .map(|e| (e.name.clone(), e.length, e.checksum))
+                .collect::<Vec<_>>()
+        };
+        let default = csc_entries(None, "default.scx");
+        assert_eq!(default.len(), 150, "premise: 150 two-column shards");
+        assert_eq!(csc_entries(Some("1M"), "named.scx"), default);
+    }
+
     /// The same, split across `n_shards` row-shards, so a test can say
     /// something about multi-shard order rather than about a single section.
     fn write_test_input_multi_shard(
@@ -917,7 +996,7 @@ mod tests {
         // Control: the same fixture with stats on every shard.
         let pristine = write_test_input_multi_shard(&dir, 40, 6, 4);
         let control = dir.path().join("control.scx");
-        run_build_csc(&pristine, &control, "4G", false, 2, None, None).unwrap();
+        run_build_csc(&pristine, &control, None, false, 2, None, None).unwrap();
 
         // The case: shard 0 — the one that must sort FIRST — loses its stats.
         let mixed = dir.path().join("mixed.scx");
@@ -943,7 +1022,7 @@ mod tests {
         }
 
         let out = dir.path().join("mixed_csc.scx");
-        run_build_csc(&mixed, &out, "4G", false, 2, None, None)
+        run_build_csc(&mixed, &out, None, false, 2, None, None)
             .expect("a stats-less shard beside a stats-bearing one is a valid file");
 
         // Same sidecar, not merely some sidecar: a re-order that got the
@@ -1026,7 +1105,7 @@ mod tests {
         }
 
         let output = dir.path().join("out.scx");
-        run_build_csc(&input, &output, "4G", false, 5000, None, None).unwrap();
+        run_build_csc(&input, &output, None, false, 5000, None, None).unwrap();
 
         let reader = ScxReader::open(&output).unwrap();
         assert_eq!(
@@ -1062,11 +1141,11 @@ mod tests {
             crate::mark_deleted(&input, &[1, 4]).unwrap();
 
             let read_path = if in_place {
-                crate::rebuild_csc_inplace(&input, 5000, "4G", None, None).unwrap();
+                crate::rebuild_csc_inplace(&input, 5000, None, None, None).unwrap();
                 input.clone()
             } else {
                 let output = dir.path().join("output.scx");
-                run_build_csc(&input, &output, "4G", false, 5000, None, None).unwrap();
+                run_build_csc(&input, &output, None, false, 5000, None, None).unwrap();
                 output
             };
 
@@ -1100,7 +1179,7 @@ mod tests {
         let input = write_test_input(&dir, 6, 4);
         let output = dir.path().join("output.scx");
 
-        run_build_csc(&input, &output, "4G", false, 5000, None, None).unwrap();
+        run_build_csc(&input, &output, None, false, 5000, None, None).unwrap();
 
         // Verify output file
         let reader = ScxReader::open(&output).unwrap();
@@ -1172,7 +1251,7 @@ mod tests {
         // about there being one of each.
         let input = write_test_input_multi_shard(&dir, 9, 8, 3);
         let output = dir.path().join("ordered.scx");
-        run_build_csc(&input, &output, "4G", false, 3, None, None).unwrap();
+        run_build_csc(&input, &output, None, false, 3, None, None).unwrap();
 
         let reader = ScxReader::open(&output).unwrap();
         let cat = reader.catalog();
@@ -1211,7 +1290,7 @@ mod tests {
         // column, so 1200 gives 10 columns and the 6-column matrix lands in
         // one shard — while still admitting one decoded source shard, which
         // the refusal below requires.
-        run_build_csc(&input, &output, "1200", false, 5000, None, None).unwrap();
+        run_build_csc(&input, &output, Some("1200"), false, 5000, None, None).unwrap();
 
         let reader = ScxReader::open(&output).unwrap();
         assert!(reader.header().has_csc());
@@ -1255,7 +1334,7 @@ mod tests {
         // 1/4 share needs 992 B. Charging all 40 rows of indptr would make it
         // 20*8 + 41*8 = 488 B -> 1952 B, so a budget between the two is the
         // discriminating case: it must be accepted.
-        run_build_csc(&input, &output, "1200", false, 5000, None, None).expect(
+        run_build_csc(&input, &output, Some("1200"), false, 5000, None, None).expect(
             "1200 B admits a 10-row shard; only the whole-matrix indptr made it look too small",
         );
         assert!(ScxReader::open(&output).unwrap().header().has_csc());
@@ -1267,7 +1346,7 @@ mod tests {
         let input = write_test_input(&dir, 10, 6);
         let output = dir.path().join("output_too_small.scx");
 
-        let err = run_build_csc(&input, &output, "150", false, 5000, None, None)
+        let err = run_build_csc(&input, &output, Some("150"), false, 5000, None, None)
             .expect_err("150 bytes cannot hold a decoded shard")
             .to_string();
         assert!(err.contains("--memory-limit 150"), "{err}");
@@ -1279,7 +1358,7 @@ mod tests {
 
         // Premise: the same input succeeds once the budget admits a shard, so
         // the test is about the budget and not about the fixture.
-        run_build_csc(&input, &output, "4G", false, 5000, None, None).unwrap();
+        run_build_csc(&input, &output, None, false, 5000, None, None).unwrap();
         assert!(ScxReader::open(&output).unwrap().header().has_csc());
     }
 
@@ -1293,11 +1372,11 @@ mod tests {
         std::fs::write(&output, b"placeholder").unwrap();
 
         // Without --force should fail
-        let err = run_build_csc(&input, &output, "4G", false, 5000, None, None);
+        let err = run_build_csc(&input, &output, None, false, 5000, None, None);
         assert!(err.is_err());
 
         // With --force should succeed
-        run_build_csc(&input, &output, "4G", true, 5000, None, None).unwrap();
+        run_build_csc(&input, &output, None, true, 5000, None, None).unwrap();
         let reader = ScxReader::open(&output).unwrap();
         assert!(reader.header().has_csc());
     }
@@ -1318,7 +1397,7 @@ mod tests {
         writer.finish().unwrap();
 
         let output = dir.path().join("output.scx");
-        let err = run_build_csc(&path, &output, "4G", false, 5000, None, None);
+        let err = run_build_csc(&path, &output, None, false, 5000, None, None);
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("no CSR shards"));
@@ -1339,7 +1418,7 @@ mod tests {
         writer.finish().unwrap();
 
         let output = dir.path().join("output.scx");
-        let outcome = run_build_csc(&path, &output, "4G", false, 5000, None, None)
+        let outcome = run_build_csc(&path, &output, None, false, 5000, None, None)
             .expect("build-csc on an empty matrix must succeed");
         assert_eq!(outcome, BuildCscOutcome::NoSidecar);
         let reader = ScxReader::open(&output).unwrap();
@@ -1369,7 +1448,7 @@ mod tests {
         assert!(ScxReader::open(&path).unwrap().header().has_csc());
 
         let output = dir.path().join("output.scx");
-        let outcome = run_build_csc(&path, &output, "4G", false, 5000, None, None).unwrap();
+        let outcome = run_build_csc(&path, &output, None, false, 5000, None, None).unwrap();
         assert_eq!(outcome, BuildCscOutcome::NoSidecar);
         let reader = ScxReader::open(&output).unwrap();
         assert!(!reader.header().has_csc(), "the stale sidecar must be gone");
@@ -1394,7 +1473,7 @@ mod tests {
         let alias = dir.path().join("alias.scx");
         std::os::unix::fs::symlink(&input, &alias).unwrap();
         assert_ne!(alias, input);
-        let err = run_build_csc(&input, &alias, "4G", true, 5000, None, None).unwrap_err();
+        let err = run_build_csc(&input, &alias, None, true, 5000, None, None).unwrap_err();
         assert!(err.to_string().contains("must be different files"), "{err}");
         assert_eq!(
             std::fs::read(&input).unwrap(),
@@ -1419,13 +1498,13 @@ mod tests {
         writer.write_var(&sample_var(0)).unwrap();
         writer.finish().unwrap();
         let output = dir.path().join("output.scx");
-        let err = run_build_csc(&path, &output, "4G", false, 5000, None, None).unwrap_err();
+        let err = run_build_csc(&path, &output, None, false, 5000, None, None).unwrap_err();
         assert!(err.to_string().contains("no CSR shards"), "{err}");
         assert!(
             !output.exists(),
             "nothing may be written for a malformed input"
         );
-        let err = crate::rebuild_csc_inplace(&path, 5000, "4G", None, None).unwrap_err();
+        let err = crate::rebuild_csc_inplace(&path, 5000, None, None, None).unwrap_err();
         assert!(err.to_string().contains("no CSR shards"), "{err}");
     }
 
@@ -1452,7 +1531,7 @@ mod tests {
         writer.finish().unwrap();
 
         let output = dir.path().join("output.scx");
-        let outcome = run_build_csc(&path, &output, "4G", false, 5000, None, None).unwrap();
+        let outcome = run_build_csc(&path, &output, None, false, 5000, None, None).unwrap();
         assert_eq!(outcome, BuildCscOutcome::NoSidecar);
         let reader = ScxReader::open(&output).unwrap();
         assert!(!reader.header().has_csc());
@@ -1481,7 +1560,7 @@ mod tests {
         writer.finish().unwrap();
         assert!(ScxReader::open(&stale).unwrap().header().has_csc());
         let output2 = dir.path().join("output2.scx");
-        let outcome = run_build_csc(&stale, &output2, "4G", false, 5000, None, None).unwrap();
+        let outcome = run_build_csc(&stale, &output2, None, false, 5000, None, None).unwrap();
         assert_eq!(outcome, BuildCscOutcome::NoSidecar);
         let reader = ScxReader::open(&output2).unwrap();
         assert!(!reader.header().has_csc());
@@ -1499,7 +1578,7 @@ mod tests {
         let input = write_test_input(&dir, 4, 10);
         let output = dir.path().join("multi_csc.scx");
 
-        run_build_csc(&input, &output, "4G", false, 3, None, None).unwrap();
+        run_build_csc(&input, &output, None, false, 3, None, None).unwrap();
 
         let reader = ScxReader::open(&output).unwrap();
         let hdr = reader.header();
@@ -1556,7 +1635,7 @@ mod tests {
         let input = write_test_input(&dir, 4, 10);
         let output = dir.path().join("multi_csc_range.scx");
 
-        run_build_csc(&input, &output, "4G", false, 3, None, None).unwrap();
+        run_build_csc(&input, &output, None, false, 3, None, None).unwrap();
 
         let orig_reader = ScxReader::open(&input).unwrap();
         let dense = orig_reader
@@ -1639,7 +1718,7 @@ mod tests {
             writer.finish().unwrap();
 
             let output = dir.path().join("multi_csc.scx");
-            run_build_csc(&path, &output, "4G", false, 3, None, None).unwrap();
+            run_build_csc(&path, &output, None, false, 3, None, None).unwrap();
 
             let reader = ScxReader::open(&output).unwrap();
             assert_eq!(reader.header().n_csc_shards, 4, "codec={codec:?}");
