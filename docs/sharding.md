@@ -1060,8 +1060,8 @@ methods (covariance and randomized SVD) explicitly reject
 ### Build policy: `off` / `auto` / `always`
 
 The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
-`from_h5ad` / `from_10x` / `from_h5mu`, `scx convert --csc`) is a three-state
-policy:
+`from_h5ad` / `from_10x` / `from_mtx` / `from_h5mu`, `scx convert --csc`) is a
+three-state policy:
 
 - **`auto`** (the default) — emit a sidecar only when the dataset is large
   enough that the column-axis acceleration pays for the extra build and
@@ -1074,7 +1074,9 @@ policy:
 
 `auto` is resolved against the matrix shape at write time, so a (unimodal)
 streaming conversion picks it up from the X reader's reported dimensions. An
-unset `csc` is `auto` on every entry point and for every `index_preset`;
+unset `csc` is `auto` on every single-modality entry point and for every
+`index_preset` (the multimodal exceptions are below: streaming h5mu and
+`from_mudata` cannot build per-modality sidecars);
 passing any explicit value — including `off` — always wins. The rule lives in
 `scx_engine::index::resolve_csc_policy` so the CLI and pyscx cannot drift
 apart. (Until this default changed, an unset `csc` was `off` and only the

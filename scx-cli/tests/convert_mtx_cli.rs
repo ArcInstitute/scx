@@ -893,9 +893,8 @@ fn mtx_to_scx_builds_a_sidecar_by_default_and_not_under_csc_off() {
 #[test]
 fn mtx_to_scx_honours_and_validates_memory_budget() {
     assert_eq!(mtx_csc(&["--memory-budget", "1M"]), (true, true));
-    assert_eq!(
-        mtx_csc(&["--memory-budget", "10MB"]).0,
-        false,
+    assert!(
+        !mtx_csc(&["--memory-budget", "10MB"]).0,
         "decimal MB is rejected"
     );
 }

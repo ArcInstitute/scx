@@ -161,16 +161,13 @@ impl CscSink {
         block_index_bytes: &[u8],
     ) -> Result<()> {
         self.note_header(header, value_max)?;
-        #[cfg(feature = "parallel")]
-        let decode = crate::shard_decode::decode_shard_regions_scipy_parallel;
-        #[cfg(not(feature = "parallel"))]
-        let decode = crate::shard_decode::decode_shard_regions_scipy;
-        let (indptr, indices, data) = decode(
+        let (indptr, indices, data) = crate::shard_decode::decode_shard_regions_scipy_with(
             header,
             indptr_bytes,
             indices_bytes,
             values_bytes,
             block_index_bytes,
+            true,
         )?;
         self.push(header, indptr, indices, data)
     }

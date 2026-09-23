@@ -1008,13 +1008,16 @@ fn from_mudata(
 /// `csc` / `csc_cols_per_shard` as for `from_anndata`: `csc=None` is `"auto"`,
 /// a CSC sidecar when `n_obs >= 50000` and `n_vars >= 5000`, appended to the
 /// written file in place (the MTX reader writes CSR only); `"off"` opts out.
+/// `memory_budget` (as for `from_h5ad`) bounds that sidecar build — its share
+/// sizes the shard widths and batches the emit — and `temp_dir` names where
+/// its buckets spill (default: the output's own directory).
 ///
 /// Example:
 ///     pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
 #[pyfunction]
 #[pyo3(signature = (
     mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto", allow_lossy=false,
-    csc=None, csc_cols_per_shard=5000,
+    csc=None, csc_cols_per_shard=5000, memory_budget=None, temp_dir=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_mtx(
@@ -1027,9 +1030,15 @@ fn from_mtx(
     allow_lossy: bool,
     csc: Option<&str>,
     csc_cols_per_shard: usize,
+    memory_budget: Option<Bound<'_, PyAny>>,
+    temp_dir: Option<std::path::PathBuf>,
 ) -> PyResult<()> {
     let csc_policy = scx_format_io::CscPolicy::parse(scx_engine::index::resolve_csc_policy(csc))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    // Parsed before any I/O, and through the sidecar share streaming ingest
+    // uses, so a budget sizes this build exactly as `from_h5ad` would.
+    let csc_memory_limit = convert::parse_memory_budget(memory_budget.as_ref())?
+        .map(|b| scx_convert::csc_sidecar_bytes(Some(b)).to_string());
     let obs_shard_policy =
         scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
     let orientation = scx_mtx::mtx_to_scx(
@@ -1047,8 +1056,8 @@ fn from_mtx(
             std::path::Path::new(scx_path),
             csc_policy,
             csc_cols_per_shard,
-            None,
-            None,
+            csc_memory_limit.as_deref(),
+            temp_dir.as_deref(),
         )
         .map_err(|e| e.to_string())
     })

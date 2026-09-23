@@ -323,3 +323,22 @@ def test_from_mtx_auto_skips_below_the_threshold(tmp_path):
     out = str(tmp_path / "out.scx")
     pyscx.from_mtx(str(_mtx_fixture(tmp_path)), out)
     assert pyscx.open(out).has_csc is False
+
+
+def test_from_mtx_budget_reaches_the_sidecar_build(tmp_path, monkeypatch):
+    """`memory_budget` / `temp_dir` reach the sidecar post-pass: a valid budget
+    still builds one, and an invalid budget is refused before anything is
+    written rather than ignored."""
+    monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
+    monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
+    mtx_dir = _mtx_fixture(tmp_path)
+    spill = tmp_path / "spill"
+    spill.mkdir()
+    out = str(tmp_path / "budgeted.scx")
+    pyscx.from_mtx(str(mtx_dir), out, memory_budget="1M", temp_dir=str(spill))
+    assert pyscx.open(out).has_csc is True
+
+    bad = tmp_path / "bad.scx"
+    with pytest.raises(ValueError):
+        pyscx.from_mtx(str(mtx_dir), str(bad), memory_budget="10MB")
+    assert not bad.exists()
