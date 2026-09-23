@@ -490,7 +490,7 @@ pub(crate) fn route_scx_backed_to_scx(
 /// hands it to `encode_one_shard` and `write_preencoded_shard`.
 /// Any source CSC sidecar is invalidated by the transforms and is
 /// dropped with a `UserWarning` unless `csc="always"` is passed (in
-/// which case it is rebuilt post-finalise).
+/// which case a new one is built in the same pass as the transformed X).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn route_scx_lazy_to_scx(
     py: Python<'_>,

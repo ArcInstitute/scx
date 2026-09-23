@@ -173,8 +173,8 @@ enum Commands {
         /// `--stream` / `--stream=true` on a non-streaming direction is
         /// an error rather than a silent no-op. A value requires the
         /// `=` form. Combine with `--csc always` on h5ad → SCX to emit
-        /// a CSC sidecar via a two-pass rebuild after the streaming
-        /// write completes.
+        /// a CSC sidecar, built in the same pass as the streaming X
+        /// write.
         #[arg(
             long,
             value_name = "BOOL",

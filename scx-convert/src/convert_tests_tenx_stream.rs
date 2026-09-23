@@ -370,9 +370,9 @@ fn streaming_tenx_seeds_the_codec_per_shard() {
     );
 }
 
-/// `--csc always` on the streaming path goes through `rebuild_csc_inplace`
-/// rather than a resident transpose, the same two-pass shape the streaming h5ad
-/// route uses. The sidecar it produces must match the eager one's layout.
+/// `--csc always` on the streaming path builds the sidecar in the same pass as
+/// X (`ScxWriter::enable_csc_sidecar`) rather than by a resident transpose,
+/// as the streaming h5ad route does. It must match the eager one's layout.
 #[test]
 fn streaming_tenx_csc_always_matches_the_eager_sidecar() {
     let dir = tempfile::tempdir().unwrap();

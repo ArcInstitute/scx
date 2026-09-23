@@ -351,7 +351,11 @@ page cache. Measured against that sequence (median of 3, one node):
 These are without `--memory-budget`. With one, `sort`, `optimize` and
 streaming ingest split it with the builder instead of stacking the two: the
 builder spills at a quarter of the budget (never more than it would stage
-alone) and the op plans against the rest. `compact`, `merge` and `subset` take
+alone) and the op plans its resident set against the rest. A grouped sort's
+sub-flush cap is the exception: it cuts X shards, so it stays sized from the
+whole budget — keeping the layout identical under `--csc carry` and
+`--csc off` — and the builder instead yields whatever a block of that cap
+leaves. `compact`, `merge` and `subset` take
 no budget of their own. When that peak matters, lower `--csc-memory-limit`, or
 run the op with `--csc off` and `scx build-csc` afterwards. A sidecar built this way is fresh
 (`csc_build_generation == data_generation`) and leaves no `build-csc`
