@@ -60,9 +60,10 @@ pub struct CscBuildOptions {
 
 impl Default for CscBuildOptions {
     fn default() -> Self {
+        let sidecar = crate::csc_sidecar::CscSidecarOptions::default();
         Self {
-            cols_per_shard: crate::csc_sidecar::CscSidecarOptions::default().cols_per_shard,
-            memory_bytes: crate::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+            cols_per_shard: sidecar.cols_per_shard,
+            memory_bytes: sidecar.memory_budget_bytes,
             spill_after_bytes: None,
             spill_root: None,
             framing: None,
