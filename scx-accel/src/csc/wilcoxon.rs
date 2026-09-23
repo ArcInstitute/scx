@@ -1428,6 +1428,108 @@ mod tests {
         }
     }
 
+    /// The exact-nnz kernel against the densify kernel it would replace, at
+    /// **zero** tolerance, on a matrix built to be tie-heavy.
+    ///
+    /// The property test above allows `1e-9 + 1e-6·|b|`. That bar is too loose
+    /// to promote the nnz kernel to the default: a default that moves a p-value
+    /// in its last bits reorders genes whose scores tie, and a tie-heavy count
+    /// matrix is where that happens. So this pins what the promotion needs —
+    /// bit-identical `scores`, `pvals`, `pvals_adj` and `logfoldchanges`, and the
+    /// same gene order within every group — through the two public drivers,
+    /// chunked the same way, rather than through the per-gene helpers.
+    ///
+    /// The fixture: counts in `{1, 2, 3}` at ~25% density, so every gene is one
+    /// large zero block plus three tie runs; an explicitly stored zero in some
+    /// columns; one column with no stored entry and one whose every stored
+    /// value is `1`; four groups plus unlabelled cells; and a chunk width that
+    /// does not divide `n_vars`.
+    #[test]
+    fn nnz_matches_the_densify_kernel_exactly_on_tie_heavy_counts() {
+        assert!(
+            !csc_wilcoxon_uses_nnz_kernel(None, false),
+            "premise: SCX_ACCEL_WILCOXON_NNZ is set in this test's environment, so \
+             the densify arm below would run the nnz kernel and compare it to itself"
+        );
+        let (n_obs, n_vars, n_groups) = (300usize, 24usize, 4usize);
+        let mut rng = ChaCha8Rng::seed_from_u64(0x7_1e5);
+        let groups: Vec<usize> = (0..n_obs).map(|_| rng.gen_range(0..=n_groups)).collect();
+        let mut cols: Vec<Vec<(i32, f32)>> = vec![Vec::new(); n_vars];
+        for (c, col) in cols.iter_mut().enumerate() {
+            if c == 3 {
+                continue; // no stored entry at all
+            }
+            for row in 0..n_obs {
+                if rng.gen::<f64>() >= 0.25 {
+                    if c % 5 == 0 && rng.gen::<f64>() < 0.02 {
+                        col.push((row as i32, 0.0)); // explicitly stored zero
+                    }
+                    continue;
+                }
+                let v = if c == 7 {
+                    1.0
+                } else {
+                    rng.gen_range(1i32..=3) as f32
+                };
+                col.push((row as i32, v));
+            }
+        }
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp{g}")).collect();
+        let src = InMemCsc { cols, n_obs };
+        let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+
+        for log_transformed in [false, true] {
+            for tie_correct in [true, false] {
+                let dense = wilcoxon_rank_sum_streaming_csc(
+                    &src,
+                    &gene_names,
+                    &groups,
+                    &group_names,
+                    None,
+                    5,
+                    log_transformed,
+                    false,
+                    tie_correct,
+                )
+                .unwrap();
+                let nnz = wilcoxon_rank_sum_nnz_csc(
+                    &src,
+                    &gene_names,
+                    &groups,
+                    &group_names,
+                    5,
+                    log_transformed,
+                    tie_correct,
+                )
+                .unwrap();
+                let ctx = format!("log_transformed={log_transformed} tie_correct={tie_correct}");
+                assert_eq!(dense.group_names, nnz.group_names, "{ctx}");
+                for g in 0..n_groups {
+                    assert_eq!(dense.names[g], nnz.names[g], "{ctx}: gene order, group {g}");
+                    for (field, a, b) in [
+                        ("scores", &dense.scores[g], &nnz.scores[g]),
+                        ("pvals", &dense.pvals[g], &nnz.pvals[g]),
+                        ("pvals_adj", &dense.pvals_adj[g], &nnz.pvals_adj[g]),
+                        (
+                            "logfoldchanges",
+                            &dense.logfoldchanges[g],
+                            &nnz.logfoldchanges[g],
+                        ),
+                    ] {
+                        for (k, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+                            assert!(
+                                same(x, y),
+                                "{ctx}: {field}[{g}][{k}] ({}) densify {x:e} vs nnz {y:e}",
+                                dense.names[g][k]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // --- ORG-7.21-3: the tie-run walk, pinned before it was shared ----------
     //
     // The nnz path's half of the duplication `diffexp::cpu::rank_with_ties`

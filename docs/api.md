@@ -2851,7 +2851,7 @@ when the dataset is large enough to benefit — `n_obs ≥ 50000` **and**
 | `pseudobulk_dex` | ✅ (gene subset) | CSR | N/A (CPU + pydeseq2) | CSC requires a gene subset (`gene_indices` or `col_projection`); full-gene CSC has no win. |
 | `highly_variable_genes` (seurat_v3) | ✅ (single-batch) | CSR | ❌ | CSC routes single-batch seurat_v3 on **either** device (`cpu_csc` / `gpu_csc_v3`) and on either handle kind, windowed or not; multi-batch and the other flavors raise on CSC. The `❌` is about speed, not support: the column-major mean/var walk is measurably *slower* than the row-major sweep, so a sidecar is not a reason to prefer CSC here. |
 | `calculate_qc_metrics` | ✅ (gene axis) | CSR | N/A | Gene-axis aggregation uses CSC; cell-axis stays CSR. `prefer_format="csc"` specifically rejects a scipy/dense `X` and a layer source — the sidecar belongs to `X`. `layer=` itself is supported on the default CSR route. |
-| `col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | ✅ | CSR | N/A | Column reductions; CSC requires only a sidecar, and answers over the visible window. |
+| `col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | ✅ | CSR | N/A | Column reductions; CSC requires only a sidecar, and answers over the visible window. CSR is measured faster on all five (see [scanpy.md § `prefer_format`](scanpy.md#prefer_formatautocsrcsc-column-major-dispatch)); `"csc"` is for a lazy handle, which the CSR route refuses. |
 | `pca` | ❌ (rejects CSC) | CSR | N/A | Inherently row-major; `prefer_format="csc"` raises `ValueError`. |
 | `neighbors` / `umap` / `leiden` | N/A | — | N/A | Operate on PCA embeddings / kNN graphs, not on `X`. |
 

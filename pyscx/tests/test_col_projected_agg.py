@@ -477,3 +477,61 @@ def test_var_scalar_projected(backed_projected_data, col_subset):
     projected_var = float(np.asarray(backed_x.var()))
     expected_var = float(full_x[:, col_subset].var())
     np.testing.assert_allclose(projected_var, expected_var, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# `pyscx.accel.col_*` on an unprojected handle: the reader's own kernels
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["whole", "deleted_rows"])
+@pytest.mark.parametrize("op", ["col_sums", "col_nnz", "col_min", "col_max", "col_var"])
+def test_accel_col_ops_agree_with_the_dunders_without_a_projection(tmp_dir, op, masked):
+    """With no column projection, `pyscx.accel.col_min` / `col_max` / `col_var`
+    run the reader's whole-axis kernels — the ones `X.min/max/var(axis=0)` use —
+    and so agree with them **bit for bit**, on a whole handle and on one with a
+    deletion vector.
+
+    They used to pass an identity column list to the projected kernels, which
+    run `project_csr` on every decoded shard: a copy of the whole matrix per
+    pass, which made those three 7x slower than `col_sums` on tabula_sapiens_100k
+    (6.6 s against 0.95 s after this change) and gave `col_var` a different
+    summation order from `X.var(axis=0)` on the same handle.
+    """
+    import anndata
+    import pyscx
+
+    # Multi-shard, with non-integer values: on one shard, or on sums of small
+    # integers, the two accumulation orders produce the same doubles and the
+    # comparison below could not tell them apart.
+    rng = np.random.default_rng(5)
+    dense = rng.lognormal(size=(400, 30)).astype(np.float32)
+    dense[rng.random((400, 30)) > 0.4] = 0
+    path = str(tmp_dir / f"col_ops_{op}_{masked}.scx")
+    pyscx.from_anndata(anndata.AnnData(X=sp.csr_matrix(dense)), path, shard_size=50)
+    if masked:
+        drop = np.zeros(400, dtype=bool)
+        drop[[0, 77, 260, 399]] = True
+        pyscx.open(path).mark_deleted(drop)
+    assert pyscx.open(path).shard_count >= 8, "premise: a multi-shard file"
+    x = pyscx.open(path).to_anndata(backed=True).X
+    got = np.asarray(getattr(pyscx.accel, op)(x), dtype=np.float64)
+    dunder = {
+        "col_sums": lambda: x.sum(axis=0),
+        "col_nnz": lambda: x.getnnz(axis=0),
+        "col_min": lambda: x.min(axis=0),
+        "col_max": lambda: x.max(axis=0),
+        "col_var": lambda: x.var(axis=0),
+    }[op]
+    want = np.asarray(dunder(), dtype=np.float64).ravel()
+    np.testing.assert_array_equal(got, want)
+
+    dense = pyscx.open(path).to_anndata().X.toarray().astype(np.float64)
+    ref = {
+        "col_sums": lambda: dense.sum(axis=0),
+        "col_nnz": lambda: (dense != 0).sum(axis=0),
+        "col_min": lambda: dense.min(axis=0),
+        "col_max": lambda: dense.max(axis=0),
+        "col_var": lambda: dense.var(axis=0),
+    }[op]()
+    np.testing.assert_allclose(got, ref, rtol=1e-9, atol=1e-12)

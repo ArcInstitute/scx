@@ -1046,13 +1046,19 @@ the field interpretation flips axes (`n_major` is columns,
 Add a CSC sidecar when your workload is **column-axis-heavy**:
 
 - **Differential expression** with small gene subsets (`pyscx.accel.rank_genes_groups(prefer_format="csc")`) — the kernel reads each chunk's columns as a single CSC slab instead of decoding every CSR row and projecting.
-- **Highly variable genes** at scale (`pyscx.accel.highly_variable_genes(prefer_format="csc")` for single-batch seurat_v3) — single-pass per-column accumulators with no `O(n_vars)` row-wise scratch.
 - **Per-gene QC** (`pyscx.accel.calculate_qc_metrics(prefer_format="csc")`) — gene-axis aggregations route through CSC.
 - **Filtered pseudobulk** (`pyscx.accel.pseudobulk_dex(prefer_format="csc", gene_indices=...)`) — only the requested gene columns are decoded.
 
 Skip the sidecar when the workload is **row-axis-only** (PCA — CSR
-already streams shards row-major; full-pass HVG without `prefer_format`
-arg; per-cell QC; subsetting by cells; ML training loaders). Both PCA
+already streams shards row-major; per-cell QC; subsetting by cells; ML
+training loaders). Two column-axis operations are **not** reasons to add one,
+because their CSC route is measured slower than CSR on the same file:
+highly variable genes (`highly_variable_genes(prefer_format="csc")`) and the
+whole-matrix column reductions (`col_sums` / `col_nnz` / `col_min` /
+`col_max` / `col_var`) — both read every column of every CSC shard for a
+statistic one row-major sweep produces. See
+[scanpy.md § `prefer_format`](scanpy.md#prefer_formatautocsrcsc-column-major-dispatch)
+for the numbers. Both PCA
 methods (covariance and randomized SVD) explicitly reject
 `prefer_format="csc"` on the pyscx side; see
 [api.md §pyscx.accel](api.md#pyscxaccel--rust-native-accelerators).

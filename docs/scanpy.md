@@ -2001,12 +2001,46 @@ Entries that accept it:
 
 | Function | CSC win |
 |----------|---------|
-| `pyscx.accel.highly_variable_genes` | Single-batch seurat_v3 only — single-pass per-column accumulators with no `O(n_vars)` row-wise scratch. Multi-batch and non-seurat_v3 raise. |
-| `pyscx.accel.rank_genes_groups` | Per gene chunk: read CSC slab + scatter into row-major dense buffer (vs decode every row + project for CSR). Clearest CSC win. |
+| `pyscx.accel.highly_variable_genes` | **None on CPU — it is slower.** Single-batch seurat_v3 only (multi-batch and non-seurat_v3 raise). Measured 4.4× slower than CSR at tabula_sapiens_100k (9.8 s vs 2.2 s) and 6.4× at census_1m (84.7 s vs 13.3 s), at 1.5–2.2× the peak RSS, selecting the same genes: the CSC mean/var pass walks every column of every CSC shard for statistics one row-major sweep produces. The kwarg stays because on `device="gpu"` it is also how a *filtered* handle reaches the column-major reduce (`gpu_csc_v3`), which the default auto-route leaves on `gpu_csr`. |
+| `pyscx.accel.rank_genes_groups` | Per gene chunk: read CSC slab + scatter into row-major dense buffer (vs decode every row + project for CSR). Clearest CSC win — how large depends on the shard cache, see below. |
 | `pyscx.accel.pseudobulk_dex` | Filtered-gene subsets only (`gene_indices=...` or column projection on `adata.X`). Full-gene pseudobulk has no CSC win and raises. |
 | `pyscx.accel.calculate_qc_metrics` | Gene-axis aggregations only (`total_counts`, `n_cells_by_counts`, and the `mean_counts` / `pct_dropout_by_counts` derived from them); cell-axis stays CSR. Both axes take one shard pass each for up to 64 `qc_vars`, with one extra row pass per additional 64, and `percent_top` adds none. `prefer_format="csc"` rejects a scipy/dense `X` and a layer source (`layer=`, or a layer handle assigned to `X`); `layer=` works on the default CSR route. |
-| `pyscx.accel.col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | Per-column aggregations on `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`. |
+| `pyscx.accel.col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | **None on a whole-matrix reduction — CSR is faster on all five.** Measured 2.4× (`col_var`) to 4.8× (`col_sums`) slower at tabula_sapiens_100k and 4.0× (`col_var`, 42.1 s vs 10.5 s) to 8.5× (`col_sums`, 42.2 s vs 5.0 s) at census_1m, identical results. What `"csc"` offers is the one thing CSR cannot do: serve a column reduction on a **lazy** `ScxLazyTransformedDataset`, which the CSR route refuses. Peak memory is bounded by one CSC shard: until this release an unprojected handle decoded the whole sidecar as one slab (12.9 GB at census_1m, against 5.7 GB now). |
 | `pyscx.accel.pca` | **Rejects `prefer_format="csc"`** with `ValueError`. Covariance build and randomized SpMM are row-major; CSC offers no measurable speed-up. |
+
+#### What the CSC route is worth, and in which regime
+
+Every CPU number below was taken on a **backed** handle, and for DE the shard
+cache the handle was opened with decides most of the answer. `to_anndata(backed=True)`
+defaults to a 4-shard cache; once a Wilcoxon pass visits more CSR shards than
+that, every gene chunk re-decodes every shard (a pass at the default
+`gene_chunk_size` is ~123 chunks on a 61.5K-gene file). The CSC route reads each
+column once either way, so its advantage is largest exactly where the CSR route
+thrashes:
+
+- **DE at the default cache** — 13.7× (CSC densify) and 21.7× (exact-nnz
+  kernel) over CSR on tabula_sapiens_100k, in
+  [performance.md § Differential expression (CPU, full-matrix)](performance.md#differential-expression-cpu-full-matrix);
+  6.2× on census_1m behind `normalize_total → log1p` (1,459.7 s → 235.2 s,
+  7.5 → 5.8 GB peak RSS; a one-off A/B, one build, two runs each, spread
+  < 2.5 %).
+- **DE with a cache sized to the file** — the CSR route stops re-decoding and
+  the sidecar's margin drops to 1.45× at census_1m (585.9 s vs 404.1 s) and
+  1.95× at tabula_sapiens_100k, with the CSR arm at 83 GB of RSS to get there.
+  That is the regime `bench_csc_dispatch`'s `de_csr` / `de_csc` arms measure (the
+  `LATEST` baseline); its `de_csr_bounded` arm is the same CSR call at the
+  default cache.
+- **HVG and the whole-matrix `col_*` reductions** are one pass over the matrix,
+  so the cache does not enter into it — and the CSC route loses on both (the
+  table above has the numbers). They make no argument for a sidecar.
+
+The HVG and `col_*` figures are one-off captures on one 16-core `cpu` node, the
+HVG arms at `d55ebf4f` and the `col_*` arms on the build that introduced the
+shard-bounded CSC walk and the unprojected CSR kernels (median of 2–3 runs, a
+fresh process per run, both arms of a pair on the same file and binary), not
+`benchmarks/comprehensive` captures; the
+`bench_csc_dispatch` arms `hvg_*` and `col_sums_*` / `col_var_*` measure the
+same calls in the suite.
 
 **DE (`rank_genes_groups`, `pdex_ref`) defaults to `"auto"`; every
 other `prefer_format`-taking function defaults to `"csr"`.**
@@ -2019,8 +2053,10 @@ the CSR shards, and CSR otherwise; on GPU it stays CSR so the planner routes
 `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`
 (`cpu_csc` vs `cpu_csr`; `cpu_csc_nnz` when the 1-vs-rest exact-nnz Wilcoxon
 kernel is opted into with `SCX_ACCEL_WILCOXON_NNZ=1`). Pass `prefer_format="csr"` explicitly to pin
-the pre-change behaviour. The non-DE functions keep `"csr"` — the
-runtime does not yet auto-route them. No thread-local default; no
+the pre-change behaviour. The non-DE functions keep `"csr"`, and that is a
+measured decision rather than a gap: HVG and the `col_*` reductions are slower
+on CSC (above), and `calculate_qc_metrics` / `pseudobulk_dex` serve only part of
+what they compute from it. No thread-local default; no
 env-var override; each call sets the choice locally.
 
 `prefer_format="csc"` requires **one** thing, and raises `RuntimeError`

@@ -453,6 +453,48 @@ def test_csc_on_both_axes_matches_the_reference(csc_path, counts, obs_cols, var_
     assert _de_route(adata) == "cpu_csc"
 
 
+def _project_genes(adata, how, counts):
+    """Project the gene axis of a backed handle three ways, with no row filter
+    and no transform chain."""
+    if how == "subset_var":
+        pyscx.accel.subset_var(adata, COL_KEEP)
+    elif how == "filter_genes":
+        detected = np.asarray((counts > 0).sum(axis=0)).ravel()
+        pyscx.accel.filter_genes(adata, min_cells=int(np.median(detected)) + 1)
+    else:
+        adata = adata[:, COL_KEEP]
+    return adata
+
+
+@pytest.mark.parametrize("how", ["subset_var", "filter_genes", "slice"])
+def test_auto_takes_csc_on_a_gene_only_projection(csc_path, counts, obs_cols, var_names, how):
+    """At the default `prefer_format="auto"`, a backed handle whose only view is
+    a gene projection takes `cpu_csc`.
+
+    It used to take `cpu_csr`: the backed handle's column source was the
+    full-axis sidecar reader, so the probe excluded a column projection by hand
+    (the kernel's `n_vars` guard would otherwise have raised), while the lazy
+    handle with the same projection already served it — `filter_genes` alone
+    routed CSR and `filter_genes + normalize_total + log1p` routed CSC. The
+    handle now hands back a view that remaps columns, and nothing excludes the
+    projection any more; this pins that for all three ways of making one.
+    """
+    adata = _project_genes(_backed(csc_path), how, counts)
+    kept = [var_names.index(n) for n in adata.var_names]
+    assert 0 < len(kept) < N_VARS, f"premise: {how} must drop some genes, kept {len(kept)}"
+    assert adata.n_obs == N_OBS, "premise: no row filter"
+    cols = np.zeros(N_VARS, dtype=bool)
+    cols[kept] = True
+    import warnings
+
+    with warnings.catch_warnings():
+        # `slice` hands the op an AnnData view, which it rebuilds in place.
+        warnings.simplefilter("ignore")
+        got = _rgg(adata)
+    _assert_de_equal(got, _rgg(_reference(counts, obs_cols, var_names, cols=cols)))
+    assert _de_route(adata) == "cpu_csc"
+
+
 # ---------------------------------------------------------------------------
 # GPU DE route: the `has_axis_view()` switch
 # ---------------------------------------------------------------------------

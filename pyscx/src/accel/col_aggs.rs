@@ -53,7 +53,7 @@ fn validated_prefer(prefer_format: &str) -> PyResult<&'static str> {
 /// Owned snapshot of a backed handle's CSR state, taken under the GIL so the
 /// streaming scan can run detached.
 ///
-/// Cheap: two `Arc` clones and (at most) one `Vec<u32>` of visible column ids.
+/// Cheap: three `Arc` clones.
 struct CsrHandle {
     reader: Arc<BackedCsrReader>,
     /// Visible → global row map, when a deletion vector / row subset is active.
@@ -62,8 +62,6 @@ struct CsrHandle {
     cols: Option<Arc<Vec<u32>>>,
     /// Visible row count (`shape_val.0`), i.e. post-subset.
     n_obs: usize,
-    /// Visible column count (`shape_val.1`), i.e. post-projection.
-    n_vars: usize,
 }
 
 impl CsrHandle {
@@ -82,7 +80,6 @@ impl CsrHandle {
             kept: backed.kept_to_global.clone(),
             cols: backed.col_projection_arc(),
             n_obs: backed.shape_val.0,
-            n_vars: backed.shape_val.1,
         })
     }
 
@@ -90,17 +87,17 @@ impl CsrHandle {
         self.kept.as_ref().map(|k| k.as_slice())
     }
 
+    /// Visible → on-disk column ids, or `None` when no projection is active.
+    ///
+    /// Every CSR entry point branches on this rather than materialising the
+    /// identity range when it is `None`. `col_min` / `col_max` / `col_var` used
+    /// to: the projected kernels run `project_csr` on every decoded shard, so an
+    /// identity "projection" copied the whole matrix once per pass (twice for
+    /// `col_var`) and made those three 8-15x slower than `col_sums` on the same
+    /// handle — slow enough that the CSC sidecar looked like the faster layout
+    /// for them when it was not.
     fn cols_slice(&self) -> Option<&[u32]> {
         self.cols.as_ref().map(|c| c.as_slice())
-    }
-
-    /// Visible column ids, materialising the identity range when no projection
-    /// is active (several kernels take a column list unconditionally).
-    fn cols_or_identity(&self) -> Vec<u32> {
-        match self.cols_slice() {
-            Some(c) => c.to_vec(),
-            None => (0..self.n_vars as u32).collect(),
-        }
     }
 }
 
@@ -218,13 +215,14 @@ pub fn col_max<'py>(
     }
 
     let h = CsrHandle::extract(dataset, "col_max")?;
-    let cols_owned = h.cols_or_identity();
-    let maxes = detached(py, || match h.kept_slice() {
+    let maxes = detached(py, || match (h.cols_slice(), h.kept_slice()) {
         // Implicit-zero correction counts against the *visible* row count.
-        Some(kept) => {
-            projected_agg::col_max_masked_projected(&h.reader, kept, &cols_owned, kept.len())
+        (Some(cols), Some(kept)) => {
+            projected_agg::col_max_masked_projected(&h.reader, kept, cols, kept.len())
         }
-        None => projected_agg::col_max_projected(&h.reader, &cols_owned, h.n_obs),
+        (Some(cols), None) => projected_agg::col_max_projected(&h.reader, cols, h.n_obs),
+        (None, Some(kept)) => h.reader.col_max_masked(kept),
+        (None, None) => h.reader.col_max(),
     })
     .map_err(to_py_err)?;
     Ok(PyArray::from_vec(py, maxes).into_any())
@@ -248,12 +246,13 @@ pub fn col_min<'py>(
     }
 
     let h = CsrHandle::extract(dataset, "col_min")?;
-    let cols_owned = h.cols_or_identity();
-    let mins = detached(py, || match h.kept_slice() {
-        Some(kept) => {
-            projected_agg::col_min_masked_projected(&h.reader, kept, &cols_owned, kept.len())
+    let mins = detached(py, || match (h.cols_slice(), h.kept_slice()) {
+        (Some(cols), Some(kept)) => {
+            projected_agg::col_min_masked_projected(&h.reader, kept, cols, kept.len())
         }
-        None => projected_agg::col_min_projected(&h.reader, &cols_owned, h.n_obs),
+        (Some(cols), None) => projected_agg::col_min_projected(&h.reader, cols, h.n_obs),
+        (None, Some(kept)) => h.reader.col_min_masked(kept),
+        (None, None) => h.reader.col_min(),
     })
     .map_err(to_py_err)?;
     Ok(PyArray::from_vec(py, mins).into_any())
@@ -279,11 +278,12 @@ pub fn col_var<'py>(
     }
 
     let h = CsrHandle::extract(dataset, "col_var")?;
-    let cols_owned = h.cols_or_identity();
-    let vars = detached(py, || match h.kept_slice() {
-        // `col_var_masked_projected` derives its denominator from `kept`.
-        Some(kept) => projected_agg::col_var_masked_projected(&h.reader, kept, &cols_owned),
-        None => projected_agg::col_var_projected(&h.reader, &cols_owned, h.n_obs),
+    let vars = detached(py, || match (h.cols_slice(), h.kept_slice()) {
+        // The masked kernels derive their denominator from `kept`.
+        (Some(cols), Some(kept)) => projected_agg::col_var_masked_projected(&h.reader, kept, cols),
+        (Some(cols), None) => projected_agg::col_var_projected(&h.reader, cols, h.n_obs),
+        (None, Some(kept)) => h.reader.col_var_masked(kept),
+        (None, None) => h.reader.col_var(),
     })
     .map_err(to_py_err)?;
     Ok(PyArray::from_vec(py, vars).into_any())

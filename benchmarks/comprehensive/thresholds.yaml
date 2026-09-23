@@ -264,6 +264,16 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: csc_dispatch_correct
     min: 1.0
+  # The exact-nnz Wilcoxon arm runs in a fresh process with
+  # SCX_ACCEL_WILCOXON_NNZ=1, and its `csc_dispatch_correct` is 1.0 only for
+  # the route `cpu_csc_nnz` — stricter than the arms above, whose "csc in
+  # route" test the densify kernel's `cpu_csc` would also pass. It is what a
+  # promotion of the nnz kernel to the default would be measured against.
+  - benchmark: bench_csc_dispatch
+    format: bench_csc__de_csc_nnz
+    dataset: tabula_sapiens_100k
+    metric: csc_dispatch_correct
+    min: 1.0
 
   # Cloud push/pull throughput — migrated from the retired
   # ``benchmark_cloud.py`` hardcoded ``_median(throughputs) > 50`` gate.

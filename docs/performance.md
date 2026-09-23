@@ -1866,14 +1866,24 @@ This is a compatibility change (DE previously defaulted to `"csr"`); pin
 `prefer_format="csr"` for the old behaviour. An **exact sparse-nnz Wilcoxon**
 kernel (opt-in `SCX_ACCEL_WILCOXON_NNZ=1`, 1-vs-rest) ranks only each gene's
 nonzeros plus an analytic implicit-zero tie-block — `O(nnz·log nnz)`/gene instead
-of an `O(n_obs·log n_obs)` dense sort — numerically equivalent to the dense kernel
-(property-tested to 1e-9). It records as its **own** route, `cpu_csc_nnz`; until
+of an `O(n_obs·log n_obs)` dense sort — bit-identical to the densify kernel:
+scores, p-values, adjusted p-values, log fold changes and gene order are pinned at
+zero tolerance on a tie-heavy count matrix
+(`nnz_matches_the_densify_kernel_exactly_on_tie_heavy_counts`), besides the
+1e-9 property test. It records as its **own** route, `cpu_csc_nnz`; until
 0.20 both CSC kernels stamped `cpu_csc`, so a benchmark could not tell from
 `uns["scx_accel"]` which of the two it had timed (review §7.17).
 
 **Measured DE-route benchmark** (`rank_genes_groups`, 1-vs-rest, backed streaming;
 a CSC sidecar built with `scx build-csc`; median of 2 runs, CPU). Routes confirmed
-via `uns["scx_accel"]` (`cpu_csr` / `cpu_csc` / `cpu_csc_nnz`):
+via `uns["scx_accel"]` (`cpu_csr` / `cpu_csc` / `cpu_csc_nnz`). Every arm opens its
+handle with `to_anndata(backed=True)`'s **default 4-shard cache**, which is fewer
+than the 7 CSR shards the pass visits — so the CSR arm re-decodes every shard for
+every gene chunk, and most of the ratio below is that re-decode rather than the
+column-major layout as such. With the cache sized to the whole file (what
+`bench_csc_dispatch`'s `de_csr` / `de_csc` arms do) the same comparison is 1.95×
+here and 1.45× at census_1m, at the cost of holding every decoded shard (83 GB of
+RSS for census_1m's CSR arm):
 
 | Dataset | Route | wall (s) | peak RSS (MB) | vs CSR | vs CSC-densify |
 |---|---|--:|--:|--:|--:|

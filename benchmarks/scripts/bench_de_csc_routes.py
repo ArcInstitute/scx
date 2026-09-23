@@ -72,6 +72,12 @@ def main() -> None:
 
     adata = pyscx.open(args.scx).to_anndata(backed=True)
     groupby = args.groupby or _select_groupby(adata)
+    # A categorical carries every level it was declared with, used or not, and
+    # `rank_genes_groups` refuses a participating group with fewer than two
+    # cells (since 0.17) — so census_1m's `disease`, 17 levels present out of
+    # the census-wide vocabulary, raised before the first gene was tested.
+    if hasattr(adata.obs[groupby], "cat"):
+        adata.obs[groupby] = adata.obs[groupby].cat.remove_unused_categories()
     n_groups = int(adata.obs[groupby].astype("str").nunique())
     n_obs, n_vars = adata.shape
 

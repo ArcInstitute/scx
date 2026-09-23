@@ -1036,6 +1036,14 @@ use scx_format_io::ColumnShardSource;
 /// column. `csc_run` is the CSC slab covering one run; `local_col_in_run`
 /// is the column within that run, and `output_col_idx` is the position
 /// of that column in the user-facing `col_indices` order.
+///
+/// A run never crosses a CSC shard boundary, so the largest slab held is one
+/// shard's worth of the requested columns. Without the split, an unprojected
+/// handle's columns form a single run and the whole sidecar was decoded into
+/// one slab — 7.2 GB resident for `col_sums` on census_500k, against 1.7 GB for
+/// the CSR route over the same file. Splitting cannot change a result: a column
+/// lives in exactly one shard, so each column is still accumulated from one
+/// slab, in the same order.
 fn walk_csc_runs(
     source: &dyn ColumnShardSource,
     col_indices: &[u32],
@@ -1052,10 +1060,21 @@ fn walk_csc_runs(
         .collect();
     sorted_with_pos.sort_by_key(|(c, _)| *c);
 
+    // First column of every shard, in the same (possibly projected) axis as
+    // `col_indices`. A source that cannot name its shard ranges gets no split.
+    let mut shard_starts: Vec<u32> = (0..source.n_csc_shards())
+        .filter_map(|i| source.csc_shard_col_range(i).map(|(lo, _)| lo))
+        .collect();
+    shard_starts.sort_unstable();
+    let starts_shard = |c: u32| shard_starts.binary_search(&c).is_ok();
+
     let mut i = 0;
     while i < sorted_with_pos.len() {
         let mut j = i + 1;
-        while j < sorted_with_pos.len() && sorted_with_pos[j].0 == sorted_with_pos[j - 1].0 + 1 {
+        while j < sorted_with_pos.len()
+            && sorted_with_pos[j].0 == sorted_with_pos[j - 1].0 + 1
+            && !starts_shard(sorted_with_pos[j].0)
+        {
             j += 1;
         }
         let run_start = sorted_with_pos[i].0;
