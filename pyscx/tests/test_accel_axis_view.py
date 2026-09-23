@@ -471,13 +471,13 @@ def test_auto_takes_csc_on_a_gene_only_projection(csc_path, counts, obs_cols, va
     """At the default `prefer_format="auto"`, a backed handle whose only view is
     a gene projection takes `cpu_csc`.
 
-    It used to take `cpu_csr`: the backed handle's column source was the
-    full-axis sidecar reader, so the probe excluded a column projection by hand
-    (the kernel's `n_vars` guard would otherwise have raised), while the lazy
-    handle with the same projection already served it — `filter_genes` alone
-    routed CSR and `filter_genes + normalize_total + log1p` routed CSC. The
-    handle now hands back a view that remaps columns, and nothing excludes the
-    projection any more; this pins that for all three ways of making one.
+    A regression pin, not the test for a fix. The behaviour arrived when the
+    backed handle started serving its CSC reads through the same view a lazy
+    one does, which remaps columns into the projected axis. Before that its
+    column source was the full-axis sidecar reader, so the probe excluded a
+    column projection by hand and `filter_genes` alone routed `cpu_csr` while
+    `filter_genes + normalize_total + log1p` routed `cpu_csc`. Nothing asserted
+    the gene-only case since, so this pins it for all three ways of making one.
     """
     adata = _project_genes(_backed(csc_path), how, counts)
     kept = [var_names.index(n) for n in adata.var_names]

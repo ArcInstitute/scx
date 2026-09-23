@@ -1891,16 +1891,18 @@ RSS for census_1m's CSR arm):
 | tabula_100k | CSC-direct densify (`csc`, §5.2) | 25.6 | 2749 | **13.7×** | 1.0× |
 | tabula_100k | CSC-direct nnz (`csc`+`SCX_ACCEL_WILCOXON_NNZ`, §5.3) | 16.2 | 2552 | **21.7×** | **1.58×** |
 
-**§5.2 — CSR → CSC-direct is ~13.7× faster with lower peak RSS.** The CSR streamer
-re-decodes every shard for each gene-chunk (here ~123 chunks × 7 shards on the
-full 61.5K-gene matrix, cache-bound), while the CSC-direct route reads each
-column-chunk exactly once — so on a sidecar file the `auto` default's CPU routing
-is a large, measured win. (For CSR-*only* files the deferred loop-inversion / a
+**§5.2 — at the default shard cache, CSR → CSC-direct is ~13.7× faster with lower
+peak RSS.** The CSR streamer re-decodes every shard for each gene-chunk (here ~123
+chunks × 7 shards on the full 61.5K-gene matrix, cache-bound), while the CSC-direct
+route reads each column-chunk exactly once — so on a sidecar file, in the bounded
+cache a backed handle opens with, the `auto` default's CPU routing is a large,
+measured win. Against a CSR route allowed to cache the whole file it is the
+1.95× / 1.45× above. (For CSR-*only* files the deferred loop-inversion / a
 larger shard cache addresses the same re-decode; `auto` sidesteps it when a sidecar
 exists.) **§5.3 — the exact sparse-nnz kernel adds ~1.58×** over CSC-densify by
 ranking only nonzeros + an analytic zero block instead of an `n_obs` dense sort,
-for **~21.7× end-to-end** over the old CSR default, at lower peak RSS. Numerically
-identical to the dense kernel (property-tested). Source: `bench_de_csc_routes.py`
+for **~21.7× end-to-end** over the old CSR default at the same default cache, at
+lower peak RSS. Bit-identical to the dense kernel (pinned at zero tolerance, above). Source: `bench_de_csc_routes.py`
 on `cpu_preemptible`; the nnz kernel stays opt-in pending a promotion decision.
 
 Source: 2026-05-25 full-tier gate (post-G10 graph capture + bench env-routing fix), candidate `candidate_2623788_20260525`. Benchmark module: `benchmarks/comprehensive/benchmarks/accel_de.py` — picks the best obs column from `cell_type`/`leiden`/`louvain`/`cluster`/`perturbation`/`target` or falls back to a deterministic 50/50 synthetic split, restricts to top-4 test groups + reference, and records the chosen `groupby` in `metadata`. Each SLURM bench job is allocated 16 CPUs; `pyscx_cpu`'s `user_s/wall_s` ratio shows ~3-5 effective cores per run.

@@ -111,14 +111,12 @@ _PSEUDOBULK_BACKEND = "pydeseq2"
 # cache instead of one sized to the file. See the module docstring.
 _BOUNDED_CACHE_VARIANTS: frozenset[str] = frozenset({"bench_csc__de_csr_bounded"})
 
-# Variants that run every repetition in a fresh process, with extra environment.
-# See the module docstring.
-_FRESH_PROCESS_VARIANTS: dict[str, dict[str, str]] = {
-    "bench_csc__de_csc_nnz": {"SCX_ACCEL_WILCOXON_NNZ": "1"},
+# Variants that run every repetition in a fresh process: the extra environment,
+# and the one route that counts as having dispatched correctly. See the module
+# docstring.
+_FRESH_PROCESS_VARIANTS: dict[str, tuple[dict[str, str], str]] = {
+    "bench_csc__de_csc_nnz": ({"SCX_ACCEL_WILCOXON_NNZ": "1"}, "cpu_csc_nnz"),
 }
-
-# The route a fresh-process variant must record; anything else is a fallback.
-_EXPECTED_ROUTE: dict[str, str] = {"bench_csc__de_csc_nnz": "cpu_csc_nnz"}
 
 # Generous: the densify CSC DE route takes ~70 s on tabula_sapiens_100k and
 # ~4 min at census_1m.
@@ -264,12 +262,35 @@ def _run_hvg(adata: Any, prefer: str) -> None:
     )
 
 
+def _unlabel_undersized_groups(adata: Any, groupby: str) -> bool:
+    """Turn every level of ``obs[groupby]`` with fewer than two cells into
+    unlabelled (NaN) cells, in place; return whether two or more levels remain.
+
+    `rank_genes_groups` refuses a participating group with fewer than two cells
+    (since 0.17), and a categorical also carries every level it was declared
+    with, so census's `cell_type` — singleton levels among 125, from a
+    census-wide vocabulary — raised before the first gene was tested. Dropping
+    unused levels is not enough: a one-cell level is used. Unlabelling rather
+    than subsetting keeps those cells where scanpy 1.12 puts them, in the rank
+    pool and in every group's "rest", so the call still ranks every cell.
+    """
+    col = adata.obs[groupby]
+    if not hasattr(col, "cat"):
+        col = col.astype("category")
+    counts = col.value_counts()
+    col = col.cat.remove_categories([c for c in col.cat.categories if counts.get(c, 0) < 2])
+    adata.obs[groupby] = col
+    return len(col.cat.categories) >= 2
+
+
 def _run_de(adata: Any, prefer: str) -> None:
     # Pick a reasonable groupby column. Most fixtures expose
     # `cell_type` or fall back to a synthetic 50/50 split.
     obs_cols = list(adata.obs.columns)
     candidates = ["cell_type", "leiden", "louvain", "cluster", "perturbation"]
     groupby = next((c for c in candidates if c in obs_cols), None)
+    if groupby is not None and not _unlabel_undersized_groups(adata, groupby):
+        groupby = None
     if groupby is None:
         # Fall back: build a 2-way synthetic split.
         n = adata.n_obs
@@ -421,14 +442,15 @@ key, path = sys.argv[1], Path(sys.argv[2])
 runner, prefer = b._VARIANT_IMPLS[key]
 adata = b._open_backed(path, bounded=key in b._BOUNDED_CACHE_VARIANTS)
 gc.collect()
+ru0 = resource.getrusage(resource.RUSAGE_SELF)
 t0 = time.perf_counter()
 runner(adata, prefer)
 wall = time.perf_counter() - t0
 ru = resource.getrusage(resource.RUSAGE_SELF)
 print(json.dumps({
     "wall_s": wall,
-    "user_s": ru.ru_utime,
-    "sys_s": ru.ru_stime,
+    "user_s": ru.ru_utime - ru0.ru_utime,
+    "sys_s": ru.ru_stime - ru0.ru_stime,
     "peak_rss_mb": ru.ru_maxrss / 1024.0,
     "route": b._extract_route(adata, b._VARIANT_OP_KEY[key]),
 }))
@@ -438,12 +460,11 @@ print(json.dumps({
 def _run_fresh_process(key: str, csc_path: Path, result: BenchmarkResult, n_runs: int):
     """Every repetition of *key* in its own interpreter; see the module docstring.
 
-    `user_s` / `sys_s` / `peak_rss_mb` are the worker's whole-process figures,
-    open included, where the in-process arms time only the op. The wall time is
-    the op alone, measured inside the worker.
+    `wall_s`, `user_s` and `sys_s` cover the op alone, measured inside the
+    worker as the in-process arms measure them. `peak_rss_mb` is the worker's
+    whole-process high-water mark, open included — `ru_maxrss` has no delta.
     """
-    env = _FRESH_PROCESS_VARIANTS[key]
-    expected = _EXPECTED_ROUTE[key]
+    env, expected = _FRESH_PROCESS_VARIANTS[key]
     for i in range(N_WARMUP_RUNS + n_runs):
         outcome = run_arm(
             _FRESH_WORKER, [key, str(csc_path)], env=env,

@@ -1065,7 +1065,11 @@ fn walk_csc_runs(
     let mut shard_starts: Vec<u32> = (0..source.n_csc_shards())
         .filter_map(|i| source.csc_shard_col_range(i).map(|(lo, _)| lo))
         .collect();
+    // Sorted rather than assumed sorted (the trait promises no order), and
+    // deduplicated: under a projection a shard it skips entirely has an empty
+    // range whose start repeats the next shard's.
     shard_starts.sort_unstable();
+    shard_starts.dedup();
     let starts_shard = |c: u32| shard_starts.binary_search(&c).is_ok();
 
     let mut i = 0;

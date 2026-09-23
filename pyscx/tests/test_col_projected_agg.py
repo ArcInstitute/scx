@@ -535,3 +535,38 @@ def test_accel_col_ops_agree_with_the_dunders_without_a_projection(tmp_dir, op, 
         "col_var": lambda: dense.var(axis=0),
     }[op]()
     np.testing.assert_allclose(got, ref, rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize("op", ["col_sums", "col_nnz", "col_min", "col_max", "col_var"])
+def test_csc_col_ops_on_a_projection_that_skips_whole_shards(tmp_dir, op):
+    """The CSC walk splits a contiguous run of requested columns at CSC shard
+    boundaries. A projection that takes the tail of one shard, skips the next
+    two entirely and resumes mid-way through a fourth exercises the cases that
+    split has to get right: a run that ends at a boundary, shards the
+    projection empties (whose ranges collapse onto the next shard's start), and
+    a run that starts part-way into a shard."""
+    import anndata
+    import pyscx
+
+    rng = np.random.default_rng(11)
+    dense = rng.lognormal(size=(120, 40)).astype(np.float32)
+    dense[rng.random((120, 40)) > 0.5] = 0
+    path = str(tmp_dir / f"skip_{op}.scx")
+    pyscx.from_anndata(
+        anndata.AnnData(X=sp.csr_matrix(dense)), path, csc="always", csc_cols_per_shard=8
+    )
+    cols = list(range(5, 8)) + list(range(28, 35)) + [39]  # shards 0, 3, 4; skips 1-2
+    adata = pyscx.open(path).to_anndata(backed=True)
+    pyscx.accel.subset_var(adata, cols)
+    got = np.asarray(getattr(pyscx.accel, op)(adata.X, prefer_format="csc"), dtype=np.float64)
+    csr = np.asarray(getattr(pyscx.accel, op)(adata.X, prefer_format="csr"), dtype=np.float64)
+    sub = dense[:, cols].astype(np.float64)
+    ref = {
+        "col_sums": sub.sum(axis=0),
+        "col_nnz": (sub != 0).sum(axis=0),
+        "col_min": sub.min(axis=0),
+        "col_max": sub.max(axis=0),
+        "col_var": sub.var(axis=0),
+    }[op]
+    np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(got, csr, rtol=1e-9, atol=1e-12)
