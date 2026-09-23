@@ -233,8 +233,12 @@ absolute_floors:
   # variant's intended layout actually dispatched (a `_csc` variant ran a route
   # containing "csc", a `_csr` variant did not), 0.0 on a silent fallback
   # (require_csc() dropped to CSR because the sidecar build failed, or vice
-  # versa). All five ops (qc_metrics, hvg, rank_genes_groups, pdex_ref,
-  # pseudobulk_dex) stamp a route, so every `_csc` variant is gated.
+  # versa). The five AnnData ops (qc_metrics, hvg, rank_genes_groups,
+  # pdex_ref, pseudobulk_dex) stamp a route, so each of their `_csc` variants
+  # is gated, and `de_csc_nnz` is gated more strictly below. The `col_sums` /
+  # `col_var` arms are outside this gate: those functions return an array and
+  # stamp no route, and an explicit `prefer_format="csc"` raises on a file
+  # without a sidecar rather than timing the wrong layout.
   #
   # Gated on tabula_sapiens_100k — its multi-shard CSC sidecar exercises the
   # column slab read that pbmc3k's single shard can't, and the 100k-cell

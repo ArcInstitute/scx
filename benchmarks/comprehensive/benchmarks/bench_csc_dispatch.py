@@ -111,16 +111,14 @@ _PSEUDOBULK_BACKEND = "pydeseq2"
 # cache instead of one sized to the file. See the module docstring.
 _BOUNDED_CACHE_VARIANTS: frozenset[str] = frozenset({"bench_csc__de_csr_bounded"})
 
-# Variants that run every repetition in a fresh process: the extra environment,
-# and the one route that counts as having dispatched correctly. See the module
+# The one variant that runs every repetition in a fresh process; see the module
 # docstring.
-_FRESH_PROCESS_VARIANTS: dict[str, tuple[dict[str, str], str]] = {
-    "bench_csc__de_csc_nnz": ({"SCX_ACCEL_WILCOXON_NNZ": "1"}, "cpu_csc_nnz"),
-}
+_NNZ_KEY = "bench_csc__de_csc_nnz"
 
-# Generous: the densify CSC DE route takes ~70 s on tabula_sapiens_100k and
-# ~4 min at census_1m.
-_FRESH_PROCESS_TIMEOUT_S = 3 * 3600
+# Per repetition. The nnz kernel measured ~6 s at tabula_sapiens_100k and ~56 s
+# at census_1m, so this is ~30x the slowest observed run: long enough never to
+# cut a real one short, short enough that a hung child frees the allocation.
+_FRESH_PROCESS_TIMEOUT_S = 30 * 60
 
 # Per-format dataset allow-lists, read by `run_parallel` at cohort-build time.
 # Only the bounded arm is scoped; every other variant runs wherever it did.
@@ -438,9 +436,9 @@ _FRESH_WORKER = '''
 import gc, json, resource, sys, time
 from pathlib import Path
 from benchmarks.comprehensive.benchmarks import bench_csc_dispatch as b
-key, path = sys.argv[1], Path(sys.argv[2])
-runner, prefer = b._VARIANT_IMPLS[key]
-adata = b._open_backed(path, bounded=key in b._BOUNDED_CACHE_VARIANTS)
+path = Path(sys.argv[1])
+runner, prefer = b._VARIANT_IMPLS[b._NNZ_KEY]
+adata = b._open_backed(path)
 gc.collect()
 ru0 = resource.getrusage(resource.RUSAGE_SELF)
 t0 = time.perf_counter()
@@ -452,32 +450,32 @@ print(json.dumps({
     "user_s": ru.ru_utime - ru0.ru_utime,
     "sys_s": ru.ru_stime - ru0.ru_stime,
     "peak_rss_mb": ru.ru_maxrss / 1024.0,
-    "route": b._extract_route(adata, b._VARIANT_OP_KEY[key]),
+    "route": b._extract_route(adata, "rank_genes_groups"),
 }))
 '''
 
 
-def _run_fresh_process(key: str, csc_path: Path, result: BenchmarkResult, n_runs: int):
-    """Every repetition of *key* in its own interpreter; see the module docstring.
+def _run_de_csc_nnz(csc_path: Path, result: BenchmarkResult, n_runs: int):
+    """Every repetition of `bench_csc__de_csc_nnz` in its own interpreter, with
+    `SCX_ACCEL_WILCOXON_NNZ=1`; see the module docstring.
 
     `wall_s`, `user_s` and `sys_s` cover the op alone, measured inside the
     worker as the in-process arms measure them. `peak_rss_mb` is the worker's
     whole-process high-water mark, open included — `ru_maxrss` has no delta.
     """
-    env, expected = _FRESH_PROCESS_VARIANTS[key]
     for i in range(N_WARMUP_RUNS + n_runs):
         outcome = run_arm(
-            _FRESH_WORKER, [key, str(csc_path)], env=env,
-            timeout_s=_FRESH_PROCESS_TIMEOUT_S, label=key,
+            _FRESH_WORKER, [str(csc_path)], env={"SCX_ACCEL_WILCOXON_NNZ": "1"},
+            timeout_s=_FRESH_PROCESS_TIMEOUT_S, label=_NNZ_KEY,
         )
         if not outcome.ok or not outcome.records:
-            logger.error("%s", outcome.failure_text(key))
+            logger.error("%s", outcome.failure_text(_NNZ_KEY))
             return None
         if i < N_WARMUP_RUNS:
             continue
         rec = outcome.records[-1]
         route = rec.get("route")
-        extras: dict[str, Any] = {"csc_dispatch_correct": 1.0 if route == expected else 0.0}
+        extras: dict[str, Any] = {"csc_dispatch_correct": 1.0 if route == "cpu_csc_nnz" else 0.0}
         if route is not None:
             extras["dispatch_route"] = route
         result.add_run(
@@ -487,7 +485,7 @@ def _run_fresh_process(key: str, csc_path: Path, result: BenchmarkResult, n_runs
             peak_rss_mb=rec["peak_rss_mb"],
             **extras,
         )
-        logger.info("  %s run %d: wall=%.3fs route=%s", key, i + 1 - N_WARMUP_RUNS,
+        logger.info("  %s run %d: wall=%.3fs route=%s", _NNZ_KEY, i + 1 - N_WARMUP_RUNS,
                     rec["wall_s"], route)
     return result
 
@@ -528,12 +526,12 @@ def run(
             # "default" = `to_anndata(backed=True)`'s own cache; "file" = one
             # slot per CSR shard, so nothing is ever re-decoded.
             "shard_cache": "default" if bounded else "file",
-            "fresh_process": key in _FRESH_PROCESS_VARIANTS,
+            "fresh_process": key == _NNZ_KEY,
         },
     )
 
-    if key in _FRESH_PROCESS_VARIANTS:
-        return _run_fresh_process(key, csc_path, result, n_runs)
+    if key == _NNZ_KEY:
+        return _run_de_csc_nnz(csc_path, result, n_runs)
 
     # Warmup runs — discarded.
     for _ in range(N_WARMUP_RUNS):
