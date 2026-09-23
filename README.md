@@ -372,11 +372,10 @@ every operation falls back to CPU automatically with a warning.
 ### Your perturb-seq evaluation pipeline is slow
 
 SCX ships Rust-accelerated equivalents of the metrics in
-[`cell-eval`](https://github.com/arcinstitute/cell-eval) and
-[`arc-bench`](https://github.com/arcinstitute/arc-bench) — pseudobulk means,
+[`cell-eval`](https://github.com/arcinstitute/cell-eval) — pseudobulk means,
 bundled bulk metrics (pearson_delta / mse / mae / mse_delta / mae_delta),
 discrimination score, energy distance, knockdown efficiency, and clustering
-agreement. Output is numerically equivalent to the Python references
+agreement. Output is numerically equivalent to the Python reference
 (32/32 parity tests pass), so you can swap in `pyscx.accel.*` without changing
 the rest of your pipeline.
 
@@ -384,7 +383,7 @@ the rest of your pipeline.
 # One call replaces cell-eval's pearson_delta + mse + mae + mse_delta + mae_delta
 results = pyscx.accel.perturbation_metrics(adata_real, adata_pred)
 
-# Per-cell knockdown efficiency vs control (arc-bench equivalent)
+# Per-cell knockdown efficiency vs control
 pyscx.accel.knockdown_efficiency(adata, pert_col="perturbation", control="control")
 # → adata.obs["KnockDownEfficiency"], adata.obs["KnockDownGeneFC"]
 
@@ -409,8 +408,8 @@ score = pyscx.accel.clustering_agreement(adata_real, adata_pred, metric="ami")
 ² 20K column is the canonical measurement (captured 2026-04-27 with the Phase 1+2 `(backend, dtype)` matrix). 100K–1M columns are pre-Phase-1 historical baselines.
 ³ Speedup grows with `n_perts` × embedding-dim; at 200 perts × 300 genes the ratio is 12.8×.
 
-See [`docs/scanpy.md`](docs/scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)
-for the full API and [`docs/performance.md`](docs/performance.md#perturbation-metrics-cell-eval--arc-bench-parity)
+See [`docs/scanpy.md`](docs/scanpy.md#perturbation-evaluation-metrics-cell-eval-parity)
+for the full API and [`docs/performance.md`](docs/performance.md#perturbation-metrics-cell-eval-parity)
 for the benchmark methodology.
 
 ### No more file locking headaches
@@ -855,7 +854,7 @@ Headline numbers at Census 1M (CELLxGENE Census, 1M cells):
 | Selective query (55% shard skip) | **4.2 ms** | — | — |
 | Append 10K cells | **1 ms** | — | — |
 
-Full benchmark suite in [`docs/performance.md`](docs/performance.md): compression and read/write/conversion timings across h5ad / Zarr / TileDB-SOMA / SLAF, parallel read and write scaling, column projection, memory (peak RSS and out-of-core), CPU analysis accelerators (PCA / DE / Leiden), Harmony2 + LISI scaling, perturbation metrics (cell-eval / arc-bench parity), GPU codec and pipeline breakdowns, training loader across datasets, query engine, and file operations. Every number is backed by a manifest entry in `benchmarks/comprehensive/results/` — see [`docs/benchmark_manifest.md`](docs/benchmark_manifest.md) for the schema and verification workflow.
+Full benchmark suite in [`docs/performance.md`](docs/performance.md): compression and read/write/conversion timings across h5ad / Zarr / TileDB-SOMA / SLAF, parallel read and write scaling, column projection, memory (peak RSS and out-of-core), CPU analysis accelerators (PCA / DE / Leiden), Harmony2 + LISI scaling, perturbation metrics (cell-eval parity), GPU codec and pipeline breakdowns, training loader across datasets, query engine, and file operations. Every number is backed by a manifest entry in `benchmarks/comprehensive/results/` — see [`docs/benchmark_manifest.md`](docs/benchmark_manifest.md) for the schema and verification workflow.
 
 ## Architecture
 

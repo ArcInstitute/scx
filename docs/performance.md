@@ -2069,9 +2069,9 @@ unchanged for the Harmony core.
 
 LISI: `pyscx.accel.compute_lisi` is **~10× faster** than R `lisi::compute_lisi` on D1–D4 (e.g. smartseq2 3.85 s vs 43.11 s; tabula_sapiens_100k 12 s vs 110 s). (The previously reported mean-LISI agreement of 0.8–2.4 % vs the R reference predates the 2026-07 raw-distance kernel fix — §2.3 of the accelerator review — and is pending a benchmark recapture.)
 
-## Perturbation Metrics (cell-eval / arc-bench parity)
+## Perturbation Metrics (cell-eval parity)
 
-Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are numerically equivalent to the Python reference implementations in `cell-eval` (v0.7) and `arc-bench` (32/32 parity tests pass within the tolerances documented in [`docs/scanpy.md`](scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)). Wall-clock speedup vs the Python reference on synthetic perturbation datasets (N cells × 2K genes × 50 perturbations, 3 runs median, reference reconstructs a cold `PerturbationAnndataPair` per op for fair comparison):
+Rust-accelerated perturbation evaluation metrics exposed via `pyscx.accel.*` are numerically equivalent to the Python reference implementations in `cell-eval` (v0.7) (32/32 parity tests pass within the tolerances documented in [`docs/scanpy.md`](scanpy.md#perturbation-evaluation-metrics-cell-eval-parity)). Wall-clock speedup vs the Python reference on synthetic perturbation datasets (N cells × 2K genes × 50 perturbations, 3 runs median, reference reconstructs a cold `PerturbationAnndataPair` per op for fair comparison):
 
 | Operation | 10K | 20K ⁴ | 100K | 500K | 1M |
 |-----------|----:|-----:|-----:|-----:|----:|
@@ -2163,11 +2163,11 @@ budget bounds **one block**, and `energy_distance` runs perturbations on a rayon
 the Gram term is `RAYON_NUM_THREADS × budget` on top of each task's own dense copy of its group's
 rows (`extract_group_rows_indexed`, untouched here).
 
-Speedups grow with cell count for the pseudobulk-driven metrics (pseudobulk, bulk_metrics, discrimination_l1) — single-pass streaming aggregation in Rust wins harder as the per-cell work scales. `knockdown_efficiency` is within ±40% of arc-bench's tight NumPy column-access loop and is not currently a speedup target.
+Speedups grow with cell count for the pseudobulk-driven metrics (pseudobulk, bulk_metrics, discrimination_l1) — single-pass streaming aggregation in Rust wins harder as the per-cell work scales. `knockdown_efficiency` is within ±40% of a tight NumPy column-access loop and is not currently a speedup target.
 
 The table above is the SCX-Rust-vs-Python-reference speedup on the **CPU**. `perturbation_metrics` and `energy_distance` (euclidean / cosine) also accept `device="gpu"` (pyscx ≥ 0.11.2) — CPU-vs-GPU wall times are in [GPU perturbation-evaluation metrics](#gpu-perturbation-evaluation-metrics) below.
 
-Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/comprehensive/results/raw/cell_eval_parity_perf__scx_auto__pert_synth_*.json` and rendered in the "Cell-eval / arc-bench Parity Performance" section of the comprehensive benchmark report. Kernel-level distance-kernel microbenchmarks live in `scx-accel/benches/distances.rs` (run via `cargo bench -p scx-accel --bench distances`; see [`benchmarks/README.md`](../benchmarks/README.md#rust-microbenchmarks-criterion)).
+Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/comprehensive/results/raw/cell_eval_parity_perf__scx_auto__pert_synth_*.json` and rendered in the "Cell-eval Parity Performance" section of the comprehensive benchmark report. Kernel-level distance-kernel microbenchmarks live in `scx-accel/benches/distances.rs` (run via `cargo bench -p scx-accel --bench distances`; see [`benchmarks/README.md`](../benchmarks/README.md#rust-microbenchmarks-criterion)).
 
 ## GPU Acceleration (NVIDIA H100)
 
@@ -2324,7 +2324,7 @@ CPU-vs-GPU wall time on H100 (synthetic paired real/pred, 2K genes × 50 perturb
 | `energy_distance` (euclidean) | 10K | 0.91 | 0.97 | 0.94× | `gpu_dense` |
 | `energy_distance` (euclidean) | 100K | 7.44 | 4.35 | **1.71×** | `gpu_dense` |
 
-GPU helps the compute-bound metric: `energy_distance` (an O(N²)-per-perturbation pairwise-distance gemm) reaches **1.71× at 100K** and widens with cell count — and it is what makes the metric feasible at atlas scale, where the CPU O(N²) reference is skipped (the bench caps `energy_distance` at ~200K cells; the CPU baseline is infeasible beyond — see the [Perturbation Metrics](#perturbation-metrics-cell-eval--arc-bench-parity) footnote ¹). `perturbation_metrics` is a cheap pseudobulk mean (O(nnz), memory / host-transfer-bound), so GPU ≈ CPU across sizes (small data even regresses on kernel-launch + host→device overhead) — its GPU kernel exists for uniform `device=` dispatch, not a speedup. All GPU runs took a `gpu_*` route (no silent CPU fallback); numeric parity is gated by `pyscx/tests/test_eval_metrics_gpu_parity.py` and the fork's `tests/test_scx_parity.py`. End-to-end, `cell-eval run --device gpu` matches `--device cpu` within the documented per-metric tolerances (fork `benchmarks/scripts/gpu_e2e_parity.py`).
+GPU helps the compute-bound metric: `energy_distance` (an O(N²)-per-perturbation pairwise-distance gemm) reaches **1.71× at 100K** and widens with cell count — and it is what makes the metric feasible at atlas scale, where the CPU O(N²) reference is skipped (the bench caps `energy_distance` at ~200K cells; the CPU baseline is infeasible beyond — see the [Perturbation Metrics](#perturbation-metrics-cell-eval-parity) footnote ¹). `perturbation_metrics` is a cheap pseudobulk mean (O(nnz), memory / host-transfer-bound), so GPU ≈ CPU across sizes (small data even regresses on kernel-launch + host→device overhead) — its GPU kernel exists for uniform `device=` dispatch, not a speedup. All GPU runs took a `gpu_*` route (no silent CPU fallback); numeric parity is gated by `pyscx/tests/test_eval_metrics_gpu_parity.py` and the fork's `tests/test_scx_parity.py`. End-to-end, `cell-eval run --device gpu` matches `--device cpu` within the documented per-metric tolerances (fork `benchmarks/scripts/gpu_e2e_parity.py`).
 
 #### Canonical baseline
 

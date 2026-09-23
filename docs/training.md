@@ -1352,8 +1352,7 @@ streaming with maximum throughput).
 ## Perturbation evaluation
 
 After training, use SCX's Rust-accelerated perturbation metrics (numerically
-equivalent to [cell-eval](https://github.com/arcinstitute/cell-eval) and
-[arc-bench](https://github.com/arcinstitute/arc-bench)):
+equivalent to [cell-eval](https://github.com/arcinstitute/cell-eval)):
 
 ```python
 from pyscx import accel
@@ -1369,7 +1368,7 @@ corr = accel.energy_distance(adata_real, adata_pred)
 score = accel.clustering_agreement(adata_real, adata_pred, metric="ami")
 ```
 
-See [scanpy.md § Perturbation evaluation metrics](scanpy.md#perturbation-evaluation-metrics-cell-eval--arc-bench-parity)
+See [scanpy.md § Perturbation evaluation metrics](scanpy.md#perturbation-evaluation-metrics-cell-eval-parity)
 for the full API.
 
 

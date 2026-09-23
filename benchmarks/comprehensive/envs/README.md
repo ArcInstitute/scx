@@ -14,7 +14,7 @@ whose runners you want exercised, then launch from there.
 | `scx-bench-gpu.yml` | `scx-bench-gpu` | GPU benchmarks: CUDA + RAPIDS (cuVS, cuGraph). Extends `scx-bench` with GPU-side deps. | `install_dependencies.sh --gpu` |
 | `scx-bench-r.yml` | `scx-bench-r` | R / BPCells benchmarks. Isolated R interpreter; pyscx not built here. | `install_dependencies.sh --r` |
 | `scx-bench-slaf.yml` | `scx-bench-slaf` | SLAF runner only — slafpy's deps conflict with the main `scx-bench` env. Active only for the `slaf_runner` row of the matrix. | manual: `conda env create -f scx-bench-slaf.yml` |
-| `scx-bench-eval.yml` | `scx-bench-eval` | `cell-eval` / `arc-bench` parity validation (cell_eval_parity_perf benchmark). | `install_dependencies.sh --eval` |
+| `scx-bench-eval.yml` | `scx-bench-eval` | `cell-eval` parity validation (cell_eval_parity_perf benchmark). | `install_dependencies.sh --eval` |
 
 Create everything at once: `install_dependencies.sh --all`.
 

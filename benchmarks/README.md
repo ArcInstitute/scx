@@ -188,7 +188,7 @@ The suite measures seven core dimensions, plus accelerator, GPU, lazy preprocess
 | **Streaming vs in-memory** (3.7b) | `read_streaming_vs_inmemory.py` | Backed row-chunk iteration vs eager-materialise-then-iterate. Wall time and peak RSS for both modes; gated on `"backed_mode"` capability — SCX-only today |
 | **Multimodal streaming vs in-memory** (3.7c) | `multimodal_read_streaming_vs_inmemory.py` | Phase 6b — `to_mudata(backed=True)` per-modality chunked iteration vs eager `to_mudata()`. Gated on `dataset.multimodal == True` AND multimodal-SCX format keys |
 | **Streaming export** (3.7d) | `export_streaming.py` | Phase 8 — paired `pyscx.to_h5ad` / `pyscx.to_h5mu` with `stream=True` vs `stream=False`. Wall time and peak RSS for both paths; gates on the streaming row's `streaming_peak_rss_mb` floor at `census_1m`. Multimodal datasets auto-dispatch to `to_h5mu`. SCX-only |
-| **Cell-eval parity perf** (3.15) | `cell_eval_parity_perf.py` | SCX `pyscx.accel.*` perturbation metrics vs cell-eval / arc-bench reference, on synthetic perturbation datasets at 100K–1M cells |
+| **Cell-eval parity perf** (3.15) | `cell_eval_parity_perf.py` | SCX `pyscx.accel.*` perturbation metrics vs cell-eval reference, on synthetic perturbation datasets at 100K–1M cells |
 | **Grouped sharding** (SCX-only) | `grouped_sort.py` | `scx sort --group-by` + convert-time grouping (one-pass vs two-pass density auto-route) + read-back correctness, on the perturbation grouping fixtures |
 | **Grouped read/write** (scx vs shardad) | `grouped_read.py` | Cross-format head-to-head: grouped write + per-perturbation `read_group` / `query_filter` / `iter_group_shards` throughput + reference isolation, scx vs shardad, on integer-count grouping fixtures (`nb_glm_synth`, `replogle_k562`, `tahoe_c38`, `chemogenetic_rgfp`) |
 | **Out-of-core peak RSS** (scx vs shardad) | `ooc_rss_boundary.py` | Full-data-pass true-peak RSS: scx bounded streaming vs shardad full materialize, across `census_500k/1m/5m` — scx-flat vs shardad-linear (the out-of-core moat) |
@@ -1137,7 +1137,7 @@ performance currently under regression governance:
 | **SCX-only fragment / manifest ops** | `fragment_ops` |
 | **Correctness parity (scanpy / backed / preprocessing)** | `correctness` |
 | **Codec round-trip parity** | `roundtrip` |
-| **Cell-eval / arc-bench parity perf** | `cell_eval_parity_perf` |
+| **Cell-eval parity perf** | `cell_eval_parity_perf` |
 | **Cloud (GCP) — push, pull, read, metadata, query, large-atlas, cost model** | `cloud_push`, `cloud_pull`, `cloud_read`, `cloud_metadata`, `cloud_filtered`, `cloud_reader_vs_pull`, `cost_model`, `cloud_large_atlas` |
 | **Analysis accelerators (CPU + GPU)** | `accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg` |
 | **End-to-end residency pipeline (CPU + GPU + rapids-singlecell)** | `accel_pipeline` |
@@ -1201,7 +1201,7 @@ every capture run picks it up automatically.
 > |---|---|
 > | `cellstream` (all benchmarks) | upstream package restructured; the runner's member imports fail. 12 `ml_loader` floors are justification-suppressed as a result. `v0.11.2` had 47 rows. |
 > | `cloud_large_atlas` | its `<ds>.scxd/` fixtures are not staged in the bucket (~4.5 GB); the benchmark deliberately does not auto-upload. `v0.11.2` had 5 rows. |
-> | `cell_eval_parity_perf` | `cell_eval` / `arc_bench` / `pdex` are editable installs in `.venv` only and no conda env has them, while the orchestrator must run from `scx-bench`. `v0.11.2` had none either. |
+> | `cell_eval_parity_perf` | `cell_eval` / `pdex` are editable installs in `.venv` only and no conda env has them, while the orchestrator must run from `scx-bench`. `v0.11.2` had none either. |
 > | `cellset_gather` at census scale | does not fit a practical time budget — killed at 205 min on run 1/3 of one scenario. See thresholds' Deferred item 15. |
 >
 > Say so when reporting a run that touches any of them: "no regressions against
@@ -2020,7 +2020,7 @@ loader, and active-development GPU / Harmony surfaces — see
 | `scripts/benchmark_harmony.py` | Harmony2 batch correction performance |
 | `scripts/benchmark_lisi.py` | LISI metric performance |
 | `scripts/benchmark_bpcells.R` | BPCells comparison (R) — driver for `benchmark_loader.py --include-bpcells` |
-| `comprehensive/benchmarks/cell_eval_parity_perf.py` | cell-eval / arc-bench parity perf (pseudobulk, perturbation metrics, energy distance, discrimination score, knockdown efficiency, clustering agreement) at synthetic 100K–1M scale |
+| `comprehensive/benchmarks/cell_eval_parity_perf.py` | cell-eval parity perf (pseudobulk, perturbation metrics, energy distance, discrimination score, knockdown efficiency, clustering agreement) at synthetic 100K–1M scale |
 
 ## Rust microbenchmarks (criterion)
 

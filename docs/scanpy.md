@@ -3535,27 +3535,26 @@ The route is recorded as `route="cpu_nb_glm"` on
 options, and algorithm details:
 [docs/pseudobulk_nb_glm.md](pseudobulk_nb_glm.md).
 
-### Perturbation evaluation metrics (cell-eval / arc-bench parity)
+### Perturbation evaluation metrics (cell-eval parity)
 
 SCX ships Rust-accelerated equivalents of the metrics in
-[`cell-eval`](https://github.com/arcinstitute/cell-eval) and
-[`arc-bench`](https://github.com/arcinstitute/arc-bench). The outputs are
+[`cell-eval`](https://github.com/arcinstitute/cell-eval). The outputs are
 numerically equivalent to the Python references within the tolerances
 below, so an existing cell-eval pipeline can swap in `pyscx.accel.*` for 10–20×
 wall-clock speedup at census-scale perturbation datasets (see
-[`docs/performance.md`](performance.md#perturbation-metrics-cell-eval--arc-bench-parity)
+[`docs/performance.md`](performance.md#perturbation-metrics-cell-eval-parity)
 for numbers at 10K / 100K / 500K / 1M cells).
 
 **How each tolerance is gated.** Every row below is pinned twice:
 
-- **Rust-side**, against reference values `cell-eval` and `arc-bench`
+- **Rust-side**, against reference values `cell-eval`
   *produced*, checked into `scx-accel/src/eval_metrics/cell_eval_reference_values.rs`
   and asserted by `cell_eval_reference_tests.rs`. This runs under plain
   `cargo test` with no Python installed, and it is what makes these claims
   reproducible. Regenerate with
   `.venv/bin/python benchmarks/scripts/generate_eval_metrics_references.py`.
 - **Python-side**, by `pyscx/tests/test_cell_eval_parity.py` against the live
-  libraries. That file `importorskip`s `cell_eval` / `arc_bench` / `polars`,
+  libraries. That file `importorskip`s `cell_eval` / `polars`,
   which are editable installs in the repo's `.venv` and are in **no** conda env
   and not in CI — so it strengthens the local gate and is not on its own
   evidence for anything here.
@@ -3850,7 +3849,7 @@ pyscx.accel.knockdown_efficiency(
 
 Input is expected on the normalized (linear) scale; the log-deviation pass
 applies `log1p` internally. Control cells and cells whose perturbation name
-isn't in `var_names` get `NaN` in both columns — matching `arc-bench`.
+isn't in `var_names` get `NaN` in both columns.
 
 #### Clustering agreement (`pyscx.accel.clustering_agreement`)
 
