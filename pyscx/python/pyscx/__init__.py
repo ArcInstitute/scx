@@ -411,7 +411,7 @@ def modify_metadata(path, **kwargs):
     Any omitted argument is left untouched (its sections pass through
     verbatim). Cost is O(size of the replaced sections); the matrix shards
     are never read or rewritten, so a pre-existing CSC sidecar and
-    `data_generation` are preserved (no `--rebuild-csc` needed). One atomic
+    `data_generation` are preserved (no CSC rebuild needed). One atomic
     commit; rollback-able via `pyscx.rollback`.
 
     **Replace semantics, not merge.** A supplied `obs`/`var` fully replaces
@@ -530,8 +530,8 @@ def from_h5ad(path, out, **kwargs):
             single section on import. This is a storage-layout choice, not
             a memory one: conversion peak RSS is unchanged.
         csc: "off", "auto", or "always". "always" adds a column-major
-            sidecar via a two-pass CSR-then-rebuild write (transient disk
-            ~2x the output); required for prefer_format="csc" accel paths.
+            sidecar, built in the same pass as X (no extra read, no second
+            copy on disk); required for prefer_format="csc" accel paths.
             When omitted, an accel-ready index_preset ("training" /
             "perturbseq") upgrades the default to "auto"; otherwise "off".
             An explicit value always wins.

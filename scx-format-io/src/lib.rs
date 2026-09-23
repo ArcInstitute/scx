@@ -26,6 +26,7 @@ pub mod bitmap;
 pub mod categorical;
 pub mod csc_budget;
 pub mod csc_sidecar;
+mod csc_sink;
 pub mod csc_spill;
 #[cfg(feature = "deletion-vectors")]
 pub mod deletion_vectors;
@@ -69,6 +70,7 @@ pub use csc_sidecar::{
     emit_csc_shards, pick_csc_encoding, write_csc_sidecar, CscEmitOptions, CscSidecarOptions,
     CscSidecarStats, DEFAULT_CSC_MEMORY_BYTES,
 };
+pub use csc_sink::CscBuildOptions;
 pub use csc_spill::TempDirSpillStore;
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::DeletionVectors;

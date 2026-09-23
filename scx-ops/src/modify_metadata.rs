@@ -6,8 +6,8 @@
 //! the replaced sections), the CSR/CSC shards are never read or rewritten.
 //!
 //! Because the matrix is untouched, `data_generation` and `csc_build_generation`
-//! are left unchanged, so a pre-existing CSC sidecar stays valid (no
-//! `--rebuild-csc`). `n_obs` / `n_vars` / `nnz` / `HAS_CSC` are invariants and
+//! are left unchanged, so a pre-existing CSC sidecar stays valid and nothing
+//! rebuilds it. `n_obs` / `n_vars` / `nnz` / `HAS_CSC` are invariants and
 //! are validated rather than changed — to add cells/genes use `append`,
 //! `subset`, or `from_*`.
 //!

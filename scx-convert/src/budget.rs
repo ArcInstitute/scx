@@ -302,6 +302,18 @@ pub(crate) const CSC_COLUMN_CHUNK_SHARE: Share = Share::new(1, 2);
 /// The CSC external transpose's pass-2 bucket record buffer.
 pub(crate) const CSC_BUCKET_SHARE: Share = Share::new(1, 4);
 
+/// The builder's share while it runs beside streaming ingest; declared with
+/// the other CSC shares in `scx-format-io` so `scx sort` and `scx optimize`,
+/// which run it beside their own budgeted working sets, split the same way.
+/// Ingest sizes itself against what is left — see [`csc_same_pass_split`].
+pub(crate) use scx_format_io::csc_budget::CSC_SAME_PASS_SHARE;
+
+/// One in-flight ingest shard's share of the whole budget while a same-pass
+/// CSC builder holds [`CSC_SAME_PASS_SHARE`]: [`SHARD_BUDGET_SHARE`] of the
+/// remaining three quarters. Written out as a literal because `Share` has no
+/// arithmetic; `the_same_pass_ingest_share_is_the_product_it_names` pins it.
+pub(crate) const INGEST_BESIDE_CSC_SHARE: Share = Share::new(3, 16);
+
 // ---------------------------------------------------------------------------
 // Working-set models.
 // ---------------------------------------------------------------------------
@@ -452,6 +464,27 @@ pub fn csc_sidecar_bytes(memory_budget: Option<u64>) -> u64 {
     memory_budget.map_or(default, |b| b.min(default))
 }
 
+/// Split `memory_budget` between streaming ingest and a CSC sidecar builder
+/// fed in the same pass: `(builder spill threshold, the budget ingest sizes
+/// itself against)`.
+///
+/// The builder's share is [`CSC_SAME_PASS_SHARE`] of the budget, but never
+/// more than it would stage on its own (`CSC_BUILD_BUCKET_SHARE` of
+/// [`csc_sidecar_bytes`]); ingest gets the rest. With no budget, neither is
+/// bounded here: ingest was unbounded already, and the builder spills at its
+/// own default.
+///
+/// Only the push phase overlaps ingest. The emit runs after the last X shard,
+/// when the ingest workers are gone, so it keeps the whole sidecar budget.
+pub(crate) fn csc_same_pass_split(memory_budget: Option<u64>) -> (Option<usize>, Option<u64>) {
+    let Some(budget) = memory_budget else {
+        return (None, None);
+    };
+    let (builder, rest) =
+        scx_format_io::csc_budget::same_pass_split(budget, csc_sidecar_bytes(Some(budget)));
+    (Some(builder as usize), Some(rest))
+}
+
 // ---------------------------------------------------------------------------
 // The declared table.
 // ---------------------------------------------------------------------------
@@ -490,6 +523,10 @@ pub(crate) enum Phase {
     /// CSC sidecar build, emit phase: one shard materialised and encoded.
     /// Not concurrent with the push — the buckets are drained by then.
     CscBuilderEmit,
+    /// Streaming ingest with a CSC sidecar built in the same pass: the ingest
+    /// workers and the builder's push phase are live together. (Its emit
+    /// phase follows ingest and is [`Phase::CscBuilderEmit`].)
+    IngestWithCscPush,
 }
 
 /// One declared claim on the budget.
@@ -724,6 +761,29 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         // `enforced` and was wrong; see the two comments above that record the
         // first two.
         enforced: false,
+    },
+    Reservation {
+        name: "ingest shard working set beside a same-pass CSC builder",
+        phase: Phase::IngestWithCscPush,
+        share: INGEST_BESIDE_CSC_SHARE,
+        multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
+        site: "pipeline/entry_streaming.rs: the X coordinator runs against the \
+               ingest half of csc_same_pass_split",
+        // The SparseIngest / DenseIngest rows again, sized against the
+        // budget minus the builder's share, with those rows' open terms.
+        enforced: false,
+    },
+    Reservation {
+        name: "same-pass CSC builder column buckets",
+        phase: Phase::IngestWithCscPush,
+        share: CSC_SAME_PASS_SHARE,
+        multiplicity: 1,
+        site: "ScxWriter::enable_csc_sidecar (spill_after_bytes from \
+               csc_same_pass_split)",
+        // ENFORCED on the same terms as the build-csc bucket row: the builder
+        // spills against exactly this threshold, plus its declared block
+        // slack.
+        enforced: true,
     },
     Reservation {
         name: "CSC column chunk",

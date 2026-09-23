@@ -170,14 +170,14 @@ def test_default_seed_is_42(clustered_adata, scx_from_adata, tmp_dir):
 # --- composition with the rest of the op -----------------------------------
 
 
-def test_shuffle_with_rebuild_csc(clustered_adata, scx_from_adata, tmp_dir):
+def test_shuffle_with_csc_always(clustered_adata, scx_from_adata, tmp_dir):
     import pyscx
 
     src = scx_from_adata(clustered_adata, "src.scx")
     out = str(tmp_dir / "shuffled.scx")
-    pyscx.shuffle(src, out, seed=3, rebuild_csc=True)
+    pyscx.shuffle(src, out, seed=3, csc="always")
 
-    # The sidecar is rebuilt against the shuffled row order; reading it back
+    # The sidecar is built against the shuffled row order; reading it back
     # must agree with the row-major view cell-for-cell.
     assert pyscx.open(out).has_csc
     before, after = _rows_by_cell(src), _rows_by_cell(out)

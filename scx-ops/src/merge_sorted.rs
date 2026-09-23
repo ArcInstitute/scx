@@ -623,6 +623,9 @@ pub(crate) fn emit_sorted(
             Ok(n)
         },
     )?;
+    // The same-pass sidecar (if the caller enabled one) is complete once X
+    // is; emit it before the layers, which go through the same `emit_x_like`.
+    crate::csc_carry::emit(writer, "merge")?;
 
     // ---- layers ----
     let layer_names = {

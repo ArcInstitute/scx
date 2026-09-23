@@ -17,6 +17,7 @@ pub fn run_optimize(
     row_group_target_nnz: Option<u64>,
     shard_obs: &str,
     memory_budget: Option<&str>,
+    csc: scx_ops::CscCarryOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
         return Err(format!("input file does not exist: {}", input.display()).into());
@@ -77,13 +78,14 @@ pub fn run_optimize(
     pb.set_message(format!("Optimizing {}...", input.display()));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let stats = scx_ops::optimize_with_budget(
+    let stats = scx_ops::optimize_with_csc(
         input,
         output,
         codec_id,
         obs_shard_policy,
         framing,
         memory_budget,
+        &csc,
     )?;
 
     pb.finish_and_clear();
@@ -107,6 +109,9 @@ pub fn run_optimize(
         detail,
         stats.format_version,
     );
+    if scx_format_io::ScxReader::open(output)?.header().has_csc() {
+        println!("  CSC sidecar built in the same pass");
+    }
     println!("  Verify with: scx validate --deep {}", output.display());
     Ok(())
 }

@@ -391,6 +391,13 @@ ingest paths — uses `ResidentCscSource` instead, which scatters straight out o
 the resident shards rather than making a second copy of them in buckets. Both
 sources feed one `csc_sidecar::emit_csc_shards` writer loop.
 
+A writer that is producing the X shards itself — streaming ingest and the
+rewrite ops — skips step 1's decode: `ScxWriter::enable_csc_sidecar` feeds
+every X CSR shard it writes (layers and `adata.raw` excluded) to the builder as
+it goes, and `emit_csc_sidecar()` writes the CSC shards right after X. The
+output is byte-identical to building the sidecar over the finished file, with
+no second read and no staged copy (`scx-format-io/src/csc_sink.rs`).
+
 Entry points:
 
 | Entry point | When |
@@ -398,7 +405,8 @@ Entry points:
 | `scx build-csc` | Post-hoc addition to an existing file |
 | `scx convert --csc=always` | During h5ad/h5mu → SCX conversion |
 | `pyscx.from_anndata(csc="always")` | During Python-side conversion |
-| `--rebuild-csc` on mutating ops | Re-emit after append/compact/merge/subset |
+| `--csc carry\|always\|off` on rewrite ops | Same-pass rebuild in compact/merge/optimize/sort/subset (`carry` is the default) |
+| `append --rebuild-csc` | In-place rebuild after an append |
 
 Measured throughput, from the `build_csc` rows of the current benchmark
 baseline (`benchmarks/comprehensive/results/baselines/LATEST`, `scx_auto`,
@@ -428,14 +436,18 @@ CSC sidecar.
 
 ### Mutating ops and CSC lifecycle
 
-Mutating operations (`append`, `compact`, `merge`, `subset`) change the row
-layout or column index space, making existing CSC `indices` arrays reference
-stale rows/columns. Each op therefore **drops the CSC sidecar by default**
-with a `log::warn!` message. Pass `--rebuild-csc` to re-emit the sidecar
-against the post-op output.
+Mutating operations change the row layout, column index space or `nnz`,
+making existing CSC `indices` arrays reference stale rows/columns, so the
+input's sidecar is never copied. The rewrite ops (`compact`, `merge`,
+`optimize`, `sort`, `subset`) **carry it by default**: they build a fresh one
+from the output's X in the same pass iff an input had one (`--csc
+carry|always|off`, `scx_ops::CscCarryOptions`). A multimodal input's sidecars
+are dropped with a warning (the builder is single-modality). `append` still
+drops the sidecar with a `log::warn!` message; `append --rebuild-csc` rebuilds
+it in place afterwards.
 
-`scx upgrade` is the exception — it preserves CSC sidecars by re-emitting
-them through `catalog.csc_shards_sorted()` into the new file.
+`scx upgrade` differs — it carries the input's CSC sidecars rather than
+rebuilding them, re-emitting them through `catalog.csc_shards_sorted()` into the new file.
 
 See [sharding.md § CSC sharding](sharding.md#csc-sharding) for the
 detailed design rationale and [format.md §4.1](format.md#41-csc-shard-internal-layout)
@@ -1113,9 +1125,11 @@ dataset size or per-key embedding dimension. The pyscx backed-routing
 path detects per-section mutation via top-level key comparison
 against the source h5ad; clean sections route through the disk
 streamer, mutated sections are extracted from Python and partitioned
-into the same sharded layout on the way out. `csc="always"` triggers a
-post-`finish()` `scx_ops::rebuild_csc_inplace` pass, which appends the
-sidecar in place (one extra read pass; no second copy of the file).
+into the same sharded layout on the way out. `csc="always"` builds the
+sidecar in the same pass as X (`ScxWriter::enable_csc_sidecar`), so there is no
+extra read pass and no second copy of the file; under `--memory-budget` the
+builder's buckets take a quarter of the budget (the `IngestWithCscPush` phase in
+`scx-convert/src/budget.rs`) and ingest sizes itself against the rest.
 
 **Streaming export** (`scx convert --to h5ad/h5mu`, `pyscx.to_h5ad`,
 `pyscx.to_h5mu`): the inverse path. `scx_convert::

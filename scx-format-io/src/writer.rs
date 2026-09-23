@@ -138,8 +138,8 @@ pub struct ScxWriter {
     /// [`Self::with_data_generation`] so a later read can detect a CSC
     /// sidecar built against an earlier generation.
     data_generation: u64,
-    /// The `data_generation` a CSC sidecar was built against, set by
-    /// `finish()` when it auto-emits CSC (and left `None` otherwise so
+    /// The `data_generation` a CSC sidecar was built against, set whenever a
+    /// CSC shard is written through `write_shard_inner` (and left `None` otherwise so
     /// the catalog records `0`). Stamped into
     /// `FullCatalog::csc_build_generation`.
     csc_build_generation: Option<u64>,
@@ -149,6 +149,13 @@ pub struct ScxWriter {
     /// the legacy unframed (v1) layout. The file `format_version` must be bumped
     /// to v4 separately by the caller when framing.
     framing: Option<crate::encoder::FramingConfig>,
+    /// The same-pass CSC sidecar builder, fed every X CSR shard this writer
+    /// writes. Set by [`Self::enable_csc_sidecar`], drained by
+    /// [`Self::emit_csc_sidecar`] (or by `finish()` if the caller did not).
+    csc_sink: Option<crate::csc_sink::CscSink>,
+    /// Set once a same-pass sidecar has been emitted: an X shard written after
+    /// that point would be missing from it, so it is refused.
+    csc_sink_closed: bool,
 }
 
 /// Output of parallel shard encoding, ready for sequential write.
@@ -374,6 +381,8 @@ impl ScxWriter {
             data_generation: 1,
             csc_build_generation: None,
             framing: None,
+            csc_sink: None,
+            csc_sink_closed: false,
         })
     }
 
@@ -463,6 +472,8 @@ impl ScxWriter {
             data_generation: 1,
             csc_build_generation: None,
             framing: None,
+            csc_sink: None,
+            csc_sink_closed: false,
         })
     }
 
@@ -1129,6 +1140,7 @@ impl ScxWriter {
         let values = shard.values;
         let codec_id = shard.codec_id;
         let value_encoding = shard.value_encoding;
+        self.guard_x_write_after_csc_emit(section_type)?;
         // Any CSC sidecar shard (X or layer, single- or multi-modality)
         // funnels through here, so this is the one place to record that
         // the sidecar was built against the current `data_generation`.
@@ -1319,6 +1331,7 @@ impl ScxWriter {
             n_minor,
             nnz,
         );
+        let value_max = stats.value_max;
 
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
@@ -1329,6 +1342,12 @@ impl ScxWriter {
             modality_id: self.current_modality_id,
             stats: Some(stats),
         });
+
+        if section_type == SectionType::CsrShard {
+            if let Some(sink) = self.csc_sink.as_mut() {
+                sink.push_buffers(&shard_header, Some(value_max), indptr, indices, values)?;
+            }
+        }
 
         Ok(())
     }
@@ -1356,6 +1375,7 @@ impl ScxWriter {
         // `SectionType::CsrShard`. Skipping the stamp on the strength of the
         // method's name left `save_layer` minting a `codec_id = 0` header over
         // copied compressed shards. The helper still ignores `RawCsrShard`.
+        self.guard_x_write_after_csc_emit(section_type)?;
         self.record_copied_csr_codec(section_type, raw_bytes);
         self.write_padding()?;
 
@@ -1365,6 +1385,7 @@ impl ScxWriter {
 
         self.writer()?.write_all(raw_bytes)?;
         self.current_offset += section_length;
+        self.feed_csc_section(section_type, raw_bytes, Some(stats.value_max))?;
 
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
@@ -1521,6 +1542,7 @@ impl ScxWriter {
         stats: ShardStats,
     ) -> Result<()> {
         self.guard_no_legacy_shard_in_v4(SectionType::CsrShard, section_bytes)?;
+        self.guard_x_write_after_csc_emit(SectionType::CsrShard)?;
         self.record_copied_csr_codec(SectionType::CsrShard, section_bytes);
         self.write_padding()?;
         let shard_global_offset = self.current_offset;
@@ -1528,6 +1550,7 @@ impl ScxWriter {
         let section_checksum = blake3_hash(section_bytes);
         self.writer()?.write_all(section_bytes)?;
         self.current_offset += section_length;
+        self.feed_csc_section(SectionType::CsrShard, section_bytes, Some(stats.value_max))?;
 
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
@@ -1539,6 +1562,114 @@ impl ScxWriter {
             stats: Some(stats),
         });
         Ok(())
+    }
+
+    /// Build a CSC sidecar in the same pass as X.
+    ///
+    /// From here until [`Self::emit_csc_sidecar`], every X CSR shard this
+    /// writer writes — through any of its methods, encoded here or copied as
+    /// bytes — is also pushed into a [`scx_sparse::CscBuilder`]. Shards must
+    /// arrive in row order from row 0, which every rewrite op and ingest
+    /// already does; one that does not is an error rather than a shifted
+    /// sidecar. Call it before the first X shard.
+    ///
+    /// Single-modality files only: a multimodal file's sidecars are per
+    /// modality and not built this way yet.
+    pub fn enable_csc_sidecar(&mut self, opts: crate::csc_sink::CscBuildOptions) -> Result<()> {
+        if !self.modalities.is_empty() {
+            return Err(ScxError::InvalidCatalog(
+                "same-pass CSC is single-modality only; this writer has a modality table"
+                    .to_string(),
+            ));
+        }
+        if self.csc_sink.is_some() || self.csc_sink_closed {
+            return Err(ScxError::InvalidCatalog(
+                "same-pass CSC was already enabled on this writer".to_string(),
+            ));
+        }
+        if self.entries.iter().any(|e| {
+            matches!(
+                e.section_type,
+                SectionType::CsrShard | SectionType::CscShard
+            )
+        }) {
+            return Err(ScxError::InvalidCatalog(
+                "same-pass CSC must be enabled before the first X shard is written".to_string(),
+            ));
+        }
+        let n_rows = usize::try_from(self.header.n_obs)
+            .map_err(|_| ScxError::InvalidCatalog("n_obs exceeds usize".to_string()))?;
+        let n_cols = usize::try_from(self.header.n_vars)
+            .map_err(|_| ScxError::NVarsOverflow(self.header.n_vars))?;
+        let default_root = self.output_dir().map(Path::to_path_buf);
+        self.csc_sink = Some(crate::csc_sink::CscSink::new(
+            n_rows,
+            n_cols,
+            opts,
+            default_root,
+        )?);
+        Ok(())
+    }
+
+    /// Emit the same-pass sidecar: close the builder and write its CSC shards.
+    ///
+    /// Call it right after the last X shard, so the builder's buckets are
+    /// released before the rest of the file is written and so an audit of the
+    /// staged catalog sees the sidecar. `finish()` calls it for a caller that
+    /// did not. Returns `None` when no sidecar was enabled or X was empty.
+    pub fn emit_csc_sidecar(&mut self) -> Result<Option<crate::csc_sidecar::CscSidecarStats>> {
+        let Some(sink) = self.csc_sink.take() else {
+            return Ok(None);
+        };
+        self.csc_sink_closed = true;
+        let output_v4 = self.header.format_version >= scx_format::CURRENT_FORMAT_VERSION;
+        let Some((mut emitter, emit_opts, framing)) = sink.finish(output_v4)? else {
+            return Ok(None);
+        };
+        // Scoped, as `write_csc_sidecar` scopes it: the writer's own framing
+        // (which may carry a `decode_target` for X) must not reach the sidecar.
+        let prev = self.framing;
+        self.framing = framing;
+        let result =
+            crate::csc_sidecar::emit_csc_shards(self, &mut emitter, &emit_opts, |_, _, _| {});
+        self.framing = prev;
+        let stats = result?;
+        if let Some(col) = stats.first_non_strict_column {
+            log::warn!(
+                "CSC sidecar: column {col} has a duplicate (row, col) in X, so its CSC rows are \
+                 not strictly increasing; GPU routes validating `sorted` will reject this sidecar"
+            );
+        }
+        Ok(Some(stats))
+    }
+
+    /// Refuse an X shard once the same-pass sidecar has been emitted: it would
+    /// be in the CSR and missing from the CSC.
+    fn guard_x_write_after_csc_emit(&self, section_type: SectionType) -> Result<()> {
+        if self.csc_sink_closed && section_type == SectionType::CsrShard {
+            return Err(ScxError::InvalidCatalog(
+                "an X shard was written after the same-pass CSC sidecar was emitted; it would \
+                 be missing from the sidecar"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Feed a byte-copied X shard to the same-pass sidecar, if one is enabled.
+    fn feed_csc_section(
+        &mut self,
+        section_type: SectionType,
+        section: &[u8],
+        value_max: Option<u32>,
+    ) -> Result<()> {
+        if section_type != SectionType::CsrShard {
+            return Ok(());
+        }
+        match self.csc_sink.as_mut() {
+            Some(sink) => sink.push_section(section, value_max),
+            None => Ok(()),
+        }
     }
 
     /// Write a pre-encoded shard section produced by parallel encoding.
@@ -1557,6 +1688,7 @@ impl ScxWriter {
     /// later global `write_csr_shard` would see a skewed auto-name index.
     pub fn write_preencoded_shard(&mut self, section: PreEncodedSection) -> Result<()> {
         self.guard_no_legacy_shard_in_v4(section.section_type, &section.header_buf)?;
+        self.guard_x_write_after_csc_emit(section.section_type)?;
         self.write_padding()?;
 
         // Read off the serialized header before `section` is partially moved
@@ -1578,6 +1710,20 @@ impl ScxWriter {
         w.write_all(&section.block_index_bytes)?;
 
         self.current_offset += section.section_length;
+
+        if section.section_type == SectionType::CsrShard {
+            if let Some(sink) = self.csc_sink.as_mut() {
+                let sh = ShardHeader::read_from(&mut &section.header_buf[..])?;
+                sink.push_regions(
+                    &sh,
+                    Some(section.stats.value_max),
+                    &section.encoded.indptr_bytes,
+                    &section.encoded.indices_bytes,
+                    &section.encoded.values_bytes,
+                    &section.block_index_bytes,
+                )?;
+            }
+        }
 
         self.entries.push(FullCatalogEntry {
             name: section.name,
@@ -1675,6 +1821,7 @@ impl ScxWriter {
         // A v4 file requires framed (shard v2) CSR-class shards; reject an
         // unframed verbatim copy into one.
         self.guard_no_legacy_shard_in_v4(src_entry.section_type, raw_bytes)?;
+        self.guard_x_write_after_csc_emit(src_entry.section_type)?;
         self.record_copied_csr_codec(src_entry.section_type, raw_bytes);
 
         self.write_padding()?;
@@ -1682,6 +1829,11 @@ impl ScxWriter {
         let shard_global_offset = self.current_offset;
         self.writer()?.write_all(raw_bytes)?;
         self.current_offset += src_entry.length;
+        self.feed_csc_section(
+            src_entry.section_type,
+            raw_bytes,
+            src_entry.stats.as_ref().map(|s| s.value_max),
+        )?;
 
         let nnz = src_entry.stats.as_ref().map(|s| s.nnz).unwrap_or(0);
 
@@ -1803,6 +1955,17 @@ impl ScxWriter {
         build_csc: bool,
     ) -> Result<u8> {
         ModalityTable::validate_name(name)?;
+        // The same-pass sidecar is single-modality and has already sized its
+        // builder from the file-level axes; a modality registered after it
+        // would route per-modality X shards into that global builder.
+        // `enable_csc_sidecar` refuses the reverse order.
+        if self.csc_sink.is_some() || self.csc_sink_closed {
+            return Err(ScxError::InvalidCatalog(
+                "cannot register a modality on a writer with a same-pass CSC sidecar; it is \
+                 single-modality only"
+                    .to_string(),
+            ));
+        }
         if self.modalities.iter().any(|m| m.name == name) {
             return Err(ScxError::InvalidCatalog(format!(
                 "modality name '{name}' already registered"
@@ -2228,9 +2391,12 @@ impl ScxWriter {
     /// `add_modality(..., build_csc)` in the tree passes `false` (pyscx's
     /// `from_mudata`, rscx, the h5mu pipeline and `scx-mtx` all build their
     /// sidecars through `write_csc_sidecar` instead), and the only `true` is
-    /// in this crate's own tests. It is kept, rather than deleted with its
-    /// parameter, because the rewrite ops want exactly this hook — a sidecar
-    /// built in the pass that is already emitting the shards.
+    /// in this crate's own tests. The rewrite ops and streaming ingest build
+    /// their sidecars in the same pass through [`Self::enable_csc_sidecar`]
+    /// instead, which pushes each X shard as it is written rather than
+    /// re-reading them here. This multimodal re-read stays until that sink is
+    /// per-modality; unlike the sink it tolerates CSR shards that cover fewer
+    /// rows than `n_obs`, which its tests rely on.
     ///
     /// Budget and shard width come from `CscSidecarOptions::default()`; this
     /// used to carry a second, independent pair of constants. The spill root
@@ -2331,9 +2497,8 @@ impl ScxWriter {
             // shard's own first row. The entries come from a catalog scan in
             // *catalog* order and `finish()` checks only the row *count*, so
             // two shards covering [0, n) recorded out of order sum to the
-            // same total, pass, and emit a sidecar shifted by the swap. This
-            // is the hook the rewrite ops will use, so it needs the guard
-            // before they arrive.
+            // same total, pass, and emit a sidecar shifted by the swap. The
+            // same-pass sink (`csc_sink.rs`) applies the same predicate.
             //
             // The first version sorted on `ShardStats::row_start` and
             // substituted `rows_pushed` where stats were absent, which made
@@ -2481,6 +2646,8 @@ impl ScxWriter {
     ///
     /// Returns the final file path on success.
     pub fn finish(mut self) -> Result<PathBuf> {
+        // A same-pass sidecar the caller did not emit explicitly.
+        self.emit_csc_sidecar()?;
         // Phase B.3: auto-emit CSC sidecars for any modality registered
         // with `build_csc=true`. Runs before the modality table is
         // serialised so the table picks up the resulting

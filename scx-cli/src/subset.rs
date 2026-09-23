@@ -57,9 +57,7 @@ pub fn run_subset(
     dry_run: bool,
     shard_size: u32,
     codec: &str,
-    rebuild_csc: bool,
-    csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc: scx_ops::CscCarryOptions,
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Refuse to clobber before any work, on every arm below. `--dry-run`
@@ -104,9 +102,7 @@ pub fn run_subset(
             dry_run,
             shard_size,
             codec,
-            rebuild_csc,
-            csc_cols_per_shard,
-            csc_memory_limit,
+            &csc,
             index_options,
         );
     }
@@ -228,19 +224,10 @@ pub fn run_subset(
             output = output.map(|p| p.display().to_string()).unwrap_or_default()
         );
     }
-    // CSC sidecars are dropped on subset: row / column projection
-    // changes the global index space, so input CSC `indices` arrays
-    // would silently reference rows / columns that no longer exist.
-    // Caller can opt back in via `--rebuild-csc` to re-run `build-csc`
-    // against the projected output.
-    if in_header.has_csc() {
-        eprintln!(
-            "Warning: subset dropped CSC shards from {input}: rerun \
-             `scx build-csc` (or pass --rebuild-csc) to restore the \
-             column-major sidecar",
-            input = input.display()
-        );
-    }
+    // The input's CSC sidecar is never copied: row / column projection
+    // changes the index space it refers to. Whether a new one is built from
+    // the projected X, in the same pass that writes it, is `--csc`'s call.
+    let csc_build = csc.resolve("subset", in_header.has_csc(), false)?;
 
     // 8. Resolve the codec intent. The full axis (`auto`/`fast`/`compact`/...),
     // not just `CodecId::parse_cli`'s explicit set: `auto` previously collapsed
@@ -267,32 +254,11 @@ pub fn run_subset(
         uns.as_ref(),
         framing,
         index_options,
+        &csc_build,
     )?;
 
     println!("Wrote {}", output.display());
     report_index_outcome(index_result);
-
-    // Re-emit the CSC sidecar against the projected output. NOT the rewrite
-    // `framing` above: under `--codec auto` that carries `decode_target:
-    // Some(_)`, which authorises the writer to re-select each shard's codec and
-    // so defeats the preservation a CSC rebuild depends on. `framing_for_file`
-    // is the one correct source here — see its contract.
-    if rebuild_csc {
-        let csc_framing = crate::cli_utils::framing_for_file(output);
-        // No `--temp-dir` on this op: the CSC builder's spill root defaults to the
-        // output's own directory, which is already where the rewrite staged a whole
-        // copy of it, and the spill only happens at all on an undersized
-        // `--csc-memory-limit`.
-        scx_ops::rebuild_csc_inplace(
-            output,
-            csc_cols_per_shard,
-            csc_memory_limit,
-            csc_framing,
-            None,
-        )?;
-        println!("Rebuilt CSC sidecar on {}", output.display());
-    }
-
     Ok(())
 }
 
@@ -532,9 +498,7 @@ fn extract_modality(
     dry_run: bool,
     shard_size: u32,
     codec: &str,
-    rebuild_csc: bool,
-    csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc: &scx_ops::CscCarryOptions,
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::Array;
@@ -562,6 +526,10 @@ fn extract_modality(
         .expect("modality_id resolved above");
     let modality_type = info.modality_type;
     let n_vars = info.n_vars;
+    // The output is single-modality, so the same-pass sidecar can be built
+    // for it even though the input is multimodal: `carry` follows the
+    // extracted modality's own sidecar.
+    let csc_build = csc.resolve("subset", info.flags.has_csc(), false)?;
 
     // Read the global obs and apply the optional filter.
     let obs = reader.read_obs()?;
@@ -761,6 +729,7 @@ fn extract_modality(
     writer.write_obs(&filtered_obs)?;
     writer.write_var(&projected_var)?;
 
+    scx_ops::csc_carry::enable(&mut writer, &csc_build)?;
     let output_shard_row_ranges = write_csr_shards_auto(
         &mut writer,
         &projected_csr.indptr,
@@ -773,6 +742,7 @@ fn extract_modality(
         modality_type,
         framing,
     )?;
+    scx_ops::csc_carry::emit(&mut writer, "subset")?;
 
     // Preserve uns: prefer per-modality, fall back to global.
     let uns = reader
@@ -844,24 +814,6 @@ fn extract_modality(
         println!("Wrote {}", output.display());
     }
     report_index_outcome(index_result);
-
-    if rebuild_csc {
-        // See the note on the sibling site above: the rewrite framing would
-        // re-authorise codec selection on the sidecar.
-        let csc_framing = crate::cli_utils::framing_for_file(output);
-        // No `--temp-dir` on this op: the CSC builder's spill root defaults to the
-        // output's own directory, which is already where the rewrite staged a whole
-        // copy of it, and the spill only happens at all on an undersized
-        // `--csc-memory-limit`.
-        scx_ops::rebuild_csc_inplace(
-            output,
-            csc_cols_per_shard,
-            csc_memory_limit,
-            csc_framing,
-            None,
-        )?;
-        println!("Rebuilt CSC sidecar on {}", output.display());
-    }
     Ok(())
 }
 
@@ -877,6 +829,7 @@ fn write_subset_scx(
     uns: Option<&serde_json::Value>,
     framing: Option<FramingConfig>,
     index_options: &ConversionPredicateIndexOptions,
+    csc_build: &Option<scx_format_io::CscBuildOptions>,
 ) -> Result<Option<ConversionPredicateIndexResult>, Box<dyn std::error::Error>> {
     let n_obs = result.x.n_rows() as u64;
     let n_vars = result.x.n_cols() as u64;
@@ -900,6 +853,7 @@ fn write_subset_scx(
     // Write X as row-major shards. Value encoding is auto-detected per shard
     // from the projected f32 values (so retained values wider than the input
     // file's first-shard encoding are handled — B3).
+    scx_ops::csc_carry::enable(&mut writer, csc_build)?;
     let output_shard_row_ranges = write_csr_shards_auto(
         &mut writer,
         &result.x.indptr,
@@ -912,6 +866,7 @@ fn write_subset_scx(
         scx_format_io::ModalityType::Rna,
         framing,
     )?;
+    scx_ops::csc_carry::emit(&mut writer, "subset")?;
 
     // Write uns if present in the input file
     if let Some(uns_data) = uns {
@@ -1130,9 +1085,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1171,9 +1124,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1203,9 +1154,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1234,9 +1183,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1265,9 +1212,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1294,9 +1239,7 @@ mod tests {
             true,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1319,9 +1262,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         );
         assert!(err.is_err());
@@ -1345,9 +1286,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         );
         assert!(err.is_err());
@@ -1379,9 +1318,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1408,9 +1345,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         );
         assert!(err.is_err());
@@ -1476,9 +1411,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1590,9 +1523,7 @@ mod tests {
             false,
             10000,
             "none",
-            false,
-            5000,
-            "4G",
+            &scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1638,9 +1569,7 @@ mod tests {
             false,
             10000,
             "none",
-            false,
-            5000,
-            "4G",
+            &scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1675,9 +1604,7 @@ mod tests {
             false,
             10000,
             "none",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1727,9 +1654,7 @@ mod tests {
                 false,
                 10000,
                 "none",
-                false,
-                5000,
-                "4G",
+                scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
                 &no_index(),
             )
             .unwrap();
@@ -1772,9 +1697,7 @@ mod tests {
             false,
             10000,
             "none",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1809,9 +1732,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -1938,9 +1859,7 @@ mod tests {
             false,
             2,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .expect("subset must succeed (pre-fix this returned `out of range for uint16`)");
@@ -1986,9 +1905,7 @@ mod tests {
             false,
             2,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .expect("0-row subset must not panic or error");
@@ -2024,9 +1941,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &no_index(),
         )
         .unwrap();
@@ -2047,9 +1962,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &forced_index(&["cell_type"], &[]),
         )
         .unwrap();
@@ -2079,9 +1992,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &forced_index(&[], &["gene_id"]),
         )
         .unwrap();
@@ -2129,9 +2040,7 @@ mod tests {
             false,
             2,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &forced_index(&["cell_id"], &[]),
         )
         .unwrap();
@@ -2189,9 +2098,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &forced_index(&["nonexistent_column"], &[]),
         );
         assert!(err.is_err(), "a missing --index-obs column must error");
@@ -2223,9 +2130,7 @@ mod tests {
             true,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &forced_index(&["nonexistent_column"], &[]),
         );
         assert!(
@@ -2246,9 +2151,7 @@ mod tests {
             true,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &forced_index(&["cell_type"], &[]),
         )
         .unwrap();
@@ -2273,9 +2176,7 @@ mod tests {
             false,
             10000,
             "none",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &forced_index(&["cell_type"], &[]),
         )
         .unwrap();
@@ -2313,9 +2214,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &ConversionPredicateIndexOptions {
                 index_obs: Vec::new(),
                 index_var: Vec::new(),
@@ -2355,9 +2254,7 @@ mod tests {
             false,
             10000,
             "auto",
-            false,
-            5000,
-            "4G",
+            scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
             &forced_index(&["cell_type"], &[]),
         )
         .unwrap();

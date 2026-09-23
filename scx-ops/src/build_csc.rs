@@ -270,7 +270,7 @@ fn truncate_on_error<T>(
 }
 
 /// Add a CSC sidecar to `path` in place — `scx build-csc` with no `<OUTPUT>`,
-/// and `--rebuild-csc` on the mutating ops. The CSC shards are appended at EOF
+/// and `scx append --rebuild-csc`. The CSC shards are appended at EOF
 /// and the catalog repointed with `prepare_in_place` / `commit_in_place`, the
 /// harness `append` and the attach ops use.
 ///
@@ -278,7 +278,8 @@ fn truncate_on_error<T>(
 /// bitmap keeps its bytes at its offset — [`crate::carry::audit_in_place`]
 /// checks that before committing — so `data_generation` is unchanged and
 /// `scx rollback` undoes the build. A sidecar already on the file is replaced;
-/// its bytes become orphans that `scx compact --rebuild-csc` reclaims, as with
+/// its bytes become orphans that `scx compact` reclaims (carrying a fresh
+/// sidecar), as with
 /// every in-place op. A *layer* sidecar is kept when it is fresh and dropped
 /// with a warning when it is not, because the generation stamp written here is
 /// the one freshness field every column-major section shares.
@@ -410,7 +411,7 @@ pub fn rebuild_csc_inplace(
         if orphaned > 0 && build.is_some() {
             log::warn!(
                 "build-csc: replacing the existing CSC sidecar on {} leaves {orphaned} bytes \
-                 unreferenced; `scx compact --rebuild-csc` reclaims them",
+                 unreferenced; `scx compact` reclaims them",
                 path.display()
             );
         }
@@ -437,7 +438,7 @@ pub fn rebuild_csc_inplace(
             log::warn!(
                 "build-csc: dropping the stale layer CSC sidecar on {} (built at generation \
                  {}, file is at {}); nothing rebuilds a layer sidecar, and its {bytes} bytes \
-                 stay unreferenced until `scx compact --rebuild-csc`",
+                 stay unreferenced until `scx compact`",
                 path.display(),
                 prep.old_catalog.csc_build_generation,
                 prep.old_catalog.data_generation
@@ -1323,9 +1324,9 @@ mod tests {
     }
 
     /// An empty matrix (`n_obs == 0` here) has nothing to transpose, so
-    /// `build-csc` is a no-op that still produces the requested output — the
-    /// `--rebuild-csc` / `rebuild_csc=True` callers run it on whatever their
-    /// rewrite produced and must not fail on one that yielded zero rows. Distinct
+    /// `build-csc` is a no-op that still produces the requested output — its
+    /// callers (`scx append --rebuild-csc`, MTX `convert --csc`) run it on
+    /// whatever they produced and must not fail on one that yielded zero rows. Distinct
     /// from `test_build_csc_no_csr_error`, whose header *claims* rows.
     #[test]
     fn test_build_csc_empty_matrix_is_a_noop() {

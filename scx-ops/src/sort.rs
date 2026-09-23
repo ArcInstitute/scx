@@ -27,8 +27,9 @@
 //!   keep their original global order — stable and deterministic regardless
 //!   of the order rows arrive in (e.g. Phase 4's parallel scatter).
 //! - Phase 0 recorded the design decisions (bitmap drop-only for v1; obs
-//!   axis globally shared; CSC rebuilt post-write via
-//!   [`crate::rebuild_csc_inplace`]).
+//!   axis globally shared). The CSC sidecar was then rebuilt post-write via
+//!   [`crate::rebuild_csc_inplace`]; it is now built in the same pass as the
+//!   sorted X (`SortOptions::csc`).
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -124,6 +125,9 @@ pub struct SortOptions {
     /// re-arms the hard M1 memory guard). Only meaningful when `group_by` is
     /// `Some`.
     pub group_write_block_bytes: Option<u64>,
+    /// Whether the output carries a CSC sidecar (default: iff the input had
+    /// one), built in the same pass as the sorted X shards.
+    pub csc: crate::csc_carry::CscCarryOptions,
 }
 
 /// How to identify reference rows for grouped sharding (F1).
@@ -153,6 +157,7 @@ impl Default for SortOptions {
             group_target_bytes: None,
             group_max_bytes: None,
             group_write_block_bytes: None,
+            csc: crate::csc_carry::CscCarryOptions::default(),
         }
     }
 }

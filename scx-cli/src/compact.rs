@@ -13,9 +13,7 @@ pub fn run_compact(
     input: &Path,
     output: &Path,
     force: bool,
-    rebuild_csc: bool,
-    csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc: scx_ops::CscCarryOptions,
     index_obs: Vec<String>,
     index_var: Vec<String>,
     index_preset: Option<String>,
@@ -90,6 +88,7 @@ pub fn run_compact(
                 index_options,
                 reshape_obs,
                 codec: resolved_codec,
+                csc,
             },
         )?;
         emit_index_summary("compact", &summary);
@@ -102,6 +101,7 @@ pub fn run_compact(
             output,
             &scx_ops::CompactOptions {
                 codec: resolved_codec,
+                csc,
                 ..Default::default()
             },
         )?;
@@ -135,17 +135,8 @@ pub fn run_compact(
         label,
     );
 
-    // Re-emit the CSC sidecar against the compacted output, preserving the
-    // output's framing (compact keeps a v4 input framed; the rebuild must not
-    // downgrade it back to unframed v3).
-    if rebuild_csc {
-        let framing = crate::cli_utils::framing_for_file(output);
-        // No `--temp-dir` on this op: the CSC builder's spill root defaults to the
-        // output's own directory, which is already where the rewrite staged a whole
-        // copy of it, and the spill only happens at all on an undersized
-        // `--csc-memory-limit`.
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing, None)?;
-        println!("Rebuilt CSC sidecar on {}", output.display());
+    if scx_format_io::ScxReader::open(output)?.header().has_csc() {
+        println!("  CSC sidecar built in the same pass");
     }
 
     Ok(())

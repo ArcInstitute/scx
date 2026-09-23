@@ -2250,3 +2250,142 @@ fn csc_sidecar_honours_memory_budget() {
          Equal counts mean the call site is still passing the 4 GiB default."
     );
 }
+
+/// The CSC entries of `path` as `(name, length, checksum)`, and every other
+/// entry except provenance (whose timestamp is the wall clock).
+#[allow(clippy::type_complexity)]
+fn csc_and_rest(path: &Path) -> (Vec<(String, u64, [u8; 32])>, Vec<(String, u64, [u8; 32])>) {
+    let r = ScxReader::open(path).unwrap();
+    let (mut csc, mut rest) = (Vec::new(), Vec::new());
+    for e in &r.catalog().entries {
+        let row = (e.name.clone(), e.length, e.checksum);
+        match e.section_type {
+            FmtSectionType::CscShard => csc.push(row),
+            FmtSectionType::Provenance => {}
+            _ => rest.push(row),
+        }
+    }
+    csc.sort();
+    rest.sort();
+    (csc, rest)
+}
+
+/// Streaming ingest builds its sidecar in the same pass as X. It must be the
+/// sidecar the second pass it replaced (`rebuild_csc_inplace` over the finished
+/// file) produced — byte for byte, on the sequential and the parallel route,
+/// with and without a `--memory-budget` (which now splits between ingest and
+/// the builder), and at a custom `--row-group-rows` — while changing nothing
+/// else in the file and leaving a single catalog generation behind.
+#[test]
+fn streaming_csc_is_built_in_the_same_pass_as_x() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("same_pass.h5ad");
+    create_test_h5ad(&h5ad, 41, 13, "csr", false);
+
+    for (tag, reader_threads, memory_budget, row_group_rows) in [
+        ("seq", Some(1), None, None),
+        ("par", Some(4), None, None),
+        ("par_budget", Some(4), Some(64u64 << 20), None),
+        ("g4", Some(1), None, Some(4)),
+    ] {
+        let opts = |csc| IngestOptions {
+            shard_target_rows: 8,
+            csc,
+            csc_cols_per_shard: 5,
+            reader_threads,
+            memory_budget,
+            row_group_rows,
+            tool: "scx".into(),
+            ..IngestOptions::default()
+        };
+        let convert = |out: &Path, csc| {
+            h5ad_to_scx_streaming(
+                &h5ad,
+                out,
+                &opts(csc),
+                &StreamingOverrides::default(),
+                &mut WarningSink::log(),
+            )
+            .unwrap()
+        };
+
+        let same = dir.path().join(format!("{tag}_same.scx"));
+        convert(&same, super::pipeline::CscPolicy::Always);
+        let two = dir.path().join(format!("{tag}_two.scx"));
+        convert(&two, super::pipeline::CscPolicy::Off);
+        let (none, two_rest) = csc_and_rest(&two);
+        assert!(none.is_empty());
+        let off = opts(super::pipeline::CscPolicy::Off);
+        scx_ops::rebuild_csc_inplace(
+            &two,
+            off.csc_cols_per_shard,
+            &crate::budget::csc_sidecar_bytes(off.memory_budget).to_string(),
+            off.framing_preserving_codec(),
+            None,
+        )
+        .unwrap();
+
+        let (same_csc, same_rest) = csc_and_rest(&same);
+        assert!(same_csc.len() > 1, "{tag}: 13 columns at 5 per shard");
+        assert_eq!(same_csc, csc_and_rest(&two).0, "{tag}: CSC bytes differ");
+        assert_eq!(
+            same_rest, two_rest,
+            "{tag}: the sidecar changed another section"
+        );
+
+        let r = ScxReader::open(&same).unwrap();
+        assert_eq!(
+            r.catalog().prev_catalog_offset,
+            0,
+            "{tag}: a same-pass sidecar leaves one catalog generation"
+        );
+        assert_eq!(
+            r.catalog().csc_build_generation,
+            r.catalog().data_generation
+        );
+    }
+}
+
+/// `--group-by` with an obsp-carrying input takes the two-pass route (plain
+/// convert, then `scx sort`); the sort builds the sidecar in its own pass,
+/// with and without a `--memory-budget` (which the sort splits with the
+/// builder rather than handing both the whole).
+#[test]
+fn grouped_two_pass_convert_carries_the_sidecar_through_the_sort() {
+    for memory_budget in [None, Some(64u64 << 20)] {
+        let dir = tempfile::tempdir().unwrap();
+        let h5ad = dir.path().join("grouped.h5ad");
+        create_test_h5ad_with_cell_type(&h5ad, 30, 12);
+        let out = dir.path().join("grouped.scx");
+        let opts = IngestOptions {
+            shard_target_rows: 8,
+            csc: super::pipeline::CscPolicy::Always,
+            csc_cols_per_shard: 5,
+            group_by: Some("cell_type".into()),
+            group_pass: GroupPass::Two,
+            memory_budget,
+            tool: "scx".into(),
+            ..IngestOptions::default()
+        };
+        h5ad_to_scx_streaming(
+            &h5ad,
+            &out,
+            &opts,
+            &StreamingOverrides::default(),
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        let r = ScxReader::open(&out).unwrap();
+        assert!(
+            r.header().has_csc(),
+            "the grouped two-pass output must carry CSC"
+        );
+        let csr = r.read_all_csr_shards().unwrap();
+        let csc = r.read_all_csc_shards().unwrap();
+        assert_eq!(csr.indptr.last(), csc.indptr.last());
+        assert_eq!(
+            r.catalog().csc_build_generation,
+            r.catalog().data_generation
+        );
+    }
+}

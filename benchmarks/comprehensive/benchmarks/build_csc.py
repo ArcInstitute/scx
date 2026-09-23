@@ -64,8 +64,10 @@ almost all interpreter baseline), tabula 2970 MB (0.73x), census_500k 8190 MB
 non-zeros. It is not "always over" and not "always fine"; a threshold has to
 pick its dataset deliberately.
 
-Five other operations accept `--rebuild-csc` and route through the same writer,
-so whatever this measures is not local to one entry point.
+The rewrite ops (`compact`, `merge`, `optimize`, `sort`, `subset`) and
+streaming convert build their sidecars through the same `CscBuilder`, fed in the
+same pass as X, so whatever this measures about the builder is not local to one
+entry point.
 
 ## What it emits
 

@@ -46,9 +46,9 @@
 //! ## Scope
 //!
 //! Local input only (cloud input deferred). obsm and layers are gathered
-//! in-memory (the bounded-memory guarantee is for X). The CSC sidecar is
-//! dropped; the CLI re-emits it post-write via `rebuild_csc_inplace` on
-//! `--rebuild-csc`.
+//! in-memory (the bounded-memory guarantee is for X). The input's CSC sidecar
+//! is never copied; `SortOptions::csc` decides whether a new one is built from
+//! the sorted X in the same pass (by default, iff the input had one).
 //!
 //! **Output size is not guaranteed neutral.** The reorder re-encodes every X
 //! shard with `--codec` (default `auto`). `scx1`-coded shards are size-neutral
@@ -204,6 +204,16 @@ pub fn sort_with_strategy(
     let _lock = SharedFileLock::acquire(input)?;
     let reader = ScxReader::open(input)?;
     let in_header = reader.header().clone();
+
+    // Decided before any output exists, so a refusal leaves nothing behind.
+    let mut csc_build = opts.csc.resolve(
+        "sort",
+        crate::csc_carry::reader_has_csc(&reader),
+        reader.is_multimodal(),
+    )?;
+    // What the user passed; the same-pass split below may hand the sort's
+    // resident-set planners less.
+    let caller_budget = opts.memory_budget;
 
     if in_header.has_raw() {
         log::warn!(
@@ -471,111 +481,148 @@ pub fn sort_with_strategy(
         opts.memory_budget,
         value_encoding,
     );
-    let mut grouped_reference_labels: Vec<String> = Vec::new();
-    let (order_local, group_plan): (Vec<u64>, Option<crate::group_plan::GroupPlan>) =
-        if let Some(group_col) = &opts.group_by {
-            // `opts.by` is normalized to `[group_col, <secondary...>]`.
-            let secondary: Vec<String> = opts.by.iter().skip(1).cloned().collect();
-            let go =
-                compute_grouped_order(&live_keys, group_col, &secondary, opts.reference.as_ref())?;
-            log::info!("scx sort: pass 0a grouped order built; argsort over {n_live} rows");
-            // Byte-budget pre-scan (skipped in row-count mode); needs emission
-            // order in global old-row ids for the shard indptr lookup.
-            let (per_row_nnz, target_units, bytes_per_nnz) = match opts.group_target_bytes {
-                Some(tb) => {
-                    let order_old_tmp: Vec<u64> =
-                        go.perm.iter().map(|&l| live_ids[l as usize]).collect();
-                    (
-                        prescan_per_row_nnz(&reader, &order_old_tmp, n_obs)?,
-                        tb.max(1),
-                        GROUP_BYTES_PER_NNZ,
-                    )
-                }
-                None => (Vec::new(), opts.shard_target_rows.max(1) as u64, 0u64),
+
+    // A same-pass sidecar's buckets are live beside the sort's own working
+    // set, so under `--memory-budget` the two split it rather than each
+    // claiming the whole: the builder spills at its share, and the sort plans
+    // its resident set (strategy, partitions, obs spill, encode concurrency)
+    // against the rest.
+    //
+    // The grouped sub-flush cap above is the one planner input that decides
+    // output LAYOUT (it cuts X shards), so it is sized from the whole budget
+    // in both modes — sizing it from the rest would make `--csc carry` and
+    // `--csc off` cut different X shards under the same budget. Instead the
+    // builder yields: its share never exceeds what a block of that cap leaves,
+    // so one block plus the buckets stays inside the budget. A spill threshold
+    // only decides what spills, so this moves no byte either.
+    let split_opts;
+    let opts = match (csc_build.as_mut(), opts.memory_budget) {
+        (Some(build), Some(budget)) => {
+            let (mut builder, _) =
+                scx_format_io::csc_budget::same_pass_split(budget, build.memory_bytes as u64);
+            if opts.group_by.is_some() && block_byte_cap > 0 {
+                let per_block = grouped_block_phase_bytes(block_byte_cap, value_encoding);
+                builder = builder.min(budget.saturating_sub(per_block)).max(1);
+            }
+            build.spill_after_bytes = Some(builder as usize);
+            split_opts = SortOptions {
+                memory_budget: Some(budget - builder),
+                ..opts.clone()
             };
-            let max_units = opts
-                .group_max_bytes
-                .unwrap_or_else(|| target_units.saturating_mul(GROUP_MAX_BYTES_MULTIPLE));
-            let plan = crate::group_plan::plan_group_shards(
-                &go.group_of_new,
-                &go.ref_of_new,
-                &go.labels,
-                &per_row_nnz,
-                target_units,
-                bytes_per_nnz,
-                max_units,
-            );
-            log::info!(
-                "scx sort: group plan -> {} shards, {} records, reference_shard={:?}",
-                plan.n_shards,
-                plan.records.len(),
-                plan.reference_shard
-            );
-            // M1: bound the largest grouped shard against `--memory-budget`.
-            // F6 Phase 0 relaxed the never-split contract: with the block-level
-            // sub-flush enabled (the default), an oversized group is split across
-            // shards and bounded at one block, so exceeding the budget is a
-            // warning, not a hard error. Only when the sub-flush is explicitly
-            // disabled (`group_write_block_bytes == Some(0)`) does the emitter
-            // still buffer the whole group — then refuse loudly.
-            if let Some(budget) = opts.memory_budget {
-                // Use exact per-row nnz for the footprint: reuse the byte-mode
-                // prescan if present, else prescan now (row-count mode). A
-                // file-wide average-density estimate could pass a group that is
-                // much denser than average and still OOM (codex P2), so when a
-                // budget is set we always size the guard from real nnz.
-                let guard_prescan: Vec<u64>;
-                let guard_nnz: &[u64] = if !per_row_nnz.is_empty() {
-                    &per_row_nnz
-                } else {
-                    let order_old_tmp: Vec<u64> =
-                        go.perm.iter().map(|&l| live_ids[l as usize]).collect();
-                    guard_prescan = prescan_per_row_nnz(&reader, &order_old_tmp, n_obs)?;
-                    &guard_prescan
-                };
-                let (max_bytes, shard_idx, label) =
-                    max_grouped_shard_footprint(&plan, guard_nnz, n_vars as usize, density);
-                if max_bytes > budget {
-                    if block_byte_cap > 0 {
-                        // `block_byte_cap` is already clamped to `budget` above, so
-                        // each sub-flushed block stays within the budget.
-                        log::warn!(
-                            "scx sort: grouped shard {shard_idx} (dominated by group {label:?}) \
+            &split_opts
+        }
+        _ => opts,
+    };
+    let mut grouped_reference_labels: Vec<String> = Vec::new();
+    let (order_local, group_plan): (Vec<u64>, Option<crate::group_plan::GroupPlan>) = if let Some(
+        group_col,
+    ) =
+        &opts.group_by
+    {
+        // `opts.by` is normalized to `[group_col, <secondary...>]`.
+        let secondary: Vec<String> = opts.by.iter().skip(1).cloned().collect();
+        let go = compute_grouped_order(&live_keys, group_col, &secondary, opts.reference.as_ref())?;
+        log::info!("scx sort: pass 0a grouped order built; argsort over {n_live} rows");
+        // Byte-budget pre-scan (skipped in row-count mode); needs emission
+        // order in global old-row ids for the shard indptr lookup.
+        let (per_row_nnz, target_units, bytes_per_nnz) = match opts.group_target_bytes {
+            Some(tb) => {
+                let order_old_tmp: Vec<u64> =
+                    go.perm.iter().map(|&l| live_ids[l as usize]).collect();
+                (
+                    prescan_per_row_nnz(&reader, &order_old_tmp, n_obs)?,
+                    tb.max(1),
+                    GROUP_BYTES_PER_NNZ,
+                )
+            }
+            None => (Vec::new(), opts.shard_target_rows.max(1) as u64, 0u64),
+        };
+        let max_units = opts
+            .group_max_bytes
+            .unwrap_or_else(|| target_units.saturating_mul(GROUP_MAX_BYTES_MULTIPLE));
+        let plan = crate::group_plan::plan_group_shards(
+            &go.group_of_new,
+            &go.ref_of_new,
+            &go.labels,
+            &per_row_nnz,
+            target_units,
+            bytes_per_nnz,
+            max_units,
+        );
+        log::info!(
+            "scx sort: group plan -> {} shards, {} records, reference_shard={:?}",
+            plan.n_shards,
+            plan.records.len(),
+            plan.reference_shard
+        );
+        // M1: bound the largest grouped shard against `--memory-budget`.
+        // F6 Phase 0 relaxed the never-split contract: with the block-level
+        // sub-flush enabled (the default), an oversized group is split across
+        // shards and bounded at one block, so exceeding the budget is a
+        // warning, not a hard error. Only when the sub-flush is explicitly
+        // disabled (`group_write_block_bytes == Some(0)`) does the emitter
+        // still buffer the whole group — then refuse loudly.
+        if let Some(budget) = opts.memory_budget {
+            // Use exact per-row nnz for the footprint: reuse the byte-mode
+            // prescan if present, else prescan now (row-count mode). A
+            // file-wide average-density estimate could pass a group that is
+            // much denser than average and still OOM (codex P2), so when a
+            // budget is set we always size the guard from real nnz.
+            let guard_prescan: Vec<u64>;
+            let guard_nnz: &[u64] = if !per_row_nnz.is_empty() {
+                &per_row_nnz
+            } else {
+                let order_old_tmp: Vec<u64> =
+                    go.perm.iter().map(|&l| live_ids[l as usize]).collect();
+                guard_prescan = prescan_per_row_nnz(&reader, &order_old_tmp, n_obs)?;
+                &guard_prescan
+            };
+            let (max_bytes, shard_idx, label) =
+                max_grouped_shard_footprint(&plan, guard_nnz, n_vars as usize, density);
+            if max_bytes > budget {
+                if block_byte_cap > 0 {
+                    // `block_byte_cap` is clamped to the caller's budget above
+                    // (and a same-pass builder yields what a block of it needs),
+                    // so each sub-flushed block stays within the budget.
+                    let beside_csc = beside_csc_note(budget, caller_budget);
+                    log::warn!(
+                        "scx sort: grouped shard {shard_idx} (dominated by group {label:?}) \
                              would need ~{max_bytes} bytes if buffered whole, exceeding \
-                             --memory-budget {budget}; the group will be sub-flushed across \
-                             multiple shards at the {block_byte_cap}-byte block cap \
+                             --memory-budget {budget}{beside_csc}; the group will be sub-flushed \
+                             across multiple shards at the {block_byte_cap}-byte block cap \
                              (min of --group-write-block-bytes and --memory-budget)"
-                        );
-                    } else {
-                        return Err(OpsError::InvalidInput(format!(
+                    );
+                } else {
+                    let beside_csc = beside_csc_note(budget, caller_budget);
+                    return Err(OpsError::InvalidInput(format!(
                             "scx sort: grouped shard {shard_idx} (dominated by group {label:?}) \
-                             needs ~{max_bytes} bytes to buffer but --memory-budget is {budget} \
-                             and the block sub-flush is disabled (--group-write-block-bytes 0); \
+                             needs ~{max_bytes} bytes to buffer but --memory-budget is \
+                             {budget}{beside_csc} and the block sub-flush is disabled (--group-write-block-bytes 0); \
                              raise --memory-budget / --group-target-bytes, enable the sub-flush, \
                              or drop --group-by"
                         )));
-                    }
                 }
             }
-            grouped_reference_labels = go.reference_labels;
-            (go.perm, Some(plan))
-        } else if let Some(seed) = opts.shuffle {
-            // 1D: the third pass-0 producer. Same shape and same `Vec<u64>`
-            // memory as `stable_argsort`, so every downstream consumer —
-            // in-memory take, spill-scatter routing, obsp remap, all three X
-            // emitters — is untouched.
-            log::info!("scx sort: pass 0a seeded permutation over {n_live} live rows");
-            (crate::shuffle_order::seeded_permutation(n_live, seed), None)
-        } else {
-            let extractor = SortKeyExtractor::new(&live_keys.schema(), &opts.by, opts.reverse)?;
-            let rows = extractor.rows(&live_keys)?;
-            log::info!("scx sort: pass 0a key rows built; argsort over {n_live} rows");
-            // Local indices into the live sequence, in sorted order (stable, ties
-            // by source id). `live_keys` and `live_obs` are filtered from the same
-            // row universe in the same shard-concatenated order, so these local
-            // indices apply to both.
-            (stable_argsort(&rows, 0), None)
-        };
+        }
+        grouped_reference_labels = go.reference_labels;
+        (go.perm, Some(plan))
+    } else if let Some(seed) = opts.shuffle {
+        // 1D: the third pass-0 producer. Same shape and same `Vec<u64>`
+        // memory as `stable_argsort`, so every downstream consumer —
+        // in-memory take, spill-scatter routing, obsp remap, all three X
+        // emitters — is untouched.
+        log::info!("scx sort: pass 0a seeded permutation over {n_live} live rows");
+        (crate::shuffle_order::seeded_permutation(n_live, seed), None)
+    } else {
+        let extractor = SortKeyExtractor::new(&live_keys.schema(), &opts.by, opts.reverse)?;
+        let rows = extractor.rows(&live_keys)?;
+        log::info!("scx sort: pass 0a key rows built; argsort over {n_live} rows");
+        // Local indices into the live sequence, in sorted order (stable, ties
+        // by source id). `live_keys` and `live_obs` are filtered from the same
+        // row universe in the same shard-concatenated order, so these local
+        // indices apply to both.
+        (stable_argsort(&rows, 0), None)
+    };
     // Output row -> original (global) old row id.
     let order_old: Vec<u64> = order_local.iter().map(|&l| live_ids[l as usize]).collect();
 
@@ -644,7 +691,6 @@ pub fn sort_with_strategy(
             &reader,
             &in_header,
             output,
-            input,
             &order_old,
             &new_pos_of_old,
             sorted_obs,
@@ -654,16 +700,11 @@ pub fn sort_with_strategy(
     }
 
     // ----- Output writer + header -----
-    // Drop has_deletion_vectors (bit 5) and has_csc (bit 0); the sort applies
-    // the deletion vector and drops the now-stale column-major sidecar.
+    // Drop has_deletion_vectors (bit 5) and has_csc (bit 0): the sort applies
+    // the deletion vector, and the input's sidecar is never copied (the rows
+    // move). `csc_build` decides whether a new one is built from the sorted X
+    // as it is written; `finish()` re-derives bit 0 from the catalog.
     let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
-    if in_header.has_csc() {
-        log::warn!(
-            "scx sort dropped CSC shards from {}: pass --rebuild-csc to restore the \
-             column-major sidecar",
-            input.display()
-        );
-    }
     // Preserve row-group framing: a v4 (framed) input yields a v4 output whose
     // re-encoded shards are all framed (via `set_framing` below), so sorting a
     // default file no longer silently downgrades it to unframed v3.
@@ -684,6 +725,7 @@ pub fn sort_with_strategy(
     let mut writer = ScxWriter::new(output, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
     writer.set_framing(framing_for_rewrite(opts.codec, output_framed, "the input")?);
+    crate::csc_carry::enable(&mut writer, &csc_build)?;
 
     // ----- obs (sorted, re-sharded) + var -----
     // In-memory: slice the materialized sorted obs. Spill: scatter input obs
@@ -694,7 +736,7 @@ pub fn sort_with_strategy(
     match &sorted_obs {
         Some(sorted_obs) => write_obs_sharded(&mut writer, sorted_obs, opts.shard_target_rows)?,
         None => {
-            let state = prepare_obs_spill(&reader, &new_pos_of_old, n_live, opts)?;
+            let state = prepare_obs_spill(&reader, &new_pos_of_old, n_live, opts, caller_budget)?;
             obs_partitions = state.n_parts;
             log::info!(
                 "scx sort: obs write pass begin ({} partitions)",
@@ -900,9 +942,11 @@ pub fn sort_with_strategy(
                         (opts.shard_target_rows.max(1) as f64 * n_vars as f64 * density * 16.0)
                             as u64;
                     if per_shard > budget {
+                        let beside_csc = beside_csc_note(budget, caller_budget);
                         return Err(OpsError::InvalidInput(format!(
                             "scx sort: --memory-budget {budget} too small for one output shard \
-                         (~{per_shard} bytes for {} rows); raise the budget or lower --shard-size",
+                         (~{per_shard} bytes for {} rows){beside_csc}; raise the budget or lower \
+                         --shard-size",
                             opts.shard_target_rows
                         )));
                     }
@@ -937,6 +981,10 @@ pub fn sort_with_strategy(
         x_emitter.finish(&mut writer)?;
         x_emitter.ranges.clone()
     };
+
+    // Every X strategy above ends here, so the same-pass sidecar is emitted
+    // once for all of them, before the group index, layers and obsm.
+    crate::csc_carry::emit(&mut writer, "sort")?;
 
     // ----- F1/F6: write the GroupIndex sidecar (reconciled to emitted shards) -----
     if let (Some(plan), Some(group_col)) = (&group_plan, &opts.group_by) {
@@ -1143,7 +1191,6 @@ fn sort_multimodal(
     reader: &ScxReader,
     in_header: &FileHeader,
     output: &Path,
-    input: &Path,
     order_old: &[u64],
     new_pos_of_old: &[i64],
     sorted_obs: &RecordBatch,
@@ -1157,14 +1204,8 @@ fn sort_multimodal(
         })?
         .clone();
 
+    // `csc_carry::resolve` already warned if a sidecar is being dropped.
     let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
-    if in_header.has_csc() || table.entries.iter().any(|i| i.flags.has_csc()) {
-        log::warn!(
-            "scx sort dropped CSC shards from {}: pass --rebuild-csc to restore the \
-             column-major sidecar",
-            input.display()
-        );
-    }
     let max_n_vars = table.entries.iter().map(|i| i.n_vars).max().unwrap_or(0);
     // Preserve framing (see the single-modality path).
     let output_framed = in_header.format_version >= CURRENT_FORMAT_VERSION;
@@ -1774,6 +1815,27 @@ fn emit_x_in_memory(
 /// the `InMemory` strategy gate guarantees a single shard fits the budget, so
 /// peak stays ~≤ 2× budget. (`per_nnz_bytes` is `4 + value_width` ≥ 5, never 0;
 /// the guard is defensive.)
+/// `""` when the sort planned against the whole `--memory-budget`, else a
+/// parenthetical naming the caller's figure and the share a same-pass CSC
+/// builder took, so a refusal does not quote a number the user never passed.
+fn beside_csc_note(budget: u64, caller_budget: Option<u64>) -> String {
+    match caller_budget {
+        Some(caller) if caller != budget => format!(
+            " (of --memory-budget {caller}, {} is held by the CSC sidecar builder; \
+             --csc off gives the sort all of it)",
+            caller - budget
+        ),
+        _ => String::new(),
+    }
+}
+
+/// Modeled live bytes of one grouped block at `block_byte_cap` — the figure
+/// [`grouped_fast_concurrency`] charges per block in flight.
+fn grouped_block_phase_bytes(block_byte_cap: u64, value_encoding: ValueEncoding) -> u64 {
+    let nnz_per_block = (block_byte_cap / block_cut_bytes_per_nnz(value_encoding)).max(1);
+    (ENCODE_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ).saturating_mul(nnz_per_block)
+}
+
 fn grouped_fast_concurrency(
     threads: usize,
     block_byte_cap: u64,
@@ -3042,6 +3104,7 @@ fn prepare_obs_spill(
     new_pos_of_old: &[i64],
     n_live: usize,
     opts: &SortOptions,
+    caller_budget: Option<u64>,
 ) -> Result<ObsSpillState> {
     let budget = opts
         .memory_budget
@@ -3054,9 +3117,11 @@ fn prepare_obs_spill(
     // external path's per-shard refuse guard).
     let one_shard = bytes_per_row.saturating_mul(opts.shard_target_rows.max(1) as u64);
     if one_shard > budget {
+        let beside_csc = beside_csc_note(budget, caller_budget);
         return Err(OpsError::InvalidInput(format!(
             "scx sort: --memory-budget {budget} too small for one obs shard \
-             (~{one_shard} bytes for {} rows); raise the budget or lower --shard-size",
+             (~{one_shard} bytes for {} rows){beside_csc}; raise the budget or lower \
+             --shard-size",
             opts.shard_target_rows
         )));
     }

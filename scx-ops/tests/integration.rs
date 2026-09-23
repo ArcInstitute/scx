@@ -2523,8 +2523,41 @@ fn test_rollback_restores_csc_count_and_flag() {
     );
 }
 
+/// The output's CSC sidecar is the transpose of its CSR, entry for entry.
+fn assert_csc_is_the_transpose_of_csr(r: &ScxReader) {
+    let csr = r.read_all_csr_shards().unwrap();
+    let csc = r.read_all_csc_shards().unwrap();
+    let (n_obs, n_vars) = (r.n_obs() as usize, r.n_vars() as usize);
+    let mut from_csr = vec![0f32; n_obs * n_vars];
+    for row in 0..n_obs {
+        for k in csr.indptr[row] as usize..csr.indptr[row + 1] as usize {
+            from_csr[row * n_vars + csr.indices[k] as usize] = csr.data[k];
+        }
+    }
+    let mut from_csc = vec![0f32; n_obs * n_vars];
+    for col in 0..n_vars {
+        for k in csc.indptr[col] as usize..csc.indptr[col + 1] as usize {
+            from_csc[csc.indices[k] as usize * n_vars + col] = csc.data[k];
+        }
+    }
+    assert_eq!(
+        from_csc, from_csr,
+        "the sidecar must be the output's own transpose"
+    );
+}
+
+fn csc_entry_count(r: &ScxReader) -> usize {
+    r.catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format_io::section::SectionType::CscShard)
+        .count()
+}
+
+/// compact carries a sidecar by default: rebuilt from the compacted X in the
+/// same pass, fresh against the output's `data_generation`. `--csc off` drops it.
 #[test]
-fn test_compact_drops_csc_from_input() {
+fn test_compact_carries_csc_from_input() {
     let dir = tempfile::tempdir().unwrap();
     let input = write_csc_test_file(&dir, "csc_compact_in.scx", 6, 8, 4);
     let output = dir.path().join("csc_compact_out.scx");
@@ -2532,43 +2565,54 @@ fn test_compact_drops_csc_from_input() {
     scx_ops::compact(&input, &output).unwrap();
 
     let r = ScxReader::open(&output).unwrap();
-    assert!(
-        !r.header().has_csc(),
-        "compact output should not advertise CSC"
+    assert!(r.header().has_csc(), "compact output should carry CSC");
+    assert_eq!(r.header().n_csc_shards as usize, csc_entry_count(&r));
+    assert_eq!(
+        r.catalog().csc_build_generation,
+        r.catalog().data_generation
     );
-    assert_eq!(r.header().n_csc_shards, 0);
-    let csc_count = r
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == scx_format_io::section::SectionType::CscShard)
-        .count();
-    assert_eq!(csc_count, 0);
+    assert_csc_is_the_transpose_of_csr(&r);
+
+    let off = dir.path().join("csc_compact_off.scx");
+    let opts = scx_ops::CompactOptions {
+        csc: scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
+        ..Default::default()
+    };
+    scx_ops::compact_with_options(&input, &off, &opts).unwrap();
+    let r = ScxReader::open(&off).unwrap();
+    assert!(!r.header().has_csc(), "--csc off drops the sidecar");
+    assert_eq!(csc_entry_count(&r), 0);
 }
 
+/// merge carries a sidecar when any input had one — here only the first.
 #[test]
-fn test_merge_drops_csc_from_inputs() {
+fn test_merge_carries_csc_when_any_input_has_one() {
     let dir = tempfile::tempdir().unwrap();
     let p1 = write_csc_test_file(&dir, "csc_m1.scx", 4, 6, 3);
-    let p2 = write_csc_test_file(&dir, "csc_m2.scx", 5, 6, 3);
+    let p2 = write_test_file(&dir, "plain_m2.scx", 5, 6, 1);
+    assert!(!ScxReader::open(&p2).unwrap().header().has_csc());
     let output = dir.path().join("csc_merged.scx");
 
     scx_ops::merge(&[p1.as_path(), p2.as_path()], &output).unwrap();
 
     let r = ScxReader::open(&output).unwrap();
-    assert!(
-        !r.header().has_csc(),
-        "merge output should not advertise CSC"
-    );
-    assert_eq!(r.header().n_csc_shards, 0);
+    assert!(r.header().has_csc(), "merge output should carry CSC");
     assert_eq!(r.n_obs(), 9);
-    let csc_count = r
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == scx_format_io::section::SectionType::CscShard)
-        .count();
-    assert_eq!(csc_count, 0);
+    assert_eq!(
+        r.catalog().csc_build_generation,
+        r.catalog().data_generation
+    );
+    assert_csc_is_the_transpose_of_csr(&r);
+
+    let off = dir.path().join("csc_merged_off.scx");
+    let opts = scx_ops::MergeOptions {
+        csc: scx_ops::CscCarryOptions::with_mode(scx_ops::CscOutput::Off),
+        ..Default::default()
+    };
+    scx_ops::merge_with_options(&[p1.as_path(), p2.as_path()], &off, &opts).unwrap();
+    let r = ScxReader::open(&off).unwrap();
+    assert!(!r.header().has_csc(), "--csc off drops the sidecar");
+    assert_eq!(csc_entry_count(&r), 0);
 }
 
 /// Pure-CSR file is untouched by the new CSC-drop logic — `has_csc`

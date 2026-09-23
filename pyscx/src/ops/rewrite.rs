@@ -43,11 +43,17 @@ use crate::convert;
 ///     pyscx.compact("experiment.scx", "compacted.scx",
 ///                   index_obs=["perturbation", "cell_type"])
 ///     pyscx.compact("experiment.scx", "compacted.scx", reshape_obs=True)
+///
+/// `csc`: whether the output carries a CSC sidecar — `"carry"` (default: iff
+/// the input had one), `"always"` or `"off"`. It is built from the compacted X
+/// in the same pass; `csc_cols_per_shard` / `csc_memory_limit` are
+/// `build_csc`'s parameters. See [`csc_carry_options`].
 #[pyfunction]
 #[pyo3(signature = (
     input, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     reshape_obs=false, codec="auto",
+    csc="carry", csc_cols_per_shard=5000, csc_memory_limit="4G",
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn compact(
@@ -60,10 +66,14 @@ pub fn compact(
     index_auto_threshold: Option<usize>,
     reshape_obs: bool,
     codec: &str,
+    csc: &str,
+    csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
     let resolved_codec = parse_codec_intent(codec)?;
+    let csc = csc_carry_options(csc, csc_cols_per_shard, csc_memory_limit, None)?;
     match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
         Some(index_opts) => {
             let summary = py
@@ -75,6 +85,7 @@ pub fn compact(
                             index_options: index_opts,
                             reshape_obs,
                             codec: resolved_codec,
+                            csc,
                         },
                     )
                 })
@@ -95,6 +106,7 @@ pub fn compact(
                         &scx_ops::CompactOptions {
                             reshape_obs: true,
                             codec: resolved_codec,
+                            csc,
                             ..Default::default()
                         },
                     )
@@ -111,6 +123,7 @@ pub fn compact(
                     &output_path,
                     &scx_ops::CompactOptions {
                         codec: resolved_codec,
+                        csc,
                         ..Default::default()
                     },
                 )
@@ -169,11 +182,16 @@ pub fn compact(
 ///             time behaviour this function had before the re-encode became
 ///             parallel — a budget below one shard's phase still encodes one
 ///             shard, since a single shard's encode is irreducible.
+///     csc: Whether the output carries a CSC sidecar: ``"carry"`` (default:
+///             iff the input had one), ``"always"`` or ``"off"``. It is
+///             rebuilt from the re-encoded X in the same pass, since
+///             canonicalisation may change the matrix the input's mirrored.
+///     csc_cols_per_shard, csc_memory_limit: as for :func:`build_csc`.
 ///
 /// Raises:
 ///     ValueError: If `codec` is not "auto"/"scx1", `shard_obs` is not
-///         "off"/"auto"/"always", or `memory_budget` is not a valid
-///         binary-prefixed size.
+///         "off"/"auto"/"always", `csc` is not "carry"/"always"/"off", or
+///         `memory_budget` is not a valid binary-prefixed size.
 ///     RuntimeError: If the file is multimodal, the input doesn't exist,
 ///         or the output already exists (no ``--force`` analogue; callers
 ///         should remove the target first or use ``output == input``).
@@ -185,7 +203,11 @@ pub fn compact(
 ///     pyscx.optimize("atlas.scx", "atlas.opt.scx", shard_obs="always")
 ///     pyscx.optimize("atlas.scx", "atlas.opt.scx", memory_budget="8G")
 #[pyfunction]
-#[pyo3(signature = (input, output, codec="auto", shard_obs="auto", memory_budget=None))]
+#[pyo3(signature = (
+    input, output, codec="auto", shard_obs="auto", memory_budget=None,
+    csc="carry", csc_cols_per_shard=5000, csc_memory_limit="4G",
+))]
+#[allow(clippy::too_many_arguments)]
 pub fn optimize(
     py: Python<'_>,
     input: &str,
@@ -198,9 +220,13 @@ pub fn optimize(
     // `memory_budget=8_000_000_000` a `TypeError` on the one op whose default
     // changed, which is the least helpful place to diverge.
     memory_budget: Option<&Bound<'_, PyAny>>,
+    csc: &str,
+    csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
+    let csc = csc_carry_options(csc, csc_cols_per_shard, csc_memory_limit, None)?;
     let codec_id = match codec {
         "auto" => None,
         "scx1" => Some(CodecId::Scx1),
@@ -238,7 +264,7 @@ pub fn optimize(
     // existing output reports the output first.
     let memory_budget = crate::convert::parse_memory_budget(memory_budget)?;
     py.detach(|| {
-        scx_ops::optimize_with_budget(
+        scx_ops::optimize_with_csc(
             &input_path,
             &output_path,
             codec_id,
@@ -250,10 +276,40 @@ pub fn optimize(
             // parallel, and a memory-constrained caller had no way back.
             None,
             memory_budget,
+            &csc,
         )
         .map(|_stats| ())
     })
     .map_err(ops_to_pyerr)
+}
+
+/// The `csc=` / `csc_cols_per_shard=` / `csc_memory_limit=` kwargs every
+/// rewrite op takes, as the ops-level options. `csc` is `"carry"` (build a
+/// sidecar iff the input had one), `"always"` or `"off"`; `temp_dir` is where
+/// the builder spills (`None`: the output's directory).
+pub(crate) fn csc_carry_options(
+    csc: &str,
+    csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
+    temp_dir: Option<PathBuf>,
+) -> PyResult<scx_ops::CscCarryOptions> {
+    let mode = match csc {
+        "carry" => scx_ops::CscOutput::Carry,
+        "always" => scx_ops::CscOutput::Always,
+        "off" => scx_ops::CscOutput::Off,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "csc must be 'carry', 'always' or 'off', got {other:?}"
+            )))
+        }
+    };
+    Ok(scx_ops::CscCarryOptions {
+        mode,
+        cols_per_shard: csc_cols_per_shard,
+        memory_limit: csc_memory_limit.to_string(),
+        temp_dir,
+        framing: None,
+    })
 }
 
 /// Parse the `reference` kwarg of `sort` into a [`ReferenceSpec`].
@@ -301,49 +357,35 @@ fn parse_codec_intent(codec: &str) -> PyResult<scx_format_io::ResolvedCodec> {
     scx_format_io::resolve_codec(Some(codec)).map_err(PyValueError::new_err)
 }
 
-/// Run a built [`scx_ops::SortOptions`] off the GIL, then optionally rebuild
-/// the CSC sidecar off the GIL too.
-///
-/// Shared by `sort` and `shuffle` so the two cannot drift on the part that
-/// matters — GIL handling, error mapping, and the post-write CSC rebuild. The
-/// *option construction* stays in each pyfunction, because that is exactly
-/// where they legitimately differ.
-fn run_sort_engine(
-    py: Python<'_>,
-    input_path: &Path,
-    output_path: &Path,
-    opts: &scx_ops::SortOptions,
-    rebuild_csc: bool,
-    csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
-) -> PyResult<()> {
-    // The sort's own spill root serves the CSC rebuild's too. Before this,
-    // `pyscx.sort(temp_dir=...)` governed the sort spill and *not* the CSC
-    // rebuild that follows it, which is the kind of split a caller pointing
-    // both at fast scratch would not expect.
-    let csc_temp_dir = opts.temp_dir.clone();
-    py.detach(|| scx_ops::sort(input_path, output_path, opts))
-        .map_err(ops_to_pyerr)?;
-    if rebuild_csc {
-        // Run the heavy CSC rebuild off the GIL too. Its `Box<dyn Error>` is
-        // not `Send`, so map it to a `String` inside the closure to cross
-        // `py.detach`.
-        // The admissible framing for the sidecar (`Some` iff the output is v4).
-        // See `scx_ops::framing_for_csc_rebuild`.
-        let csc_framing = scx_ops::framing_for_csc_rebuild(output_path);
-        py.detach(|| {
-            scx_ops::rebuild_csc_inplace(
-                output_path,
-                csc_cols_per_shard,
-                csc_memory_limit,
-                csc_framing,
-                csc_temp_dir.as_deref(),
-            )
-            .map_err(|e| e.to_string())
-        })
-        .map_err(PyRuntimeError::new_err)?;
-    }
-    Ok(())
+/// Resolve `sort` / `shuffle`'s `csc` kwarg, honouring the deprecated
+/// `rebuild_csc` spelling: `True` meant "build one" (`"always"`), `False` meant
+/// the old default of dropping it (`"off"`). Passing both is an error — both
+/// default to `None` so that an explicit `csc="carry"` is detectable, and
+/// omitting both is `"carry"`. `rebuild_csc` keeps its old positional slot and
+/// `csc` is keyword-appended, so a positional call written against the old
+/// signature still reaches the alias.
+fn sort_csc_mode(py: Python<'_>, csc: Option<&str>, rebuild_csc: Option<bool>) -> PyResult<String> {
+    let rebuild = match (csc, rebuild_csc) {
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "pass csc= or the deprecated rebuild_csc=, not both",
+            ))
+        }
+        (Some(mode), None) => return Ok(mode.to_string()),
+        (None, None) => return Ok("carry".to_string()),
+        (None, Some(rebuild)) => rebuild,
+    };
+    let mode = if rebuild { "always" } else { "off" };
+    let category = py.get_type::<pyo3::exceptions::PyDeprecationWarning>();
+    crate::pyimport::import_module(py, "warnings")?.call_method1(
+        "warn",
+        (
+            format!("rebuild_csc= is deprecated; use csc={mode:?}"),
+            category,
+            2,
+        ),
+    )?;
+    Ok(mode.to_string())
 }
 
 /// Globally reorder cells (the obs axis) of an SCX file by an obs key,
@@ -353,9 +395,10 @@ fn run_sort_engine(
 /// `by`: one or more obs columns, lexicographic in order (the leading key
 /// gets the full X-read-locality benefit). `reverse`: descending on all keys.
 /// Pass `memory_budget` (e.g. "4G") to force the bounded external partition
-/// sort; without it the in-memory path is used. The detection bitmap and CSC
-/// sidecar are dropped (the reorder invalidates them); pass `rebuild_csc=True`
-/// to re-emit the column-major sidecar.
+/// sort; without it the in-memory path is used. The detection bitmap is
+/// dropped (the reorder invalidates it). A CSC sidecar is carried by default —
+/// rebuilt from the sorted X in the same pass — and `csc="always"` / `"off"`
+/// override that; `rebuild_csc=` is the deprecated spelling.
 ///
 /// For a *random* reorder — training-batch diversity rather than query
 /// locality — see `pyscx.shuffle`.
@@ -366,10 +409,10 @@ fn run_sort_engine(
 #[pyo3(signature = (
     input, output, by, reverse=false, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=false,
+    memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=None,
     csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
     group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None,
-    group_write_block_bytes=None,
+    group_write_block_bytes=None, csc=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn sort(
@@ -387,7 +430,7 @@ pub fn sort(
     memory_budget: Option<String>,
     temp_dir: Option<String>,
     bitmap: String,
-    rebuild_csc: bool,
+    rebuild_csc: Option<bool>,
     csc_cols_per_shard: usize,
     csc_memory_limit: String,
     group_by: Option<String>,
@@ -395,6 +438,7 @@ pub fn sort(
     group_target_bytes: Option<Bound<'_, PyAny>>,
     group_max_bytes: Option<Bound<'_, PyAny>>,
     group_write_block_bytes: Option<Bound<'_, PyAny>>,
+    csc: Option<&str>,
 ) -> PyResult<()> {
     if by.is_empty() && group_by.is_none() {
         return Err(PyValueError::new_err(
@@ -422,6 +466,14 @@ pub fn sort(
     // value is a clean `ValueError`, not pyo3 `OverflowError`), matching every
     // other op.
     let shard_target_rows = validate_shard_size(shard_size)?.get();
+    let temp_dir = temp_dir.map(PathBuf::from);
+    // The sidecar builder spills where the sort's external partitions do.
+    let csc = csc_carry_options(
+        &sort_csc_mode(py, csc, rebuild_csc)?,
+        csc_cols_per_shard,
+        &csc_memory_limit,
+        temp_dir.clone(),
+    )?;
     let opts = scx_ops::SortOptions {
         by,
         reverse,
@@ -437,7 +489,7 @@ pub fn sort(
             index_auto_threshold: index_auto_threshold.unwrap_or(0),
         },
         memory_budget,
-        temp_dir: temp_dir.map(PathBuf::from),
+        temp_dir,
         bitmap,
         // F1 grouped sharding (7.2a): thread the grouping options through so
         // Python can write grouped files without the `scx sort --group-by` CLI.
@@ -446,16 +498,11 @@ pub fn sort(
         group_target_bytes,
         group_max_bytes,
         group_write_block_bytes,
+        csc,
     };
-    run_sort_engine(
-        py,
-        &input_path,
-        &output_path,
-        &opts,
-        rebuild_csc,
-        csc_cols_per_shard,
-        &csc_memory_limit,
-    )
+    py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
+        .map(|_| ())
+        .map_err(ops_to_pyerr)
 }
 
 // ---------------------------------------------------------------------------
@@ -506,8 +553,8 @@ pub fn sort(
 #[pyo3(signature = (
     input, output, seed=42, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=false,
-    csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
+    memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=None,
+    csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(), csc=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn shuffle(
@@ -524,9 +571,10 @@ pub fn shuffle(
     memory_budget: Option<String>,
     temp_dir: Option<String>,
     bitmap: String,
-    rebuild_csc: bool,
+    rebuild_csc: Option<bool>,
     csc_cols_per_shard: usize,
     csc_memory_limit: String,
+    csc: Option<&str>,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -536,6 +584,13 @@ pub fn shuffle(
     };
     let bitmap = scx_format_io::BitmapPolicy::parse(&bitmap).map_err(PyValueError::new_err)?;
     let shard_target_rows = validate_shard_size(shard_size)?.get();
+    let temp_dir = temp_dir.map(PathBuf::from);
+    let csc = csc_carry_options(
+        &sort_csc_mode(py, csc, rebuild_csc)?,
+        csc_cols_per_shard,
+        &csc_memory_limit,
+        temp_dir.clone(),
+    )?;
     let opts = scx_ops::SortOptions {
         // Shuffle is an order *source*, not a modifier: there is no key, and
         // the engine rejects `by` / `group_by` / `reverse` alongside it. This
@@ -552,23 +607,18 @@ pub fn shuffle(
             index_auto_threshold: index_auto_threshold.unwrap_or(0),
         },
         memory_budget,
-        temp_dir: temp_dir.map(PathBuf::from),
+        temp_dir,
         bitmap,
         group_by: None,
         reference: None,
         group_target_bytes: None,
         group_max_bytes: None,
         group_write_block_bytes: None,
+        csc,
     };
-    run_sort_engine(
-        py,
-        &input_path,
-        &output_path,
-        &opts,
-        rebuild_csc,
-        csc_cols_per_shard,
-        &csc_memory_limit,
-    )
+    py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
+        .map(|_| ())
+        .map_err(ops_to_pyerr)
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +819,12 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
 ///   keeps input 0 and records a `_scx_uns_conflicts` array.
 ///   Applied independently at the global and per-modality levels
 ///   for multimodal inputs.
+/// * `csc="carry"` — whether the merged file carries a CSC sidecar:
+///   `"carry"` builds one iff any input had one, `"always"` regardless,
+///   `"off"` never. It is built from the merged X in the same pass;
+///   `csc_cols_per_shard` / `csc_memory_limit` are `build_csc`'s parameters.
+///   Multimodal inputs: `"carry"` drops their sidecars with a warning and
+///   `"always"` raises.
 ///
 /// Raises `RuntimeError` when the inputs disagree about what they carry:
 /// an `obsm` or `obsp` key that some inputs have and others lack is a
@@ -798,6 +854,7 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     assume_identical_var=false, assume_identical_obs=false, uns_policy=None,
     sort_by=None, reverse=false, codec="auto",
+    csc="carry", csc_cols_per_shard=5000, csc_memory_limit="4G",
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn merge(
@@ -814,8 +871,12 @@ pub fn merge(
     sort_by: Option<Vec<String>>,
     reverse: bool,
     codec: &str,
+    csc: &str,
+    csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
 ) -> PyResult<()> {
     let resolved_codec = parse_codec_intent(codec)?;
+    let csc = csc_carry_options(csc, csc_cols_per_shard, csc_memory_limit, None)?;
     if inputs.len() < 2 {
         return Err(PyValueError::new_err(
             "merge requires at least 2 input files",
@@ -855,6 +916,7 @@ pub fn merge(
                 shard_target_rows: None,
                 sort_by,
                 sort_reverse: reverse,
+                csc,
             };
             let summary = py
                 .detach(|| scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts))
@@ -876,6 +938,7 @@ pub fn merge(
                 shard_target_rows: None,
                 sort_by,
                 sort_reverse: reverse,
+                csc,
             };
             let summary = py
                 .detach(|| scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts))
@@ -891,6 +954,7 @@ pub fn merge(
                     &output_path,
                     &scx_ops::MergeOptions {
                         codec: resolved_codec,
+                        csc,
                         ..Default::default()
                     },
                 )

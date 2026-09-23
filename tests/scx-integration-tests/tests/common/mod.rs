@@ -405,7 +405,8 @@ fn build_all_families_with_obs(
     // `the_fixture_carries_every_family_an_op_can_decide_about`, and the CSC
     // `Dropped` arms stay pinned by the pre-existing CLI tests rather than here
     // — adding one here would make every op's digest carry a sidecar it has
-    // nothing to say about.
+    // nothing to say about. The rewrite ops' carry arms use
+    // `fixture_all_families_with_csc` instead.
     scx_ops::mark_deleted(&path, &[2, 5]).unwrap();
     path
 }
@@ -990,5 +991,25 @@ pub fn fixture_with_colliding_obsm_keys(dir: &Path, name: &str) -> PathBuf {
         .write_obsm("legacy_shard_name", &dense_embedding(N_OBS))
         .unwrap();
     writer.finish().unwrap();
+    path
+}
+
+/// [`fixture_all_families`] carrying an X CSC sidecar `cols_per_shard` columns
+/// wide, added by the real op (`rebuild_csc_inplace`, i.e. `scx build-csc`).
+///
+/// For the rewrite ops' carry arms: they build a new sidecar from their own
+/// output iff the input had one, so the input has to have one. It is a
+/// separate fixture rather than a change to `fixture_all_families` because the
+/// sidecar would otherwise move every other op's digest.
+pub fn fixture_all_families_with_csc(dir: &Path, name: &str, cols_per_shard: usize) -> PathBuf {
+    let path = fixture_all_families(dir, name);
+    scx_ops::rebuild_csc_inplace(
+        &path,
+        cols_per_shard,
+        "4G",
+        scx_ops::framing_for_csc_rebuild(&path),
+        None,
+    )
+    .unwrap();
     path
 }

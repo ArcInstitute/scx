@@ -100,8 +100,9 @@ use std::path::{Path, PathBuf};
 
 use common::{
     appendable_rows, appendable_rows_categorical, fixture_all_families,
-    fixture_all_families_with_categorical_obs, fixture_all_families_without_raw,
-    fixture_all_families_without_raw_with_categorical_obs, fixture_with_csr_obsp,
+    fixture_all_families_with_categorical_obs, fixture_all_families_with_csc,
+    fixture_all_families_without_raw, fixture_all_families_without_raw_with_categorical_obs,
+    fixture_with_csr_obsp,
 };
 use scx_codec::ValueEncoding;
 use scx_testkit::ab::{assert_manifests_eq, resolve_against_env, OpDigestManifest};
@@ -120,8 +121,9 @@ use scx_testkit::fixtures::{
 /// obs the caller can hand them a categorical in, added when they stopped
 /// decoding those to plain strings), `sort_categorical_spilled` (the obs
 /// spill-scatter write, which is a *different writer* from the `sort` arm's
-/// in-memory one), and `optimize_framed` and `optimize_csr_obsp` — seventeen in
-/// all.
+/// in-memory one), `optimize_framed` and `optimize_csr_obsp`, and the four
+/// `*_csc` arms (compact, merge, optimize and sort over an input carrying a CSC
+/// sidecar, which they now rebuild in the same pass) — twenty-one in all.
 /// `optimize_framed` is the **only** arm whose output goes through the
 /// row-group-framed encoder, and `optimize_csr_obsp` the **only** one whose
 /// output carries an `ObspCsrShard`; see their comments in `build_manifest`
@@ -135,15 +137,19 @@ const EXPECTED_OPS: &[&str] = &[
     "build_csc_indexed",
     "build_csc_multi_shard",
     "compact",
+    "compact_csc",
     "compact_indexed",
     "delete",
     "merge",
     "merge_categorical",
+    "merge_csc",
     "optimize",
+    "optimize_csc",
     "optimize_csr_obsp",
     "optimize_framed",
     "sort",
     "sort_categorical_spilled",
+    "sort_csc",
 ];
 
 /// Force a predicate index on one obs column.
@@ -312,6 +318,59 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     scx_ops::run_build_csc(&csc_multi, &out, "1G", false, 3, None, None).unwrap();
     m.record("build_csc_multi_shard", &out, Strictness::Content)
         .unwrap();
+
+    // --- the rewrite ops over an input carrying a CSC sidecar ---------------
+    //
+    // No other arm's input has a sidecar, so none of them can see the
+    // same-pass build: each of these four ops carries one (the default,
+    // `--csc carry`) by building it from its own X shards as they are written.
+    // What these pin is the sidecar that build emits, beside everything else
+    // the op writes; `csc_same_pass.rs` proves it byte-identical to the second
+    // pass it replaced. Four columns per shard, so each sidecar is two shards
+    // over the fixture's six columns.
+    let csc_x = fixture_all_families_with_csc(dir, "csc_x.scx", 4);
+    let csc4 = || scx_ops::CscCarryOptions {
+        cols_per_shard: 4,
+        ..Default::default()
+    };
+    let out = dir.join("compact_csc.scx");
+    let compact_opts = scx_ops::CompactOptions {
+        csc: csc4(),
+        ..Default::default()
+    };
+    scx_ops::compact_with_options(&csc_x, &out, &compact_opts).unwrap();
+    m.record("compact_csc", &out, Strictness::Content).unwrap();
+
+    let out = dir.join("sort_csc.scx");
+    let sort_opts = scx_ops::SortOptions {
+        by: vec!["cell_type".to_string()],
+        csc: csc4(),
+        ..Default::default()
+    };
+    scx_ops::sort_engine::sort(&csc_x, &out, &sort_opts).unwrap();
+    m.record("sort_csc", &out, Strictness::Content).unwrap();
+
+    let out = dir.join("optimize_csc.scx");
+    scx_ops::optimize_with_csc(
+        &csc_x,
+        &out,
+        None,
+        scx_format_io::ObsShardPolicy::Off,
+        None,
+        None,
+        &csc4(),
+    )
+    .unwrap();
+    m.record("optimize_csc", &out, Strictness::Content).unwrap();
+
+    let csc_y = fixture_all_families(dir, "csc_y.scx");
+    let out = dir.join("merge_csc.scx");
+    let merge_opts = scx_ops::MergeOptions {
+        csc: csc4(),
+        ..Default::default()
+    };
+    scx_ops::merge_with_options(&[&csc_x, &csc_y], &out, &merge_opts).unwrap();
+    m.record("merge_csc", &out, Strictness::Content).unwrap();
 
     // --- the same two ops over an input carrying per-shard `column_stats` ---
     //

@@ -297,15 +297,13 @@ impl IngestOptions {
     /// [`Self::framing`] with codec re-selection switched **off**, for a pass
     /// that must preserve each shard's existing codec rather than pick one.
     ///
-    /// The CSC sidecar rebuild is the case: `scx_ops::rebuild_csc_inplace`
-    /// re-writes every CSR shard at the codec read off that shard's own header,
-    /// and `decode_target: Some(_)` authorises `write_shard_inner` to override
-    /// it (see `FramingConfig`'s contract). Passing `framing()` there was
-    /// harmless only while `write_shard_inner` ignored the field; now that it
-    /// honours it, the sidecar rebuild would re-decide a codec the just-written
-    /// X had already settled. Same rule as `scx-cli`'s
-    /// `cli_utils::framing_for_file`, expressed locally because `scx-convert`
-    /// does not depend on the CLI.
+    /// The CSC sidecar is the case: its codec follows X's (`pick_csc_encoding`),
+    /// and `decode_target: Some(_)` would authorise `write_shard_inner` to
+    /// re-decide it (see `FramingConfig`'s contract). The same-pass sidecar
+    /// (`ScxWriter::enable_csc_sidecar`) clears both knobs itself; passing this
+    /// keeps a custom `--row-group-rows` for the sidecar and says what is meant.
+    /// Same rule as `scx-cli`'s `cli_utils::framing_for_file`, expressed
+    /// locally because `scx-convert` does not depend on the CLI.
     pub fn framing_preserving_codec(&self) -> Option<scx_format_io::FramingConfig> {
         self.framing().map(|f| scx_format_io::FramingConfig {
             trial: false,

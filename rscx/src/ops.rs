@@ -215,8 +215,10 @@ fn scx_delete_impl(path: &str, cell_indices: Vec<f64>) -> Result<Robj> {
 /// @param index_auto_threshold Auto-index cardinality cap (0 = disabled).
 /// @param reshape_obs Migrate legacy single-section obs to row-sharded layout.
 ///
-/// `shard_target_rows` is inherited from the input header; CSC sidecars are
-/// dropped (rebuild separately).
+/// `shard_target_rows` is inherited from the input header. A CSC sidecar is
+/// carried: rebuilt from the compacted X in the same pass iff the input had
+/// one (`scx_ops::CscCarryOptions`' default; this binding exposes no `csc`
+/// argument yet).
 ///
 /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
@@ -305,8 +307,9 @@ fn scx_rollback_impl(path: &str, to_seq: Nullable<i32>) -> Result<()> {
 ///   empty = legacy concatenation.
 /// @param reverse Descending order when `sort_by` is set.
 ///
-/// `shard_target_rows` is inherited from the first input; CSC sidecars are
-/// dropped (rebuild separately).
+/// `shard_target_rows` is inherited from the first input. A CSC sidecar is
+/// carried: rebuilt from the merged X in the same pass iff any input had one
+/// (this binding exposes no `csc` argument yet).
 ///
 /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
@@ -379,6 +382,9 @@ fn scx_merge_impl(
         shard_target_rows: None,
         sort_by: sort_by.iter().map(|s| s.to_string()).collect(),
         sort_reverse: reverse,
+        // Carry a CSC sidecar iff an input had one, built in the same pass;
+        // `scx_merge()` exposes no `csc` argument yet.
+        csc: Default::default(),
     };
 
     scx_ops::merge_with_options(&input_refs, Path::new(output), &options)

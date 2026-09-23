@@ -14,9 +14,7 @@ pub fn run_merge(
     inputs: &[PathBuf],
     output: &Path,
     force: bool,
-    rebuild_csc: bool,
-    csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc: scx_ops::CscCarryOptions,
     index_obs: Vec<String>,
     index_var: Vec<String>,
     index_preset: Option<String>,
@@ -108,6 +106,7 @@ pub fn run_merge(
             shard_target_rows: None,
             sort_by,
             sort_reverse,
+            csc,
         };
         let summary = scx_ops::merge_with_options(&input_refs, output, &merge_opts)?;
         emit_index_summary("merge", &summary);
@@ -116,6 +115,7 @@ pub fn run_merge(
         // `MergeOptions::default()` reproduces the bare `merge` wrapper.
         let merge_opts = MergeOptions {
             codec: resolved_codec,
+            csc,
             ..Default::default()
         };
         scx_ops::merge_with_options(&input_refs, output, &merge_opts)?;
@@ -153,18 +153,8 @@ pub fn run_merge(
             total_obs.saturating_sub(n_deleted),
         );
     }
-    drop(out_reader);
-
-    // Re-emit the CSC sidecar against the merged output, preserving its framing
-    // (a v4 merged output must not be downgraded to unframed v3 by the rebuild).
-    if rebuild_csc {
-        let framing = crate::cli_utils::framing_for_file(output);
-        // No `--temp-dir` on this op: the CSC builder's spill root defaults to the
-        // output's own directory, which is already where the rewrite staged a whole
-        // copy of it, and the spill only happens at all on an undersized
-        // `--csc-memory-limit`.
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing, None)?;
-        println!("Rebuilt CSC sidecar on {}", output.display());
+    if out_reader.header().has_csc() {
+        println!("  CSC sidecar built in the same pass");
     }
 
     Ok(())

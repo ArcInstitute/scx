@@ -75,9 +75,10 @@ pub struct StreamingOverrides {
 /// threadsafe (gated by an `H5is_library_threadsafe` probe), when the
 /// reader can't do row-range reads, or when `reader_threads <= 1`.
 ///
-/// `opts.csc == true` runs a post-`finish()`
-/// [`scx_ops::rebuild_csc_inplace`] pass over the just-written file;
-/// peak disk briefly reaches ~2× the output size during the rebuild.
+/// When `opts.csc` asks for a sidecar it is built in the same pass as X
+/// (`ScxWriter::enable_csc_sidecar`): each X shard is pushed into the builder
+/// as it is written, and the CSC shards follow X in the file. No second read of
+/// the output, and no second copy of it on disk.
 ///
 /// `obsm` / `varm` / `obsp` / `varp` are hyperslab-read one row-range
 /// at a time and emitted as row-sharded sections
@@ -87,8 +88,9 @@ pub struct StreamingOverrides {
 /// overrides supplied via [`StreamingOverrides`] are partitioned
 /// into the same row-shards on the way out. `uns` is read in full
 /// from disk when not overridden (typically KB–MB; no shard format
-/// makes sense for a JSON tree). CSC-on-disk and dense `X` are
-/// rejected up front with [`ConvertError::StreamingUnsupported`].
+/// makes sense for a JSON tree). CSR, dense and CSC-on-disk `X` all stream
+/// (see `open_x_streaming`); a CSC-on-disk `X` cannot be reordered on the way
+/// in, so `--sort-by` / `--group-by` refuse it.
 /// True when the h5ad has a non-empty `obsp` group (ignoring `__`-prefixed
 /// internal members). Used by the grouped-convert router (M3) to route
 /// obsp-carrying inputs through the obsp-preserving two-pass path.
@@ -349,10 +351,11 @@ pub fn h5ad_to_scx_streaming(
     // indexable + libhdf5 is thread-safe + the resolved thread count
     // is > 1; otherwise it falls back to the sequential path. Output
     // is byte-identical regardless of route.
+    let x_opts = begin_same_pass_csc(&mut writer, opts, n_obs, n_vars)?;
     let (_csr_shard_count, csr_row_ranges) = run_streaming_writer_coordinator(
         x_reader.as_mut(),
         &mut writer,
-        opts,
+        x_opts.as_ref().unwrap_or(opts),
         index_dtype,
         n_vars_u32,
         SectionType::CsrShard,
@@ -368,6 +371,9 @@ pub fn h5ad_to_scx_streaming(
         group_ranges.as_deref(),
     )?;
     drop(x_reader);
+    // The same-pass sidecar, if one was started: emitted before layers and
+    // obsm so its buckets are released first.
+    writer.emit_csc_sidecar()?;
 
     // Phase 7.4: write the `group_index` sidecar (same bytes `scx sort` emits).
     if let Some(bytes) = &group_index_bytes {
@@ -662,27 +668,6 @@ pub fn h5ad_to_scx_streaming(
     }])?;
 
     writer.finish()?;
-
-    // CSC sidecar (opt-in). Two-pass: streaming write produces CSR
-    // shards only; if requested, append the CSC sidecar to the
-    // just-finished file in place (one extra read pass over the CSR, no
-    // second copy of the file).
-    if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
-        // Pass framing so `--csc <policy> --row-group-rows N` frames the
-        // sidecar at the same G as X.
-        scx_ops::rebuild_csc_inplace(
-            output,
-            opts.csc_cols_per_shard,
-            &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
-            opts.framing_preserving_codec(),
-            // `--temp-dir` already names the spill root for the Phase 2
-            // external transpose; the CSC builder's buckets are the same kind
-            // of spill and honour the same flag.
-            opts.temp_dir.as_deref(),
-        )
-        .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
-    }
-
     Ok(())
 }
 
@@ -727,6 +712,14 @@ fn convert_then_sort_grouped(
     };
     h5ad_to_scx_streaming(input, &tmp, &plain_opts, overrides, sink)?;
 
+    // The CSC policy is decided on the plain pass's shape — the sort keeps
+    // every row and column — and honoured by the sort itself, which builds the
+    // sidecar in the same pass as its X shards.
+    let build_csc = {
+        let reader = scx_format_io::reader::ScxReader::open(&tmp)?;
+        opts.csc.should_build_csc(reader.n_obs(), reader.n_vars())
+    };
+
     let mut by = Vec::with_capacity(opts.sort_by.len() + 1);
     by.push(group_by.clone());
     by.extend(opts.sort_by.iter().filter(|c| **c != group_by).cloned());
@@ -768,29 +761,23 @@ fn convert_then_sort_grouped(
         // None => the sort engine's default block cap (256 MB), giving the
         // convert two-pass sort the F6 grouped-write OOM fix for free.
         group_write_block_bytes: None,
+        csc: scx_ops::CscCarryOptions {
+            mode: if build_csc {
+                scx_ops::CscOutput::Always
+            } else {
+                scx_ops::CscOutput::Off
+            },
+            cols_per_shard: opts.csc_cols_per_shard,
+            memory_limit: crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
+            temp_dir: opts.temp_dir.clone(),
+            framing: opts.framing_preserving_codec(),
+        },
     };
     let sort_result = scx_ops::sort(&tmp, output, &sort_opts)
         .map_err(|e| ConvertError::Other(format!("convert --group-by (two-pass sort): {e}")));
     // Always clean up the temp, even on sort failure.
     let _ = std::fs::remove_file(&tmp);
     sort_result?;
-
-    // `scx sort` drops any CSC sidecar; rebuild it on the output to honour the
-    // requested CSC policy (mirrors the one-pass path's end-of-convert rebuild).
-    if let Ok(reader) = scx_format_io::reader::ScxReader::open(output) {
-        let (n_obs, n_vars) = (reader.n_obs(), reader.n_vars());
-        drop(reader);
-        if opts.csc.should_build_csc(n_obs, n_vars) {
-            scx_ops::rebuild_csc_inplace(
-                output,
-                opts.csc_cols_per_shard,
-                &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
-                opts.framing_preserving_codec(),
-                opts.temp_dir.as_deref(),
-            )
-            .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
-        }
-    }
     Ok(())
 }
 
@@ -870,10 +857,11 @@ pub fn tenx_to_scx_streaming(
 
     // `"X_shard"` uppercase is load-bearing (see the h5ad call site above);
     // `explicit_ranges = None` because this direction has no reorder.
+    let x_opts = begin_same_pass_csc(&mut writer, opts, n_obs, n_vars)?;
     let (_csr_shard_count, csr_row_ranges) = run_streaming_writer_coordinator(
         &mut x_reader,
         &mut writer,
-        opts,
+        x_opts.as_ref().unwrap_or(opts),
         index_dtype,
         n_vars_u32,
         SectionType::CsrShard,
@@ -883,6 +871,7 @@ pub fn tenx_to_scx_streaming(
         None,
     )?;
     drop(x_reader);
+    writer.emit_csc_sidecar()?;
 
     // Ranges come from the coordinator, never from an assumed partition.
     let (obs_indexed, var_indexed) = build_and_write_predicate_indexes(
@@ -924,23 +913,42 @@ pub fn tenx_to_scx_streaming(
     }])?;
 
     writer.finish()?;
-
-    // CSC sidecar (opt-in), in the streaming form: rebuild in place over the
-    // finished file rather than transposing resident arrays, which is what the
-    // eager path does and what streaming has no arrays for.
-    if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
-        scx_ops::rebuild_csc_inplace(
-            output,
-            opts.csc_cols_per_shard,
-            &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
-            opts.framing_preserving_codec(),
-            // `--temp-dir` already names the spill root for the Phase 2
-            // external transpose; the CSC builder's buckets are the same kind
-            // of spill and honour the same flag.
-            opts.temp_dir.as_deref(),
-        )
-        .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
-    }
-
     Ok(())
+}
+
+/// Start a CSC sidecar in the same pass as X when `opts.csc` asks for one on
+/// an `n_obs` x `n_vars` matrix. Returns the options the X coordinator must run
+/// with: under a `--memory-budget` the builder's buckets are live beside the
+/// ingest workers, so ingest sizes itself against what the builder leaves
+/// (`budget::csc_same_pass_split`). `None` means "run X with `opts`".
+///
+/// Pair with `writer.emit_csc_sidecar()` right after X. The sidecar is the one
+/// a second pass (`scx_ops::rebuild_csc_inplace`) would have built — same
+/// budget, width and framing — without re-reading the output.
+fn begin_same_pass_csc(
+    writer: &mut ScxWriter,
+    opts: &IngestOptions,
+    n_obs: usize,
+    n_vars: usize,
+) -> Result<Option<IngestOptions>, ConvertError> {
+    if !opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
+        return Ok(None);
+    }
+    let (spill_after_bytes, ingest_budget) = crate::budget::csc_same_pass_split(opts.memory_budget);
+    writer.enable_csc_sidecar(scx_format_io::CscBuildOptions {
+        cols_per_shard: opts.csc_cols_per_shard,
+        memory_bytes: crate::budget::csc_sidecar_bytes(opts.memory_budget) as usize,
+        spill_after_bytes,
+        // `--temp-dir` already names the spill root for the external CSC
+        // transpose; the builder's buckets are the same kind of spill.
+        spill_root: opts.temp_dir.clone(),
+        // So `--csc <policy> --row-group-rows N` frames the sidecar at X's G.
+        framing: opts.framing_preserving_codec(),
+    })?;
+    Ok(
+        (ingest_budget != opts.memory_budget).then(|| IngestOptions {
+            memory_budget: ingest_budget,
+            ..opts.clone()
+        }),
+    )
 }

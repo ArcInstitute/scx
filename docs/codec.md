@@ -393,8 +393,10 @@ flag / `SCX_COMPACT_TRIAL_GPU_MARGIN` — was removed with the decode sidecar; s
 A framed **CSC** sidecar is produced whenever framing is requested alongside CSC — e.g.
 `pyscx.from_anndata(csc="always", row_group_rows=N)` or `scx convert --csc
 always --row-group-rows N` (the CSC producers thread an explicit `FramingConfig`
-rather than relying on writer state; `scx build-csc` / mutating-op `--rebuild-csc`
-stay unframed — use `scx optimize` to (re)frame an existing file).
+rather than relying on writer state). `scx build-csc` and the rewrite ops'
+same-pass sidecar build (`--csc carry|always`) frame the sidecar iff the file
+they write is v4 and never re-frame the CSR — use `scx optimize` to (re)frame an
+existing file.
 
 On the read side, a framed CSC sidecar supports per-gene-group scattered reads
 (`read_csc_columns` decodes only the touched column-groups via the block index),
@@ -545,10 +547,11 @@ the residual ~1.3× a rewrite costs on a **mixed-width** file: the ops widen the
 value encoding to one file-wide width rather than preserving each shard's — see
 [docs/sharding.md § Output size](sharding.md#three-ways-to-sort).
 
-One deliberate exception: a CSC rebuild (`scx build-csc`, and the
-`--rebuild-csc` pass of the ops) re-writes each CSR shard *at the codec read off
-the source header*, so it passes `decode_target: None` on purpose — re-selection
-would defeat the preservation. See `FramingConfig`'s contract docs.
+One deliberate exception: a CSC sidecar build (`scx build-csc`, and the
+rewrite ops' same-pass build) takes the sidecar's codec from the X shards it
+transposes (`pick_csc_encoding`) rather than re-selecting, so it passes
+`decode_target: None` on purpose — re-selection would defeat the preservation.
+See `FramingConfig`'s contract docs.
 
 ## 9. Limitations & Pitfalls
 

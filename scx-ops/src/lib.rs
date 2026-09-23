@@ -9,6 +9,7 @@ pub mod carry;
 pub mod checksum;
 pub mod codec_intent;
 pub mod compact;
+pub mod csc_carry;
 pub mod delete;
 mod encode_budget;
 pub mod error;
@@ -43,6 +44,7 @@ pub use append::{
 pub use build_csc::{rebuild_csc_inplace, run_build_csc, BuildCscOutcome};
 pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
 pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};
+pub use csc_carry::{CscCarryOptions, CscOutput};
 // Re-exported from `scx-format-io`, which is where the obs shard-boundary loop
 // now lives so `scx-mtx` (which cannot depend on this crate) shares it too.
 pub use delete::mark_deleted;
@@ -68,7 +70,9 @@ pub use merge_options::{MergeOptions, UnsPolicy};
 pub use modify_metadata::{
     modify_metadata, set_uns, update_uns, MetadataPatch, ModifyMetadataSummary,
 };
-pub use optimize::{optimize, optimize_with_budget, optimize_with_framing, OptimizeStats};
+pub use optimize::{
+    optimize, optimize_with_budget, optimize_with_csc, optimize_with_framing, OptimizeStats,
+};
 pub use predicate_index::{ObsVarIndexPass, PredicateIndexBuildSummary, StatsSink};
 pub use rebuild_csc::framing_for_csc_rebuild;
 pub use rewrite_helpers::{

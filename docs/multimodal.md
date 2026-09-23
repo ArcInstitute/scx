@@ -473,8 +473,11 @@ Multimodal `scx merge` and `scx compact` now dispatch to
 `scx-ops::merge_multimodal` / `compact_multimodal`: the keep mask /
 concatenation is applied across every modality's CSR shards and
 layers, the modality table and per-modality var / obsm / uns are
-preserved, and per-modality CSC sidecars are dropped (rebuild via
-`--rebuild-csc`). Merge validates var identity (index, column names,
+preserved, and per-modality CSC sidecars are dropped with a warning —
+the same-pass sidecar build that single-modality rewrites use to carry
+one is single-modality, so `--csc always` on a multimodal input is refused
+before the output is created, and `scx build-csc` refuses multimodal files
+too; there is no rebuild path for a multimodal sidecar yet. Merge validates var identity (index, column names,
 values) across all inputs by default; pass `assume_identical_var=True`
 to check only `n_vars`. Obs is streamed shard-by-shard (no full obs
 materialization). The `uns_policy` kwarg (`"first"` / `"require_equal"`
@@ -612,11 +615,11 @@ Nothing in the current builders depends on it arriving.
 | Modality-scoped lazy transforms | Supported | Per-modality `pp.normalize_total` / `pp.log1p` |
 | `scx convert --from/--to h5mu` | Supported | Streaming default; `--modalities`, `--modality-types` |
 | `pyscx.MultimodalTrainingDataset` | Supported | — |
-| `scx subset --modality NAME` | Supported | — |
+| `scx subset --modality NAME` | Supported | Single-modality output: `--csc carry` (default) follows the extracted modality's own CSC sidecar, rebuilt in the same pass; `--csc always` works |
 | `scx subset --modality NAME --filter … --genes …` | Supported | Composes filter + projection in one pass |
 | `query(modality=…)` / `scx query --modality` / `scx_query(modality=)` | Supported | Local modality-scoped predicate pushdown (obs mask global, X at the modality's `n_vars`); §&nbsp;3.4 |
 | `scx append --modality NAME` | Not supported (deferred) | Rejected with `MultimodalUnsupported`: a single-modality append would leave siblings under-covering the global obs axis. Extract via `scx subset --modality`, append, then `scx merge` |
-| `scx merge` on multimodal inputs | Supported | Dispatches to `merge_multimodal`; per-modality CSC dropped — `--rebuild-csc` to re-emit |
+| `scx merge` on multimodal inputs | Supported | Dispatches to `merge_multimodal`; per-modality CSC dropped with a warning; `--csc always` refused (no multimodal rebuild path yet) |
 | `scx delete` / `mark_deleted` / `scx_delete` on multimodal inputs | Supported | Whole-cell delete: global-obs deletion vector removes the cell from **every** modality; modality-scoped query returns deletion-filtered rows |
 | `scx compact` on multimodal inputs | Supported | Dispatches to `compact_multimodal`; keep mask applied across every modality |
 | `to_anndata(modality=…, backed=True)` + filter kwargs | Not supported | Use `query(modality=…)` (in-memory) or `scx subset --modality NAME --filter` |
@@ -639,8 +642,11 @@ Nothing in the current builders depends on it arriving.
   adjusted for the cumulative global obs offset, and preserves
   per-modality var/obsm/uns from the first input. `compact` applies
   the deletion-vector keep mask across every modality's CSR shards
-  and per-modality layers. Both drop CSC sidecars by default;
-  `--rebuild-csc` regenerates them.
+  and per-modality layers. Both drop CSC sidecars with a warning (the
+  same-pass builder that carries a single-modality sidecar is
+  single-modality); `--csc always` is refused before the output is
+  created, and `scx build-csc` refuses multimodal files, so a multimodal
+  sidecar cannot be rebuilt yet.
 - **Deleting cells (whole-cell)**: `scx delete` / `pyscx.mark_deleted` /
   `scx_delete` mark cells on the shared global obs axis. The deletion vector
   stores global obs row indices (`modality_id = 0`, see

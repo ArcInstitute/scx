@@ -34,7 +34,8 @@ fn allocation_table_shares_sum_to_at_most_one_per_phase() {
                 | Phase::CscExternalColumnScan
                 | Phase::CscExternalBucketDrain
                 | Phase::CscBuilderPush
-                | Phase::CscBuilderEmit => p,
+                | Phase::CscBuilderEmit
+                | Phase::IngestWithCscPush => p,
             }
         };
         [
@@ -45,6 +46,7 @@ fn allocation_table_shares_sum_to_at_most_one_per_phase() {
             Phase::CscExternalBucketDrain,
             Phase::CscBuilderPush,
             Phase::CscBuilderEmit,
+            Phase::IngestWithCscPush,
         ]
         .into_iter()
         .map(every)
@@ -131,9 +133,14 @@ fn unenforced_reservations_are_declared_not_silent() {
     //
     // The count went *up* while coverage improved, which is why this comment
     // exists: a bare number would read as a regression.
+    //
+    // **Eight became nine** when the CSC sidecar started being built in the
+    // same pass as streaming ingest: the ingest rows' open terms now also
+    // appear in the `IngestWithCscPush` phase, sized against the budget minus
+    // the builder's share. The builder's own row there is enforced.
     assert_eq!(
         unenforced.len(),
-        8,
+        9,
         "expected the three CSC external-transpose rows, the CSC builder's \
          source-shard and emit rows, and the three per-shard rows to be \
          unenforced, got {unenforced:?}. Adding an unenforced row without \
@@ -181,6 +188,37 @@ fn the_csc_builder_rows_cite_the_shared_constants() {
         emit.contains(&scx_format_io::csc_budget::CSC_EMIT_SHARE),
         "the emit row must cite CSC_EMIT_SHARE, got {emit:?}"
     );
+}
+
+/// `INGEST_BESIDE_CSC_SHARE` is a literal because `Share` has no arithmetic;
+/// this is what keeps it equal to the product it stands for.
+#[test]
+fn the_same_pass_ingest_share_is_the_product_it_names() {
+    let rest = CSC_SAME_PASS_SHARE.denominator() - CSC_SAME_PASS_SHARE.numerator();
+    assert_eq!(
+        INGEST_BESIDE_CSC_SHARE.numerator()
+            * CSC_SAME_PASS_SHARE.denominator()
+            * SHARD_BUDGET_SHARE.denominator(),
+        SHARD_BUDGET_SHARE.numerator() * rest * INGEST_BESIDE_CSC_SHARE.denominator(),
+    );
+}
+
+/// The split hands the builder its share and ingest the rest, never more than
+/// the builder would stage alone, and nothing at all without a budget.
+#[test]
+fn the_same_pass_split_adds_up() {
+    assert_eq!(csc_same_pass_split(None), (None, None));
+    for budget in [1u64 << 20, 1 << 30, 64 << 30] {
+        let (builder, ingest) = csc_same_pass_split(Some(budget));
+        let (builder, ingest) = (builder.unwrap() as u64, ingest.unwrap());
+        assert_eq!(builder + ingest, budget);
+        assert!(builder <= CSC_SAME_PASS_SHARE.of(budget));
+        assert!(
+            builder
+                <= scx_format_io::csc_budget::CSC_BUILD_BUCKET_SHARE
+                    .of(csc_sidecar_bytes(Some(budget)))
+        );
+    }
 }
 
 #[test]

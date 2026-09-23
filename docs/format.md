@@ -522,8 +522,9 @@ genes → ~24M non-zeros per shard → ~50–100 MB compressed. Rationale and tr
 CSC sidecar shards are an **optional column-major view** of the same
 data the CSR shards hold. They are emitted by `scx convert
 --csc=always`, `pyscx.from_anndata(csc="always")`, `scx build-csc`,
-and the `--rebuild-csc` flag on the mutating ops (`append`, `compact`,
-`merge`, `subset`).
+`scx append --rebuild-csc`, and the rewrite ops (`compact`, `merge`,
+`optimize`, `sort`, `subset`), which carry a sidecar by default by rebuilding
+it from the output's X in the same pass (`--csc carry|always|off`).
 
 A CSC shard has the **same on-disk structure** as a CSR shard — same
 76-byte shard header, same encoded `indptr` / `indices` / `values`

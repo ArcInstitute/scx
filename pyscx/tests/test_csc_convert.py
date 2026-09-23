@@ -195,9 +195,32 @@ def _csc_preset_entry_points():
             params = inspect.signature(obj).parameters
         except (TypeError, ValueError):
             continue
-        if "csc" in params and "index_preset" in params:
+        if "csc" in params and "index_preset" in params and name not in _REWRITE_OPS:
             found[name] = params["csc"].default
     return found
+
+
+# The rewrite ops take a `csc` too, but a different one: whether the output
+# carries a sidecar through the rewrite (`"carry"` / `"always"` / `"off"`), not
+# an ingest `CscPolicy`. A preset does not upgrade it — rewriting a file that
+# has no sidecar builds none, preset or not, which is also what those ops did
+# before they carried one — so the None-default rule above does not apply.
+_REWRITE_OPS = frozenset({"compact", "merge", "optimize", "sort", "shuffle"})
+
+
+def test_the_rewrite_ops_excluded_above_are_the_carry_kind():
+    """The exclusion cannot hide an ingest entry point: every name in it takes
+    `csc` with the rewrite ops' `"carry"` default, and nothing else does."""
+    import inspect
+
+    import pyscx.pyscx as native
+
+    for name in sorted(_REWRITE_OPS):
+        params = inspect.signature(getattr(native, name)).parameters
+        # `sort` / `shuffle` default to None so an explicit `csc=` can be told
+        # apart from the deprecated `rebuild_csc=`; None resolves to "carry".
+        expected = None if name in ("sort", "shuffle") else "carry"
+        assert params["csc"].default == expected, (name, params["csc"].default)
 
 
 def test_every_preset_aware_entry_point_defaults_csc_to_none():

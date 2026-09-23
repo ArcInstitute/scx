@@ -26,9 +26,7 @@ pub fn run_sort(
     memory_budget: Option<String>,
     temp_dir: Option<PathBuf>,
     bitmap: &str,
-    rebuild_csc: bool,
-    csc_cols_per_shard: usize,
-    csc_memory_limit: &str,
+    csc: crate::cli_utils::CscArgs,
     group_by: Option<String>,
     reference: Option<String>,
     group_target_bytes: Option<String>,
@@ -125,9 +123,8 @@ pub fn run_sort(
     });
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // `temp_dir` is moved into `opts`; the CSC rebuild below wants it too, and
-    // it is the same kind of spill for the same reason.
-    let csc_temp_dir = temp_dir.clone();
+    // The sidecar builder spills where the sort's external partitions do.
+    let csc = csc.options(temp_dir.clone());
     let opts = scx_ops::SortOptions {
         by,
         reverse,
@@ -150,6 +147,7 @@ pub fn run_sort(
         group_target_bytes,
         group_max_bytes,
         group_write_block_bytes,
+        csc,
     };
 
     let summary = scx_ops::sort(input, output, &opts)?;
@@ -184,18 +182,8 @@ pub fn run_sort(
         );
     }
 
-    // Preserve the sorted output's framing on CSC rebuild (don't downgrade a v4
-    // output back to unframed v3).
-    if rebuild_csc {
-        let framing = crate::cli_utils::framing_for_file(output);
-        scx_ops::rebuild_csc_inplace(
-            output,
-            csc_cols_per_shard,
-            csc_memory_limit,
-            framing,
-            csc_temp_dir.as_deref(),
-        )?;
-        println!("Rebuilt CSC sidecar on {}", output.display());
+    if scx_format_io::ScxReader::open(output)?.header().has_csc() {
+        println!("  CSC sidecar built in the same pass");
     }
 
     Ok(())

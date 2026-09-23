@@ -1350,6 +1350,9 @@ def optimize(
     codec: str = ...,
     shard_obs: str = ...,
     memory_budget: int | str | None = ...,
+    csc: str = ...,
+    csc_cols_per_shard: int = ...,
+    csc_memory_limit: str = ...,
 ) -> None: ...
 
 
@@ -1367,7 +1370,7 @@ def sort(
     memory_budget: str | None = ...,
     temp_dir: str | None = ...,
     bitmap: str = ...,
-    rebuild_csc: bool = ...,
+    rebuild_csc: bool | None = ...,
     csc_cols_per_shard: int = ...,
     csc_memory_limit: str = ...,
     group_by: str | None = ...,
@@ -1375,6 +1378,7 @@ def sort(
     group_target_bytes: int | str | None = ...,
     group_max_bytes: int | str | None = ...,
     group_write_block_bytes: int | str | None = ...,
+    csc: str | None = ...,
 ) -> None:
     """Globally reorder cells (the obs axis) by an obs key, for X-read locality
     and contiguous predicate-index shard ranges on the sort key. See
@@ -1395,9 +1399,10 @@ def shuffle(
     memory_budget: str | None = ...,
     temp_dir: str | None = ...,
     bitmap: str = ...,
-    rebuild_csc: bool = ...,
+    rebuild_csc: bool | None = ...,
     csc_cols_per_shard: int = ...,
     csc_memory_limit: str = ...,
+    csc: str | None = ...,
 ) -> None:
     """Globally reorder cells (the obs axis) by a seeded random permutation, so
     a training loader gets i.i.d. batches at any `shard_group_size`. `seed` is

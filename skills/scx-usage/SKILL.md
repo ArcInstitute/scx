@@ -145,8 +145,10 @@ Most-used kwargs (shared across ingest entry points):
   them, pushdown silently regresses to a full obs scan. Set these if the file
   will be queried.
 - `csc="off"|"auto"|"always"` — write a column-major sidecar (needed for
-  `prefer_format="csc"` accel paths + the CSC-direct `gpu_csc_v3` DE route; two-pass,
-  transient disk ~2× output). `"auto"` builds it only when the dataset is large
+  `prefer_format="csc"` accel paths + the CSC-direct `gpu_csc_v3` DE route; built
+  in the same write as X, no extra read or second copy on disk; later
+  `compact`/`merge`/`optimize`/`sort`/`subset` carry it by default, `append`
+  drops it). `"auto"` builds it only when the dataset is large
   enough to benefit (`n_obs ≥ 50000` and `n_vars ≥ 5000`, env-tunable via
   `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`). To get the
   **GPU-fast** CSC-direct DE route (`gpu_csc_v3`), call `rank_genes_groups`/`pdex_ref`
