@@ -206,6 +206,10 @@ def _run_sort_group(
             by=[],
             group_by=group_col,
             reference=ref_arg,
+            # The Phase-A `scx_auto` fixture carries a CSC sidecar, and `sort`
+            # carries one by default by building it in the same pass; pinned
+            # off so this arm keeps timing the re-shard alone.
+            csc="off",
         )
         result.add_run(
             wall_s=wall,
@@ -344,12 +348,16 @@ def _run_convert(
     ref_arg = [reference] if reference is not None else None
     for i in range(n_runs):
         out = workdir / f"{scenario}_{i}.scx"
+        # `csc="off"` on both: these time the grouped / sorted CSR write, and
+        # the ingest default (`auto`) would add a same-pass sidecar build on
+        # any input of at least 50,000 x 5,000.
         if reorder == "sort_by":
             _, wall, rss = _time_op(
                 pyscx.from_h5ad,
                 str(source_h5ad),
                 str(out),
                 sort_by=[group_col],
+                csc="off",
             )
         else:
             _, wall, rss = _time_op(
@@ -359,6 +367,7 @@ def _run_convert(
                 group_by=group_col,
                 reference=ref_arg,
                 group_pass=group_pass,
+                csc="off",
             )
         extra: dict[str, object] = {
             f"peak_rss_mb__{scenario}": round(rss, 1),
@@ -427,7 +436,7 @@ def run(
             import pyscx
 
             plain_scx = workdir / "plain.scx"
-            pyscx.from_h5ad(str(source_h5ad), str(plain_scx))
+            pyscx.from_h5ad(str(source_h5ad), str(plain_scx), csc="off")
         result.file_size_bytes = plain_scx.stat().st_size
 
         sort_runs = min(n_runs, _MAX_SORT_RUNS)

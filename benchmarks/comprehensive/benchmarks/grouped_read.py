@@ -94,8 +94,11 @@ def _scx_grouped_write(out: Path, src: Path, col: str, ref: str | None):
     import pyscx
 
     ref_arg = [ref] if ref is not None else None
+    # `csc="off"`: this times the grouped CSR write; the ingest default would
+    # add a sidecar build on a >= 50,000 x 5,000 input.
     return _time_op(
-        pyscx.from_h5ad, str(src), str(out), group_by=col, reference=ref_arg
+        pyscx.from_h5ad, str(src), str(out), group_by=col, reference=ref_arg,
+        csc="off",
     )
 
 

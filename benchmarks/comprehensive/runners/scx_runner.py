@@ -90,6 +90,7 @@ class ScxRunner(FormatRunner):
         codec_per_modality: bool = True,
         with_csc: bool = False,
         row_group_rows: int | None = None,
+        csc: str = "off",
     ) -> None:
         if codec not in _CODEC_NAMES:
             raise ValueError(
@@ -123,6 +124,17 @@ class ScxRunner(FormatRunner):
         # Toggle via the `SCX_BENCH_WITH_CSC=1` env var picked up by
         # the gate orchestrator (`gate_candidate.py`) and forwarded here.
         self.with_csc = with_csc
+        # The CSC policy passed on every conversion when `with_csc` is off.
+        # Pinned rather than left to the library default: the ingest default
+        # is `auto`, which builds a sidecar on any file with n_obs >= 50,000
+        # and n_vars >= 5,000, so an unpinned runner would silently add a
+        # sidecar build to every benchmark that times a conversion here
+        # (`write`, `parallel_write_scaling`, the read benchmarks' temp
+        # conversions) and change what each one has always measured.
+        # `convert.convert_dataset_format` — the fixture path — sets `"auto"`
+        # so the shared `_auto.scx` fixtures carry what a default conversion
+        # writes.
+        self.csc = csc
 
     @property
     def name(self) -> str:
@@ -175,9 +187,10 @@ class ScxRunner(FormatRunner):
         t0 = time.perf_counter()
 
         adata = anndata.read_h5ad(h5ad_path)
-        from_anndata_kwargs: dict[str, object] = {"codec": self.codec}
-        if self.with_csc:
-            from_anndata_kwargs["csc"] = "always"
+        from_anndata_kwargs: dict[str, object] = {
+            "codec": self.codec,
+            "csc": "always" if self.with_csc else self.csc,
+        }
         if self.row_group_rows is not None:
             from_anndata_kwargs["row_group_rows"] = self.row_group_rows
         if self.shard_size is not None:

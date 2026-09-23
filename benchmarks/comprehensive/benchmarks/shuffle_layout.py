@@ -194,7 +194,12 @@ def _shuffle(
 ) -> None:
     import pyscx
 
-    pyscx.shuffle(str(src), str(dst), seed=seed, shard_size=shard_size, codec=codec)
+    # `csc="off"`: `src` may be an `scx_auto` fixture carrying a CSC sidecar,
+    # which `shuffle` would otherwise rebuild in the same pass — a transpose
+    # this layout comparison does not read.
+    pyscx.shuffle(
+        str(src), str(dst), seed=seed, shard_size=shard_size, codec=codec, csc="off",
+    )
 
 
 def _label_codes(path: Path, column: str) -> np.ndarray | None:

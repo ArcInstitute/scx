@@ -39,6 +39,53 @@ def _estimate_nnz(h5ad_path: Path) -> int:
     return nnz
 
 
+def _csc_sidecar_bytes(path: Path) -> int:
+    """Bytes the CSC sidecar occupies in an SCX file, or 0 when it has none.
+
+    The shared `_auto.scx` fixtures carry a sidecar once they are converted at
+    the ingest default (`csc="auto"` builds one on any file with n_obs >= 50,000
+    and n_vars >= 5,000), and this benchmark measures the CSR-only layout. The
+    fixture is reused rather than reconverted because this benchmark is sized
+    for Python overhead only (`config.estimate_memory_gb`) — an eager
+    reconversion at census_1m needs ~14 GB. So the sidecar is subtracted,
+    section by section, from `scx info --json`; pyscx exposes no per-section
+    lengths.
+
+    What remains differs from a CSR-only conversion by the sidecar's catalog
+    entries and alignment padding — tens of bytes per CSC shard, against
+    hundreds of MB of payload. Raises when the file has a sidecar and no `scx`
+    binary can report its sections: guessing the number would change the
+    metric silently, which is the thing this exists to prevent.
+    """
+    import json
+    import subprocess
+
+    import pyscx
+
+    if not bool(pyscx.open(str(path)).has_csc):
+        return 0
+    from benchmarks.comprehensive import scx_cli
+
+    scx_bin = scx_cli.resolve_scx_bin(("info", "--help"), requires=b"--json")
+    if scx_bin is None:
+        raise RuntimeError(
+            f"{path} carries a CSC sidecar, and no `scx` binary with "
+            f"`info --json` was found to size it (set $SCX_CLI_BIN or build "
+            f"target/release/scx). Refusing to report a file size that "
+            f"includes the sidecar under the CSR-only metric."
+        )
+    proc = subprocess.run(
+        [scx_bin, "info", "--json", str(path)],
+        capture_output=True, text=True, check=True, timeout=600,
+    )
+    info = json.loads(proc.stdout)
+    return sum(
+        int(sec["length"])
+        for sec in info.get("sections", [])
+        if str(sec.get("name", "")).startswith("X_csc")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -99,8 +146,14 @@ def run(
     # A shared converted_path may carry a CSC sidecar when SCX_BENCH_WITH_CSC
     # is set, so skip it and reconvert CSR-only in that case.
     convert_result = None
+    csc_sidecar_bytes = 0
     if converted_path is not None and Path(converted_path).exists() and not force_csr_only:
         converted_bytes = runner.file_size(converted_path)
+        if Path(converted_path).suffix == ".scx" and Path(converted_path).is_file():
+            # The shared fixture may carry the ingest default's sidecar; see
+            # `_csc_sidecar_bytes`.
+            csc_sidecar_bytes = _csc_sidecar_bytes(Path(converted_path))
+            converted_bytes -= csc_sidecar_bytes
     else:
         with tempfile.TemporaryDirectory(prefix="scx_bench_comp_") as tmp:
             out_path = Path(tmp) / f"converted.{format_variant.key}"
@@ -132,6 +185,9 @@ def run(
             "compression_ratio": round(compression_ratio, 4),
             "bits_per_nnz": round(bits_per_nnz, 4),
             "output_size_bytes": converted_bytes,
+            # Subtracted from the measured file so the metric stays CSR-only;
+            # 0 when the file carried no sidecar.
+            "csc_sidecar_bytes_excluded": csc_sidecar_bytes,
             "n_obs": dataset.n_obs,
             "n_vars": dataset.n_vars,
             # The single run's wall_s/peak_rss_mb are the CONVERSION cost, and are
