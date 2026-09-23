@@ -375,9 +375,9 @@ def test_de_on_the_normalize_log1p_chain_routes_csc_and_is_bit_identical(tmp_pat
     route_auto, _ = _de_on(path, adata, "auto")
 
     assert route_csr == "cpu_csr"
-    assert route_csc == "cpu_csc"
+    assert route_csc == "cpu_csc_nnz"
     # `auto` is DE's default, so this is what an ordinary caller now gets.
-    assert route_auto == "cpu_csc"
+    assert route_auto == "cpu_csc_nnz"
 
     for field in ("scores", "pvals", "logfoldchanges"):
         a = np.array([list(r) for r in res_csr[field]])
@@ -791,8 +791,8 @@ def test_the_full_pipeline_shape_routes_csc_and_matches_csr(tmp_path):
     route_auto, res_auto = de("auto")
 
     assert route_csr == "cpu_csr"
-    assert route_csc == "cpu_csc"
-    assert route_auto == "cpu_csc"
+    assert route_csc == "cpu_csc_nnz"
+    assert route_auto == "cpu_csc_nnz"
 
     for field in ("scores", "pvals", "logfoldchanges"):
         a = np.array([list(r) for r in res_csr[field]])
@@ -1004,7 +1004,8 @@ def test_a_filtered_pdex_ref_matches_csr(tmp_path):
 # ---------------------------------------------------------------------------
 # The exact-nnz Wilcoxon kernel under a row filter.
 #
-# `SCX_ACCEL_WILCOXON_NNZ=1` swaps in a structurally different kernel that does
+# The exact-nnz kernel (the 1-vs-rest default; the probe also sets
+# `SCX_ACCEL_WILCOXON_NNZ=1` explicitly) is structurally different. It does
 # not densify: it sorts each gene's stored values and derives the zero
 # tie-block arithmetically, as `n_obs - (n_neg + n_pos)` pooled and
 # `group_cell_counts[g] - nonzero_in_g[g]` per bucket. Both sides of those
@@ -1172,7 +1173,7 @@ def test_a_narrow_row_window_leaves_auto_on_csr(tmp_path):
 
     # The capability is still there for a caller who asks for it, and it agrees.
     info_csc, res_csc = de("csc")
-    assert info_csc["route"] == "cpu_csc"
+    assert info_csc["route"] == "cpu_csc_nnz"
     assert info_csc["csc_available"] is True
     for field in ("scores", "pvals", "logfoldchanges"):
         np.testing.assert_array_equal(
@@ -1203,5 +1204,5 @@ def test_a_wide_row_window_still_auto_routes_csc(tmp_path):
     pyscx.accel.log1p(a)
     pyscx.accel.rank_genes_groups(a, groupby="grp", method="wilcoxon", device="cpu")
     info = a.uns["scx_accel"]["rank_genes_groups"]
-    assert info["route"] == "cpu_csc"
+    assert info["route"] == "cpu_csc_nnz"
     assert info["csc_available"] is True

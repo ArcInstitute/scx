@@ -219,8 +219,9 @@ fn the_two_tie_conventions_are_genuinely_different_answers() {
 /// The analytic sparse-nnz kernel against the same reference values.
 ///
 /// Called directly rather than through `wilcoxon_rank_sum_streaming_csc`,
-/// because that entry point is behind `SCX_ACCEL_WILCOXON_NNZ` (default off) —
-/// an env-gated test would silently stop testing the moment the default moved.
+/// because that entry point reads the process-global `SCX_ACCEL_WILCOXON_NNZ`
+/// gate (default on since the kernel's promotion) — an env-gated test would
+/// silently test the other kernel the moment someone set it.
 ///
 /// `gene_stats_nnz` takes one gene's stored nonzeros, so the columns come from
 /// [`csc_column`](r::csc_column), which **keeps stored zeros**: `g3` has exact

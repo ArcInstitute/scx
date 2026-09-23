@@ -11,6 +11,10 @@ AnnData:
   - `bench_csc__de_csr`         / `_csc`     (`rank_genes_groups`)
   - `bench_csc__de_csr_bounded`              (`rank_genes_groups`, CSR, at
                                               the default shard cache)
+  - `bench_csc__de_csc_densify`              (`rank_genes_groups`, CSC, the
+                                              densify Wilcoxon kernel)
+  - `bench_csc__col_sums_csr` / `_csc`       (`pyscx.accel.col_sums`)
+  - `bench_csc__col_var_csr`  / `_csc`       (`pyscx.accel.col_var`)
   - `bench_csc__pdex_ref_csr`   / `_csc`     (`pdex_ref`)
   - `bench_csc__pseudobulk_csr` / `_csc`     (`pseudobulk_dex`)
 
@@ -34,6 +38,22 @@ one it merely beats. It is scoped to `tabula_sapiens_100k` (7 CSR shards, so
 the default cache thrashes) through `FORMAT_DATASET_SCOPE`: at census scale the
 bounded CSR route runs for tens of minutes per repetition, which a warm-up plus
 three runs would push past this benchmark's SLURM time budget.
+
+`bench_csc__de_csc` times the default CSC Wilcoxon kernel, the exact-nnz one,
+and its `csc_dispatch_correct` is 1.0 only for the route `cpu_csc_nnz`.
+`bench_csc__de_csc_densify` is the same call on the densify kernel it replaced
+(`SCX_ACCEL_WILCOXON_NNZ=0`), kept as the control that shows what the default
+is worth, and floored on the route `cpu_csc`. It runs each repetition in a
+fresh process: pyscx reads the gate once per process through a `OnceLock`, so
+set in this interpreter after `bench_csc__de_csc` had run it would change
+nothing and the arm would time the nnz kernel under the densify name. Both of
+these are stricter than the other arms' "csc in route" test, which either
+kernel passes.
+
+The `col_*` arms carry no `csc_dispatch_correct`: those functions return an
+array rather than annotating an AnnData, so there is no route to read. An
+explicit `prefer_format="csc"` raises on a file without a sidecar rather than
+falling back, so the arm fails instead of timing the wrong layout.
 
 CSC has no GPU path; all variants are CPU. PCA is intentionally
 absent (PCA explicitly rejects `prefer_format="csc"`).
@@ -63,6 +83,7 @@ from benchmarks.comprehensive.config import (
     pseudobulk_n_cpus_cap,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.subproc_arm import run_arm
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +113,16 @@ _PSEUDOBULK_BACKEND = "pydeseq2"
 # Variants that open their handle at `to_anndata(backed=True)`'s default shard
 # cache instead of one sized to the file. See the module docstring.
 _BOUNDED_CACHE_VARIANTS: frozenset[str] = frozenset({"bench_csc__de_csr_bounded"})
+
+# The one variant that runs every repetition in a fresh process; see the module
+# docstring.
+_DENSIFY_KEY = "bench_csc__de_csc_densify"
+
+# Per repetition. The densify kernel measured ~20 s at tabula_sapiens_100k and
+# ~226 s at census_1m, so this is ~8x the slowest observed run: long enough
+# never to cut a real one short, short enough that a hung child frees the
+# allocation.
+_FRESH_PROCESS_TIMEOUT_S = 30 * 60
 
 # Per-format dataset allow-lists, read by `run_parallel` at cohort-build time.
 # Only the bounded arm is scoped; every other variant runs wherever it did.
@@ -142,6 +173,11 @@ def bench_csc_dispatch_variants() -> list[FormatVariant]:
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
+            name="rank_genes_groups (CSC, densify Wilcoxon)",
+            key="bench_csc__de_csc_densify",
+            category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
             name="pdex_ref (CSR)",
             key="bench_csc__pdex_ref_csr",
             category="accel", runner="accel_runner",
@@ -162,6 +198,15 @@ def bench_csc_dispatch_variants() -> list[FormatVariant]:
             category="accel", runner="accel_runner",
         ),
     ]
+    for op in ("col_sums", "col_var"):
+        for layout in ("csr", "csc"):
+            out.append(
+                FormatVariant(
+                    name=f"{op} ({layout.upper()})",
+                    key=f"bench_csc__{op}_{layout}",
+                    category="accel", runner="accel_runner",
+                )
+            )
     return out
 
 
@@ -219,12 +264,35 @@ def _run_hvg(adata: Any, prefer: str) -> None:
     )
 
 
+def _unlabel_undersized_groups(adata: Any, groupby: str) -> bool:
+    """Turn every level of ``obs[groupby]`` with fewer than two cells into
+    unlabelled (NaN) cells, in place; return whether two or more levels remain.
+
+    `rank_genes_groups` refuses a participating group with fewer than two cells
+    (since 0.17), and a categorical also carries every level it was declared
+    with, so census's `cell_type` — singleton levels among 125, from a
+    census-wide vocabulary — raised before the first gene was tested. Dropping
+    unused levels is not enough: a one-cell level is used. Unlabelling rather
+    than subsetting keeps those cells where scanpy 1.12 puts them, in the rank
+    pool and in every group's "rest", so the call still ranks every cell.
+    """
+    col = adata.obs[groupby]
+    if not hasattr(col, "cat"):
+        col = col.astype("category")
+    counts = col.value_counts()
+    col = col.cat.remove_categories([c for c in col.cat.categories if counts.get(c, 0) < 2])
+    adata.obs[groupby] = col
+    return len(col.cat.categories) >= 2
+
+
 def _run_de(adata: Any, prefer: str) -> None:
     # Pick a reasonable groupby column. Most fixtures expose
     # `cell_type` or fall back to a synthetic 50/50 split.
     obs_cols = list(adata.obs.columns)
     candidates = ["cell_type", "leiden", "louvain", "cluster", "perturbation"]
     groupby = next((c for c in candidates if c in obs_cols), None)
+    if groupby is not None and not _unlabel_undersized_groups(adata, groupby):
+        groupby = None
     if groupby is None:
         # Fall back: build a 2-way synthetic split.
         n = adata.n_obs
@@ -233,6 +301,14 @@ def _run_de(adata: Any, prefer: str) -> None:
     pyscx.accel.rank_genes_groups(
         adata, groupby, gene_chunk_size=500, prefer_format=prefer
     )
+
+
+def _run_col_sums(adata: Any, prefer: str) -> None:
+    pyscx.accel.col_sums(adata.X, prefer_format=prefer)
+
+
+def _run_col_var(adata: Any, prefer: str) -> None:
+    pyscx.accel.col_var(adata.X, prefer_format=prefer)
 
 
 def _run_pdex_ref(adata: Any, prefer: str) -> None:
@@ -318,16 +394,22 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[[Any, str], None], str]] = {
     "bench_csc__de_csr":          (_run_de, "csr"),
     "bench_csc__de_csc":          (_run_de, "csc"),
     "bench_csc__de_csr_bounded":  (_run_de, "csr"),
+    "bench_csc__de_csc_densify":  (_run_de, "csc"),
     "bench_csc__pdex_ref_csr":    (_run_pdex_ref, "csr"),
     "bench_csc__pdex_ref_csc":    (_run_pdex_ref, "csc"),
     "bench_csc__pseudobulk_csr":  (_run_pseudobulk, "csr"),
     "bench_csc__pseudobulk_csc":  (_run_pseudobulk, "csc"),
+    "bench_csc__col_sums_csr":    (_run_col_sums, "csr"),
+    "bench_csc__col_sums_csc":    (_run_col_sums, "csc"),
+    "bench_csc__col_var_csr":     (_run_col_var, "csr"),
+    "bench_csc__col_var_csc":     (_run_col_var, "csc"),
 }
 
 # Variant key → adata.uns["scx_accel"] op key for route extraction. Ops that
 # stamp a route to `adata.uns["scx_accel"][op]["route"]` emit the numeric
 # `csc_dispatch_correct` gate signal so a silent CSC→CSR (or CSR→CSC) fallback
-# fails the gate. All five ops stamp a route, so every variant is gated.
+# fails the gate. The five AnnData ops all stamp a route; the `col_*` arms are
+# absent here because those functions return an array and stamp nothing.
 _VARIANT_OP_KEY: dict[str, str] = {
     "bench_csc__qc_metrics_csr": "calculate_qc_metrics",
     "bench_csc__qc_metrics_csc": "calculate_qc_metrics",
@@ -336,6 +418,7 @@ _VARIANT_OP_KEY: dict[str, str] = {
     "bench_csc__de_csr": "rank_genes_groups",
     "bench_csc__de_csc": "rank_genes_groups",
     "bench_csc__de_csr_bounded": "rank_genes_groups",
+    "bench_csc__de_csc_densify": "rank_genes_groups",
     "bench_csc__pdex_ref_csr": "pdex_ref",
     "bench_csc__pdex_ref_csc": "pdex_ref",
     "bench_csc__pseudobulk_csr": "pseudobulk_dex",
@@ -349,6 +432,66 @@ def _extract_route(adata: Any, op: str) -> str | None:
         return adata.uns["scx_accel"][op]["route"]
     except Exception:
         return None
+
+
+# One repetition of a fresh-process variant. Imports this module's own runner
+# so the measured call is the in-process arm's, byte for byte.
+_FRESH_WORKER = '''
+import gc, json, resource, sys, time
+from pathlib import Path
+from benchmarks.comprehensive.benchmarks import bench_csc_dispatch as b
+path = Path(sys.argv[1])
+runner, prefer = b._VARIANT_IMPLS[b._DENSIFY_KEY]
+adata = b._open_backed(path)
+gc.collect()
+ru0 = resource.getrusage(resource.RUSAGE_SELF)
+t0 = time.perf_counter()
+runner(adata, prefer)
+wall = time.perf_counter() - t0
+ru = resource.getrusage(resource.RUSAGE_SELF)
+print(json.dumps({
+    "wall_s": wall,
+    "user_s": ru.ru_utime - ru0.ru_utime,
+    "sys_s": ru.ru_stime - ru0.ru_stime,
+    "peak_rss_mb": ru.ru_maxrss / 1024.0,
+    "route": b._extract_route(adata, "rank_genes_groups"),
+}))
+'''
+
+
+def _run_de_csc_densify(csc_path: Path, result: BenchmarkResult, n_runs: int):
+    """Every repetition of `bench_csc__de_csc_densify` in its own interpreter,
+    with `SCX_ACCEL_WILCOXON_NNZ=0`; see the module docstring.
+
+    `wall_s`, `user_s` and `sys_s` cover the op alone, measured inside the
+    worker as the in-process arms measure them. `peak_rss_mb` is the worker's
+    whole-process high-water mark, open included — `ru_maxrss` has no delta.
+    """
+    for i in range(N_WARMUP_RUNS + n_runs):
+        outcome = run_arm(
+            _FRESH_WORKER, [str(csc_path)], env={"SCX_ACCEL_WILCOXON_NNZ": "0"},
+            timeout_s=_FRESH_PROCESS_TIMEOUT_S, label=_DENSIFY_KEY,
+        )
+        if not outcome.ok or not outcome.records:
+            logger.error("%s", outcome.failure_text(_DENSIFY_KEY))
+            return None
+        if i < N_WARMUP_RUNS:
+            continue
+        rec = outcome.records[-1]
+        route = rec.get("route")
+        extras: dict[str, Any] = {"csc_dispatch_correct": 1.0 if route == "cpu_csc" else 0.0}
+        if route is not None:
+            extras["dispatch_route"] = route
+        result.add_run(
+            wall_s=rec["wall_s"],
+            user_s=rec["user_s"],
+            sys_s=rec["sys_s"],
+            peak_rss_mb=rec["peak_rss_mb"],
+            **extras,
+        )
+        logger.info("  %s run %d: wall=%.3fs route=%s", _DENSIFY_KEY, i + 1 - N_WARMUP_RUNS,
+                    rec["wall_s"], route)
+    return result
 
 
 def run(
@@ -387,8 +530,12 @@ def run(
             # "default" = `to_anndata(backed=True)`'s own cache; "file" = one
             # slot per CSR shard, so nothing is ever re-decoded.
             "shard_cache": "default" if bounded else "file",
+            "fresh_process": key == _DENSIFY_KEY,
         },
     )
+
+    if key == _DENSIFY_KEY:
+        return _run_de_csc_densify(csc_path, result, n_runs)
 
     # Warmup runs — discarded.
     for _ in range(N_WARMUP_RUNS):
@@ -428,7 +575,10 @@ def run(
             route = _extract_route(adata, op_key)
             if route is not None:
                 extras["dispatch_route"] = route
-                if prefer == "csc":
+                if key == "bench_csc__de_csc":
+                    # The default CSC Wilcoxon kernel, not merely a CSC one.
+                    extras["csc_dispatch_correct"] = 1.0 if route == "cpu_csc_nnz" else 0.0
+                elif prefer == "csc":
                     extras["csc_dispatch_correct"] = 1.0 if "csc" in route else 0.0
                 else:
                     extras["csc_dispatch_correct"] = 1.0 if "csc" not in route else 0.0

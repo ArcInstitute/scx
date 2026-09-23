@@ -40,10 +40,12 @@ pub enum AccelRoute {
     /// CPU, CSR (row-major) input.
     CpuCsr,
     /// CPU, CSC (column-major / gene-major) input, densify + dense per-gene
-    /// sort — the default CSC kernel.
+    /// sort. Every CSC DE op but 1-vs-rest Wilcoxon, and that one too under
+    /// `SCX_ACCEL_WILCOXON_NNZ=0`.
     CpuCsc,
-    /// CPU, CSC input, **exact sparse-nnz** Wilcoxon kernel
-    /// (`SCX_ACCEL_WILCOXON_NNZ=1`, 1-vs-rest only).
+    /// CPU, CSC input, **exact sparse-nnz** Wilcoxon kernel — the default for
+    /// 1-vs-rest Wilcoxon (`reference="rest"`, no `rankby_abs`);
+    /// `SCX_ACCEL_WILCOXON_NNZ=0` turns it off.
     ///
     /// A structurally different kernel from [`CpuCsc`](AccelRoute::CpuCsc): it
     /// ranks each gene's nonzeros plus an analytic implicit-zero tie block

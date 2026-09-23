@@ -372,8 +372,10 @@ fn compute_group_nonzero_counts(
 
 /// The CPU CSC route stamp for `rank_genes_groups`.
 ///
-/// `SCX_ACCEL_WILCOXON_NNZ=1` swaps in a structurally different kernel, but the
-/// stamp used to read `cpu_csc` either way, so a benchmark timing the nnz path
+/// 1-vs-rest runs the exact-nnz kernel by default and the densify kernel under
+/// `SCX_ACCEL_WILCOXON_NNZ=0` (or with `reference=` / `rankby_abs`). Those are
+/// structurally different kernels, but the stamp used to read `cpu_csc` either
+/// way, so a benchmark timing the nnz path
 /// could not tell from `uns["scx_accel"]` which kernel it had measured
 /// (review §7.17). The kernel choice comes from
 /// `scx_accel::csc_wilcoxon_uses_nnz_kernel`, the same predicate

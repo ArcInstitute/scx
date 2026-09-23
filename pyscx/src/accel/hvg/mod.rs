@@ -137,7 +137,10 @@ fn backed_x_has_csc_sidecar(x: &Bound<'_, PyAny>) -> bool {
 ///         seurat_v3 only — multi-batch and seurat flavor raise on CSC.
 ///         With `device="gpu"` the CSC sidecar runs the column-major
 ///         reduce kernel (route `gpu_csc_v3`, no `atomicAdd` contention);
-///         on CPU it runs the CSC reduce (route `cpu_csc`). Note: even
+///         on CPU it runs the CSC reduce (route `cpu_csc`), which is
+///         **slower than the CSR default** on every file measured (4.4x at
+///         tabula_sapiens_100k, 6.4x at census_1m) and is kept for parity
+///         testing, not speed. Note: even
 ///         under the default `prefer_format="csr"`, a single-batch
 ///         seurat_v3 GPU run on a backed dataset that has a CSC sidecar
 ///         auto-routes to `gpu_csc_v3` — but **only when no row filter is

@@ -427,7 +427,7 @@ def test_csc_on_row_subset_matches_the_reference(csc_path, counts, obs_cols, var
         _rgg(adata, prefer_format="csc"),
         _rgg(_reference(counts, obs_cols, var_names, rows=ROW_KEEP)),
     )
-    assert _de_route(adata) == "cpu_csc"
+    assert _de_route(adata) == "cpu_csc_nnz"
 
 
 def test_csc_on_var_subset_matches_the_reference(csc_path, counts, obs_cols, var_names):
@@ -437,7 +437,7 @@ def test_csc_on_var_subset_matches_the_reference(csc_path, counts, obs_cols, var
         _rgg(adata, prefer_format="csc"),
         _rgg(_reference(counts, obs_cols, var_names, cols=COL_KEEP)),
     )
-    assert _de_route(adata) == "cpu_csc"
+    assert _de_route(adata) == "cpu_csc_nnz"
 
 
 def test_csc_on_both_axes_matches_the_reference(csc_path, counts, obs_cols, var_names):
@@ -450,7 +450,49 @@ def test_csc_on_both_axes_matches_the_reference(csc_path, counts, obs_cols, var_
         _rgg(adata, prefer_format="csc"),
         _rgg(_reference(counts, obs_cols, var_names, rows=ROW_KEEP, cols=COL_KEEP)),
     )
-    assert _de_route(adata) == "cpu_csc"
+    assert _de_route(adata) == "cpu_csc_nnz"
+
+
+def _project_genes(adata, how, counts):
+    """Project the gene axis of a backed handle three ways, with no row filter
+    and no transform chain."""
+    if how == "subset_var":
+        pyscx.accel.subset_var(adata, COL_KEEP)
+    elif how == "filter_genes":
+        detected = np.asarray((counts > 0).sum(axis=0)).ravel()
+        pyscx.accel.filter_genes(adata, min_cells=int(np.median(detected)) + 1)
+    else:
+        adata = adata[:, COL_KEEP]
+    return adata
+
+
+@pytest.mark.parametrize("how", ["subset_var", "filter_genes", "slice"])
+def test_auto_takes_csc_on_a_gene_only_projection(csc_path, counts, obs_cols, var_names, how):
+    """At the default `prefer_format="auto"`, a backed handle whose only view is
+    a gene projection takes `cpu_csc`.
+
+    A regression pin, not the test for a fix. The behaviour arrived when the
+    backed handle started serving its CSC reads through the same view a lazy
+    one does, which remaps columns into the projected axis. Before that its
+    column source was the full-axis sidecar reader, so the probe excluded a
+    column projection by hand and `filter_genes` alone routed `cpu_csr` while
+    `filter_genes + normalize_total + log1p` routed `cpu_csc`. Nothing asserted
+    the gene-only case since, so this pins it for all three ways of making one.
+    """
+    adata = _project_genes(_backed(csc_path), how, counts)
+    kept = [var_names.index(n) for n in adata.var_names]
+    assert 0 < len(kept) < N_VARS, f"premise: {how} must drop some genes, kept {len(kept)}"
+    assert adata.n_obs == N_OBS, "premise: no row filter"
+    cols = np.zeros(N_VARS, dtype=bool)
+    cols[kept] = True
+    import warnings
+
+    with warnings.catch_warnings():
+        # `slice` hands the op an AnnData view, which it rebuilds in place.
+        warnings.simplefilter("ignore")
+        got = _rgg(adata)
+    _assert_de_equal(got, _rgg(_reference(counts, obs_cols, var_names, cols=cols)))
+    assert _de_route(adata) == "cpu_csc_nnz"
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +632,7 @@ def test_gpu_de_keeps_csc_direct_on_a_transformed_handle(csc_path):
         f"a transformed handle with a sidecar must reach the CSC-direct GPU "
         f"route, got {gpu_route!r}"
     )
-    assert cpu_route == "cpu_csc", f"premise: the CPU side takes CSC too, got {cpu_route!r}"
+    assert cpu_route == "cpu_csc_nnz", f"premise: the CPU side takes CSC too, got {cpu_route!r}"
     assert list(gpu_df["names"]) == list(cpu_df["names"])
     np.testing.assert_allclose(
         gpu_df["scores"].to_numpy().astype(np.float64),

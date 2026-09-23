@@ -233,8 +233,13 @@ absolute_floors:
   # variant's intended layout actually dispatched (a `_csc` variant ran a route
   # containing "csc", a `_csr` variant did not), 0.0 on a silent fallback
   # (require_csc() dropped to CSR because the sidecar build failed, or vice
-  # versa). All five ops (qc_metrics, hvg, rank_genes_groups, pdex_ref,
-  # pseudobulk_dex) stamp a route, so every `_csc` variant is gated.
+  # versa). The five AnnData ops (qc_metrics, hvg, rank_genes_groups,
+  # pdex_ref, pseudobulk_dex) stamp a route, so each of their `_csc` variants
+  # is gated. `de_csc` and `de_csc_densify` are gated more strictly: each on
+  # the one Wilcoxon kernel it names. The `col_sums` /
+  # `col_var` arms are outside this gate: those functions return an array and
+  # stamp no route, and an explicit `prefer_format="csc"` raises on a file
+  # without a sidecar rather than timing the wrong layout.
   #
   # Gated on tabula_sapiens_100k — its multi-shard CSC sidecar exercises the
   # column slab read that pbmc3k's single shard can't, and the 100k-cell
@@ -261,6 +266,15 @@ absolute_floors:
     min: 1.0
   - benchmark: bench_csc_dispatch
     format: bench_csc__pseudobulk_csc
+    dataset: tabula_sapiens_100k
+    metric: csc_dispatch_correct
+    min: 1.0
+  # `de_csc` above reads 1.0 only for `cpu_csc_nnz`, the default CSC
+  # Wilcoxon kernel since its promotion, so a silent fall back to densify
+  # fails that floor. The densify control runs in a fresh process with
+  # SCX_ACCEL_WILCOXON_NNZ=0 and reads 1.0 only for `cpu_csc`.
+  - benchmark: bench_csc_dispatch
+    format: bench_csc__de_csc_densify
     dataset: tabula_sapiens_100k
     metric: csc_dispatch_correct
     min: 1.0

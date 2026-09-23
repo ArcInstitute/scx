@@ -156,7 +156,7 @@ def test_a_layer_is_not_routed_through_x_s_csc_sidecar(paths):
 
     on_x = pyscx.open(paths["csc"]).to_anndata(backed=True)
     pyscx.accel.rank_genes_groups(on_x, "grp", prefer_format="auto", device="cpu")
-    assert on_x.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc", (
+    assert on_x.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc_nnz", (
         "premise: the file's sidecar really does drive X to the CSC route"
     )
 

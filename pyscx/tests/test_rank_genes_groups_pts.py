@@ -174,7 +174,7 @@ def test_pts_on_backed_lazy_csc_and_dense_equals_in_memory(synthetic_adata, tmp_
 
     csc = pyscx.open(path).to_anndata(backed=True)
     got = _rgg(csc, pts=True, prefer_format="csc")
-    assert csc.uns["scx_accel"][KEY]["route"] == "cpu_csc"
+    assert csc.uns["scx_accel"][KEY]["route"] == "cpu_csc_nnz"
     for table in ("pts", "pts_rest"):
         pd.testing.assert_frame_equal(got[table], ref[table])
 
