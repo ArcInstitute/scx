@@ -3988,3 +3988,102 @@ fn raw_copy_paths_also_stamp_the_header_codec() {
         shard_codec
     );
 }
+
+/// `write_csc_shards` is `write_csc_shard` once per entry, encoded in
+/// parallel: the same names, offsets, lengths, checksums and stats in the
+/// catalog, framed and unframed, and the batch continues the numbering of
+/// shards already written.
+#[test]
+fn write_csc_shards_matches_one_at_a_time() {
+    use crate::reader::ScxReader;
+    // Four 3-column shards over 100 rows, uneven nnz.
+    let shards: Vec<CscShardBytes> = (0..4u64)
+        .map(|s| {
+            let mut indptr = vec![0u64];
+            let mut indices = Vec::new();
+            for c in 0..3u64 {
+                for r in (0..100u32).filter(|r| (r + (s * 3 + c) as u32) % (2 + s as u32) == 0) {
+                    indices.push(r);
+                }
+                indptr.push(indices.len() as u64);
+            }
+            let values = (0..indices.len()).map(|i| (i % 7 + 1) as u8).collect();
+            CscShardBytes {
+                col_start: s * 3,
+                indptr,
+                indices,
+                values,
+            }
+        })
+        .collect();
+    for framed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, batch: bool| {
+            let mut header = sample_header();
+            if framed {
+                header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+            }
+            let mut writer = ScxWriter::new(dir.path().join(name), header).unwrap();
+            if framed {
+                writer.set_framing(Some(crate::encoder::FramingConfig {
+                    row_group_rows: 2,
+                    target_nnz: None,
+                    trial: false,
+                    decode_target: None,
+                }));
+            }
+            writer.write_obs(&sample_obs()).unwrap();
+            writer.write_var(&sample_var()).unwrap();
+            let one = |w: &mut ScxWriter, s: &CscShardBytes| {
+                w.write_csc_shard(
+                    &s.indptr,
+                    &s.indices,
+                    &s.values,
+                    CodecId::ShufDeltaZstd,
+                    ValueEncoding::Uint8,
+                    s.col_start,
+                )
+                .unwrap()
+            };
+            if batch {
+                // One ahead of the batch, so the batch must continue the
+                // shard numbering rather than restart it.
+                one(&mut writer, &shards[0]);
+                writer
+                    .write_csc_shards(&shards[1..], CodecId::ShufDeltaZstd, ValueEncoding::Uint8)
+                    .unwrap();
+            } else {
+                for s in &shards {
+                    one(&mut writer, s);
+                }
+            }
+            let path = writer.finish().unwrap();
+            let reader = ScxReader::open(&path).unwrap();
+            reader
+                .catalog()
+                .entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.name.clone(),
+                        e.offset,
+                        e.length,
+                        e.checksum,
+                        format!("{:?}", e.stats),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let serial = write("serial.scx", false);
+        let batched = write("batched.scx", true);
+        assert_eq!(batched, serial, "framed={framed}");
+        assert_eq!(
+            serial
+                .iter()
+                .filter(|e| e.0.starts_with("X_csc_shard_"))
+                .count(),
+            4,
+            "framed={framed}"
+        );
+    }
+}

@@ -89,6 +89,26 @@ impl SpillStore for TempDirSpillStore {
         Ok(())
     }
 
+    /// One open for the whole spill, still closed before returning, so the
+    /// store keeps its one-descriptor-at-a-time property.
+    fn append_all(&mut self, bucket: usize, blocks: &[Vec<u8>]) -> std::io::Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        if self.bytes.len() <= bucket {
+            self.bytes.resize(bucket + 1, 0);
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.bucket_path(bucket))?;
+        for block in blocks {
+            file.write_all(block)?;
+            self.bytes[bucket] += block.len() as u64;
+        }
+        Ok(())
+    }
+
     fn reader(&self, bucket: usize) -> std::io::Result<Option<Box<dyn Read + '_>>> {
         if self.bytes.get(bucket).copied().unwrap_or(0) == 0 {
             return Ok(None);

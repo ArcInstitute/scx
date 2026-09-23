@@ -11,8 +11,10 @@ default = ["parallel", "deletion-vectors"]
 # `parallel` covers both the rayon-backed decode helpers and the bounded ordered
 # decode-prefetch pipeline in `prefetch.rs` (which needs a bounded MPSC channel
 # on top of the pool). Without it every prefetch front-end still exists and
-# falls back to a plain sequential loop.
-parallel = ["rayon", "crossbeam-channel"]
+# falls back to a plain sequential loop. It also turns on `scx-sparse/parallel`,
+# which routes a CSC sidecar build's pushes across the builder's buckets in
+# parallel.
+parallel = ["rayon", "crossbeam-channel", "scx-sparse/parallel"]
 deletion-vectors = ["roaring"]
 # Opt-in seams that exist only so a *downstream* crate's tests can establish a
 # premise it otherwise cannot: `BackedCsrReader::set_decode_barrier` lets

@@ -609,6 +609,7 @@ fn append_csc_shards(
         value_encoding: b.csc_value_encoding,
         codec_id: b.csc_codec,
         modality_id: None,
+        batch_nnz: scx_format_io::csc_budget::csc_emit_batch_nnz(b.max_bytes as u64),
     };
     let stats = scx_format_io::emit_csc_shards(
         &mut writer,

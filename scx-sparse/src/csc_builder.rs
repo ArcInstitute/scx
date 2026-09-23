@@ -128,10 +128,23 @@ pub enum CscBuilderError {
 /// a bucket that never overflows must never produce a file, because
 /// `reader` returning `Ok(None)` for it is what keeps an all-in-memory build
 /// free of disk entirely.
-pub trait SpillStore: Send {
+pub trait SpillStore: Send + Sync {
     /// Append `block` to `bucket`'s stream. Calls for one bucket arrive in
     /// stream order.
     fn append(&mut self, bucket: usize, block: &[u8]) -> std::io::Result<()>;
+
+    /// [`Self::append`] each of `blocks`, in order.
+    ///
+    /// Every spill hands over all of a bucket's sealed blocks at once, so a
+    /// store whose append has a per-call cost — a file store opening and
+    /// closing its file, which on a network filesystem is the dominant cost
+    /// of a spill — can pay it once per spill instead of once per block.
+    fn append_all(&mut self, bucket: usize, blocks: &[Vec<u8>]) -> std::io::Result<()> {
+        for block in blocks {
+            self.append(bucket, block)?;
+        }
+        Ok(())
+    }
 
     /// Everything appended to `bucket`, in append order. `Ok(None)` iff the
     /// bucket never spilled.
@@ -280,12 +293,31 @@ pub struct CscBuilderStats {
 // Bucket layout
 // ---------------------------------------------------------------------------
 
+/// How columns map to shards and to buckets.
+///
+/// Buckets are uniform `bucket_cols`-wide column ranges and never straddle a
+/// shard boundary, in one of two shapes:
+///
+/// * **coarse** — a bucket holds `shards_per_bucket >= 1` whole shards. The
+///   only shape before the parallel push, and still the one used whenever
+///   there are at least `target_buckets` shards.
+/// * **fine** — a shard holds `buckets_per_shard > 1` buckets. Used, with the
+///   `parallel` feature, when there are fewer shards than `target_buckets`:
+///   the push runs one task per bucket and the emit drains a shard's buckets
+///   in parallel, so a 13-shard layout (61k genes at 5,000 columns a shard)
+///   otherwise caps both at 13 tasks, unevenly loaded. `bucket_cols` must
+///   divide `shard_cols` so no bucket straddles a boundary; a shard width with
+///   no divisor in range falls back to coarse.
+///
+/// Neither shape reaches the emitted bytes: `shard_cols` is the one rule that
+/// does, and it is computed first and never changed by the bucket choice.
 #[derive(Debug, Clone, Copy)]
 struct Layout {
     shard_cols: usize,
     n_shards: usize,
     n_buckets: usize,
     shards_per_bucket: usize,
+    buckets_per_shard: usize,
     bucket_cols: usize,
 }
 
@@ -318,13 +350,69 @@ impl Layout {
             n_shards.div_ceil(shards_per_bucket)
         };
         let bucket_cols = shards_per_bucket.saturating_mul(shard_cols);
-        Ok(Self {
+        let coarse = Self {
             shard_cols,
             n_shards,
             n_buckets,
             shards_per_bucket,
+            buckets_per_shard: 1,
+            bucket_cols,
+        };
+        if !cfg!(feature = "parallel") || n_shards == 0 || n_shards >= target {
+            return Ok(coarse);
+        }
+        // Fine: split each shard into `d` equal buckets, `d` the largest
+        // divisor of the shard width within `target / n_shards`. One shard
+        // has no interior boundary to respect, so any width works there.
+        let per_shard = target / n_shards;
+        let width = shard_cols.min(n_cols);
+        let bucket_cols = if n_shards == 1 {
+            width.div_ceil(per_shard)
+        } else {
+            match (2..=per_shard).rev().find(|d| shard_cols % d == 0) {
+                Some(d) => shard_cols / d,
+                None => return Ok(coarse),
+            }
+        };
+        if bucket_cols == 0 || bucket_cols >= width {
+            return Ok(coarse);
+        }
+        let n_buckets = n_cols.div_ceil(bucket_cols);
+        let buckets_per_shard = if n_shards == 1 {
+            n_buckets
+        } else {
+            shard_cols / bucket_cols
+        };
+        Ok(Self {
+            shard_cols,
+            n_shards,
+            n_buckets,
+            shards_per_bucket: 1,
+            buckets_per_shard,
             bucket_cols,
         })
+    }
+
+    /// Emit units: a coarse bucket (its whole shards), or a fine shard (its
+    /// buckets). Each is `(shard range, bucket range)`, half-open.
+    fn n_groups(&self) -> usize {
+        if self.buckets_per_shard > 1 {
+            self.n_shards
+        } else {
+            self.n_buckets
+        }
+    }
+
+    fn group(&self, g: usize) -> ((usize, usize), (usize, usize)) {
+        if self.buckets_per_shard > 1 {
+            let lo = g * self.buckets_per_shard;
+            (
+                (g, g + 1),
+                (lo, (lo + self.buckets_per_shard).min(self.n_buckets)),
+            )
+        } else {
+            (self.bucket_shards(g), (g, g + 1))
+        }
     }
 
     #[inline]
@@ -421,6 +509,68 @@ impl Bucket {
         }
     }
 
+    /// [`Self::push`] for a run of one row's nonzeros, `cols[k]` / `vals[k]`,
+    /// returning how many it took.
+    ///
+    /// Takes records up to and including the one that brings `cur` to
+    /// `block_bytes` — exactly where [`Self::push`]'s caller would seal — so a
+    /// caller that seals whenever `cur.len() >= block_bytes` after each call
+    /// produces the same bytes, in the same blocks, as one record at a time.
+    /// The difference is one resize per run instead of four `extend`s per
+    /// record, which is what made the per-record path the parallel push's
+    /// bottleneck.
+    #[cfg(feature = "parallel")]
+    #[inline]
+    fn push_run(&mut self, row: u32, cols: &[i32], vals: &[f32], block_bytes: usize) -> usize {
+        debug_assert!(!cols.is_empty() && cols.len() == vals.len());
+        if self.open.is_none() || self.last_row != Some(row) {
+            self.close_row();
+            let at = self.cur.len();
+            self.cur.extend_from_slice(&row.to_le_bytes());
+            self.cur.extend_from_slice(&0u32.to_le_bytes());
+            self.open = Some((at, 0));
+            self.last_row = Some(row);
+        }
+        // Records until the one that reaches `block_bytes`; at least one,
+        // since the seal test only ever runs after a record.
+        let room = block_bytes.saturating_sub(self.cur.len());
+        let take = cols.len().min(room.div_ceil(SPILL_BYTES_PER_NNZ).max(1));
+        let old = self.cur.len();
+        self.cur.resize(old + take * SPILL_BYTES_PER_NNZ, 0);
+        for ((rec, &col), &val) in self.cur[old..]
+            .as_chunks_mut::<SPILL_BYTES_PER_NNZ>()
+            .0
+            .iter_mut()
+            .zip(&cols[..take])
+            .zip(&vals[..take])
+        {
+            rec[..4].copy_from_slice(&(col as u32).to_le_bytes());
+            rec[4..].copy_from_slice(&val.to_le_bytes());
+        }
+        if let Some((_, n)) = self.open.as_mut() {
+            *n += take as u32;
+        }
+        take
+    }
+
+    /// Seal the open block and start a fresh one of `block_capacity`, closing
+    /// the row block first so every byte handed to the store holds whole row
+    /// blocks and no count field is patched after it has left. Returns the
+    /// capacity the sealed block is charged at.
+    ///
+    /// Charges what was actually allocated, not `block_capacity`. The two are
+    /// equal for canonical input, and sealing inside the row keeps them close
+    /// even for duplicate-bearing input, but a single row block whose
+    /// header-plus-payload exceeds the reserve can still grow the vec once.
+    fn seal(&mut self, block_capacity: usize) -> usize {
+        self.close_row();
+        let sealed = std::mem::replace(&mut self.cur, Vec::with_capacity(block_capacity));
+        let grew = sealed.capacity();
+        self.sealed_bytes += grew;
+        self.sealed.push(sealed);
+        grew
+    }
+
     /// Patch the open row block's count. A block with `n == 0` is never
     /// written: a row that contributes nothing to this bucket must cost
     /// nothing, which is precisely why the row is an explicit field rather
@@ -458,7 +608,17 @@ pub struct CscBuilder {
     nnz: u64,
     in_memory_bytes: usize,
     peak_in_memory_bytes: usize,
+    /// Shards with fewer nonzeros than this are pushed serially; see
+    /// [`PARALLEL_PUSH_MIN_NNZ`]. A field rather than the constant so the
+    /// tests can force either path on the same input.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    parallel_min_nnz: usize,
 }
+
+/// Below this many nonzeros a shard is routed serially: the parallel push
+/// scans every row once per bucket, which on a small shard costs more in
+/// task overhead than it saves.
+pub const PARALLEL_PUSH_MIN_NNZ: usize = 1 << 16;
 
 impl CscBuilder {
     pub fn new(
@@ -502,6 +662,7 @@ impl CscBuilder {
             nnz: 0,
             in_memory_bytes,
             peak_in_memory_bytes: in_memory_bytes,
+            parallel_min_nnz: PARALLEL_PUSH_MIN_NNZ,
         })
     }
 
@@ -554,6 +715,16 @@ impl CscBuilder {
         }
         let n_shard_rows = csr.n_rows();
         if n_shard_rows == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "parallel")]
+        if self.layout.n_buckets > 1
+            && csr.nnz() >= self.parallel_min_nnz
+            && rows_route_by_search(csr, self.n_cols)
+        {
+            self.push_shard_parallel(csr)?;
+            self.rows_pushed += n_shard_rows as u64;
+            self.nnz += csr.nnz() as u64;
             return Ok(());
         }
         // A shard whose columns all lie outside `[0, n_cols)` cannot happen on
@@ -612,21 +783,9 @@ impl CscBuilder {
     /// handed to the store holds whole row blocks and no count field is
     /// patched after it has left.
     fn seal_bucket(&mut self, i: usize) {
-        let bucket = &mut self.buckets[i];
-        bucket.close_row();
-        let sealed = std::mem::take(&mut bucket.cur);
-        // Charge what was actually allocated, not `block_capacity`. The two
-        // are equal for canonical input, and `push_shard`'s seal-inside-the-row
-        // keeps them close even for duplicate-bearing input, but a single row
-        // block whose header-plus-payload exceeds the reserve can still grow
-        // the vec once.
-        let grew = sealed.capacity();
-        bucket.sealed_bytes += grew;
-        bucket.sealed.push(sealed);
-        bucket.cur = Vec::with_capacity(self.block_capacity);
         // The retained block keeps its real capacity and a fresh one replaces
         // it, so the bucket's cost rises by exactly the retained block.
-        self.in_memory_bytes += grew;
+        self.in_memory_bytes += self.buckets[i].seal(self.block_capacity);
     }
 
     /// Spill sealed blocks, largest bucket first, until the staged total is
@@ -669,13 +828,118 @@ impl CscBuilder {
                     budget: self.cfg.spill_after_bytes,
                 });
             }
-            for block in std::mem::take(&mut self.buckets[v].sealed) {
-                self.store.append(v, &block)?;
-            }
+            self.store
+                .append_all(v, &std::mem::take(&mut self.buckets[v].sealed))?;
             self.buckets[v].sealed_bytes = 0;
             self.in_memory_bytes -= freed;
         }
         Ok(())
+    }
+
+    /// [`Self::push_shard`]'s routing, one task per bucket.
+    ///
+    /// # Same bytes
+    ///
+    /// Each task walks every row of the shard in order and copies the row's
+    /// entries in its bucket's column range, found by binary search — which is
+    /// why [`rows_route_by_search`] must hold. A bucket therefore receives
+    /// exactly the records, in exactly the order, the serial scan gives it, and
+    /// it seals at the same records, because the seal test is the bucket's own
+    /// block length. Everything a bucket holds is thus identical; what differs
+    /// is only *when* sealed blocks go to the store, and a spill never changes
+    /// the emitted bytes (the drain reads a bucket's spill stream, then its
+    /// sealed blocks, then `cur`, and every spill takes a prefix of them).
+    ///
+    /// # Same bound
+    ///
+    /// The serial push spills the *largest* bucket at the seal that crossed
+    /// the ceiling. Buckets here are owned by different tasks, so a task
+    /// that crosses the ceiling spills its **own** sealed blocks instead —
+    /// always including the one it just sealed. Every byte over the ceiling
+    /// is then a block some task has sealed and is about to spill, at most
+    /// one per bucket at any instant, which is inside the
+    /// `2 * n_buckets * block_capacity` slack [`CscBuilderConfig`] declares
+    /// (the other `n_buckets` blocks being the live `cur` ones). The victim
+    /// choice moves which bytes reach disk, never how many may stay in RAM.
+    #[cfg(feature = "parallel")]
+    fn push_shard_parallel(&mut self, csr: &ScxCsr) -> Result<(), CscBuilderError> {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        // `n_rows <= i32::MAX` was checked at construction, so no global row
+        // overflows `u32`.
+        let base = self.rows_pushed as u32;
+        let n_rows = csr.n_rows();
+        let n_cols = self.n_cols;
+        let n_buckets = self.layout.n_buckets;
+        let bucket_cols = self.layout.bucket_cols;
+        let block_bytes = self.cfg.block_bytes.max(1);
+        let block_capacity = self.block_capacity;
+        let ceiling = self.cfg.spill_after_bytes;
+        let in_memory = AtomicUsize::new(self.in_memory_bytes);
+        let peak = AtomicUsize::new(self.peak_in_memory_bytes);
+        let store = Mutex::new(std::mem::replace(&mut self.store, Box::new(NoSpillStore)));
+        // `bucket_of` clamps to the last bucket, and `Layout::plan` sizes the
+        // bucket count so the last one's range ends at or past `n_cols`; the
+        // `bucket_cols`-wide chunks of `col_counts` are therefore exactly the
+        // buckets' column ranges.
+        debug_assert_eq!(n_cols.div_ceil(bucket_cols), n_buckets);
+
+        let result = self
+            .buckets
+            .par_iter_mut()
+            .zip(self.col_counts.par_chunks_mut(bucket_cols))
+            .enumerate()
+            .try_for_each(|(b, (bucket, counts))| -> Result<(), CscBuilderError> {
+                let lo = b * bucket_cols;
+                let hi = if b + 1 == n_buckets {
+                    n_cols
+                } else {
+                    lo + bucket_cols
+                };
+                for row in 0..n_rows {
+                    let start = csr.indptr[row] as usize;
+                    let end = csr.indptr[row + 1] as usize;
+                    let idx = &csr.indices[start..end];
+                    let a = start + idx.partition_point(|&c| (c as usize) < lo);
+                    let z = start + idx.partition_point(|&c| (c as usize) < hi);
+                    for &col in &csr.indices[a..z] {
+                        counts[col as usize - lo] += 1;
+                    }
+                    let mut j = a;
+                    while j < z {
+                        j += bucket.push_run(
+                            base + row as u32,
+                            &csr.indices[j..z],
+                            &csr.data[j..z],
+                            block_bytes,
+                        );
+                        if bucket.cur.len() < block_bytes {
+                            continue;
+                        }
+                        let grew = bucket.seal(block_capacity);
+                        let now = in_memory.fetch_add(grew, Ordering::Relaxed) + grew;
+                        peak.fetch_max(now, Ordering::Relaxed);
+                        if now <= ceiling {
+                            continue;
+                        }
+                        let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+                        if !store.can_spill() {
+                            return Err(CscBuilderError::SpillRefused { budget: ceiling });
+                        }
+                        store.append_all(b, &std::mem::take(&mut bucket.sealed))?;
+                        in_memory.fetch_sub(bucket.sealed_bytes, Ordering::Relaxed);
+                        bucket.sealed_bytes = 0;
+                    }
+                }
+                Ok(())
+            });
+
+        self.store = store.into_inner().unwrap_or_else(|p| p.into_inner());
+        self.in_memory_bytes = in_memory.into_inner();
+        self.peak_in_memory_bytes = peak.into_inner();
+        result
     }
 
     pub fn finish(mut self) -> Result<CscEmitter, CscBuilderError> {
@@ -711,7 +975,7 @@ impl CscBuilder {
             buckets: self.buckets,
             col_counts: self.col_counts,
             plan,
-            next_bucket: 0,
+            next_group: 0,
             pending: VecDeque::new(),
             stats: CscBuilderStats {
                 nnz: self.nnz,
@@ -722,6 +986,32 @@ impl CscBuilder {
             },
         })
     }
+}
+
+/// Whether every row of `csr` can be routed by binary search: indices
+/// non-decreasing within each row and inside `[0, n_cols)`.
+///
+/// Canonical CSR always passes. A row with unsorted indices, or an index out
+/// of range, sends the whole shard down the serial path, which routes in `j`
+/// order and reports the out-of-range column exactly as it always has.
+/// Non-decreasing rather than strictly increasing: a duplicate `(row, col)` is
+/// adjacent in a sorted row, so a search keeps both copies in `j` order, as
+/// the serial scan does.
+#[cfg(feature = "parallel")]
+fn rows_route_by_search(csr: &ScxCsr, n_cols: usize) -> bool {
+    use rayon::prelude::*;
+    (0..csr.n_rows())
+        .into_par_iter()
+        .with_min_len(1024)
+        .all(|row| {
+            let idx = &csr.indices[csr.indptr[row] as usize..csr.indptr[row + 1] as usize];
+            match (idx.first(), idx.last()) {
+                (Some(&first), Some(&last)) => {
+                    first >= 0 && (last as usize) < n_cols && idx.windows(2).all(|w| w[0] <= w[1])
+                }
+                _ => true,
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +1053,23 @@ pub trait CscShardSource {
         indices: &mut Vec<u32>,
         data: &mut Vec<f32>,
     ) -> Result<Option<u64>, CscBuilderError>;
+
+    /// The next shards, up to `max_nnz` nonzeros of them — always at least
+    /// one while any remain, empty once drained. A source that cannot build
+    /// ahead cheaply yields one at a time, which is this default.
+    fn next_batch(&mut self, max_nnz: u64) -> Result<Vec<CscShardArrays>, CscBuilderError> {
+        let _ = max_nnz;
+        let mut a = CscShardArrays::default();
+        Ok(
+            match self.next_shard_into(&mut a.indptr, &mut a.indices, &mut a.data)? {
+                Some(col_start) => {
+                    a.col_start = col_start;
+                    vec![a]
+                }
+                None => Vec::new(),
+            },
+        )
+    }
 
     fn stats(&self) -> CscBuilderStats;
 }
@@ -917,12 +1224,13 @@ impl CscShardSource for ResidentCscSource<'_> {
 // Emitter
 // ---------------------------------------------------------------------------
 
-/// One built shard, at on-disk widths.
-struct Built {
-    col_start: u64,
-    indptr: Vec<u64>,
-    indices: Vec<u32>,
-    data: Vec<f32>,
+/// One emitted CSC shard, at on-disk widths.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CscShardArrays {
+    pub col_start: u64,
+    pub indptr: Vec<u64>,
+    pub indices: Vec<u32>,
+    pub data: Vec<f32>,
 }
 
 pub struct CscEmitter {
@@ -933,8 +1241,8 @@ pub struct CscEmitter {
     buckets: Vec<Bucket>,
     col_counts: Vec<u64>,
     plan: Vec<CscShardSpec>,
-    next_bucket: usize,
-    pending: VecDeque<Built>,
+    next_group: usize,
+    pending: VecDeque<CscShardArrays>,
     stats: CscBuilderStats,
 }
 
@@ -960,11 +1268,10 @@ impl CscEmitter {
         data: &mut Vec<f32>,
     ) -> Result<Option<u64>, CscBuilderError> {
         while self.pending.is_empty() {
-            if self.next_bucket >= self.layout.n_buckets {
+            if self.next_group >= self.layout.n_groups() {
                 return Ok(None);
             }
-            self.build_bucket(self.next_bucket)?;
-            self.next_bucket += 1;
+            self.build_groups(1)?;
         }
         let built = self.pending.pop_front().expect("non-empty");
         *indptr = built.indptr;
@@ -973,158 +1280,79 @@ impl CscEmitter {
         Ok(Some(built.col_start))
     }
 
-    /// Build every shard bucket `b` covers, in one pass over its records.
+    /// The next shards, up to `max_nnz` nonzeros of them (always at least one
+    /// group's worth), built in parallel; empty once the plan is drained.
     ///
-    /// One pass rather than one per shard: each shard's columns are a disjoint
-    /// slice of the bucket's range, so a single walk fills them all without any
-    /// re-read of the spill.
-    fn build_bucket(&mut self, b: usize) -> Result<(), CscBuilderError> {
-        let (shard_lo, shard_hi) = self.layout.bucket_shards(b);
-        if shard_lo >= shard_hi {
-            return Ok(());
-        }
-        let bucket_col_lo = self.plan[shard_lo].col_start;
-        let bucket_col_hi = self.plan[shard_hi - 1].col_end;
-
-        // One prefix sum per shard, from counts that are already exact.
-        let mut built: Vec<Built> = Vec::with_capacity(shard_hi - shard_lo);
-        for s in shard_lo..shard_hi {
-            let spec = self.plan[s];
-            let width = spec.col_end - spec.col_start;
-            let mut indptr = Vec::with_capacity(width + 1);
-            indptr.push(0u64);
-            let mut cumsum = 0u64;
-            for c in spec.col_start..spec.col_end {
-                cumsum += self.col_counts[c];
-                indptr.push(cumsum);
-            }
-            let nnz = cumsum as usize;
-            built.push(Built {
-                col_start: spec.col_start as u64,
-                indptr,
-                indices: vec![0u32; nnz],
-                data: vec![0.0f32; nnz],
-            });
-        }
-        // Per-column write cursors, flat across the whole bucket range.
-        let mut cursor = vec![0u64; bucket_col_hi - bucket_col_lo];
-        let shard_cols = self.layout.shard_cols;
-        // The widest row block this bucket's writer could have produced: one
-        // record per column it owns. A duplicate-bearing source row can exceed
-        // it, so allow the whole bucket's nnz as the ceiling rather than the
-        // column count — the point is to reject a corrupt length, not to
-        // second-guess a legal one.
-        let max_records = self.plan[shard_lo..shard_hi]
-            .iter()
-            .map(|s| s.nnz)
-            .sum::<u64>()
-            .max(1) as usize;
-
-        {
-            let plan = &self.plan;
-            let built = &mut built;
-            let cursor = &mut cursor;
-            let mut scatter = |row: u32, payload: &[u8]| -> Result<(), CscBuilderError> {
-                let (recs, tail) = payload.as_chunks::<SPILL_BYTES_PER_NNZ>();
-                debug_assert!(tail.is_empty(), "a row block's payload is 8 B per nonzero");
-                for rec in recs {
-                    let col = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
-                    let val = f32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
-                    // Fail at the FIRST bad record rather than noting it and
-                    // reading on. Recording the column and returning from this
-                    // one block left `drain_bucket` walking the rest, so a
-                    // later record — or two individually legal blocks whose
-                    // totals exceed the planned slots — could index past
-                    // `indices` and panic before the note was ever inspected.
-                    if col < bucket_col_lo || col >= bucket_col_hi {
-                        return Err(CscBuilderError::SpillCorrupt {
-                            bucket: b,
-                            detail: format!(
-                                "column {col} is outside this bucket's range \
-                                 [{bucket_col_lo}, {bucket_col_hi})"
-                            ),
-                        });
-                    }
-                    // Which shard owns this column. `shard_cols` is uniform, so
-                    // this is a divide, not a search; the `.min` guards the
-                    // `usize::MAX` width the zero-row case produces.
-                    let s = (col / shard_cols).min(plan.len() - 1);
-                    debug_assert!(s >= shard_lo && s < shard_hi);
-                    let target = &mut built[s - shard_lo];
-                    let lc = col - plan[s].col_start;
-                    let flat = col - bucket_col_lo;
-                    let dest = (target.indptr[lc] + cursor[flat]) as usize;
-                    // The planned slot count for this column is exact, so a
-                    // stream carrying more records for it than were counted
-                    // during the push is corrupt — and would otherwise write
-                    // into the next column's slots, or past the end.
-                    if cursor[flat] >= target.indptr[lc + 1] - target.indptr[lc] {
-                        return Err(CscBuilderError::SpillCorrupt {
-                            bucket: b,
-                            detail: format!(
-                                "column {col} carries more records than the {} counted \
-                                 for it during the push",
-                                target.indptr[lc + 1] - target.indptr[lc]
-                            ),
-                        });
-                    }
-                    target.indices[dest] = row;
-                    target.data[dest] = val;
-                    cursor[flat] += 1;
+    /// Whole emit groups (see [`Layout::group`]) are taken while their exact
+    /// planned nnz fits. Groups own disjoint buckets, so they build
+    /// concurrently; the shards come back in column order.
+    pub fn next_batch(&mut self, max_nnz: u64) -> Result<Vec<CscShardArrays>, CscBuilderError> {
+        if self.pending.is_empty() {
+            let n_groups = self.layout.n_groups();
+            let (mut n, mut nnz) = (0usize, 0u64);
+            while self.next_group + n < n_groups {
+                let ((lo, hi), _) = self.layout.group(self.next_group + n);
+                let group_nnz: u64 = self.plan[lo..hi.max(lo)].iter().map(|s| s.nnz).sum();
+                if n > 0 && nnz + group_nnz > max_nnz {
+                    break;
                 }
-                Ok(())
-            };
-            drain_bucket(
-                &*self.store,
-                &mut self.buckets[b],
-                b,
-                max_records,
-                &mut scatter,
-            )?;
+                nnz += group_nnz;
+                n += 1;
+            }
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+            self.build_groups(n)?;
         }
+        Ok(self.pending.drain(..).collect())
+    }
 
-        for (i, t) in built.iter().enumerate() {
-            let s = shard_lo + i;
-            let spec = self.plan[s];
-            debug_assert_eq!(
-                t.indices.len(),
-                spec.nnz as usize,
-                "shard {s} filled {} of {} slots",
-                t.indices.len(),
-                spec.nnz
-            );
-            for lc in 0..(spec.col_end - spec.col_start) {
-                let flat = spec.col_start + lc - bucket_col_lo;
-                debug_assert_eq!(
-                    cursor[flat],
-                    t.indptr[lc + 1] - t.indptr[lc],
-                    "column {} filled {} of {} slots",
-                    spec.col_start + lc,
-                    cursor[flat],
-                    t.indptr[lc + 1] - t.indptr[lc]
-                );
-                let (a, z) = (t.indptr[lc] as usize, t.indptr[lc + 1] as usize);
-                if t.indices[a..z].windows(2).any(|w| w[0] >= w[1]) {
-                    // Reported in BOTH profiles, never panicked in either.
-                    //
-                    // A non-strict column means the *source* carried a
-                    // duplicate `(row, col)`; it is not this builder's bug,
-                    // and `run_build_csc` accepts such input by design. A
-                    // `debug_assert!(false)` here made the contract depend on
-                    // the build profile — panic in debug, silently emit in
-                    // release — which is worse than either. The bytes match
-                    // the predecessor's (both entries, in `j` order) and the
-                    // caller gets the column so it can warn; `validate_csc`
-                    // is what rejects such a sidecar at the GPU.
-                    let col = spec.col_start + lc;
-                    if self.stats.first_non_strict_column.is_none_or(|c| col < c) {
-                        self.stats.first_non_strict_column = Some(col);
-                    }
+    /// Build the next `n` groups into `pending`, concurrently with `parallel`.
+    fn build_groups(&mut self, n: usize) -> Result<(), CscBuilderError> {
+        let first = self.next_group;
+        let ctx = GroupCtx {
+            layout: &self.layout,
+            plan: &self.plan,
+            col_counts: &self.col_counts,
+            store: &*self.store,
+            n_cols: self.n_cols,
+        };
+        // Consecutive groups own consecutive, disjoint bucket ranges.
+        let mut jobs: Vec<(usize, &mut [Bucket])> = Vec::with_capacity(n);
+        let mut rest: &mut [Bucket] = &mut self.buckets;
+        let mut consumed = 0usize;
+        for g in first..first + n {
+            let (_, (lo, hi)) = ctx.layout.group(g);
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(lo - consumed);
+            let (mine, tail) = tail.split_at_mut(hi - lo);
+            rest = tail;
+            consumed = hi;
+            jobs.push((g, mine));
+        }
+        #[cfg(feature = "parallel")]
+        let results: Vec<_> = {
+            use rayon::prelude::*;
+            jobs.into_par_iter()
+                .map(|(g, buckets)| build_group(&ctx, g, buckets))
+                .collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let results: Vec<_> = jobs
+            .into_iter()
+            .map(|(g, buckets)| build_group(&ctx, g, buckets))
+            .collect();
+        // In group order, so the first error — and the pending order — are
+        // what one group at a time would give.
+        for r in results {
+            let (built, first_non_strict) = r?;
+            if let Some(col) = first_non_strict {
+                if self.stats.first_non_strict_column.is_none_or(|c| col < c) {
+                    self.stats.first_non_strict_column = Some(col);
                 }
             }
+            self.pending.extend(built);
         }
-
-        self.pending.extend(built);
+        self.next_group += n;
         Ok(())
     }
 
@@ -1137,6 +1365,179 @@ impl CscEmitter {
     pub fn n_cols(&self) -> usize {
         self.n_cols
     }
+}
+
+/// What every group build of a batch reads.
+struct GroupCtx<'a> {
+    layout: &'a Layout,
+    plan: &'a [CscShardSpec],
+    col_counts: &'a [u64],
+    store: &'a dyn SpillStore,
+    n_cols: usize,
+}
+
+/// Build the shards of emit group `g` (see [`Layout::group`]), in one pass
+/// over each of its buckets' records.
+///
+/// One pass per bucket rather than per shard: a bucket's columns are a
+/// union of contiguous per-shard column ranges, and a contiguous column
+/// range of a CSC shard is a contiguous slice of its `indices` / `data`.
+/// So each bucket owns disjoint slices of the group's shards, which is what
+/// lets a fine group drain its buckets in parallel with no locking and no
+/// change to where any record lands.
+fn build_group(
+    ctx: &GroupCtx<'_>,
+    g: usize,
+    buckets: &mut [Bucket],
+) -> Result<(Vec<CscShardArrays>, Option<usize>), CscBuilderError> {
+    let ((shard_lo, shard_hi), (bucket_lo, bucket_hi)) = ctx.layout.group(g);
+    debug_assert_eq!(buckets.len(), bucket_hi - bucket_lo);
+    if shard_lo >= shard_hi {
+        return Ok((Vec::new(), None));
+    }
+
+    // One prefix sum per shard, from counts that are already exact.
+    let mut built: Vec<CscShardArrays> = Vec::with_capacity(shard_hi - shard_lo);
+    for s in shard_lo..shard_hi {
+        let spec = ctx.plan[s];
+        let width = spec.col_end - spec.col_start;
+        let mut indptr = Vec::with_capacity(width + 1);
+        indptr.push(0u64);
+        let mut cumsum = 0u64;
+        for c in spec.col_start..spec.col_end {
+            cumsum += ctx.col_counts[c];
+            indptr.push(cumsum);
+        }
+        let nnz = cumsum as usize;
+        built.push(CscShardArrays {
+            col_start: spec.col_start as u64,
+            indptr,
+            indices: vec![0u32; nnz],
+            data: vec![0.0f32; nnz],
+        });
+    }
+
+    // Carve every shard's arrays into the per-bucket segments that cover
+    // them. Buckets and shards both run left to right, so each segment is
+    // the front of what is left of its shard.
+    let bucket_cols = ctx.layout.bucket_cols;
+    let n_cols = ctx.n_cols;
+    let mut jobs: Vec<DrainJob<'_>> = Vec::with_capacity(bucket_hi - bucket_lo);
+    {
+        // What is left of each shard, as a segment spanning it whole.
+        let mut rest: Vec<Segment<'_>> = built
+            .iter_mut()
+            .map(|t| Segment {
+                col_lo: t.col_start as usize,
+                indptr: t.indptr.as_slice(),
+                indices: t.indices.as_mut_slice(),
+                data: t.data.as_mut_slice(),
+            })
+            .collect();
+        let group_lo = ctx.plan[shard_lo].col_start;
+        let group_hi = ctx.plan[shard_hi - 1].col_end;
+        for (b, bucket) in (bucket_lo..bucket_hi).zip(buckets.iter_mut()) {
+            let c0 = (b * bucket_cols).max(group_lo);
+            let c1 = if b + 1 == ctx.layout.n_buckets {
+                n_cols
+            } else {
+                ((b + 1) * bucket_cols).min(group_hi)
+            };
+            let mut segments = Vec::new();
+            for shard in rest.iter_mut() {
+                let shard_end = shard.col_lo + shard.indptr.len() - 1;
+                let (lo, hi) = (c0.max(shard.col_lo), c1.min(shard_end));
+                if lo >= hi {
+                    continue;
+                }
+                let (l0, l1) = (lo - shard.col_lo, hi - shard.col_lo);
+                let n = (shard.indptr[l1] - shard.indptr[l0]) as usize;
+                let (ix, ix_rest) = std::mem::take(&mut shard.indices).split_at_mut(n);
+                let (dv, dv_rest) = std::mem::take(&mut shard.data).split_at_mut(n);
+                segments.push(Segment {
+                    col_lo: lo,
+                    indptr: &shard.indptr[l0..=l1],
+                    indices: ix,
+                    data: dv,
+                });
+                // The shard's remainder now starts where this segment ends.
+                shard.col_lo = hi;
+                shard.indptr = &shard.indptr[l1..];
+                shard.indices = ix_rest;
+                shard.data = dv_rest;
+            }
+            jobs.push(DrainJob {
+                index: b,
+                col_lo: c0,
+                col_hi: c1,
+                bucket,
+                segments,
+            });
+        }
+    }
+
+    let store = ctx.store;
+    let shard_cols = ctx.layout.shard_cols;
+    let col_counts = ctx.col_counts;
+    #[cfg(feature = "parallel")]
+    if jobs.len() > 1 {
+        use rayon::prelude::*;
+        jobs.into_par_iter()
+            .try_for_each(|job| job.drain(store, shard_cols, col_counts))?;
+    } else {
+        for job in jobs {
+            job.drain(store, shard_cols, col_counts)?;
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    for job in jobs {
+        job.drain(store, shard_cols, col_counts)?;
+    }
+
+    let mut first_non_strict: Option<usize> = None;
+    for (i, t) in built.iter().enumerate() {
+        let s = shard_lo + i;
+        let spec = ctx.plan[s];
+        debug_assert_eq!(
+            t.indices.len(),
+            spec.nnz as usize,
+            "shard {s} filled {} of {} slots",
+            t.indices.len(),
+            spec.nnz
+        );
+        // Reported in BOTH profiles, never panicked in either.
+        //
+        // A non-strict column means the *source* carried a duplicate
+        // `(row, col)`; it is not this builder's bug, and `run_build_csc`
+        // accepts such input by design. A `debug_assert!(false)` here made
+        // the contract depend on the build profile — panic in debug,
+        // silently emit in release — which is worse than either. The bytes
+        // match the predecessor's (both entries, in `j` order) and the
+        // caller gets the column so it can warn; `validate_csc` is what
+        // rejects such a sidecar at the GPU.
+        let non_strict = |lc: &usize| {
+            let (a, z) = (t.indptr[*lc] as usize, t.indptr[*lc + 1] as usize);
+            t.indices[a..z].windows(2).any(|w| w[0] >= w[1])
+        };
+        let width = spec.col_end - spec.col_start;
+        #[cfg(feature = "parallel")]
+        let first = {
+            use rayon::prelude::*;
+            (0..width)
+                .into_par_iter()
+                .with_min_len(64)
+                .find_first(non_strict)
+        };
+        #[cfg(not(feature = "parallel"))]
+        let first = (0..width).find(non_strict);
+        if let Some(lc) = first {
+            let col = spec.col_start + lc;
+            if first_non_strict.is_none_or(|c| col < c) {
+                first_non_strict = Some(col);
+            }
+        }
+    }
+    Ok((built, first_non_strict))
 }
 
 impl CscShardSource for CscEmitter {
@@ -1154,8 +1555,104 @@ impl CscShardSource for CscEmitter {
     ) -> Result<Option<u64>, CscBuilderError> {
         CscEmitter::next_shard_into(self, indptr, indices, data)
     }
+    fn next_batch(&mut self, max_nnz: u64) -> Result<Vec<CscShardArrays>, CscBuilderError> {
+        CscEmitter::next_batch(self, max_nnz)
+    }
     fn stats(&self) -> CscBuilderStats {
         CscEmitter::stats(self).clone()
+    }
+}
+
+/// A contiguous column range of one shard being built, and the slices of its
+/// arrays that range owns. `indptr` is the shard's own, restricted to the
+/// range, so `indptr[k] - indptr[0]` is an offset into `indices` / `data`.
+struct Segment<'a> {
+    col_lo: usize,
+    indptr: &'a [u64],
+    indices: &'a mut [u32],
+    data: &'a mut [f32],
+}
+
+/// One bucket to drain into the segments it covers.
+struct DrainJob<'a> {
+    index: usize,
+    col_lo: usize,
+    col_hi: usize,
+    bucket: &'a mut Bucket,
+    segments: Vec<Segment<'a>>,
+}
+
+impl DrainJob<'_> {
+    fn drain(
+        mut self,
+        store: &dyn SpillStore,
+        shard_cols: usize,
+        col_counts: &[u64],
+    ) -> Result<(), CscBuilderError> {
+        let (b, col_lo, col_hi) = (self.index, self.col_lo, self.col_hi);
+        // The widest row block this bucket's writer could have produced: one
+        // record per column it owns. A duplicate-bearing source row can exceed
+        // it, so allow the whole bucket's nnz as the ceiling rather than the
+        // column count — the point is to reject a corrupt length, not to
+        // second-guess a legal one.
+        let max_records = col_counts[col_lo..col_hi].iter().sum::<u64>().max(1) as usize;
+        // Per-column write cursors, flat across the bucket's range.
+        let mut cursor = vec![0u64; col_hi - col_lo];
+        // Segments are whole shards (coarse) or one part of one shard (fine),
+        // so a column's segment is its shard's offset from the first one.
+        // `shard_cols` is uniform, so this is a divide, not a search.
+        let first_shard = col_lo / shard_cols;
+        let segments = &mut self.segments;
+        let mut scatter = |row: u32, payload: &[u8]| -> Result<(), CscBuilderError> {
+            let (recs, tail) = payload.as_chunks::<SPILL_BYTES_PER_NNZ>();
+            debug_assert!(tail.is_empty(), "a row block's payload is 8 B per nonzero");
+            for rec in recs {
+                let col = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+                let val = f32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+                // Fail at the FIRST bad record rather than noting it and
+                // reading on. Recording the column and returning from this one
+                // block left `drain_bucket` walking the rest, so a later record
+                // — or two individually legal blocks whose totals exceed the
+                // planned slots — could index past `indices` and panic before
+                // the note was ever inspected.
+                if col < col_lo || col >= col_hi {
+                    return Err(CscBuilderError::SpillCorrupt {
+                        bucket: b,
+                        detail: format!(
+                            "column {col} is outside this bucket's range [{col_lo}, {col_hi})"
+                        ),
+                    });
+                }
+                let seg = &mut segments[col / shard_cols - first_shard];
+                let lc = col - seg.col_lo;
+                let flat = col - col_lo;
+                let slots = seg.indptr[lc + 1] - seg.indptr[lc];
+                // The planned slot count for this column is exact, so a stream
+                // carrying more records for it than were counted during the
+                // push is corrupt — and would otherwise write into the next
+                // column's slots, or past the end.
+                if cursor[flat] >= slots {
+                    return Err(CscBuilderError::SpillCorrupt {
+                        bucket: b,
+                        detail: format!(
+                            "column {col} carries more records than the {slots} counted \
+                             for it during the push"
+                        ),
+                    });
+                }
+                let dest = (seg.indptr[lc] - seg.indptr[0] + cursor[flat]) as usize;
+                seg.indices[dest] = row;
+                seg.data[dest] = val;
+                cursor[flat] += 1;
+            }
+            Ok(())
+        };
+        drain_bucket(store, self.bucket, b, max_records, &mut scatter)?;
+        debug_assert!(
+            (col_lo..col_hi).all(|c| cursor[c - col_lo] == col_counts[c]),
+            "bucket {b} left a column short of its counted slots"
+        );
+        Ok(())
     }
 }
 

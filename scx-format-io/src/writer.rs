@@ -158,6 +158,219 @@ pub struct ScxWriter {
     csc_sink_closed: bool,
 }
 
+/// One CSC shard ready for [`ScxWriter::write_csc_shards`]: its first column,
+/// and its arrays at on-disk widths with the values already encoded.
+#[derive(Debug, Clone, Default)]
+pub struct CscShardBytes {
+    pub col_start: u64,
+    pub indptr: Vec<u64>,
+    pub indices: Vec<u32>,
+    pub values: Vec<u8>,
+}
+
+/// See [`ScxWriter::shard_encode_context`].
+#[derive(Debug, Clone, Copy)]
+struct ShardEncodeContext {
+    section_type: SectionType,
+    shard_n_minor: u64,
+    framing: Option<crate::encoder::FramingConfig>,
+}
+
+/// A shard section encoded by [`encode_shard_section`], not yet written.
+struct EncodedShardSection {
+    header: ShardHeader,
+    header_buf: Vec<u8>,
+    encoded: scx_codec::EncodedShard,
+    block_index_bytes: Vec<u8>,
+    section_checksum: [u8; 32],
+    section_length: u64,
+    stats: ShardStats,
+    section_type: SectionType,
+}
+
+/// Encode one sparse shard section: codec streams, block index, shard header,
+/// both checksums and the catalog stats. Pure — it reads nothing off the
+/// writer but `ctx` — so a batch of these can run in parallel and still
+/// commit the bytes [`ScxWriter::write_shard_inner`] would have written.
+fn encode_shard_section(
+    ctx: &ShardEncodeContext,
+    shard: ShardBuffers<'_>,
+    row_start: u64,
+) -> Result<EncodedShardSection> {
+    let section_type = ctx.section_type;
+    let indptr = shard.indptr;
+    let indices = shard.indices;
+    let values = shard.values;
+    let codec_id = shard.codec_id;
+    let value_encoding = shard.value_encoding;
+    if indptr.is_empty() {
+        return Err(ScxError::EmptyIndptr);
+    }
+    let n_major = (indptr.len() - 1) as u32;
+    let nnz = *indptr.last().unwrap_or(&0);
+
+    // One rule, one implementation: see `Self::shard_n_minor`, which this
+    // function used to spell out three separate times. The index width is
+    // derived from the extent right here rather than through a second
+    // accessor that would recompute it: `0` = u16 indices, `1` = u32. The
+    // file-level `header.index_dtype` is set at creation from `n_vars` and
+    // is CSR-correct, so using it for a CSC shard breaks files with
+    // `n_obs > 65535` and `n_vars <= 65535` (census_500k / census_1m); the
+    // per-shard field is what the reader trusts (`sh.index_dtype == 0`), so
+    // widening to u32 on a CSC shard is read-correct even when the file
+    // header says u16.
+    let shard_n_minor = ctx.shard_n_minor;
+    let index_dtype_u16 = shard_n_minor.saturating_sub(1) <= u16::MAX as u64;
+    let shard_index_dtype: u8 = if index_dtype_u16 { 0 } else { 1 };
+
+    // Encode the shard data. When row-group framing is enabled on the writer
+    // (F5-b), every sparse shard funneling through here — CSC sidecars,
+    // layers, obsp — is emitted row-group-framed (shard v2) for
+    // codec-agnostic sub-shard random access; else the monolithic layout
+    // (shard v1, byte-identical to legacy).
+    //
+    // `codec_id` is the caller's *candidate*. When `ctx.framing` carries a
+    // `decode_target` (`auto`/`compact`) or `trial`, an integer shard is
+    // dual-encoded against ShufDeltaZstd and `chosen_codec` may differ — see
+    // `encode_shard_adaptive`. Before that call existed this path ignored
+    // both fields, so every shard written through here (layers, the CSC
+    // sidecar, multimodal X) silently got the `fast` heuristic even when the
+    // caller asked for `auto`.
+    let (encoded, block_index, shard_version, chosen_codec) =
+        crate::encoder::encode_shard_adaptive(
+            indptr,
+            indices,
+            values,
+            codec_id,
+            value_encoding,
+            index_dtype_u16,
+            ctx.framing,
+        )?;
+    let mut block_index_bytes = Vec::new();
+    block_index.write_to(&mut block_index_bytes)?;
+
+    // Compute shard-level checksum: streaming blake3 of (indptr + indices + values + block_index), truncated to 8 bytes
+    let mut shard_hasher = blake3::Hasher::new();
+    shard_hasher.update(&encoded.indptr_bytes);
+    shard_hasher.update(&encoded.indices_bytes);
+    shard_hasher.update(&encoded.values_bytes);
+    shard_hasher.update(&block_index_bytes);
+    let shard_hash = shard_hasher.finalize();
+    let mut shard_checksum = [0u8; 8];
+    shard_checksum.copy_from_slice(&shard_hash.as_bytes()[..8]);
+
+    // Build shard header with relative offsets. u32 fields; fail loud on a
+    // >4 GiB sub-stream / cumulative offset instead of silently wrapping (F-c).
+    let len_u32 = |n: usize, what: &str| -> Result<u32> {
+        u32::try_from(n).map_err(|_| {
+            ScxError::ShardStreamTooLarge(format!("{what} length {n} exceeds u32::MAX"))
+        })
+    };
+    let add_u32 = |a: u32, b: u32, what: &str| -> Result<u32> {
+        a.checked_add(b).ok_or_else(|| {
+            ScxError::ShardStreamTooLarge(format!("{what} relative offset exceeds u32::MAX"))
+        })
+    };
+    let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
+    let indptr_length = len_u32(encoded.indptr_bytes.len(), "indptr")?;
+    let indices_rel_offset = add_u32(indptr_rel_offset, indptr_length, "indices")?;
+    let indices_length = len_u32(encoded.indices_bytes.len(), "indices")?;
+    let values_rel_offset = add_u32(indices_rel_offset, indices_length, "values")?;
+    let values_length = len_u32(encoded.values_bytes.len(), "values")?;
+    let block_index_rel_offset = add_u32(values_rel_offset, values_length, "block_index")?;
+    let block_index_length = len_u32(block_index_bytes.len(), "block_index")?;
+
+    let shard_header = ShardHeader {
+        magic: crate::shard::SHARD_MAGIC,
+        shard_format_version: shard_version,
+        shard_type: derive_shard_type(section_type),
+        // The adaptively-chosen codec, NOT the caller's candidate — the
+        // reader dispatches on this byte.
+        codec_id: chosen_codec as u8,
+        value_encoding: value_encoding as u8,
+        index_dtype: shard_index_dtype,
+        reserved_flags: [0; 3],
+        n_major,
+        n_minor: {
+            if shard_n_minor > u32::MAX as u64 {
+                return Err(ScxError::NVarsOverflow(shard_n_minor));
+            }
+            shard_n_minor as u32
+        },
+        nnz,
+        global_offset: row_start,
+        indptr_rel_offset,
+        indptr_length,
+        indices_rel_offset,
+        indices_length,
+        values_rel_offset,
+        values_length,
+        block_index_rel_offset,
+        block_index_length,
+        checksum: shard_checksum,
+    };
+
+    // Serialize shard header to buffer
+    let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
+    shard_header.write_to(&mut header_buf)?;
+
+    // Full 32-byte section checksum over exactly the bytes the commit
+    // writes, in the order it writes them.
+    let mut section_hasher = blake3::Hasher::new();
+    section_hasher.update(&header_buf);
+    section_hasher.update(&encoded.indptr_bytes);
+    section_hasher.update(&encoded.indices_bytes);
+    section_hasher.update(&encoded.values_bytes);
+    section_hasher.update(&block_index_bytes);
+    let section_checksum = *section_hasher.finalize().as_bytes();
+    let section_length = (header_buf.len()
+        + encoded.indptr_bytes.len()
+        + encoded.indices_bytes.len()
+        + encoded.values_bytes.len()
+        + block_index_bytes.len()) as u64;
+
+    // Compute shard stats from raw values. Dispatch on section
+    // type: column-major shards use the column-major axis (the
+    // file-wide `n_obs` is the unbound row range, shared across
+    // modalities), all others use the row-major axis with the
+    // per-modality column extent resolved at the top of this
+    // function. `row_start` here is interpreted on the major axis —
+    // for column-major paths it carries `col_start` (see
+    // `write_csc_shard`, which passes its `col_start` argument as
+    // the inner `row_start`).
+    //
+    // `is_column_major` rather than a bare `CscShard` arm: `LayerCscShard`
+    // is a CSC sidecar too, and matching only `CscShard` wrote its stats on
+    // the row axis while the readers looked for them on the column axis.
+    // The extent itself comes from `shard_n_minor`, which encodes the same
+    // distinction once.
+    let major_kind = if crate::shard::is_column_major(section_type) {
+        MajorAxis::Col
+    } else {
+        MajorAxis::Row
+    };
+    let n_minor = shard_n_minor;
+    let stats = compute_shard_stats(
+        values,
+        value_encoding,
+        major_kind,
+        row_start,
+        n_major as u64,
+        n_minor,
+        nnz,
+    );
+    Ok(EncodedShardSection {
+        header: shard_header,
+        header_buf,
+        encoded,
+        block_index_bytes,
+        section_checksum,
+        section_length,
+        stats,
+        section_type,
+    })
+}
+
 /// Output of parallel shard encoding, ready for sequential write.
 ///
 /// Contains all bytes and metadata needed to write a complete shard section
@@ -1127,7 +1340,23 @@ impl ScxWriter {
         self.write_shard_inner(shard, row_start, &name, SectionType::ObspCsrShard)
     }
 
+    /// What [`encode_shard_section`] reads off the writer for a shard of
+    /// `section_type`: fixed across a batch of shards of one type, which is
+    /// what lets the batch encode run off the writer.
+    fn shard_encode_context(&self, section_type: SectionType) -> ShardEncodeContext {
+        ShardEncodeContext {
+            section_type,
+            shard_n_minor: self.shard_n_minor(section_type),
+            framing: self.framing,
+        }
+    }
+
     /// Core shard writing logic shared by write_csr_shard, write_layer_csr_shard, write_obsp_shard.
+    ///
+    /// The encode is [`encode_shard_section`] and the write is
+    /// [`Self::commit_shard_section`]; [`Self::write_csc_shards`] runs the same
+    /// two for a batch, which is what keeps a batch-encoded shard byte-identical
+    /// to one written here.
     fn write_shard_inner(
         &mut self,
         shard: ShardBuffers<'_>,
@@ -1135,220 +1364,114 @@ impl ScxWriter {
         name: &str,
         section_type: SectionType,
     ) -> Result<()> {
-        let indptr = shard.indptr;
-        let indices = shard.indices;
-        let values = shard.values;
-        let codec_id = shard.codec_id;
-        let value_encoding = shard.value_encoding;
         self.guard_x_write_after_csc_emit(section_type)?;
         // Any CSC sidecar shard (X or layer, single- or multi-modality)
-        // funnels through here, so this is the one place to record that
-        // the sidecar was built against the current `data_generation`.
-        // `finish()` stamps it into `FullCatalog::csc_build_generation`;
-        // the reader rejects a sidecar whose recorded generation does not
-        // match `data_generation` (staleness guard). Mutating ops that
-        // drop CSC never reach this branch, so the field stays `0`.
+        // funnels through here or `write_csc_shards`, so these are the places
+        // to record that the sidecar was built against the current
+        // `data_generation`. `finish()` stamps it into
+        // `FullCatalog::csc_build_generation`; the reader rejects a sidecar
+        // whose recorded generation does not match `data_generation`
+        // (staleness guard). Mutating ops that drop CSC never reach this
+        // branch, so the field stays `0`.
         if crate::shard::is_column_major(section_type) {
             self.csc_build_generation = Some(self.data_generation);
         }
-
-        self.write_padding()?;
-
-        let shard_global_offset = self.current_offset;
-        if indptr.is_empty() {
-            return Err(ScxError::EmptyIndptr);
+        let ctx = self.shard_encode_context(section_type);
+        let section = encode_shard_section(&ctx, shard, row_start)?;
+        let (header, value_max) = (section.header.clone(), section.stats.value_max);
+        self.commit_shard_section(section, name)?;
+        if section_type == SectionType::CsrShard {
+            if let Some(sink) = self.csc_sink.as_mut() {
+                sink.push_buffers(
+                    &header,
+                    Some(value_max),
+                    shard.indptr,
+                    shard.indices,
+                    shard.values,
+                )?;
+            }
         }
-        let n_major = (indptr.len() - 1) as u32;
-        let nnz = *indptr.last().unwrap_or(&0);
+        Ok(())
+    }
 
-        // One rule, one implementation: see `Self::shard_n_minor`, which this
-        // function used to spell out three separate times. The index width is
-        // derived from the extent right here rather than through a second
-        // accessor that would recompute it: `0` = u16 indices, `1` = u32. The
-        // file-level `header.index_dtype` is set at creation from `n_vars` and
-        // is CSR-correct, so using it for a CSC shard breaks files with
-        // `n_obs > 65535` and `n_vars <= 65535` (census_500k / census_1m); the
-        // per-shard field is what the reader trusts (`sh.index_dtype == 0`), so
-        // widening to u32 on a CSC shard is read-correct even when the file
-        // header says u16.
-        let shard_n_minor = self.shard_n_minor(section_type);
-        let index_dtype_u16 = shard_n_minor.saturating_sub(1) <= u16::MAX as u64;
-        let shard_index_dtype: u8 = if index_dtype_u16 { 0 } else { 1 };
-
-        // Encode the shard data. When row-group framing is enabled on the writer
-        // (F5-b), every sparse shard funneling through here — CSC sidecars,
-        // layers, obsp — is emitted row-group-framed (shard v2) for
-        // codec-agnostic sub-shard random access; else the monolithic layout
-        // (shard v1, byte-identical to legacy).
-        //
-        // `codec_id` is the caller's *candidate*. When `self.framing` carries a
-        // `decode_target` (`auto`/`compact`) or `trial`, an integer shard is
-        // dual-encoded against ShufDeltaZstd and `chosen_codec` may differ — see
-        // `encode_shard_adaptive`. Before that call existed this path ignored
-        // both fields, so every shard written through here (layers, the CSC
-        // sidecar, multimodal X) silently got the `fast` heuristic even when the
-        // caller asked for `auto`.
-        let (encoded, block_index, shard_version, chosen_codec) =
-            crate::encoder::encode_shard_adaptive(
-                indptr,
-                indices,
-                values,
-                codec_id,
-                value_encoding,
-                index_dtype_u16,
-                self.framing,
-            )?;
-        let mut block_index_bytes = Vec::new();
-        block_index.write_to(&mut block_index_bytes)?;
-
-        // Compute shard-level checksum: streaming blake3 of (indptr + indices + values + block_index), truncated to 8 bytes
-        let mut shard_hasher = blake3::Hasher::new();
-        shard_hasher.update(&encoded.indptr_bytes);
-        shard_hasher.update(&encoded.indices_bytes);
-        shard_hasher.update(&encoded.values_bytes);
-        shard_hasher.update(&block_index_bytes);
-        let shard_hash = shard_hasher.finalize();
-        let mut shard_checksum = [0u8; 8];
-        shard_checksum.copy_from_slice(&shard_hash.as_bytes()[..8]);
-
-        // Build shard header with relative offsets. u32 fields; fail loud on a
-        // >4 GiB sub-stream / cumulative offset instead of silently wrapping (F-c).
-        let len_u32 = |n: usize, what: &str| -> Result<u32> {
-            u32::try_from(n).map_err(|_| {
-                ScxError::ShardStreamTooLarge(format!("{what} length {n} exceeds u32::MAX"))
-            })
-        };
-        let add_u32 = |a: u32, b: u32, what: &str| -> Result<u32> {
-            a.checked_add(b).ok_or_else(|| {
-                ScxError::ShardStreamTooLarge(format!("{what} relative offset exceeds u32::MAX"))
-            })
-        };
-        let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-        let indptr_length = len_u32(encoded.indptr_bytes.len(), "indptr")?;
-        let indices_rel_offset = add_u32(indptr_rel_offset, indptr_length, "indices")?;
-        let indices_length = len_u32(encoded.indices_bytes.len(), "indices")?;
-        let values_rel_offset = add_u32(indices_rel_offset, indices_length, "values")?;
-        let values_length = len_u32(encoded.values_bytes.len(), "values")?;
-        let block_index_rel_offset = add_u32(values_rel_offset, values_length, "block_index")?;
-        let block_index_length = len_u32(block_index_bytes.len(), "block_index")?;
+    /// Write an encoded section at the cursor and record its catalog entry.
+    fn commit_shard_section(&mut self, section: EncodedShardSection, name: &str) -> Result<()> {
+        self.write_padding()?;
+        let shard_global_offset = self.current_offset;
+        let w = self.writer()?;
+        w.write_all(&section.header_buf)?;
+        w.write_all(&section.encoded.indptr_bytes)?;
+        w.write_all(&section.encoded.indices_bytes)?;
+        w.write_all(&section.encoded.values_bytes)?;
+        w.write_all(&section.block_index_bytes)?;
+        self.current_offset += section.section_length;
 
         // Record the main matrix's first codec for the file-header default.
-        // `chosen_codec`, not the caller's candidate: the candidate may have
-        // been overridden (Scx1 asked for on float data, or an adaptive trial
-        // picking ShufDeltaZstd), and a header naming a codec no shard uses is
-        // exactly the fiction this guards against. See `Self::first_csr_codec`.
-        if matches!(section_type, SectionType::CsrShard) && self.first_csr_codec.is_none() {
-            self.first_csr_codec = Some(chosen_codec as u8);
+        // The header's codec — the adaptively chosen one, not the caller's
+        // candidate: the candidate may have been overridden (Scx1 asked for on
+        // float data, or an adaptive trial picking ShufDeltaZstd), and a
+        // header naming a codec no shard uses is exactly the fiction this
+        // guards against. See `Self::first_csr_codec`.
+        if matches!(section.section_type, SectionType::CsrShard) && self.first_csr_codec.is_none() {
+            self.first_csr_codec = Some(section.header.codec_id);
         }
-
-        let shard_header = ShardHeader {
-            magic: crate::shard::SHARD_MAGIC,
-            shard_format_version: shard_version,
-            shard_type: derive_shard_type(section_type),
-            // The adaptively-chosen codec, NOT the caller's candidate — the
-            // reader dispatches on this byte.
-            codec_id: chosen_codec as u8,
-            value_encoding: value_encoding as u8,
-            index_dtype: shard_index_dtype,
-            reserved_flags: [0; 3],
-            n_major,
-            n_minor: {
-                if shard_n_minor > u32::MAX as u64 {
-                    return Err(ScxError::NVarsOverflow(shard_n_minor));
-                }
-                shard_n_minor as u32
-            },
-            nnz,
-            global_offset: row_start,
-            indptr_rel_offset,
-            indptr_length,
-            indices_rel_offset,
-            indices_length,
-            values_rel_offset,
-            values_length,
-            block_index_rel_offset,
-            block_index_length,
-            checksum: shard_checksum,
-        };
-
-        // Serialize shard header to buffer
-        let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
-        shard_header.write_to(&mut header_buf)?;
-
-        // Compute section-level BLAKE3 (full 32-byte) via streaming hasher — no section_data Vec needed
-        let mut section_hasher = blake3::Hasher::new();
-
-        section_hasher.update(&header_buf);
-        self.writer()?.write_all(&header_buf)?;
-
-        section_hasher.update(&encoded.indptr_bytes);
-        self.writer()?.write_all(&encoded.indptr_bytes)?;
-
-        section_hasher.update(&encoded.indices_bytes);
-        self.writer()?.write_all(&encoded.indices_bytes)?;
-
-        section_hasher.update(&encoded.values_bytes);
-        self.writer()?.write_all(&encoded.values_bytes)?;
-
-        section_hasher.update(&block_index_bytes);
-        self.writer()?.write_all(&block_index_bytes)?;
-
-        let section_checksum = *section_hasher.finalize().as_bytes();
-        let section_length = (header_buf.len()
-            + encoded.indptr_bytes.len()
-            + encoded.indices_bytes.len()
-            + encoded.values_bytes.len()
-            + block_index_bytes.len()) as u64;
-        self.current_offset += section_length;
-
-        // Compute shard stats from raw values. Dispatch on section
-        // type: column-major shards use the column-major axis (the
-        // file-wide `n_obs` is the unbound row range, shared across
-        // modalities), all others use the row-major axis with the
-        // per-modality column extent resolved at the top of this
-        // function. `row_start` here is interpreted on the major axis —
-        // for column-major paths it carries `col_start` (see
-        // `write_csc_shard`, which passes its `col_start` argument as
-        // the inner `row_start`).
-        //
-        // `is_column_major` rather than a bare `CscShard` arm: `LayerCscShard`
-        // is a CSC sidecar too, and matching only `CscShard` wrote its stats on
-        // the row axis while the readers looked for them on the column axis.
-        // The extent itself comes from `shard_n_minor`, which encodes the same
-        // distinction once.
-        let major_kind = if crate::shard::is_column_major(section_type) {
-            MajorAxis::Col
-        } else {
-            MajorAxis::Row
-        };
-        let n_minor = shard_n_minor;
-        let stats = compute_shard_stats(
-            values,
-            value_encoding,
-            major_kind,
-            row_start,
-            n_major as u64,
-            n_minor,
-            nnz,
-        );
-        let value_max = stats.value_max;
 
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
             offset: shard_global_offset,
-            length: section_length,
-            section_type,
-            checksum: section_checksum,
+            length: section.section_length,
+            section_type: section.section_type,
+            checksum: section.section_checksum,
             modality_id: self.current_modality_id,
-            stats: Some(stats),
+            stats: Some(section.stats),
         });
+        Ok(())
+    }
 
-        if section_type == SectionType::CsrShard {
-            if let Some(sink) = self.csc_sink.as_mut() {
-                sink.push_buffers(&shard_header, Some(value_max), indptr, indices, values)?;
-            }
+    /// Write a run of single-modality X CSC shards, encoding them in parallel.
+    ///
+    /// Each entry is `(col_start, indptr, indices, raw value bytes)`, in
+    /// column order and continuing from the shards already written. Bytes,
+    /// names, catalog entries and counters are exactly those of calling
+    /// [`Self::write_csc_shard`] once per entry: the encode is the same
+    /// [`encode_shard_section`] against the same context, only run for all
+    /// entries at once, and the commits are in order.
+    ///
+    /// For the CSC emit, where shards are narrow enough (715 columns at
+    /// census_500k's layout) that one shard's row groups cannot fill the pool
+    /// on their own.
+    pub fn write_csc_shards(
+        &mut self,
+        shards: &[CscShardBytes],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+    ) -> Result<()> {
+        self.guard_x_write_after_csc_emit(SectionType::CscShard)?;
+        if shards.is_empty() {
+            return Ok(());
         }
-
+        self.csc_build_generation = Some(self.data_generation);
+        let ctx = self.shard_encode_context(SectionType::CscShard);
+        let encode = |s: &CscShardBytes| {
+            let shard =
+                ShardBuffers::new(&s.indptr, &s.indices, &s.values, codec_id, value_encoding);
+            encode_shard_section(&ctx, shard, s.col_start)
+        };
+        // `Vec<Result<_>>`, then a sequential collect: the first error in
+        // shard order wins, as it would one shard at a time.
+        #[cfg(feature = "parallel")]
+        let sections: Vec<Result<EncodedShardSection>> = {
+            use rayon::prelude::*;
+            shards.par_iter().map(encode).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let sections: Vec<Result<EncodedShardSection>> = shards.iter().map(encode).collect();
+        let sections = sections.into_iter().collect::<Result<Vec<_>>>()?;
+        for section in sections {
+            let name = format!("X_csc_shard_{}", self.csc_shard_count);
+            self.commit_shard_section(section, &name)?;
+            self.csc_shard_count += 1;
+        }
         Ok(())
     }
 
@@ -2563,6 +2686,8 @@ impl ScxWriter {
                     value_encoding,
                     codec_id: codec,
                     modality_id: Some(modality_id),
+                    // Per-modality shards are written one at a time.
+                    batch_nnz: 0,
                 },
                 |_, _, _| {},
             )?;

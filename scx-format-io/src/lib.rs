@@ -111,6 +111,6 @@ pub use typed_read::{
 pub use writer::{
     assign_csr_shard_column_stats, carry_csr_shard_column_stats, chmod_to_umask,
     clear_all_csr_shard_column_stats, clear_csr_shard_column_stats_for, compute_shard_stats,
-    fsync_parent_dir, make_sibling_tempfile, write_obs_section, DenseShardMetadata, MajorAxis,
-    PreEncodedSection, ScxWriter, ShardBuffers, SECTIONS_START_OFFSET,
+    fsync_parent_dir, make_sibling_tempfile, write_obs_section, CscShardBytes, DenseShardMetadata,
+    MajorAxis, PreEncodedSection, ScxWriter, ShardBuffers, SECTIONS_START_OFFSET,
 };

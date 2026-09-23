@@ -677,9 +677,11 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         // path has no row in this table at all — its peak is the caller's.
         //
         // The builder keeps one running total of staged bucket bytes and
-        // spills the largest bucket whenever a push takes it past exactly this
-        // share, so the resident set is bounded by construction rather than by
-        // an estimate. The realized bound is that share plus
+        // spills whenever a push takes it past exactly this share — the
+        // largest bucket on the serial push, the crossing bucket's own sealed
+        // blocks on the parallel one (`scx-sparse`'s `parallel` feature) — so
+        // the resident set is bounded by construction rather than by an
+        // estimate. The realized bound is that share plus
         // `2 * n_buckets * block_capacity` of block slack, declared on
         // `CscBuilderConfig` and asserted by
         // `staged_bytes_never_exceed_the_declared_bound` rather than hidden.

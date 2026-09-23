@@ -80,6 +80,8 @@ pub(crate) struct CscSink {
     max_int_val: u32,
     first_codec: Option<CodecId>,
     framing: Option<FramingConfig>,
+    /// The builder's `memory_bytes`, which also sizes the emit's batches.
+    memory_bytes: usize,
 }
 
 impl CscSink {
@@ -114,6 +116,7 @@ impl CscSink {
             max_int_val: 0,
             first_codec: None,
             framing: opts.framing,
+            memory_bytes: opts.memory_bytes,
         })
     }
 
@@ -148,7 +151,11 @@ impl CscSink {
         block_index_bytes: &[u8],
     ) -> Result<()> {
         self.note_header(header, value_max)?;
-        let (indptr, indices, data) = crate::shard_decode::decode_shard_regions_scipy(
+        #[cfg(feature = "parallel")]
+        let decode = crate::shard_decode::decode_shard_regions_scipy_parallel;
+        #[cfg(not(feature = "parallel"))]
+        let decode = crate::shard_decode::decode_shard_regions_scipy;
+        let (indptr, indices, data) = decode(
             header,
             indptr_bytes,
             indices_bytes,
@@ -263,6 +270,7 @@ impl CscSink {
                 value_encoding,
                 codec_id,
                 modality_id: None,
+                batch_nnz: crate::csc_budget::csc_emit_batch_nnz(self.memory_bytes as u64),
             },
             framing,
         )))

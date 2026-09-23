@@ -53,6 +53,29 @@ pub const CSC_BUILD_INPUT_SHARE: Share = Share::new(1, 4);
 /// has returned and its decode buffers are dropped before `finish()`.
 pub const CSC_EMIT_SHARE: Share = Share::new(1, 4);
 
+/// Bytes per nonzero an emitted CSC shard holds before its codec encode: the
+/// `u32` row and `f32` value, plus the value-encoded bytes (at most 4). What
+/// the emit charges [`CSC_EMIT_SHARE`] per shard when it batches them.
+///
+/// The encoder's own streams are **not** in it — they are the open term the
+/// allocation table already names on this row — so a batch sized from it is an
+/// estimate, not a bound.
+pub const CSC_EMIT_ARRAY_BYTES_PER_NNZ: u64 = 12;
+
+/// How many nonzeros of built CSC shards one emit batch holds, for an emit
+/// sized from `memory_bytes`: half of [`CSC_EMIT_SHARE`] at
+/// [`CSC_EMIT_ARRAY_BYTES_PER_NNZ`], because two batches are in flight — one
+/// being encoded, the next being built.
+///
+/// Batching is what lets the emit encode several shards concurrently. It
+/// matters because the shard width rule sizes a shard for a dense worst case
+/// (`compute_chunk_cols`, 12 B per potential entry): at census_500k's
+/// 500,000 rows and a 4 GiB budget that is 715 columns, three row groups, so
+/// one shard at a time kept the encoder about three threads wide.
+pub fn csc_emit_batch_nnz(memory_bytes: u64) -> u64 {
+    CSC_EMIT_SHARE.of(memory_bytes) / CSC_EMIT_ARRAY_BYTES_PER_NNZ / 2
+}
+
 /// What a CSC sidecar builder running **beside** other work may keep resident:
 /// its column buckets, when it is fed in the same pass as X
 /// (`ScxWriter::enable_csc_sidecar`) by an op or an ingest that is sizing its
