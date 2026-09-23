@@ -1761,7 +1761,7 @@ impl DrainJob<'_> {
 /// one per rayon worker, which on a large machine outgrows a small
 /// `ulimit -n` — the failure `TempDirSpillStore`'s one-descriptor design
 /// exists to rule out. Eight keeps the drains overlapped without that.
-pub const MAX_CONCURRENT_SPILL_READS: usize = 8;
+pub(crate) const MAX_CONCURRENT_SPILL_READS: usize = 8;
 
 static SPILL_READS: (std::sync::Mutex<usize>, std::sync::Condvar) =
     (std::sync::Mutex::new(0), std::sync::Condvar::new());

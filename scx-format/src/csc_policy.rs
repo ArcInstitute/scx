@@ -26,8 +26,10 @@ const VARS_THRESHOLD_ENV: &str = "SCX_CSC_AUTO_VARS_THRESHOLD";
 /// `Auto` builds a sidecar when the dataset is large enough that the
 /// column-axis acceleration pays for the extra write-time transpose + storage.
 ///
-/// The default is `Auto` on every ingest entry point, since the builder runs
-/// in the same pass as X and in parallel; `Off` is the opt-out.
+/// The default is `Auto` on every single-modality ingest entry point, since the
+/// builder runs in the same pass as X and in parallel; `Off` is the opt-out.
+/// (Streaming h5mu and `from_mudata` cannot build per-modality sidecars, so
+/// `Auto` degrades to no sidecar there.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CscPolicy {
     /// Never emit a CSC sidecar.

@@ -1179,6 +1179,13 @@ than every decoded shard at once. It **refuses** a budget that cannot
 admit its largest source shard, naming the figure to raise it to,
 instead of accepting one and overshooting.
 
+Naming a limit also changes the emit, never the bytes. Unset, the emit encodes
+every shard of an emit group at once (the fast mode); named — `4G` included —
+it batches whole shards against the emit share, which is slower and holds the
+peak nearer the limit. At census_1m on a 12-core node that is 55.8 s / 6.75 GB
+against 77.1 s / 5.63 GB; the same holds for `--csc-memory-limit` on the
+rewrite ops and `--memory-budget` on convert, sort and optimize.
+
 That refusal is a behaviour change: a `--memory-limit` far below the
 matrix now errors where it used to be accepted and ignored. Before it,
 a declared 512 MiB produced a 2,233 MB allocation on

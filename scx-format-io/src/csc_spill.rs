@@ -14,7 +14,7 @@
 //     a mutex), so the push opens one file at a time. The parallel emit drains
 //     buckets concurrently and each drain holds its bucket's reader, so the
 //     builder caps concurrent spill reads at
-//     `scx_sparse::MAX_CONCURRENT_SPILL_READS` (8): a constant, never the
+//     eight (`MAX_CONCURRENT_SPILL_READS` in `scx-sparse`): a constant, never the
 //     rayon pool's size or the bucket count. `csc_spill_parallel_fd_limit.rs`
 //     fails with EMFILE without the cap.
 //   * Lazy creation is what makes an all-in-memory build touch no disk at all.

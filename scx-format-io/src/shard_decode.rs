@@ -551,7 +551,7 @@ fn decode_groups_into_slots(
     spans: &[scx_codec::RowGroupSpan],
     n_major: usize,
     nnz: usize,
-    decode_group: &(dyn Fn(&scx_codec::RowGroupSpan) -> Result<ScipyCsr> + Sync),
+    decode_group: &(impl Fn(&scx_codec::RowGroupSpan) -> Result<ScipyCsr> + Sync),
 ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
     use rayon::prelude::*;
 

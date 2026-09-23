@@ -1035,8 +1035,11 @@ fn from_mtx(
 ) -> PyResult<()> {
     let csc_policy = scx_format_io::CscPolicy::parse(scx_engine::index::resolve_csc_policy(csc))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    // Parsed before any I/O, and through the sidecar share streaming ingest
-    // uses, so a budget sizes this build exactly as `from_h5ad` would.
+    // Parsed before any I/O. `csc_sidecar_bytes` is the sidecar figure
+    // streaming ingest uses, so the shard widths and the bounded emit match
+    // what `from_h5ad` would write under the same budget. The spill threshold
+    // does not: this is a post-pass with nothing running beside it, so it is
+    // `build-csc`'s half of the limit, not ingest's same-pass quarter.
     let csc_memory_limit = convert::parse_memory_budget(memory_budget.as_ref())?
         .map(|b| scx_convert::csc_sidecar_bytes(Some(b)).to_string());
     let obs_shard_policy =

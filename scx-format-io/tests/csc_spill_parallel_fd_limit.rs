@@ -6,12 +6,16 @@
 #![cfg(all(target_os = "linux", feature = "parallel"))]
 
 use scx_format_io::TempDirSpillStore;
-use scx_sparse::{CscBuilder, CscBuilderConfig, ScxCsr, MAX_BUCKETS, MAX_CONCURRENT_SPILL_READS};
+use scx_sparse::{CscBuilder, CscBuilderConfig, ScxCsr, MAX_BUCKETS};
+
+/// `scx_sparse`'s internal cap on concurrent spill reads. Hard-coded: this
+/// test's claim is "a pool of 32 under a limit well below 32", not the value.
+const PERMITTED_SPILL_READS: u64 = 8;
 
 /// A parallel drain holds one store reader per bucket it is walking, so
 /// without a cap the descriptor count grows with the rayon pool rather than
 /// staying constant. Here 200 spilled groups drain in one batch on a 32-thread
-/// pool under a limit of only `MAX_CONCURRENT_SPILL_READS` descriptors above
+/// pool under a limit of only `PERMITTED_SPILL_READS` descriptors above
 /// what the process already holds — which 32 concurrent readers would exceed.
 #[test]
 fn a_parallel_drain_stays_under_a_descriptor_limit_below_the_pool() {
@@ -60,7 +64,7 @@ fn a_parallel_drain_stays_under_a_descriptor_limit_below_the_pool() {
     // threads hold none, so this leaves room for the permitted readers and a
     // small margin — well short of 32.
     let tight = libc::rlimit {
-        rlim_cur: open_fds() + MAX_CONCURRENT_SPILL_READS as u64 + 4,
+        rlim_cur: open_fds() + PERMITTED_SPILL_READS + 4,
         rlim_max: restore.rlim_max,
     };
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &tight) }, 0);
