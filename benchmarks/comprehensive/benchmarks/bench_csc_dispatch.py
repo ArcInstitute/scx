@@ -11,8 +11,8 @@ AnnData:
   - `bench_csc__de_csr`         / `_csc`     (`rank_genes_groups`)
   - `bench_csc__de_csr_bounded`              (`rank_genes_groups`, CSR, at
                                               the default shard cache)
-  - `bench_csc__de_csc_nnz`                  (`rank_genes_groups`, CSC, the
-                                              exact-nnz Wilcoxon kernel)
+  - `bench_csc__de_csc_densify`              (`rank_genes_groups`, CSC, the
+                                              densify Wilcoxon kernel)
   - `bench_csc__col_sums_csr` / `_csc`       (`pyscx.accel.col_sums`)
   - `bench_csc__col_var_csr`  / `_csc`       (`pyscx.accel.col_var`)
   - `bench_csc__pdex_ref_csr`   / `_csc`     (`pdex_ref`)
@@ -39,13 +39,16 @@ the default cache thrashes) through `FORMAT_DATASET_SCOPE`: at census scale the
 bounded CSR route runs for tens of minutes per repetition, which a warm-up plus
 three runs would push past this benchmark's SLURM time budget.
 
-`bench_csc__de_csc_nnz` runs each repetition in a fresh process. The kernel it
-measures is selected by `SCX_ACCEL_WILCOXON_NNZ=1`, which pyscx reads once per
-process through a `OnceLock`: set in this interpreter after `bench_csc__de_csc`
-had run, it would change nothing and the arm would time the densify kernel
-under the other's name. Its `csc_dispatch_correct` is therefore stricter than
-the other arms' — 1.0 only for the route `cpu_csc_nnz`, not for any route
-containing "csc".
+`bench_csc__de_csc` times the default CSC Wilcoxon kernel, the exact-nnz one,
+and its `csc_dispatch_correct` is 1.0 only for the route `cpu_csc_nnz`.
+`bench_csc__de_csc_densify` is the same call on the densify kernel it replaced
+(`SCX_ACCEL_WILCOXON_NNZ=0`), kept as the control that shows what the default
+is worth, and floored on the route `cpu_csc`. It runs each repetition in a
+fresh process: pyscx reads the gate once per process through a `OnceLock`, so
+set in this interpreter after `bench_csc__de_csc` had run it would change
+nothing and the arm would time the nnz kernel under the densify name. Both of
+these are stricter than the other arms' "csc in route" test, which either
+kernel passes.
 
 The `col_*` arms carry no `csc_dispatch_correct`: those functions return an
 array rather than annotating an AnnData, so there is no route to read. An
@@ -113,11 +116,12 @@ _BOUNDED_CACHE_VARIANTS: frozenset[str] = frozenset({"bench_csc__de_csr_bounded"
 
 # The one variant that runs every repetition in a fresh process; see the module
 # docstring.
-_NNZ_KEY = "bench_csc__de_csc_nnz"
+_DENSIFY_KEY = "bench_csc__de_csc_densify"
 
-# Per repetition. The nnz kernel measured ~6 s at tabula_sapiens_100k and ~56 s
-# at census_1m, so this is ~30x the slowest observed run: long enough never to
-# cut a real one short, short enough that a hung child frees the allocation.
+# Per repetition. The densify kernel measured ~20 s at tabula_sapiens_100k and
+# ~226 s at census_1m, so this is ~8x the slowest observed run: long enough
+# never to cut a real one short, short enough that a hung child frees the
+# allocation.
 _FRESH_PROCESS_TIMEOUT_S = 30 * 60
 
 # Per-format dataset allow-lists, read by `run_parallel` at cohort-build time.
@@ -169,8 +173,8 @@ def bench_csc_dispatch_variants() -> list[FormatVariant]:
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
-            name="rank_genes_groups (CSC, exact-nnz Wilcoxon)",
-            key="bench_csc__de_csc_nnz",
+            name="rank_genes_groups (CSC, densify Wilcoxon)",
+            key="bench_csc__de_csc_densify",
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
@@ -390,7 +394,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[[Any, str], None], str]] = {
     "bench_csc__de_csr":          (_run_de, "csr"),
     "bench_csc__de_csc":          (_run_de, "csc"),
     "bench_csc__de_csr_bounded":  (_run_de, "csr"),
-    "bench_csc__de_csc_nnz":      (_run_de, "csc"),
+    "bench_csc__de_csc_densify":  (_run_de, "csc"),
     "bench_csc__pdex_ref_csr":    (_run_pdex_ref, "csr"),
     "bench_csc__pdex_ref_csc":    (_run_pdex_ref, "csc"),
     "bench_csc__pseudobulk_csr":  (_run_pseudobulk, "csr"),
@@ -414,7 +418,7 @@ _VARIANT_OP_KEY: dict[str, str] = {
     "bench_csc__de_csr": "rank_genes_groups",
     "bench_csc__de_csc": "rank_genes_groups",
     "bench_csc__de_csr_bounded": "rank_genes_groups",
-    "bench_csc__de_csc_nnz": "rank_genes_groups",
+    "bench_csc__de_csc_densify": "rank_genes_groups",
     "bench_csc__pdex_ref_csr": "pdex_ref",
     "bench_csc__pdex_ref_csc": "pdex_ref",
     "bench_csc__pseudobulk_csr": "pseudobulk_dex",
@@ -437,7 +441,7 @@ import gc, json, resource, sys, time
 from pathlib import Path
 from benchmarks.comprehensive.benchmarks import bench_csc_dispatch as b
 path = Path(sys.argv[1])
-runner, prefer = b._VARIANT_IMPLS[b._NNZ_KEY]
+runner, prefer = b._VARIANT_IMPLS[b._DENSIFY_KEY]
 adata = b._open_backed(path)
 gc.collect()
 ru0 = resource.getrusage(resource.RUSAGE_SELF)
@@ -455,9 +459,9 @@ print(json.dumps({
 '''
 
 
-def _run_de_csc_nnz(csc_path: Path, result: BenchmarkResult, n_runs: int):
-    """Every repetition of `bench_csc__de_csc_nnz` in its own interpreter, with
-    `SCX_ACCEL_WILCOXON_NNZ=1`; see the module docstring.
+def _run_de_csc_densify(csc_path: Path, result: BenchmarkResult, n_runs: int):
+    """Every repetition of `bench_csc__de_csc_densify` in its own interpreter,
+    with `SCX_ACCEL_WILCOXON_NNZ=0`; see the module docstring.
 
     `wall_s`, `user_s` and `sys_s` cover the op alone, measured inside the
     worker as the in-process arms measure them. `peak_rss_mb` is the worker's
@@ -465,17 +469,17 @@ def _run_de_csc_nnz(csc_path: Path, result: BenchmarkResult, n_runs: int):
     """
     for i in range(N_WARMUP_RUNS + n_runs):
         outcome = run_arm(
-            _FRESH_WORKER, [str(csc_path)], env={"SCX_ACCEL_WILCOXON_NNZ": "1"},
-            timeout_s=_FRESH_PROCESS_TIMEOUT_S, label=_NNZ_KEY,
+            _FRESH_WORKER, [str(csc_path)], env={"SCX_ACCEL_WILCOXON_NNZ": "0"},
+            timeout_s=_FRESH_PROCESS_TIMEOUT_S, label=_DENSIFY_KEY,
         )
         if not outcome.ok or not outcome.records:
-            logger.error("%s", outcome.failure_text(_NNZ_KEY))
+            logger.error("%s", outcome.failure_text(_DENSIFY_KEY))
             return None
         if i < N_WARMUP_RUNS:
             continue
         rec = outcome.records[-1]
         route = rec.get("route")
-        extras: dict[str, Any] = {"csc_dispatch_correct": 1.0 if route == "cpu_csc_nnz" else 0.0}
+        extras: dict[str, Any] = {"csc_dispatch_correct": 1.0 if route == "cpu_csc" else 0.0}
         if route is not None:
             extras["dispatch_route"] = route
         result.add_run(
@@ -485,7 +489,7 @@ def _run_de_csc_nnz(csc_path: Path, result: BenchmarkResult, n_runs: int):
             peak_rss_mb=rec["peak_rss_mb"],
             **extras,
         )
-        logger.info("  %s run %d: wall=%.3fs route=%s", _NNZ_KEY, i + 1 - N_WARMUP_RUNS,
+        logger.info("  %s run %d: wall=%.3fs route=%s", _DENSIFY_KEY, i + 1 - N_WARMUP_RUNS,
                     rec["wall_s"], route)
     return result
 
@@ -526,12 +530,12 @@ def run(
             # "default" = `to_anndata(backed=True)`'s own cache; "file" = one
             # slot per CSR shard, so nothing is ever re-decoded.
             "shard_cache": "default" if bounded else "file",
-            "fresh_process": key == _NNZ_KEY,
+            "fresh_process": key == _DENSIFY_KEY,
         },
     )
 
-    if key == _NNZ_KEY:
-        return _run_de_csc_nnz(csc_path, result, n_runs)
+    if key == _DENSIFY_KEY:
+        return _run_de_csc_densify(csc_path, result, n_runs)
 
     # Warmup runs — discarded.
     for _ in range(N_WARMUP_RUNS):
@@ -571,7 +575,10 @@ def run(
             route = _extract_route(adata, op_key)
             if route is not None:
                 extras["dispatch_route"] = route
-                if prefer == "csc":
+                if key == "bench_csc__de_csc":
+                    # The default CSC Wilcoxon kernel, not merely a CSC one.
+                    extras["csc_dispatch_correct"] = 1.0 if route == "cpu_csc_nnz" else 0.0
+                elif prefer == "csc":
                     extras["csc_dispatch_correct"] = 1.0 if "csc" in route else 0.0
                 else:
                     extras["csc_dispatch_correct"] = 1.0 if "csc" not in route else 0.0

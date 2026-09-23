@@ -2051,8 +2051,11 @@ file has a sidecar **and** the handle's row window still spans at least half
 the CSR shards, and CSR otherwise; on GPU it stays CSR so the planner routes
 `gpu_csc_v3` under the same condition. The route and
 `csc_available` flag are recorded on `adata.uns["scx_accel"][<op>]`
-(`cpu_csc` vs `cpu_csr`; `cpu_csc_nnz` when the 1-vs-rest exact-nnz Wilcoxon
-kernel is opted into with `SCX_ACCEL_WILCOXON_NNZ=1`). Pass `prefer_format="csr"` explicitly to pin
+(`cpu_csc` vs `cpu_csr`; `cpu_csc_nnz` for 1-vs-rest `rank_genes_groups`, whose
+CSC route runs the exact-nnz Wilcoxon kernel by default since 0.20 —
+bit-identical to the densify kernel and 3.1× / 4.1× faster than it on
+tabula_sapiens_100k / census_1m; `SCX_ACCEL_WILCOXON_NNZ=0` restores densify, and
+`reference=` / `rankby_abs=True` always use it). Pass `prefer_format="csr"` explicitly to pin
 the pre-change behaviour. The non-DE functions keep `"csr"`, and that is a
 measured decision rather than a gap: HVG and the `col_*` reductions are slower
 on CSC (above), and `calculate_qc_metrics` / `pseudobulk_dex` serve only part of

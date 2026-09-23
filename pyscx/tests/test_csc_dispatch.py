@@ -193,7 +193,7 @@ def test_rank_genes_groups_csc_matches_csr(small_adata, tmp_path):
     pyscx.accel.rank_genes_groups(a_csc, "group", prefer_format="csc", device="cpu")
 
     assert a_csr.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csr"
-    assert a_csc.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc"
+    assert a_csc.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc_nnz"
     csr_res = a_csr.uns["rank_genes_groups"]
     csc_res = a_csc.uns["rank_genes_groups"]
     # Genuine CSR-vs-CSC comparison: identical gene ordering AND scores.
@@ -332,7 +332,7 @@ def test_rank_genes_groups_auto_routes_csc_when_sidecar_present(small_adata, tmp
     pyscx.accel.rank_genes_groups(a_csc, "group", prefer_format="csc", device="cpu")
 
     info = a_auto.uns["scx_accel"]["rank_genes_groups"]
-    assert info["route"] == "cpu_csc"
+    assert info["route"] == "cpu_csc_nnz"
     assert info["csc_available"] is True
     auto_res = a_auto.uns["rank_genes_groups"]
     csc_res = a_csc.uns["rank_genes_groups"]
@@ -372,7 +372,7 @@ def test_rank_genes_groups_auto_gene_subset_backed_routes_csc(small_adata, tmp_p
     pyscx.accel.rank_genes_groups(sub_auto, "group", device="cpu")  # auto default
     pyscx.accel.rank_genes_groups(sub_csr, "group", prefer_format="csr", device="cpu")
 
-    assert sub_auto.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc"
+    assert sub_auto.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csc_nnz"
     assert sub_csr.uns["scx_accel"]["rank_genes_groups"]["route"] == "cpu_csr"
     for field in ("names", "scores", "pvals"):
         np.testing.assert_array_equal(
@@ -628,7 +628,8 @@ def _nnz_route(tmp_path, env_value):
 
 
 def test_wilcoxon_csc_route_names_the_kernel_that_ran(tmp_path):
-    """`SCX_ACCEL_WILCOXON_NNZ=1` swaps in a structurally different kernel.
+    """1-vs-rest CSC Wilcoxon runs the exact-nnz kernel by default and the
+    densify kernel under `SCX_ACCEL_WILCOXON_NNZ=0`, and the stamp names which.
 
     Before review §7.17 both kernels stamped `cpu_csc`, so
     `benchmarks/scripts/bench_de_csc_routes.py` — which reads exactly this key —
@@ -637,13 +638,16 @@ def test_wilcoxon_csc_route_names_the_kernel_that_ran(tmp_path):
     `uns["rank_genes_groups"]["scx_accel_route"]` copy.
     """
     pytest.importorskip("anndata")
-    dense_route, dense_mirror = _nnz_route(tmp_path, None)
+    nnz_route, nnz_mirror = _nnz_route(tmp_path, None)
+    assert nnz_route == "cpu_csc_nnz", f"unset is the nnz default: {nnz_route}"
+    assert nnz_mirror == "cpu_csc_nnz", nnz_mirror
+
+    dense_route, dense_mirror = _nnz_route(tmp_path, "0")
     assert dense_route == "cpu_csc", dense_route
     assert dense_mirror == "cpu_csc", dense_mirror
 
-    nnz_route, nnz_mirror = _nnz_route(tmp_path, "1")
-    assert nnz_route == "cpu_csc_nnz", nnz_route
-    assert nnz_mirror == "cpu_csc_nnz", nnz_mirror
+    explicit, _ = _nnz_route(tmp_path, "1")
+    assert explicit == "cpu_csc_nnz", explicit
 
     # `bench_csc_dispatch.py`'s `csc_dispatch_correct` gate is `"csc" in route`.
     assert "csc" in nnz_route
@@ -651,7 +655,7 @@ def test_wilcoxon_csc_route_names_the_kernel_that_ran(tmp_path):
 
 def test_wilcoxon_nnz_route_is_not_claimed_for_a_reference_call(tmp_path):
     """The nnz kernel is 1-vs-rest only, so an explicit `reference=` keeps the
-    densify path even with the gate set — and the stamp must say so."""
+    densify path even with the gate explicitly on — and the stamp must say so."""
     pytest.importorskip("anndata")
     import os
     import subprocess

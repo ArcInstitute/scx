@@ -26,17 +26,25 @@ use scx_format_io::ColumnShardSource;
 /// read below so the accepted spellings are unit-testable. The process-global
 /// cache makes [`nnz_wilcoxon_enabled`] itself untestable from a test binary
 /// that has already read it once.
+///
+/// Only an explicit off spelling turns the kernel off; unset, and any other
+/// value, leave the default on.
 fn nnz_gate_from_env_str(raw: Option<&str>) -> bool {
-    matches!(raw, Some("1" | "true" | "TRUE" | "on"))
+    !matches!(raw, Some("0" | "false" | "FALSE" | "off"))
 }
 
-/// Opt-in gate for the exact sparse-nnz Wilcoxon fast path (§5.3).
+/// Gate for the exact sparse-nnz Wilcoxon kernel (§5.3). **On by default**;
+/// `SCX_ACCEL_WILCOXON_NNZ=0` falls back to the densify kernel, as a
+/// same-build A/B arm and a kill switch.
 ///
-/// Default **off**: the densify + dense-kernel path stays the measured baseline
-/// until a benchmark promotes the nnz path to default. `SCX_ACCEL_WILCOXON_NNZ=1`
-/// opts in. The nnz path is *numerically equivalent* (property-tested to ~1e-9)
-/// but ranks only the nonzeros plus a synthesized implicit-zero tie-block instead
-/// of sorting an `n_obs`-length dense column per gene.
+/// It ranks only each gene's nonzeros plus a synthesized implicit-zero
+/// tie-block instead of sorting an `n_obs`-length dense column per gene, and
+/// is bit-identical to the densify kernel — scores, p-values, adjusted
+/// p-values, log fold changes and gene order, pinned at zero tolerance by
+/// `nnz_matches_the_densify_kernel_exactly_on_tie_heavy_counts`. It was
+/// promoted after measuring 3.1x (tabula_sapiens_100k, 19.6 s -> 6.2 s) and
+/// 4.1x (census_1m, 225.9 s -> 55.7 s) over densify, at the same or lower peak
+/// RSS; until then it was opt-in with `=1`.
 fn nnz_wilcoxon_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
@@ -55,8 +63,8 @@ fn nnz_wilcoxon_enabled() -> bool {
 /// another ran" class the planner exists to close).
 ///
 /// Note the gate alone is not the answer: the nnz kernel is 1-vs-rest only, so
-/// `rankby_abs` or an explicit `reference` keeps the densify path even with
-/// `SCX_ACCEL_WILCOXON_NNZ=1` set.
+/// `rankby_abs` or an explicit `reference` keeps the densify path whatever the
+/// gate says.
 pub fn csc_wilcoxon_uses_nnz_kernel(reference: Option<usize>, rankby_abs: bool) -> bool {
     csc_wilcoxon_selects_nnz(nnz_wilcoxon_enabled(), reference, rankby_abs)
 }
@@ -114,7 +122,7 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
             source.n_vars()
         )));
     }
-    // Exact sparse-nnz fast path (§5.3), opt-in and 1-vs-rest only (rankby_abs
+    // Exact sparse-nnz kernel (§5.3), the default for 1-vs-rest (rankby_abs
     // and an explicit reference keep the densify path). Ranks only the nonzeros +
     // an analytic implicit-zero tie-block — no `n_obs` dense column per gene.
     if csc_wilcoxon_uses_nnz_kernel(reference, rankby_abs) {
@@ -128,6 +136,40 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
             tie_correct,
         );
     }
+    wilcoxon_rank_sum_densify_csc(
+        source,
+        gene_names,
+        groups,
+        group_names,
+        reference,
+        gene_chunk_size,
+        log_transformed,
+        rankby_abs,
+        tie_correct,
+    )
+}
+
+/// The densify kernel: each gene chunk's CSC slab scattered into a row-major
+/// dense buffer and ranked by the dense Wilcoxon kernel.
+///
+/// What [`wilcoxon_rank_sum_streaming_csc`] runs for a `reference=` or
+/// `rankby_abs` call, and for 1-vs-rest under `SCX_ACCEL_WILCOXON_NNZ=0`. A
+/// function of its own so the exact-parity test can call it without going
+/// through the process-global gate. Arguments are validated by the caller.
+#[allow(clippy::too_many_arguments)]
+fn wilcoxon_rank_sum_densify_csc<S: ColumnShardSource + ?Sized>(
+    source: &S,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: Option<usize>,
+    gene_chunk_size: usize,
+    log_transformed: bool,
+    rankby_abs: bool,
+    tie_correct: bool,
+) -> Result<DiffExpResult> {
+    let n_obs = source.n_obs();
+    let n_vars = gene_names.len();
 
     // Clamp the dense n_obs×chunk f32 scatter buffer to the CPU memory budget.
     let gene_chunk_size = crate::mem_budget::de_gene_chunk_or_err(
@@ -511,14 +553,17 @@ mod tests {
     // ── Review §7.17 — the nnz kernel has its own recorded route ───────
 
     #[test]
-    fn the_nnz_gate_accepts_only_the_documented_spellings() {
-        for raw in ["1", "true", "TRUE", "on"] {
-            assert!(nnz_gate_from_env_str(Some(raw)), "{raw} should enable");
+    fn the_nnz_gate_is_on_unless_explicitly_turned_off() {
+        for raw in ["0", "false", "FALSE", "off"] {
+            assert!(!nnz_gate_from_env_str(Some(raw)), "{raw} should disable");
         }
-        for raw in ["0", "false", "False", "off", "", "yes", "True "] {
-            assert!(!nnz_gate_from_env_str(Some(raw)), "{raw} should not enable");
+        for raw in ["1", "true", "on", "", "False", "no", "0 "] {
+            assert!(
+                nnz_gate_from_env_str(Some(raw)),
+                "{raw:?} should leave the default on"
+            );
         }
-        assert!(!nnz_gate_from_env_str(None), "unset means off");
+        assert!(nnz_gate_from_env_str(None), "unset means on");
     }
 
     /// The selection rule is more than the env gate: the nnz kernel is
@@ -676,8 +721,23 @@ mod tests {
         )
         .unwrap();
 
+        // Both CSC kernels: the public driver (the nnz kernel, for 1-vs-rest by
+        // default) and the densify kernel it no longer reaches unless the gate
+        // is turned off.
         let csc_reader = BackedCscReader::new(ScxReader::open(&path).unwrap(), 0).unwrap();
-        let csc_res = wilcoxon_rank_sum_streaming_csc(
+        let driver = wilcoxon_rank_sum_streaming_csc(
+            &csc_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            4,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let densify = wilcoxon_rank_sum_densify_csc(
             &csc_reader,
             &gene_names,
             &groups,
@@ -693,18 +753,23 @@ mod tests {
         // Compare per-group sorted score vectors. Names ordering must
         // match because the underlying sort is by score and inputs are
         // identical.
-        assert_eq!(csr_res.group_names, csc_res.group_names);
-        for g in 0..csr_res.group_names.len() {
-            assert_eq!(csr_res.names[g], csc_res.names[g], "group {g} gene order");
-            for k in 0..csr_res.scores[g].len() {
-                assert!(
-                    (csr_res.scores[g][k] - csc_res.scores[g][k]).abs() < 1e-9,
-                    "group {g} score[{k}] mismatch"
+        for (kernel, csc_res) in [("driver", &driver), ("densify", &densify)] {
+            assert_eq!(csr_res.group_names, csc_res.group_names, "{kernel}");
+            for g in 0..csr_res.group_names.len() {
+                assert_eq!(
+                    csr_res.names[g], csc_res.names[g],
+                    "{kernel}: group {g} gene order"
                 );
-                assert!(
-                    (csr_res.pvals[g][k] - csc_res.pvals[g][k]).abs() < 1e-9,
-                    "group {g} pval[{k}] mismatch"
-                );
+                for k in 0..csr_res.scores[g].len() {
+                    assert!(
+                        (csr_res.scores[g][k] - csc_res.scores[g][k]).abs() < 1e-9,
+                        "{kernel}: group {g} score[{k}] mismatch"
+                    );
+                    assert!(
+                        (csr_res.pvals[g][k] - csc_res.pvals[g][k]).abs() < 1e-9,
+                        "{kernel}: group {g} pval[{k}] mismatch"
+                    );
+                }
             }
         }
     }
@@ -799,6 +864,21 @@ mod tests {
             true,
         )
         .expect_err("CPU CSC path must reject a non-finite value");
+        assert!(err.to_string().contains("non-finite"), "{err}");
+        // The densify kernel, which the driver above no longer reaches by
+        // default, refuses it too.
+        let err = wilcoxon_rank_sum_densify_csc(
+            &reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            4,
+            false,
+            false,
+            true,
+        )
+        .expect_err("the densify kernel must reject a non-finite value");
         assert!(err.to_string().contains("non-finite"), "{err}");
     }
 
@@ -1446,11 +1526,6 @@ mod tests {
     /// does not divide `n_vars`.
     #[test]
     fn nnz_matches_the_densify_kernel_exactly_on_tie_heavy_counts() {
-        assert!(
-            !csc_wilcoxon_uses_nnz_kernel(None, false),
-            "premise: SCX_ACCEL_WILCOXON_NNZ is set in this test's environment, so \
-             the densify arm below would run the nnz kernel and compare it to itself"
-        );
         let (n_obs, n_vars, n_groups) = (300usize, 24usize, 4usize);
         let mut rng = ChaCha8Rng::seed_from_u64(0x7_1e5);
         let groups: Vec<usize> = (0..n_obs).map(|_| rng.gen_range(0..=n_groups)).collect();
@@ -1481,7 +1556,7 @@ mod tests {
 
         for log_transformed in [false, true] {
             for tie_correct in [true, false] {
-                let dense = wilcoxon_rank_sum_streaming_csc(
+                let dense = wilcoxon_rank_sum_densify_csc(
                     &src,
                     &gene_names,
                     &groups,

@@ -427,7 +427,7 @@ def test_csc_on_row_subset_matches_the_reference(csc_path, counts, obs_cols, var
         _rgg(adata, prefer_format="csc"),
         _rgg(_reference(counts, obs_cols, var_names, rows=ROW_KEEP)),
     )
-    assert _de_route(adata) == "cpu_csc"
+    assert _de_route(adata) == "cpu_csc_nnz"
 
 
 def test_csc_on_var_subset_matches_the_reference(csc_path, counts, obs_cols, var_names):
@@ -437,7 +437,7 @@ def test_csc_on_var_subset_matches_the_reference(csc_path, counts, obs_cols, var
         _rgg(adata, prefer_format="csc"),
         _rgg(_reference(counts, obs_cols, var_names, cols=COL_KEEP)),
     )
-    assert _de_route(adata) == "cpu_csc"
+    assert _de_route(adata) == "cpu_csc_nnz"
 
 
 def test_csc_on_both_axes_matches_the_reference(csc_path, counts, obs_cols, var_names):
@@ -450,7 +450,7 @@ def test_csc_on_both_axes_matches_the_reference(csc_path, counts, obs_cols, var_
         _rgg(adata, prefer_format="csc"),
         _rgg(_reference(counts, obs_cols, var_names, rows=ROW_KEEP, cols=COL_KEEP)),
     )
-    assert _de_route(adata) == "cpu_csc"
+    assert _de_route(adata) == "cpu_csc_nnz"
 
 
 def _project_genes(adata, how, counts):
@@ -492,7 +492,7 @@ def test_auto_takes_csc_on_a_gene_only_projection(csc_path, counts, obs_cols, va
         warnings.simplefilter("ignore")
         got = _rgg(adata)
     _assert_de_equal(got, _rgg(_reference(counts, obs_cols, var_names, cols=cols)))
-    assert _de_route(adata) == "cpu_csc"
+    assert _de_route(adata) == "cpu_csc_nnz"
 
 
 # ---------------------------------------------------------------------------
@@ -632,7 +632,7 @@ def test_gpu_de_keeps_csc_direct_on_a_transformed_handle(csc_path):
         f"a transformed handle with a sidecar must reach the CSC-direct GPU "
         f"route, got {gpu_route!r}"
     )
-    assert cpu_route == "cpu_csc", f"premise: the CPU side takes CSC too, got {cpu_route!r}"
+    assert cpu_route == "cpu_csc_nnz", f"premise: the CPU side takes CSC too, got {cpu_route!r}"
     assert list(gpu_df["names"]) == list(cpu_df["names"])
     np.testing.assert_allclose(
         gpu_df["scores"].to_numpy().astype(np.float64),

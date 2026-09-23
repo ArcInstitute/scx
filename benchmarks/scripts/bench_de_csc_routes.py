@@ -3,20 +3,21 @@
 exact sparse-nnz Wilcoxon.
 
 Runs **one** (mode, dataset) configuration per process — the caller launches a
-fresh process per mode so the `SCX_ACCEL_WILCOXON_NNZ` gate (read once via
-`OnceLock`) and process RSS start clean. Prints one JSON line to stdout with
-wall-clock, peak RSS, and the route the op actually took.
+fresh process per mode so process RSS starts clean. The script sets the
+`SCX_ACCEL_WILCOXON_NNZ` gate itself from `--mode`, before pyscx is imported,
+because pyscx reads it once per process through a `OnceLock`. Prints one JSON
+line to stdout with wall-clock, peak RSS, and the route the op actually took.
 
 Modes:
-  csr        — prefer_format="csr"                         (CSR streaming, §5.2 baseline)
-  csc_dense  — prefer_format="csc"                         (CSC-direct densify, §5.2 win)
-  csc_nnz    — prefer_format="csc" + SCX_ACCEL_WILCOXON_NNZ=1 (§5.3 exact sparse-nnz)
+  csr        — prefer_format="csr"                            (CSR streaming, §5.2 baseline)
+  csc_dense  — prefer_format="csc" + SCX_ACCEL_WILCOXON_NNZ=0 (CSC-direct densify, §5.2)
+  csc_nnz    — prefer_format="csc"                            (§5.3 exact sparse-nnz, the default)
 
 The input file MUST carry a CSC sidecar (`scx build-csc`) and the full cell axis
 (no obs subset — a deletion vector disables the CSC route).
 
 Usage:
-  SCX_ACCEL_WILCOXON_NNZ=1 python bench_de_csc_routes.py \
+  python bench_de_csc_routes.py \
       --scx <sidecar.scx> --mode csc_nnz --groupby cell_type
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import resource
 import time
 
@@ -66,6 +68,9 @@ def main() -> None:
     ap.add_argument("--gene-chunk-size", type=int, default=None)
     args = ap.parse_args()
 
+    # Before the import, and overriding whatever the caller exported, so the
+    # mode names the kernel that runs; the recorded `route` confirms it.
+    os.environ["SCX_ACCEL_WILCOXON_NNZ"] = "0" if args.mode == "csc_dense" else "1"
     import pyscx
 
     prefer_format = "csr" if args.mode == "csr" else "csc"
