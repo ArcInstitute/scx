@@ -333,7 +333,23 @@ dropped.
 are `scx build-csc`'s parameters for that build. The builder's column buckets
 (bounded by half of `--csc-memory-limit`) are live during the op's X pass
 rather than after it, and are released when the sidecar is emitted, before the
-rest of the output is written. A sidecar built this way is fresh
+rest of the output is written.
+
+What that buys is one fewer read of the output, and what it costs is peak
+memory: the op's own working set and the builder are resident together, where
+the old op-then-`build-csc` sequence held the larger of the two. Wall time is
+roughly unchanged, because the build dominates and the second read came from
+page cache. Measured against that sequence (median of 3, one node):
+
+| op | dataset | wall, two-pass → same-pass | peak RSS, two-pass → same-pass |
+|---|---|---:|---:|
+| `compact` | census_1m | 163 s → 176 s | 5,316 → 6,773 MB |
+| `sort` | census_500k | 67 s → 64 s | 7,828 → 10,140 MB |
+| `merge` | tabula_100k × 2 | 22.6 s → 22.0 s | 3,917 → 3,994 MB |
+| `convert` | census_500k | 66 s → 63 s | 5,241 → 5,756 MB |
+
+When that peak matters, lower `--csc-memory-limit`, or run the op with
+`--csc off` and `scx build-csc` afterwards. A sidecar built this way is fresh
 (`csc_build_generation == data_generation`) and leaves no `build-csc`
 provenance entry or extra catalog generation. `--rebuild-csc` (pyscx
 `rebuild_csc=True` on `sort` / `shuffle`) is kept as a deprecated alias for

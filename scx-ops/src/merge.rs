@@ -213,8 +213,12 @@ pub fn merge_with_options(
     // input, not to the concatenated row space. `csc_build` decides whether a
     // new one is built from the merged X as it is written. On the raw-copy
     // fast path the sidecar builder decodes the copied bytes (nothing is
-    // re-encoded), which is still one read fewer than building it afterwards
-    // from the finished file.
+    // re-encoded) rather than the op keeping raw-copy and appending the
+    // sidecar afterwards with an in-place build. Measured on tabula_100k x 2
+    // (median of 3, one node): 22.0 s / 3,994 MB this way against 22.6 s /
+    // 3,917 MB for merge + in-place build — a tie on both, so the same pass
+    // wins on what it avoids: a second catalog generation and a `build-csc`
+    // provenance entry the user did not ask for.
 
     // Raw (`adata.raw`) is not carried through merge: the raw obs axis would
     // need to be concatenated in lockstep with X across inputs, which is not
