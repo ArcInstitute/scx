@@ -354,13 +354,21 @@ pub fn optimize_with_csc(
     // `first_csr_codec` (first CSR write wins, and `finish()` stamps it as the
     // file header's codec) are all positional, so parallel encode is safe and
     // parallel write is not.
-    let chunk_lens = crate::encode_budget::plan_encode_chunks(
-        &nnz_per_shard,
-        rayon::current_num_threads().max(1),
-        // `None` is not "unbounded" -- see `DEFAULT_IN_FLIGHT_BYTES`, which keeps
-        // the default peak a constant rather than a multiple of the core count.
-        memory_budget.unwrap_or(crate::encode_budget::DEFAULT_IN_FLIGHT_BYTES),
-    );
+    // Planned as two runs, X and then everything else, so no chunk straddles
+    // the end of X: the same-pass sidecar is emitted there, and a chunk that
+    // also held encoded layer / obsp shards would keep them resident under the
+    // emit (they are charged to the budget the builder does not have).
+    let threads = rayon::current_num_threads().max(1);
+    // `None` is not "unbounded" -- see `DEFAULT_IN_FLIGHT_BYTES`, which keeps
+    // the default peak a constant rather than a multiple of the core count.
+    let in_flight = memory_budget.unwrap_or(crate::encode_budget::DEFAULT_IN_FLIGHT_BYTES);
+    let mut chunk_lens =
+        crate::encode_budget::plan_encode_chunks(&nnz_per_shard[..n_x], threads, in_flight);
+    chunk_lens.extend(crate::encode_budget::plan_encode_chunks(
+        &nnz_per_shard[n_x..],
+        threads,
+        in_flight,
+    ));
     let mut at = 0usize;
     for len in chunk_lens {
         // `Vec<Result<_>>` rather than `collect::<Result<Vec<_>>>()`: rayon
@@ -495,8 +503,9 @@ pub fn optimize_with_csc(
     //
     // Rare in practice — `canonicalize_csr` short-circuits via
     // `is_canonical_csr` and every file a current writer produces is canonical
-    // — which is why the sidecar is dropped only when X was actually rewritten,
-    // rather than dropped outright the way the CSC sidecar is.
+    // — which is why the sidecar is dropped only when X was actually rewritten.
+    // (The CSC sidecar is never copied; it is rebuilt from the re-encoded X in
+    // the same pass when `csc` asks for one.)
     let mut bitmap_entries: Vec<_> = reader
         .catalog()
         .entries

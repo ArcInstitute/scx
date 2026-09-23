@@ -1955,6 +1955,17 @@ impl ScxWriter {
         build_csc: bool,
     ) -> Result<u8> {
         ModalityTable::validate_name(name)?;
+        // The same-pass sidecar is single-modality and has already sized its
+        // builder from the file-level axes; a modality registered after it
+        // would route per-modality X shards into that global builder.
+        // `enable_csc_sidecar` refuses the reverse order.
+        if self.csc_sink.is_some() || self.csc_sink_closed {
+            return Err(ScxError::InvalidCatalog(
+                "cannot register a modality on a writer with a same-pass CSC sidecar; it is \
+                 single-modality only"
+                    .to_string(),
+            ));
+        }
         if self.modalities.iter().any(|m| m.name == name) {
             return Err(ScxError::InvalidCatalog(format!(
                 "modality name '{name}' already registered"

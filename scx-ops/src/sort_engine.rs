@@ -214,7 +214,15 @@ pub fn sort_with_strategy(
     // A same-pass sidecar's buckets are live beside the sort's own working
     // set, so under `--memory-budget` the two split it rather than each
     // claiming the whole: the builder spills at its share, and the sort plans
-    // (strategy, partitions, spill) against the rest.
+    // its resident set (strategy, partitions, obs spill) against the rest.
+    //
+    // `caller_budget` keeps what the user passed, for the one planner input
+    // that decides output LAYOUT — the grouped sub-flush cap, which cuts X
+    // shards — and for the refusal messages. Sizing the cap from the rest
+    // would make `--csc carry` and `--csc off` write different X shard
+    // boundaries under the same budget, and the sidecar must change nothing
+    // else in the file.
+    let caller_budget = opts.memory_budget;
     let split_opts;
     let opts = match (csc_build.as_mut(), opts.memory_budget) {
         (Some(build), Some(budget)) => {
@@ -493,7 +501,7 @@ pub fn sort_with_strategy(
     let block_byte_cap: u64 = grouped_block_byte_cap(
         opts.group_write_block_bytes
             .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES),
-        opts.memory_budget,
+        caller_budget,
         value_encoding,
     );
     let mut grouped_reference_labels: Vec<String> = Vec::new();
@@ -920,9 +928,19 @@ pub fn sort_with_strategy(
                         (opts.shard_target_rows.max(1) as f64 * n_vars as f64 * density * 16.0)
                             as u64;
                     if per_shard > budget {
+                        let beside_csc = if caller_budget == Some(budget) {
+                            String::new()
+                        } else {
+                            format!(
+                                " ({budget} of --memory-budget {} is left beside the CSC \
+                                 sidecar builder; --csc off gives the sort all of it)",
+                                caller_budget.unwrap_or(budget)
+                            )
+                        };
                         return Err(OpsError::InvalidInput(format!(
                             "scx sort: --memory-budget {budget} too small for one output shard \
-                         (~{per_shard} bytes for {} rows); raise the budget or lower --shard-size",
+                         (~{per_shard} bytes for {} rows){beside_csc}; raise the budget or lower \
+                         --shard-size",
                             opts.shard_target_rows
                         )));
                     }

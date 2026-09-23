@@ -334,6 +334,28 @@ fn enable_is_refused_where_it_cannot_see_every_shard() {
     )
     .unwrap();
     assert!(w.enable_csc_sidecar(opts(7)).is_err());
+
+    // And the reverse order: a modality registered after the sink exists (or
+    // after it was emitted) is refused too.
+    for emitted in [false, true] {
+        let mut w =
+            ScxWriter::new(dir.path().join(format!("d{emitted}.scx")), header(false)).unwrap();
+        w.enable_csc_sidecar(opts(7)).unwrap();
+        if emitted {
+            write_x(&mut w, Via::Buffers, false, false);
+            w.emit_csc_sidecar().unwrap();
+        }
+        let err = w
+            .add_modality(
+                "rna",
+                crate::modality::ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("single-modality"), "{err}");
+    }
 }
 
 /// `finish()` emits a sidecar the caller never emitted.

@@ -336,3 +336,47 @@ fn always_on_a_multimodal_input_is_refused_before_writing() {
     let out = d.join("compact_carry.scx");
     scx_ops::compact(&src, &out).unwrap();
 }
+
+/// Under `--memory-budget` a grouped sort's X layout must not depend on
+/// whether a sidecar is being built. The sort splits its budget with the
+/// builder, but the grouped sub-flush cap — which cuts X shards — is sized
+/// from the caller's budget, so `--csc always` and `--csc off` write the same
+/// X shard boundaries. The sweep runs budgets small enough for the cap to cut
+/// this fixture's groups, where a cap sized from the remainder would cut them
+/// differently.
+#[test]
+fn a_grouped_sorts_layout_does_not_depend_on_the_sidecar_under_a_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let src = fixture_all_families(d, "src.scx");
+    let mut cut = false;
+    for budget in [48u64, 64, 96, 128, 192, 256, 384, 512, 1024] {
+        let run = |mode: CscOutput, tag: &str| {
+            let out = d.join(format!("g{budget}_{tag}.scx"));
+            let opts = scx_ops::SortOptions {
+                group_by: Some("cell_type".to_string()),
+                memory_budget: Some(budget),
+                csc: csc(mode),
+                ..Default::default()
+            };
+            scx_ops::sort_engine::sort_with_strategy(
+                &src,
+                &out,
+                &opts,
+                Some(scx_ops::SortStrategy::InMemory),
+            )
+            .unwrap();
+            out
+        };
+        let always = run(CscOutput::Always, "always");
+        let off = run(CscOutput::Off, "off");
+        assert_eq!(
+            entries(&always, false),
+            entries(&off, false),
+            "budget {budget}: the sidecar changed the X layout"
+        );
+        let n_x = ScxReader::open(&off).unwrap().header().n_csr_shards;
+        cut |= n_x > 3; // more shards than the fixture's three groups
+    }
+    assert!(cut, "no budget in the sweep made the block cap cut a group");
+}

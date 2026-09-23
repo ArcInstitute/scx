@@ -64,8 +64,9 @@ impl Default for CompactOptions {
 }
 
 impl CompactOptions {
-    /// Reproduce a legacy `compact_with_index_options(...)` call, so the
-    /// back-compat wrappers don't change behaviour beyond the codec default.
+    /// Reproduce a legacy `compact_with_index_options(...)` call. Everything
+    /// else is `Default`, so the back-compat wrapper takes the current
+    /// defaults: the `auto` codec, and carrying a CSC sidecar the input has.
     pub fn legacy_with_index_options(
         index_options: ConversionPredicateIndexOptions,
         reshape_obs: bool,
