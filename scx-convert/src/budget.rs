@@ -302,11 +302,11 @@ pub(crate) const CSC_COLUMN_CHUNK_SHARE: Share = Share::new(1, 2);
 /// The CSC external transpose's pass-2 bucket record buffer.
 pub(crate) const CSC_BUCKET_SHARE: Share = Share::new(1, 4);
 
-/// What a CSC sidecar builder running **beside** streaming ingest may keep
-/// resident: its column buckets, built in the same pass as X
-/// (`ScxWriter::enable_csc_sidecar`) rather than in a second pass after it.
+/// The builder's share while it runs beside streaming ingest; declared with
+/// the other CSC shares in `scx-format-io` so `scx sort` and `scx optimize`,
+/// which run it beside their own budgeted working sets, split the same way.
 /// Ingest sizes itself against what is left — see [`csc_same_pass_split`].
-pub(crate) const CSC_SAME_PASS_SHARE: Share = Share::new(1, 4);
+pub(crate) use scx_format_io::csc_budget::CSC_SAME_PASS_SHARE;
 
 /// One in-flight ingest shard's share of the whole budget while a same-pass
 /// CSC builder holds [`CSC_SAME_PASS_SHARE`]: [`SHARD_BUDGET_SHARE`] of the
@@ -480,10 +480,9 @@ pub(crate) fn csc_same_pass_split(memory_budget: Option<u64>) -> (Option<usize>,
     let Some(budget) = memory_budget else {
         return (None, None);
     };
-    let builder = CSC_SAME_PASS_SHARE
-        .of(budget)
-        .min(scx_format_io::csc_budget::CSC_BUILD_BUCKET_SHARE.of(csc_sidecar_bytes(Some(budget))));
-    (Some(builder as usize), Some(budget - builder))
+    let (builder, rest) =
+        scx_format_io::csc_budget::same_pass_split(budget, csc_sidecar_bytes(Some(budget)));
+    (Some(builder as usize), Some(rest))
 }
 
 // ---------------------------------------------------------------------------

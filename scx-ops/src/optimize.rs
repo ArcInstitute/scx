@@ -171,7 +171,20 @@ pub fn optimize_with_csc(
     // `DeletionVectors` section through (otherwise the header would claim
     // deletions with no section, and the logically-deleted rows would silently
     // reappear).
-    let csc_build = csc.resolve("optimize", crate::csc_carry::reader_has_csc(&reader), false)?;
+    let mut csc_build =
+        csc.resolve("optimize", crate::csc_carry::reader_has_csc(&reader), false)?;
+    // Under `--memory-budget` a same-pass builder's buckets and the parallel
+    // re-encode's in-flight shards are live together, so they split it (as
+    // `sort` does) rather than each claiming the whole.
+    let memory_budget = match (csc_build.as_mut(), memory_budget) {
+        (Some(build), Some(budget)) => {
+            let (builder, rest) =
+                scx_format_io::csc_budget::same_pass_split(budget, build.memory_bytes as u64);
+            build.spill_after_bytes = Some(builder as usize);
+            Some(rest)
+        }
+        (_, budget) => budget,
+    };
     // Raw (`adata.raw`) is not carried through optimize's section allowlist.
     // Warn loudly rather than drop it silently (SCX-002), matching
     // compact/sort/merge.

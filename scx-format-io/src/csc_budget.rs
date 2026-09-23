@@ -53,6 +53,26 @@ pub const CSC_BUILD_INPUT_SHARE: Share = Share::new(1, 4);
 /// has returned and its decode buffers are dropped before `finish()`.
 pub const CSC_EMIT_SHARE: Share = Share::new(1, 4);
 
+/// What a CSC sidecar builder running **beside** other work may keep resident:
+/// its column buckets, when it is fed in the same pass as X
+/// (`ScxWriter::enable_csc_sidecar`) by an op or an ingest that is sizing its
+/// own working set against the same budget. See [`same_pass_split`].
+pub const CSC_SAME_PASS_SHARE: Share = Share::new(1, 4);
+
+/// Split `budget` between a same-pass CSC builder and the work it runs beside:
+/// `(builder spill threshold, what the rest of the op sizes itself against)`.
+///
+/// The builder gets [`CSC_SAME_PASS_SHARE`] of the budget, but never more than
+/// it would stage on its own ([`CSC_BUILD_BUCKET_SHARE`] of `sidecar_bytes`,
+/// the budget its shard widths are sized from). Only the push phase overlaps
+/// the op; the emit follows the last X shard.
+pub fn same_pass_split(budget: u64, sidecar_bytes: u64) -> (u64, u64) {
+    let builder = CSC_SAME_PASS_SHARE
+        .of(budget)
+        .min(CSC_BUILD_BUCKET_SHARE.of(sidecar_bytes));
+    (builder, budget - builder)
+}
+
 /// Bytes one decoded CSR shard of `nnz` nonzeros over `n_rows` rows occupies.
 ///
 /// `indices` + `data` at [`CSC_PAYLOAD_BYTES_PER_NNZ`], plus an `i64` indptr
@@ -77,6 +97,20 @@ mod tests {
         let budget = 1 << 30;
         let claimed = CSC_BUILD_BUCKET_SHARE.of(budget) + CSC_BUILD_INPUT_SHARE.of(budget);
         assert!(claimed <= budget, "{claimed} > {budget}");
+    }
+
+    /// The split hands the builder its share and the rest to the op, and never
+    /// more than the builder would stage alone.
+    #[test]
+    fn the_same_pass_split_adds_up() {
+        for budget in [1u64 << 20, 1 << 30, 64 << 30] {
+            for sidecar in [budget, 4 << 30] {
+                let (builder, rest) = same_pass_split(budget, sidecar);
+                assert_eq!(builder + rest, budget);
+                assert!(builder <= CSC_SAME_PASS_SHARE.of(budget));
+                assert!(builder <= CSC_BUILD_BUCKET_SHARE.of(sidecar));
+            }
+        }
     }
 
     /// `min_budget_for` is the refusal predicate *and* the "raise it to at

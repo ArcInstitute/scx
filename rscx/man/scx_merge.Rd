@@ -44,7 +44,8 @@ identity checks across inputs.}
 \description{
 Combines two or more SCX files into a single output file. Var identity is
 validated by default. \code{shard_target_rows} is inherited from the first
-input; CSC sidecars are dropped (rebuild separately).
+input. A CSC sidecar is carried: it is rebuilt from the merged \code{X} in
+the same pass iff any input had one (there is no \code{csc} argument yet).
 }
 \examples{
 \dontrun{

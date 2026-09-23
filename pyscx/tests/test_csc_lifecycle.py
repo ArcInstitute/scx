@@ -463,3 +463,22 @@ def test_sort_rebuild_csc_is_deprecated(small_adata, tmp_path):
 
     with pytest.raises(ValueError, match="not both"):
         pyscx.sort(src, str(tmp_path / "x.scx"), by=["cell_id"], rebuild_csc=True, csc="off")
+    # An explicit "carry" is still an explicit choice, not the omitted default.
+    with pytest.raises(ValueError, match="not both"):
+        pyscx.sort(src, str(tmp_path / "y.scx"), by=["cell_id"], rebuild_csc=False, csc="carry")
+
+
+def test_shuffle_rebuild_csc_keeps_its_positional_slot(small_adata, tmp_path):
+    """A call written against the old positional signature — `rebuild_csc`
+    right after `bitmap` — still reaches the deprecated alias."""
+    import pyscx
+
+    src = str(tmp_path / "src.scx")
+    pyscx.from_anndata(small_adata, src)
+    out = str(tmp_path / "shuffled.scx")
+    with pytest.warns(DeprecationWarning, match="rebuild_csc"):
+        # input, output, seed, shard_size, codec, index_obs, index_var,
+        # index_preset, index_auto_threshold, memory_budget, temp_dir, bitmap,
+        # rebuild_csc
+        pyscx.shuffle(src, out, 1, None, "auto", None, None, None, None, None, None, "off", True)
+    assert pyscx.open(out).has_csc

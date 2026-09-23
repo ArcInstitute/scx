@@ -142,15 +142,30 @@ fn sort_every_strategy() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let src = fixture_all_families(d, "src.scx");
-    for (tag, strategy, group_by) in [
-        ("inmem", scx_ops::SortStrategy::InMemory, None),
-        ("external", scx_ops::SortStrategy::ExternalPartition, None),
+    for (tag, strategy, group_by, memory_budget) in [
+        ("inmem", scx_ops::SortStrategy::InMemory, None, None),
+        (
+            "external",
+            scx_ops::SortStrategy::ExternalPartition,
+            None,
+            None,
+        ),
+        // Under a budget the builder and the sort split it
+        // (`csc_budget::same_pass_split`); the split moves only the builder's
+        // spill threshold and the sort's plan, never a byte.
+        (
+            "external_budget",
+            scx_ops::SortStrategy::ExternalPartition,
+            None,
+            Some(1u64 << 20),
+        ),
         // Grouped + in-memory is the parallel fast path, which writes
         // pre-encoded shards rather than going through the row emitter.
         (
             "grouped",
             scx_ops::SortStrategy::InMemory,
             Some("cell_type"),
+            None,
         ),
     ] {
         same_pass_equals_second_pass(d, &format!("sort_{tag}"), |out, csc| {
@@ -161,6 +176,7 @@ fn sort_every_strategy() {
                     vec!["cell_type".to_string()]
                 },
                 group_by: group_by.map(str::to_string),
+                memory_budget,
                 csc,
                 ..Default::default()
             };

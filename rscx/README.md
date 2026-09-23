@@ -150,7 +150,9 @@ refused, because each modality owns its own var table (extract one with
 (predicate-index columns via `index_obs`/`index_var`/`index_preset`, `uns_policy`
 and `assume_identical_var`/`sort_by` on merge, `codec`/`shard_size`/`modality` on
 append, `reshape_obs` on compact). `shard_target_rows` is inherited from the
-input; CSC sidecars are dropped by these ops (rebuild separately).
+input. `scx_compact` and `scx_merge` carry a CSC sidecar (rebuilt from the
+output's X in the same pass iff an input had one; no `csc` argument yet), and
+`scx_append` drops it (rebuild separately).
 
 ## Codecs and framing on import
 

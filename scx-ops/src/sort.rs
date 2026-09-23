@@ -27,8 +27,9 @@
 //!   keep their original global order — stable and deterministic regardless
 //!   of the order rows arrive in (e.g. Phase 4's parallel scatter).
 //! - Phase 0 recorded the design decisions (bitmap drop-only for v1; obs
-//!   axis globally shared; CSC rebuilt post-write via
-//!   [`crate::rebuild_csc_inplace`]).
+//!   axis globally shared). The CSC sidecar was then rebuilt post-write via
+//!   [`crate::rebuild_csc_inplace`]; it is now built in the same pass as the
+//!   sorted X (`SortOptions::csc`).
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

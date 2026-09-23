@@ -348,8 +348,12 @@ page cache. Measured against that sequence (median of 3, one node):
 | `merge` | tabula_100k × 2 | 22.6 s → 22.0 s | 3,917 → 3,994 MB |
 | `convert` | census_500k | 66 s → 63 s | 5,241 → 5,756 MB |
 
-When that peak matters, lower `--csc-memory-limit`, or run the op with
-`--csc off` and `scx build-csc` afterwards. A sidecar built this way is fresh
+These are without `--memory-budget`. With one, `sort`, `optimize` and
+streaming ingest split it with the builder instead of stacking the two: the
+builder spills at a quarter of the budget (never more than it would stage
+alone) and the op plans against the rest. `compact`, `merge` and `subset` take
+no budget of their own. When that peak matters, lower `--csc-memory-limit`, or
+run the op with `--csc off` and `scx build-csc` afterwards. A sidecar built this way is fresh
 (`csc_build_generation == data_generation`) and leaves no `build-csc`
 provenance entry or extra catalog generation. `--rebuild-csc` (pyscx
 `rebuild_csc=True` on `sort` / `shuffle`) is kept as a deprecated alias for

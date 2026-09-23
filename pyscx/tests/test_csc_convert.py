@@ -217,7 +217,10 @@ def test_the_rewrite_ops_excluded_above_are_the_carry_kind():
 
     for name in sorted(_REWRITE_OPS):
         params = inspect.signature(getattr(native, name)).parameters
-        assert params["csc"].default == "carry", (name, params["csc"].default)
+        # `sort` / `shuffle` default to None so an explicit `csc=` can be told
+        # apart from the deprecated `rebuild_csc=`; None resolves to "carry".
+        expected = None if name in ("sort", "shuffle") else "carry"
+        assert params["csc"].default == expected, (name, params["csc"].default)
 
 
 def test_every_preset_aware_entry_point_defaults_csc_to_none():

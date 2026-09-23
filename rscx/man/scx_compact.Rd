@@ -32,7 +32,9 @@ row-sharded layout.}
 \description{
 Rewrites the file, removing deleted rows and reclaiming space from
 orphaned sections and stale catalogs. \code{shard_target_rows} is inherited
-from the input header; CSC sidecars are dropped (rebuild separately).
+from the input header. A CSC sidecar is carried: it is rebuilt from the
+compacted \code{X} in the same pass iff the input had one (there is no
+\code{csc} argument yet).
 }
 \examples{
 \dontrun{

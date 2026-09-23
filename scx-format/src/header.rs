@@ -437,10 +437,11 @@ impl FileHeader {
         self.flags |= 1 << 0;
     }
 
-    /// Clear the CSC flag (bit 0). Used by mutating ops (`append`,
-    /// `compact`, `merge`, `subset`) when CSC sidecars are dropped
-    /// from the output and the row layout no longer matches the
-    /// previously-stored column-major shards.
+    /// Clear the CSC flag (bit 0). Used where a sidecar is dropped because
+    /// the row layout no longer matches the stored column-major shards:
+    /// `append`, and a rewrite op's output header before `finish()`
+    /// re-derives the bit from the catalog (a sidecar the op rebuilt in the
+    /// same pass sets it again).
     pub fn clear_csc(&mut self) {
         self.flags &= !(1 << 0);
     }

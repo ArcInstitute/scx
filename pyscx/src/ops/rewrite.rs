@@ -359,16 +359,22 @@ fn parse_codec_intent(codec: &str) -> PyResult<scx_format_io::ResolvedCodec> {
 
 /// Resolve `sort` / `shuffle`'s `csc` kwarg, honouring the deprecated
 /// `rebuild_csc` spelling: `True` meant "build one" (`"always"`), `False` meant
-/// the old default of dropping it (`"off"`). Passing both is an error.
-fn sort_csc_mode(py: Python<'_>, csc: &str, rebuild_csc: Option<bool>) -> PyResult<String> {
-    let Some(rebuild) = rebuild_csc else {
-        return Ok(csc.to_string());
+/// the old default of dropping it (`"off"`). Passing both is an error — both
+/// default to `None` so that an explicit `csc="carry"` is detectable, and
+/// omitting both is `"carry"`. `rebuild_csc` keeps its old positional slot and
+/// `csc` is keyword-appended, so a positional call written against the old
+/// signature still reaches the alias.
+fn sort_csc_mode(py: Python<'_>, csc: Option<&str>, rebuild_csc: Option<bool>) -> PyResult<String> {
+    let rebuild = match (csc, rebuild_csc) {
+        (Some(_), Some(_)) => {
+            return Err(PyValueError::new_err(
+                "pass csc= or the deprecated rebuild_csc=, not both",
+            ))
+        }
+        (Some(mode), None) => return Ok(mode.to_string()),
+        (None, None) => return Ok("carry".to_string()),
+        (None, Some(rebuild)) => rebuild,
     };
-    if csc != "carry" {
-        return Err(PyValueError::new_err(
-            "pass csc= or the deprecated rebuild_csc=, not both",
-        ));
-    }
     let mode = if rebuild { "always" } else { "off" };
     let category = py.get_type::<pyo3::exceptions::PyDeprecationWarning>();
     crate::pyimport::import_module(py, "warnings")?.call_method1(
@@ -403,10 +409,10 @@ fn sort_csc_mode(py: Python<'_>, csc: &str, rebuild_csc: Option<bool>) -> PyResu
 #[pyo3(signature = (
     input, output, by, reverse=false, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    memory_budget=None, temp_dir=None, bitmap="off".to_string(), csc="carry",
-    rebuild_csc=None, csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
+    memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=None,
+    csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
     group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None,
-    group_write_block_bytes=None,
+    group_write_block_bytes=None, csc=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn sort(
@@ -424,7 +430,6 @@ pub fn sort(
     memory_budget: Option<String>,
     temp_dir: Option<String>,
     bitmap: String,
-    csc: &str,
     rebuild_csc: Option<bool>,
     csc_cols_per_shard: usize,
     csc_memory_limit: String,
@@ -433,6 +438,7 @@ pub fn sort(
     group_target_bytes: Option<Bound<'_, PyAny>>,
     group_max_bytes: Option<Bound<'_, PyAny>>,
     group_write_block_bytes: Option<Bound<'_, PyAny>>,
+    csc: Option<&str>,
 ) -> PyResult<()> {
     if by.is_empty() && group_by.is_none() {
         return Err(PyValueError::new_err(
@@ -547,8 +553,8 @@ pub fn sort(
 #[pyo3(signature = (
     input, output, seed=42, shard_size=None, codec="auto".to_string(),
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    memory_budget=None, temp_dir=None, bitmap="off".to_string(), csc="carry",
-    rebuild_csc=None, csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
+    memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=None,
+    csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(), csc=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn shuffle(
@@ -565,10 +571,10 @@ pub fn shuffle(
     memory_budget: Option<String>,
     temp_dir: Option<String>,
     bitmap: String,
-    csc: &str,
     rebuild_csc: Option<bool>,
     csc_cols_per_shard: usize,
     csc_memory_limit: String,
+    csc: Option<&str>,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);

@@ -205,6 +205,31 @@ pub fn sort_with_strategy(
     let reader = ScxReader::open(input)?;
     let in_header = reader.header().clone();
 
+    // Decided before any output exists, so a refusal leaves nothing behind.
+    let mut csc_build = opts.csc.resolve(
+        "sort",
+        crate::csc_carry::reader_has_csc(&reader),
+        reader.is_multimodal(),
+    )?;
+    // A same-pass sidecar's buckets are live beside the sort's own working
+    // set, so under `--memory-budget` the two split it rather than each
+    // claiming the whole: the builder spills at its share, and the sort plans
+    // (strategy, partitions, spill) against the rest.
+    let split_opts;
+    let opts = match (csc_build.as_mut(), opts.memory_budget) {
+        (Some(build), Some(budget)) => {
+            let (builder, rest) =
+                scx_format_io::csc_budget::same_pass_split(budget, build.memory_bytes as u64);
+            build.spill_after_bytes = Some(builder as usize);
+            split_opts = SortOptions {
+                memory_budget: Some(rest),
+                ..opts.clone()
+            };
+            &split_opts
+        }
+        _ => opts,
+    };
+
     if in_header.has_raw() {
         log::warn!(
             "scx sort: input {} carries an adata.raw matrix, which is not preserved \
@@ -636,13 +661,6 @@ pub fn sort_with_strategy(
     // Multimodal inputs reorder every modality's X by the same global obs
     // order; the single-modality engine below handles the
     // common case. Multimodal always takes the in-memory obs path.
-    // Decided before any output exists, so a refusal leaves nothing behind.
-    let csc_build = opts.csc.resolve(
-        "sort",
-        crate::csc_carry::reader_has_csc(&reader),
-        reader.is_multimodal(),
-    )?;
-
     if reader.is_multimodal() {
         let sorted_obs = sorted_obs
             .as_ref()

@@ -2347,40 +2347,45 @@ fn streaming_csc_is_built_in_the_same_pass_as_x() {
 }
 
 /// `--group-by` with an obsp-carrying input takes the two-pass route (plain
-/// convert, then `scx sort`); the sort builds the sidecar in its own pass.
+/// convert, then `scx sort`); the sort builds the sidecar in its own pass,
+/// with and without a `--memory-budget` (which the sort splits with the
+/// builder rather than handing both the whole).
 #[test]
 fn grouped_two_pass_convert_carries_the_sidecar_through_the_sort() {
-    let dir = tempfile::tempdir().unwrap();
-    let h5ad = dir.path().join("grouped.h5ad");
-    create_test_h5ad_with_cell_type(&h5ad, 30, 12);
-    let out = dir.path().join("grouped.scx");
-    let opts = IngestOptions {
-        shard_target_rows: 8,
-        csc: super::pipeline::CscPolicy::Always,
-        csc_cols_per_shard: 5,
-        group_by: Some("cell_type".into()),
-        group_pass: GroupPass::Two,
-        tool: "scx".into(),
-        ..IngestOptions::default()
-    };
-    h5ad_to_scx_streaming(
-        &h5ad,
-        &out,
-        &opts,
-        &StreamingOverrides::default(),
-        &mut WarningSink::log(),
-    )
-    .unwrap();
-    let r = ScxReader::open(&out).unwrap();
-    assert!(
-        r.header().has_csc(),
-        "the grouped two-pass output must carry CSC"
-    );
-    let csr = r.read_all_csr_shards().unwrap();
-    let csc = r.read_all_csc_shards().unwrap();
-    assert_eq!(csr.indptr.last(), csc.indptr.last());
-    assert_eq!(
-        r.catalog().csc_build_generation,
-        r.catalog().data_generation
-    );
+    for memory_budget in [None, Some(64u64 << 20)] {
+        let dir = tempfile::tempdir().unwrap();
+        let h5ad = dir.path().join("grouped.h5ad");
+        create_test_h5ad_with_cell_type(&h5ad, 30, 12);
+        let out = dir.path().join("grouped.scx");
+        let opts = IngestOptions {
+            shard_target_rows: 8,
+            csc: super::pipeline::CscPolicy::Always,
+            csc_cols_per_shard: 5,
+            group_by: Some("cell_type".into()),
+            group_pass: GroupPass::Two,
+            memory_budget,
+            tool: "scx".into(),
+            ..IngestOptions::default()
+        };
+        h5ad_to_scx_streaming(
+            &h5ad,
+            &out,
+            &opts,
+            &StreamingOverrides::default(),
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        let r = ScxReader::open(&out).unwrap();
+        assert!(
+            r.header().has_csc(),
+            "the grouped two-pass output must carry CSC"
+        );
+        let csr = r.read_all_csr_shards().unwrap();
+        let csc = r.read_all_csc_shards().unwrap();
+        assert_eq!(csr.indptr.last(), csc.indptr.last());
+        assert_eq!(
+            r.catalog().csc_build_generation,
+            r.catalog().data_generation
+        );
+    }
 }
