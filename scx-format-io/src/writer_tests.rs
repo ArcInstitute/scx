@@ -4002,7 +4002,9 @@ fn write_csc_shards_matches_one_at_a_time() {
             let mut indptr = vec![0u64];
             let mut indices = Vec::new();
             for c in 0..3u64 {
-                for r in (0..100u32).filter(|r| (r + (s * 3 + c) as u32) % (2 + s as u32) == 0) {
+                for r in
+                    (0..100u32).filter(|r| (r + (s * 3 + c) as u32).is_multiple_of(2 + s as u32))
+                {
                     indices.push(r);
                 }
                 indptr.push(indices.len() as u64);

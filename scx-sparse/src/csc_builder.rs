@@ -997,21 +997,26 @@ impl CscBuilder {
 /// Non-decreasing rather than strictly increasing: a duplicate `(row, col)` is
 /// adjacent in a sorted row, so a search keeps both copies in `j` order, as
 /// the serial scan does.
-#[cfg(feature = "parallel")]
 fn rows_route_by_search(csr: &ScxCsr, n_cols: usize) -> bool {
-    use rayon::prelude::*;
-    (0..csr.n_rows())
-        .into_par_iter()
-        .with_min_len(1024)
-        .all(|row| {
-            let idx = &csr.indices[csr.indptr[row] as usize..csr.indptr[row + 1] as usize];
-            match (idx.first(), idx.last()) {
-                (Some(&first), Some(&last)) => {
-                    first >= 0 && (last as usize) < n_cols && idx.windows(2).all(|w| w[0] <= w[1])
-                }
-                _ => true,
+    let row_ok = |row: usize| {
+        let idx = &csr.indices[csr.indptr[row] as usize..csr.indptr[row + 1] as usize];
+        match (idx.first(), idx.last()) {
+            (Some(&first), Some(&last)) => {
+                first >= 0 && (last as usize) < n_cols && idx.windows(2).all(|w| w[0] <= w[1])
             }
-        })
+            _ => true,
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        (0..csr.n_rows())
+            .into_par_iter()
+            .with_min_len(1024)
+            .all(row_ok)
+    }
+    #[cfg(not(feature = "parallel"))]
+    (0..csr.n_rows()).all(row_ok)
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1093,12 @@ pub struct ResidentCscSource<'a> {
     plan: Vec<CscShardSpec>,
     next: usize,
     nnz: u64,
+    /// Every row of every shard passes [`rows_route_by_search`], so a shard's
+    /// column range is found by binary search per row instead of by testing
+    /// every nonzero — `n_rows * log` per CSC shard rather than `nnz`, which
+    /// at census_500k's 87 shards is the difference between reading the
+    /// matrix once and reading it 87 times.
+    sorted: bool,
 }
 
 impl<'a> ResidentCscSource<'a> {
@@ -1138,6 +1149,7 @@ impl<'a> ResidentCscSource<'a> {
                 nnz: col_counts[lo..hi].iter().sum(),
             });
         }
+        let sorted = shards.iter().all(|s| rows_route_by_search(s, n_cols));
         Ok(Self {
             shards,
             n_rows,
@@ -1145,7 +1157,64 @@ impl<'a> ResidentCscSource<'a> {
             plan,
             next: 0,
             nnz,
+            sorted,
         })
+    }
+
+    /// Scatter shard `spec`'s columns out of the resident CSR.
+    ///
+    /// Shards in order, rows in order, positions in order — the scan order the
+    /// predecessor's comment names, and the reason each column comes out
+    /// strictly increasing in row without a sort. A sorted row's range is a
+    /// contiguous run of it, so searching for the run visits the same entries
+    /// in the same order the full scan would keep.
+    fn fill(&self, spec: CscShardSpec) -> CscShardArrays {
+        let (c0, c1) = (spec.col_start, spec.col_end);
+        let mut indptr = Vec::with_capacity(c1 - c0 + 1);
+        indptr.push(0u64);
+        let mut cumsum = 0u64;
+        for c in c0..c1 {
+            cumsum += self.col_counts[c];
+            indptr.push(cumsum);
+        }
+        let nnz = cumsum as usize;
+        let mut indices = vec![0u32; nnz];
+        let mut data = vec![0.0f32; nnz];
+        let mut cursor = vec![0u64; c1 - c0];
+        let mut row_offset: usize = 0;
+        for shard in self.shards {
+            let shard_n_rows = shard.n_rows();
+            for row in 0..shard_n_rows {
+                let start = shard.indptr[row] as usize;
+                let end = shard.indptr[row + 1] as usize;
+                let (a, z) = if self.sorted {
+                    let idx = &shard.indices[start..end];
+                    (
+                        start + idx.partition_point(|&c| (c as usize) < c0),
+                        start + idx.partition_point(|&c| (c as usize) < c1),
+                    )
+                } else {
+                    (start, end)
+                };
+                for j in a..z {
+                    let col = shard.indices[j] as usize;
+                    if col >= c0 && col < c1 {
+                        let lc = col - c0;
+                        let dest = (indptr[lc] + cursor[lc]) as usize;
+                        indices[dest] = (row_offset + row) as u32;
+                        data[dest] = shard.data[j];
+                        cursor[lc] += 1;
+                    }
+                }
+            }
+            row_offset += shard_n_rows;
+        }
+        CscShardArrays {
+            col_start: c0 as u64,
+            indptr,
+            indices,
+            data,
+        }
     }
 }
 
@@ -1168,45 +1237,34 @@ impl CscShardSource for ResidentCscSource<'_> {
             return Ok(None);
         };
         self.next += 1;
-        let (c0, c1) = (spec.col_start, spec.col_end);
+        let a = self.fill(spec);
+        *indptr = a.indptr;
+        *indices = a.indices;
+        *data = a.data;
+        Ok(Some(a.col_start))
+    }
 
-        indptr.clear();
-        indptr.push(0u64);
-        let mut cumsum = 0u64;
-        for c in c0..c1 {
-            cumsum += self.col_counts[c];
-            indptr.push(cumsum);
-        }
-        let nnz = cumsum as usize;
-        indices.clear();
-        indices.resize(nnz, 0u32);
-        data.clear();
-        data.resize(nnz, 0.0f32);
-        let mut cursor = vec![0u64; c1 - c0];
-
-        // Shards in order, rows in order, positions in order — the scan order
-        // the predecessor's comment names, and the reason each column comes out
-        // strictly increasing in row without a sort.
-        let mut row_offset: usize = 0;
-        for shard in self.shards {
-            let shard_n_rows = shard.n_rows();
-            for row in 0..shard_n_rows {
-                let start = shard.indptr[row] as usize;
-                let end = shard.indptr[row + 1] as usize;
-                for j in start..end {
-                    let col = shard.indices[j] as usize;
-                    if col >= c0 && col < c1 {
-                        let lc = col - c0;
-                        let dest = (indptr[lc] + cursor[lc]) as usize;
-                        indices[dest] = (row_offset + row) as u32;
-                        data[dest] = shard.data[j];
-                        cursor[lc] += 1;
-                    }
-                }
+    /// Shards are independent reads of the resident CSR, so a batch fills them
+    /// in parallel with `parallel`.
+    fn next_batch(&mut self, max_nnz: u64) -> Result<Vec<CscShardArrays>, CscBuilderError> {
+        let (mut n, mut nnz) = (0usize, 0u64);
+        while let Some(spec) = self.plan.get(self.next + n) {
+            if n > 0 && nnz + spec.nnz > max_nnz {
+                break;
             }
-            row_offset += shard_n_rows;
+            nnz += spec.nnz;
+            n += 1;
         }
-        Ok(Some(c0 as u64))
+        let specs = &self.plan[self.next..self.next + n];
+        #[cfg(feature = "parallel")]
+        let out = {
+            use rayon::prelude::*;
+            specs.par_iter().map(|&spec| self.fill(spec)).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let out = specs.iter().map(|&spec| self.fill(spec)).collect();
+        self.next += n;
+        Ok(out)
     }
 
     fn stats(&self) -> CscBuilderStats {

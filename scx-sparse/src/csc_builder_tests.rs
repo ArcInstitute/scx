@@ -404,6 +404,21 @@ proptest! {
             resident.push((col_start, to_csc_arrays(n_rows, &ip, &ix, &dt)));
         }
         assert_same(&resident, &pushed);
+
+        // And a batch at a time, which fills several shards concurrently.
+        let mut src = ResidentCscSource::new(&shards, n_rows, n_cols, cols_per_shard, memory_bytes)
+            .expect("resident");
+        let mut batched = Vec::new();
+        loop {
+            let batch = src.next_batch(5).expect("batch");
+            if batch.is_empty() {
+                break;
+            }
+            for a in batch {
+                batched.push((a.col_start, to_csc_arrays(n_rows, &a.indptr, &a.indices, &a.data)));
+            }
+        }
+        assert_same(&batched, &pushed);
     }
 }
 

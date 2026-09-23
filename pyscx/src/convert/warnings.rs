@@ -44,9 +44,9 @@ pub(crate) fn emit_python_warnings(
 }
 
 /// Warn (Python `UserWarning`) that a CSC sidecar on the source is
-/// being dropped on rewrite. Matches the convention documented in
-/// `AGENTS.md`'s "CSC storage" bullet — mutating ops drop the
-/// sidecar by default; callers opt into a rebuild via `csc="always"`.
+/// being dropped on rewrite: the source's offsets are stale in the new file,
+/// and the resolved `csc` policy builds no fresh one (`"off"`, or the
+/// default `"auto"` on an output below its size threshold).
 pub(crate) fn warn_csc_dropped(py: Python<'_>) {
     let msg = "source SCX has a CSC sidecar; the rewrite drops it. \
                Pass csc=\"always\" to rebuild a fresh CSC sidecar over the new CSR shards.";

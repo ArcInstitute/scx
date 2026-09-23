@@ -27,12 +27,14 @@ def small_adata():
     return adata
 
 
-def test_from_anndata_csc_off_default(small_adata, tmp_path):
-    """Default `csc='off'` emits no CSC sidecar."""
+def test_from_anndata_default_below_the_auto_threshold_is_csr_only(small_adata, tmp_path):
+    """The default is `csc="auto"`, which a 20 x 15 matrix does not clear, so
+    no sidecar — and the values still round-trip."""
     import pyscx
 
     path = tmp_path / "csr_only.scx"
     pyscx.from_anndata(small_adata, str(path))
+    assert _csc_available(path) is False
 
     exp = pyscx.open(str(path))
     # Round-trip values still match.
@@ -109,16 +111,17 @@ def test_from_anndata_csc_auto_env_override_builds(small_adata, tmp_path, monkey
 
 
 # ---------------------------------------------------------------------------
-# Phase 0.3: an accel-ready index_preset implies csc="auto" when the caller
-# did not pass an explicit `csc`. An explicit value always wins.
+# An unset `csc` is "auto" on every entry point, whatever the `index_preset`.
+# It used to be "off" unless the preset was `training` / `perturbseq`, so the
+# preset axis is kept to show that no preset still opts out. An explicit value
+# always wins.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("preset", ["training", "perturbseq"])
-def test_index_preset_implies_csc_auto(small_adata, tmp_path, monkeypatch, preset):
-    """An accel-ready preset with no explicit `csc` upgrades to "auto".
-    With the thresholds lowered to 0, that builds a sidecar on the tiny
-    fixture."""
+@pytest.mark.parametrize("preset", [None, "training", "perturbseq", "cellxgene"])
+def test_unset_csc_is_auto_for_every_preset(small_adata, tmp_path, monkeypatch, preset):
+    """With the thresholds lowered to 0, the default builds a sidecar on the
+    tiny fixture — with or without a preset, `cellxgene` included."""
     monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
     monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
 
@@ -129,22 +132,8 @@ def test_index_preset_implies_csc_auto(small_adata, tmp_path, monkeypatch, prese
     assert _csc_available(path) is True
 
 
-def test_index_preset_cellxgene_does_not_imply_csc(small_adata, tmp_path, monkeypatch):
-    """The query-oriented `cellxgene` preset does NOT imply csc="auto" —
-    no sidecar even with the thresholds at 0."""
-    monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
-    monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
-
-    path = tmp_path / "preset_cellxgene.scx"
-    import pyscx
-
-    pyscx.from_anndata(small_adata, str(path), index_preset="cellxgene", csc_cols_per_shard=5)
-    assert _csc_available(path) is False
-
-
 def test_explicit_csc_off_overrides_preset(small_adata, tmp_path, monkeypatch):
-    """An explicit `csc="off"` wins over an accel-ready preset's implied
-    "auto" — the user's explicit choice is honored."""
+    """An explicit `csc="off"` wins over the "auto" default — the opt-out."""
     monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
     monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
 
@@ -158,12 +147,13 @@ def test_explicit_csc_off_overrides_preset(small_adata, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The preset -> csc="auto" upgrade can only fire on an *unset* `csc`, so any
-# entry point that spells a non-None default silently opts itself out. That is
-# not a hypothetical: `from_10x` shipped with `csc="off"` while accepting
-# `index_preset`, so `from_10x(..., index_preset="training")` produced no CSC
-# sidecar and GPU DE on the result took the slower `gpu_csr_v3` route, while
-# the byte-identical dataset through `from_h5ad` took `gpu_csc_v3`.
+# The shared "auto" default applies only to an *unset* `csc`, so any entry
+# point that spells a non-None default silently opts itself out. That is not a
+# hypothetical: `from_10x` shipped with `csc="off"` (back when the default was
+# "off" and only an accel-ready preset upgraded it), so
+# `from_10x(..., index_preset="training")` produced no CSC sidecar and GPU DE on
+# the result took the slower `gpu_csr_v3` route, while the byte-identical
+# dataset through `from_h5ad` took `gpu_csc_v3`.
 #
 # The tests above cover `from_anndata` only — 1 of the 4 entry points — which
 # is exactly how that drifted. This guard covers the whole surface by
@@ -202,9 +192,9 @@ def _csc_preset_entry_points():
 
 # The rewrite ops take a `csc` too, but a different one: whether the output
 # carries a sidecar through the rewrite (`"carry"` / `"always"` / `"off"`), not
-# an ingest `CscPolicy`. A preset does not upgrade it — rewriting a file that
-# has no sidecar builds none, preset or not, which is also what those ops did
-# before they carried one — so the None-default rule above does not apply.
+# an ingest `CscPolicy`. Their default is "carry" — rewriting a file that has
+# no sidecar builds none, which is also what those ops did before they carried
+# one — so the None-default rule above does not apply.
 _REWRITE_OPS = frozenset({"compact", "merge", "optimize", "sort", "shuffle"})
 
 
@@ -224,12 +214,13 @@ def test_the_rewrite_ops_excluded_above_are_the_carry_kind():
 
 
 def test_every_preset_aware_entry_point_defaults_csc_to_none():
-    """`csc` must default to None wherever `index_preset` is accepted.
+    """`csc` must default to None on every ingest entry point.
 
     A non-None default (e.g. `"off"`) is indistinguishable from a caller
-    who explicitly asked for it, so `resolve_csc_policy` cannot apply the
-    accel-ready preset upgrade and the entry point diverges from its
-    siblings with no error.
+    who explicitly asked for it, so `resolve_csc_policy` never supplies
+    the shared "auto" default and the entry point diverges from its
+    siblings with no error. (The discovery keys on `index_preset` because
+    that is what marks the ingest entry points apart from the rewrite ops.)
     """
     entry_points = _csc_preset_entry_points()
 
@@ -242,8 +233,8 @@ def test_every_preset_aware_entry_point_defaults_csc_to_none():
 
     offenders = {n: d for n, d in entry_points.items() if d is not None}
     assert not offenders, (
-        f"these entry points accept `index_preset` but pin a non-None `csc` "
-        f"default, so the preset -> csc='auto' upgrade can never fire: "
+        f"these ingest entry points pin a non-None `csc` default, so the "
+        f"shared csc='auto' default can never apply: "
         f"{offenders}. Declare `csc=None` and resolve via "
         f"`scx_engine::index::resolve_csc_policy`."
     )
@@ -312,10 +303,10 @@ def _pyfunction_blocks():
 def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
     """`csc=None` is necessary but not sufficient — resolution must run.
 
-    Declaring `csc=None` only makes the upgrade *possible*. An entry point
-    that then did `csc.unwrap_or("off")`, or passed the `Option` on to a
-    default of its own, would satisfy the signature guard above and
-    silently reintroduce exactly the opt-out this PR fixes.
+    Declaring `csc=None` only makes the shared default *possible*. An entry
+    point that then did `csc.unwrap_or("off")`, or passed the `Option` on to
+    a default of its own, would satisfy the signature guard above and
+    silently opt out of the "auto" default its siblings have.
 
     So assert the other half at the source: every `#[pyfunction]` whose
     pyo3 signature carries both `csc` and `index_preset` must call
@@ -354,9 +345,8 @@ def test_every_preset_aware_entry_point_calls_resolve_csc_policy():
     # `resolve_csc_policy(` — a call, not a bare mention.
     missing = [n for n, body in preset_aware if "resolve_csc_policy(" not in body]
     assert not missing, (
-        f"these entry points accept both `csc` and `index_preset` but never "
-        f"call `resolve_csc_policy`, so an accel-ready preset cannot upgrade "
-        f"an unset `csc`: {missing}."
+        f"these ingest entry points never call `resolve_csc_policy`, so an "
+        f"unset `csc` does not get the shared 'auto' default: {missing}."
     )
 
 
@@ -437,12 +427,12 @@ def test_from_10x_fixture_round_trips(tenx_h5, tmp_path):
     assert list(adata.var_names[:2]) == ["GENE0", "GENE1"]
 
 
-@pytest.mark.parametrize("preset", ["training", "perturbseq"])
-def test_from_10x_index_preset_implies_csc_auto(tenx_h5, tmp_path, monkeypatch, preset):
-    """`from_10x` honors the preset -> csc="auto" upgrade, like its siblings.
+@pytest.mark.parametrize("preset", [None, "training", "cellxgene"])
+def test_from_10x_unset_csc_is_auto(tenx_h5, tmp_path, monkeypatch, preset):
+    """`from_10x` resolves an unset `csc` to "auto" like its siblings.
 
-    Regression: `from_10x` declared `csc="off"`, so this produced a
-    CSR-only file and GPU DE on it silently fell back to `gpu_csr_v3`.
+    Regression: `from_10x` once declared `csc="off"`, so it produced a
+    CSR-only file where the other entry points built a sidecar.
     """
     pytest.importorskip("scanpy")
     import pyscx
@@ -455,22 +445,8 @@ def test_from_10x_index_preset_implies_csc_auto(tenx_h5, tmp_path, monkeypatch, 
     assert _csc_available(path) is True
 
 
-def test_from_10x_index_preset_cellxgene_does_not_imply_csc(tenx_h5, tmp_path, monkeypatch):
-    """The query-oriented preset must NOT be upgraded — the fix resolves
-    the policy, it does not turn CSC on for every preset."""
-    pytest.importorskip("scanpy")
-    import pyscx
-
-    monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
-    monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
-
-    path = tmp_path / "tenx_cellxgene.scx"
-    pyscx.from_10x(str(tenx_h5), str(path), index_preset="cellxgene", csc_cols_per_shard=5)
-    assert _csc_available(path) is False
-
-
 def test_from_10x_explicit_csc_off_overrides_preset(tenx_h5, tmp_path, monkeypatch):
-    """An explicit `csc="off"` still wins over an accel-ready preset."""
+    """An explicit `csc="off"` still wins over the "auto" default."""
     pytest.importorskip("scanpy")
     import pyscx
 

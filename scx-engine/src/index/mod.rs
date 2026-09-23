@@ -41,7 +41,7 @@ pub use build::{
 pub use derive::{apply_obs_shard_column_stats, derive_shard_column_stats};
 pub use diagnostics::{
     column_not_found_message, forced_column_missing_message, forced_columns_missing_message,
-    index_preset_columns, preset_implies_csc_auto, resolve_csc_policy, IndexPreset,
+    index_preset_columns, resolve_csc_policy, IndexPreset,
 };
 pub use lookup::index_covers_all_obs;
 pub use stream::ObsPredicateIndexBuilder;

@@ -108,15 +108,14 @@ enum Commands {
         codec: String,
         /// Whether to also emit a CSC sidecar at write time.
         ///
-        /// `off` (default): CSR-only output, matches existing behavior.
-        /// `auto`: emit a CSC sidecar when the dataset is large enough to
-        ///   benefit (n_obs ≥ 50000 and n_vars ≥ 5000 by default; tune via
-        ///   `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`).
+        /// `auto` (default): emit a CSC sidecar when the dataset is large
+        ///   enough to benefit (n_obs ≥ 50000 and n_vars ≥ 5000 by default;
+        ///   tune via `SCX_CSC_AUTO_OBS_THRESHOLD` /
+        ///   `SCX_CSC_AUTO_VARS_THRESHOLD`). It is built in the same pass as
+        ///   X, and costs disk (the sidecar holds every nonzero again) and
+        ///   convert time.
         /// `always`: always emit a CSC sidecar (column-major shards).
-        ///
-        /// When omitted, an accel-ready `--index-preset` (`training` /
-        /// `perturbseq`) upgrades the default to `auto`; otherwise the
-        /// default is `off`. An explicit value here always wins.
+        /// `off`: CSR-only output, the opt-out.
         #[arg(long, value_parser = ["off", "auto", "always"])]
         csc: Option<String>,
         /// Columns per CSC shard when a CSC sidecar is emitted (default 5000).
@@ -1385,12 +1384,9 @@ fn main() {
             group_max_bytes,
             group_pass,
         } => {
-            // Resolve the CSC policy: an explicit `--csc` always wins;
-            // otherwise an accel-ready `--index-preset` upgrades the
-            // default to `auto` (column substrate for DE/pseudobulk).
-            // Shared with pyscx via `scx_engine::index::resolve_csc_policy`.
-            let csc =
-                scx_engine::index::resolve_csc_policy(csc.as_deref(), index_preset.as_deref());
+            // An explicit `--csc` wins; unset is `auto`. Shared with pyscx
+            // via `scx_engine::index::resolve_csc_policy`.
+            let csc = scx_engine::index::resolve_csc_policy(csc.as_deref());
             run_convert(
                 &input,
                 &output,
@@ -1401,7 +1397,7 @@ fn main() {
                 shard_size,
                 &shard_obs,
                 &codec,
-                &csc,
+                csc,
                 csc_cols_per_shard,
                 row_group_rows,
                 row_group_target_nnz,

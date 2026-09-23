@@ -342,8 +342,9 @@ fn write_csc_sidecar_inner(
         value_encoding,
         codec_id,
         modality_id: opts.modality_id,
-        // The resident source yields one shard at a time regardless.
-        batch_nnz: 0,
+        // Beside a caller that already holds the whole CSR, so only the batch
+        // is new; the emit share is the same one the streamed path uses.
+        batch_nnz: crate::csc_budget::csc_emit_batch_nnz(opts.memory_budget_bytes as u64),
     };
     emit_csc_shards(writer, &mut source, &emit, |_, _, _| {})
 }
