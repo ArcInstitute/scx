@@ -279,7 +279,7 @@ fn build_csc_matches_the_table() {
     let dir = tempfile::tempdir().unwrap();
     let input = fixture_all_families(dir.path(), "in.scx");
     let output = dir.path().join("with_csc.scx");
-    scx_ops::run_build_csc(&input, &output, "1G", false, 1024, None, None).unwrap();
+    scx_ops::run_build_csc(&input, &output, Some("1G"), false, 1024, None, None).unwrap();
     assert_matches_table(RewriteOp::BuildCsc, &input, &output);
 
     // The op's whole purpose, and the one family it *adds*.
@@ -373,7 +373,7 @@ fn build_csc_carries_what_optimize_carries() {
     let input = fixture_all_families(dir.path(), "in.scx");
 
     let with_csc = dir.path().join("with_csc.scx");
-    scx_ops::run_build_csc(&input, &with_csc, "1G", false, 1024, None, None).unwrap();
+    scx_ops::run_build_csc(&input, &with_csc, Some("1G"), false, 1024, None, None).unwrap();
     let after_csc = families_of(&with_csc);
 
     let optimized = dir.path().join("optimized.scx");
@@ -798,7 +798,7 @@ fn build_csc_keeps_obsm_sharded() {
     );
 
     let output = dir.path().join("with_csc.scx");
-    scx_ops::run_build_csc(&input, &output, "1G", false, 1024, None, None).unwrap();
+    scx_ops::run_build_csc(&input, &output, Some("1G"), false, 1024, None, None).unwrap();
 
     assert_eq!(
         count(&output, SectionType::ObsmEmbeddingShard),

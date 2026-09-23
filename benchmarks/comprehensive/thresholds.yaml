@@ -96,6 +96,35 @@ absolute_floors:
     metric: wilcoxon_route_csc_direct
     min: 1.0
 
+  # CPU CSC route gate. `accel_de.py`'s `_cpu_csc` variants run the CPU DE ops
+  # on the bench-built CSC fixture (the same file the GPU variants open) through
+  # a backed handle at the default `prefer_format="auto"`, and emit
+  # `de_route_csc_cpu`: 1.0 iff a `cpu_csc*` route ran. Unlike the GPU
+  # `*_route_csc_direct` signals it is **not** 1.0 when no fixture was built —
+  # the variant has no other purpose, so a lost fixture fails the floor rather
+  # than reading as coverage. Same two tiers as the GPU route floors: pbmc3k is
+  # the single-CSC-shard check, tabula_sapiens_100k the multi-shard one.
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_cpu_csc
+    dataset: pbmc3k
+    metric: de_route_csc_cpu
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_cpu_csc
+    dataset: tabula_sapiens_100k
+    metric: de_route_csc_cpu
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_pdex_ref_cpu_csc
+    dataset: pbmc3k
+    metric: de_route_csc_cpu
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_pdex_ref_cpu_csc
+    dataset: tabula_sapiens_100k
+    metric: de_route_csc_cpu
+    min: 1.0
+
   # GPU CSR device-residency gate (§9.11 / task 4.5). `accel_de.py` emits
   # `de_route_resident_csr` **only on a `gpu_csr*` route**: 1.0 when the CSR
   # route held the matrix device-resident across gene chunks, 0.0 when it
@@ -3427,6 +3456,38 @@ absolute_floors:
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: pbmc10k
     metric: pipeline_completed_int
+    min: 1.0
+
+  # The DE stage's route under the pipeline's own shape: a row filter, a gene
+  # filter and `normalize_total -> log1p`, on a default-cache backed handle,
+  # at `rank_genes_groups`' default `prefer_format="auto"`. Nothing else in the
+  # suite gates the *auto* route in that shape — `bench_csc_dispatch` passes
+  # `prefer_format` explicitly and caches the whole matrix, and `accel_de`'s
+  # CPU variants run on an in-memory AnnData. `de_route_is_csc` is 1.0 iff the
+  # recorded route contains "csc".
+  #
+  # Floored on the three datasets whose `_auto.scx` fixture clears the ingest
+  # `auto` rule (n_obs >= 50,000 and n_vars >= 5,000) and therefore carries a
+  # sidecar; pbmc10k does not, and records 0.0 unfloored. The metric is not
+  # vacuous on a fixture without a sidecar — it reads 0.0 there and
+  # `fixture_has_csc` names the cause — so a reconvert that drops the sidecar
+  # fails these floors instead of passing them silently. The route the planner
+  # declines to take on a narrow row window (`csc_preferred_for_auto`) cannot
+  # arise here: `filter_cells(min_genes=200)` keeps nearly every row.
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: tabula_sapiens_100k
+    metric: de_route_is_csc
+    min: 1.0
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_500k
+    metric: de_route_is_csc
+    min: 1.0
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_1m
+    metric: de_route_is_csc
     min: 1.0
 
   # --- multimodal_atlas_streaming: atlas-scale multiome / CITE-seq ---------

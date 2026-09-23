@@ -25,13 +25,18 @@ const VARS_THRESHOLD_ENV: &str = "SCX_CSC_AUTO_VARS_THRESHOLD";
 /// HVG, per-gene QC, pseudobulk) and the GPU `pdex_ref` v3 CSC-direct route.
 /// `Auto` builds a sidecar when the dataset is large enough that the
 /// column-axis acceleration pays for the extra write-time transpose + storage.
+///
+/// The default is `Auto` on every single-modality ingest entry point, since the
+/// builder runs in the same pass as X and in parallel; `Off` is the opt-out.
+/// (Streaming h5mu and `from_mudata` cannot build per-modality sidecars, so
+/// `Auto` degrades to no sidecar there.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CscPolicy {
     /// Never emit a CSC sidecar.
-    #[default]
     Off,
     /// Emit a CSC sidecar when the dataset passes the size heuristic
     /// (`n_obs >= obs_threshold && n_vars >= vars_threshold`).
+    #[default]
     Auto,
     /// Always emit a CSC sidecar regardless of dataset size.
     Always,
@@ -49,6 +54,15 @@ impl CscPolicy {
             other => Err(format!(
                 "invalid csc value '{other}'; expected off|auto|always"
             )),
+        }
+    }
+
+    /// The CLI / Python spelling, the inverse of [`Self::parse`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Always => "always",
         }
     }
 
@@ -113,9 +127,11 @@ mod tests {
     }
 
     #[test]
-    fn default_is_off() {
-        assert_eq!(CscPolicy::default(), CscPolicy::Off);
-        assert!(!CscPolicy::default().should_build_csc(u64::MAX, u64::MAX));
+    fn default_is_auto() {
+        assert_eq!(CscPolicy::default(), CscPolicy::Auto);
+        for p in [CscPolicy::Off, CscPolicy::Auto, CscPolicy::Always] {
+            assert_eq!(CscPolicy::parse(p.as_str()).unwrap(), p);
+        }
     }
 
     #[test]

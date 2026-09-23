@@ -9,6 +9,8 @@ AnnData:
   - `bench_csc__hvg_csr`        / `_csc`     (`highly_variable_genes`,
                                               single-batch seurat_v3)
   - `bench_csc__de_csr`         / `_csc`     (`rank_genes_groups`)
+  - `bench_csc__de_csr_bounded`              (`rank_genes_groups`, CSR, at
+                                              the default shard cache)
   - `bench_csc__pdex_ref_csr`   / `_csc`     (`pdex_ref`)
   - `bench_csc__pseudobulk_csr` / `_csc`     (`pseudobulk_dex`)
 
@@ -20,6 +22,18 @@ Records wall time, peak RSS, and (for CSC variants on
 `BackedCscReader`) cache hit/miss counts via
 `pyscx`'s public `prefer_format` surface — no internal metrics
 plumbing needed.
+
+Every variant but one opens its handle with the shard cache sized to the
+whole file (`_open_backed`), so the CSR arms never re-decode a shard. That is
+the *favourable* regime for CSR, and not the one a real pipeline runs in:
+`to_anndata(backed=True)` defaults to a 4-shard cache, and once a DE pass
+visits more shards than that, every gene chunk re-decodes every shard.
+`bench_csc__de_csr_bounded` is the same CSR DE call on a handle opened at that
+default, so the suite measures the regime the sidecar exists to fix beside the
+one it merely beats. It is scoped to `tabula_sapiens_100k` (7 CSR shards, so
+the default cache thrashes) through `FORMAT_DATASET_SCOPE`: at census scale the
+bounded CSR route runs for tens of minutes per repetition, which a warm-up plus
+three runs would push past this benchmark's SLURM time budget.
 
 CSC has no GPU path; all variants are CPU. PCA is intentionally
 absent (PCA explicitly rejects `prefer_format="csc"`).
@@ -75,6 +89,16 @@ _PSEUDOBULK_N_CPUS = pseudobulk_n_cpus_cap()
 # pin keeps the gate measuring the same thing it always did.)
 _PSEUDOBULK_BACKEND = "pydeseq2"
 
+# Variants that open their handle at `to_anndata(backed=True)`'s default shard
+# cache instead of one sized to the file. See the module docstring.
+_BOUNDED_CACHE_VARIANTS: frozenset[str] = frozenset({"bench_csc__de_csr_bounded"})
+
+# Per-format dataset allow-lists, read by `run_parallel` at cohort-build time.
+# Only the bounded arm is scoped; every other variant runs wherever it did.
+FORMAT_DATASET_SCOPE: dict[str, frozenset[str]] = {
+    "bench_csc__de_csr_bounded": frozenset({"tabula_sapiens_100k"}),
+}
+
 # Per-dataset cache for the converted CSC-equipped SCX file. Keyed by
 # `(dataset.name, csc_cols_per_shard)`.
 _csc_path_cache: dict[tuple[str, int], Path] = {}
@@ -110,6 +134,11 @@ def bench_csc_dispatch_variants() -> list[FormatVariant]:
         FormatVariant(
             name="rank_genes_groups (CSC)",
             key="bench_csc__de_csc",
+            category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
+            name="rank_genes_groups (CSR, default shard cache)",
+            key="bench_csc__de_csr_bounded",
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
@@ -156,12 +185,17 @@ def _convert_to_csc_scx(dataset: DatasetConfig, tmpdir: Path) -> Path:
     return out_path
 
 
-def _open_backed(path: Path) -> Any:
+def _open_backed(path: Path, *, bounded: bool = False) -> Any:
     # Size the LRU shard cache to the file's shard count. The default
     # cache_shards=4 is < tabula_sapiens_100k's 7 CSR shards, which makes the
     # CSR pdex_ref variant re-decode every shard per gene chunk (hours-long).
     # Caching all shards keeps the per-gene-chunk slab reads from thrashing.
+    #
+    # `bounded=True` leaves the cache at the default instead — that thrash is
+    # exactly what `bench_csc__de_csr_bounded` exists to measure.
     exp = pyscx.open(str(path))
+    if bounded:
+        return exp.to_anndata(backed=True)
     return exp.to_anndata(backed=True, cache_shards=max(4, exp.shard_count))
 
 
@@ -283,6 +317,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[[Any, str], None], str]] = {
     "bench_csc__hvg_csc":         (_run_hvg, "csc"),
     "bench_csc__de_csr":          (_run_de, "csr"),
     "bench_csc__de_csc":          (_run_de, "csc"),
+    "bench_csc__de_csr_bounded":  (_run_de, "csr"),
     "bench_csc__pdex_ref_csr":    (_run_pdex_ref, "csr"),
     "bench_csc__pdex_ref_csc":    (_run_pdex_ref, "csc"),
     "bench_csc__pseudobulk_csr":  (_run_pseudobulk, "csr"),
@@ -300,6 +335,7 @@ _VARIANT_OP_KEY: dict[str, str] = {
     "bench_csc__hvg_csc": "highly_variable_genes",
     "bench_csc__de_csr": "rank_genes_groups",
     "bench_csc__de_csc": "rank_genes_groups",
+    "bench_csc__de_csr_bounded": "rank_genes_groups",
     "bench_csc__pdex_ref_csr": "pdex_ref",
     "bench_csc__pdex_ref_csc": "pdex_ref",
     "bench_csc__pseudobulk_csr": "pseudobulk_dex",
@@ -328,6 +364,7 @@ def run(
     if key not in _VARIANT_IMPLS:
         return None
     runner, prefer = _VARIANT_IMPLS[key]
+    bounded = key in _BOUNDED_CACHE_VARIANTS
 
     # Materialise the CSC-equipped SCX file for the dataset (cached).
     # CSR variants also use this file — a CSC sidecar is harmless on
@@ -347,12 +384,15 @@ def run(
             "n_obs": dataset.n_obs,
             "prefer_format": prefer,
             "random_seed": RANDOM_SEED,
+            # "default" = `to_anndata(backed=True)`'s own cache; "file" = one
+            # slot per CSR shard, so nothing is ever re-decoded.
+            "shard_cache": "default" if bounded else "file",
         },
     )
 
     # Warmup runs — discarded.
     for _ in range(N_WARMUP_RUNS):
-        adata = _open_backed(csc_path)
+        adata = _open_backed(csc_path, bounded=bounded)
         try:
             runner(adata, prefer)
         except Exception as e:
@@ -362,7 +402,7 @@ def run(
 
     for i in range(n_runs):
         gc.collect()
-        adata = _open_backed(csc_path)
+        adata = _open_backed(csc_path, bounded=bounded)
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()

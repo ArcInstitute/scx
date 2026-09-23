@@ -1321,7 +1321,7 @@ def validate(path: Any, deep: bool = ...) -> list[tuple[str, bool]]:
 def build_csc(
     input: Any,
     output: Any | None = ...,
-    memory_limit: str = ...,
+    memory_limit: str | None = ...,
     force: bool = ...,
     csc_cols_per_shard: int = ...,
     temp_dir: str | None = ...,
@@ -1352,7 +1352,7 @@ def optimize(
     memory_budget: int | str | None = ...,
     csc: str = ...,
     csc_cols_per_shard: int = ...,
-    csc_memory_limit: str = ...,
+    csc_memory_limit: str | None = ...,
 ) -> None: ...
 
 
@@ -1372,7 +1372,7 @@ def sort(
     bitmap: str = ...,
     rebuild_csc: bool | None = ...,
     csc_cols_per_shard: int = ...,
-    csc_memory_limit: str = ...,
+    csc_memory_limit: str | None = ...,
     group_by: str | None = ...,
     reference: str | Sequence[str] | dict[str, str] | None = ...,
     group_target_bytes: int | str | None = ...,
@@ -1401,7 +1401,7 @@ def shuffle(
     bitmap: str = ...,
     rebuild_csc: bool | None = ...,
     csc_cols_per_shard: int = ...,
-    csc_memory_limit: str = ...,
+    csc_memory_limit: str | None = ...,
     csc: str | None = ...,
 ) -> None:
     """Globally reorder cells (the obs axis) by a seeded random permutation, so

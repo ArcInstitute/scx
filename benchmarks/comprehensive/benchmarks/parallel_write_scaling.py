@@ -99,7 +99,9 @@ _WORKER_SCRIPT = textwrap.dedent("""\
         t0 = time.perf_counter()
         if mode == "write_only":
             import pyscx
-            pyscx.from_anndata(adata, str(out_path), codec=codec)
+            # `csc="off"`, as `ScxRunner` pins for the other mode: this times
+            # the CSR write, and the ingest default would add a sidecar build.
+            pyscx.from_anndata(adata, str(out_path), codec=codec, csc="off")
             wall = time.perf_counter() - t0
             rss_after = _get_rss_mb()
             output_size = os.path.getsize(out_path)

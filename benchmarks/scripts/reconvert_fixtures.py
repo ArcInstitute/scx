@@ -26,6 +26,12 @@ Usage::
     # See what would happen without touching anything.
     python benchmarks/scripts/reconvert_fixtures.py --dry-run --cloud-push
 
+CSC sidecars: ``scx_auto`` fixtures are converted with ``csc="auto"``
+(``benchmarks.comprehensive.convert.FIXTURE_CSC_POLICY``), so every fixture
+that clears the ingest rule (n_obs >= 50,000 and n_vars >= 5,000) comes back
+with a sidecar, and a reconvert cannot drop the one the route floors in
+``thresholds.yaml`` depend on. The other SCX codec variants stay CSR-only.
+
 Pre-reqs:
   - ``SCX_DATA_DIR`` resolves to the staged h5ad fixtures (or
     ``SCX_WORK_DIR/benchmarks/datasets`` if not set explicitly).

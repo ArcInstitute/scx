@@ -1006,7 +1006,7 @@ pub fn fixture_all_families_with_csc(dir: &Path, name: &str, cols_per_shard: usi
     scx_ops::rebuild_csc_inplace(
         &path,
         cols_per_shard,
-        "4G",
+        None,
         scx_ops::framing_for_csc_rebuild(&path),
         None,
     )

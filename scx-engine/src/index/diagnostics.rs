@@ -7,8 +7,6 @@
 //! conversion entry points cannot live in `scx-convert`. Moving it *within*
 //! this crate is fine; moving it out is not.
 
-use std::borrow::Cow;
-
 /// Render an actionable error message for a forced obs/var index
 /// column that doesn't exist in the source DataFrame. Adds the
 /// available column list and, when one is close enough, a single
@@ -197,30 +195,15 @@ pub fn index_preset_columns(name: &str) -> Option<IndexPreset> {
     }
 }
 
-/// Whether a named index preset implies a CSC sidecar should be built
-/// when the caller did not explicitly pass a `csc` policy.
+/// Resolve the effective CSC policy string for a conversion entry point: an
+/// explicit `csc` wins, and an unset one is [`scx_format::CscPolicy`]'s
+/// default, `"auto"`.
 ///
-/// The accel-ready presets — `training` and `perturbseq` — drive
-/// column/DE-heavy workloads (pseudobulk, `pdex_ref`, `rank_genes_groups`)
-/// whose primary substrate is the column-major CSC sidecar, so selecting
-/// one of those presets upgrades an *unset* `csc` to `auto`. `cellxgene`
-/// is query/browse-oriented and does not imply CSC. An explicit `--csc`
-/// value (including `off`) always wins over this default.
-pub fn preset_implies_csc_auto(name: &str) -> bool {
-    matches!(name, "training" | "perturbseq")
-}
-
-/// Resolve the effective CSC policy string for a conversion entry point.
-///
-/// An explicit `csc` always wins; when unset (`None`), an accel-ready
-/// `index_preset` (`training` / `perturbseq`) upgrades the default to
-/// `"auto"`, otherwise the default is `"off"`. Shared by the `scx convert`
-/// CLI and the pyscx conversion entry points so the two front-ends cannot
-/// drift.
-pub fn resolve_csc_policy<'a>(csc: Option<&'a str>, index_preset: Option<&str>) -> Cow<'a, str> {
-    match csc {
-        Some(v) => Cow::Borrowed(v),
-        None if index_preset.is_some_and(preset_implies_csc_auto) => Cow::Borrowed("auto"),
-        None => Cow::Borrowed("off"),
-    }
+/// Shared by the `scx convert` CLI and the pyscx conversion entry points so the
+/// front-ends cannot drift. It used to take the `index_preset` too, because the
+/// default was `"off"` and only the `training` / `perturbseq` presets upgraded
+/// it; with `"auto"` the default for every preset, there is nothing left for
+/// the preset to decide.
+pub fn resolve_csc_policy(csc: Option<&str>) -> &str {
+    csc.unwrap_or(scx_format::CscPolicy::default().as_str())
 }

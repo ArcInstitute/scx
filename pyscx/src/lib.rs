@@ -320,11 +320,12 @@ pub(crate) fn deep_validate_into(
 ///     backed = sc.read_h5ad("big.h5ad", backed="r")
 ///     pyscx.from_anndata(backed, "big.scx")
 ///
-/// `csc`: `"off"` (default) emits CSR shards only; `"always"` also writes
-///   a CSC (column-major) sidecar; `"auto"` writes one when the dataset is
-///   large enough to benefit (`n_obs >= 50000` and `n_vars >= 5000` by
-///   default, tunable via the `SCX_CSC_AUTO_OBS_THRESHOLD` /
-///   `SCX_CSC_AUTO_VARS_THRESHOLD` env vars). Matches `scx convert --csc`.
+/// `csc`: `None` (default) is `"auto"`, which writes a CSC (column-major)
+///   sidecar when the dataset is large enough to benefit (`n_obs >= 50000`
+///   and `n_vars >= 5000` by default, tunable via the
+///   `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD` env vars);
+///   `"always"` writes one whatever the size; `"off"` emits CSR shards only.
+///   Matches `scx convert --csc`.
 ///
 /// `csc_cols_per_shard`: columns per emitted CSC shard (default 5000).
 ///   Pass `0` to disable the cap (single CSC shard, memory permitting).
@@ -391,7 +392,7 @@ fn from_anndata(
     row_group_target_nnz: Option<u64>,
 ) -> PyResult<()> {
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
-    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
+    let csc = scx_engine::index::resolve_csc_policy(csc);
     convert::from_anndata_impl(
         py,
         adata,
@@ -399,7 +400,7 @@ fn from_anndata(
         codec,
         shard_size,
         in_place,
-        &csc,
+        csc,
         csc_cols_per_shard,
         uns_format,
         index_obs.unwrap_or_default(),
@@ -497,9 +498,9 @@ fn from_h5ad(
             resolved.profile
         )));
     }
-    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
+    let csc = scx_engine::index::resolve_csc_policy(csc);
     let csc_policy =
-        scx_format_io::CscPolicy::parse(&csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        scx_format_io::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = convert::parse_uns_format(uns_format)?;
     let shard_target_rows =
         resolve_shard_size(shard_size, scx_format_io::DEFAULT_SHARD_TARGET_ROWS)?;
@@ -633,8 +634,7 @@ fn from_h5ad(
 ///
 /// `csc`, `csc_cols_per_shard`, and `uns_format` mirror `from_anndata`
 /// — see those docs. In particular `csc=None` (the default) resolves to
-/// `"off"` unless an accel-ready `index_preset` (`training` /
-/// `perturbseq`) upgrades it to `"auto"`; an explicit value always wins.
+/// `"auto"`; an explicit value always wins.
 #[pyfunction]
 #[pyo3(signature = (
     h5_path, scx_path, codec=None, shard_size=None, csc=None,
@@ -674,11 +674,11 @@ fn from_10x(
     )?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
-    // An explicit `csc` always wins; an unset one is upgraded to `auto` by an
-    // accel-ready `index_preset`. Shared with `from_anndata` / `from_h5ad` /
-    // `from_h5mu` and the `scx convert` CLI so the front-ends cannot drift —
-    // this entry point previously pinned `"off"` and silently opted out.
-    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
+    // An explicit `csc` always wins; an unset one is `auto`. Shared with
+    // `from_anndata` / `from_h5ad` / `from_h5mu` and the `scx convert` CLI so
+    // the front-ends cannot drift — this entry point once pinned `"off"` and
+    // silently opted out.
+    let csc = scx_engine::index::resolve_csc_policy(csc);
     convert::from_anndata_impl(
         py,
         &adata,
@@ -689,7 +689,7 @@ fn from_10x(
         // returns a fresh AnnData with no other reference. The kwarg was
         // removed from the public signature (T3.7); pass false.
         false,
-        &csc,
+        csc,
         csc_cols_per_shard,
         uns_format,
         index_obs.unwrap_or_default(),
@@ -747,7 +747,7 @@ fn from_h5mu(
     writer_queue_depth: usize,
     row_group_rows: u32,
 ) -> PyResult<()> {
-    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
+    let csc = scx_engine::index::resolve_csc_policy(csc);
     mudata::from_h5mu_impl(
         py,
         path,
@@ -755,7 +755,7 @@ fn from_h5mu(
         codec,
         shard_size,
         shard_obs,
-        &csc,
+        csc,
         csc_cols_per_shard,
         stream,
         strict_uns,
@@ -1005,10 +1005,21 @@ fn from_mudata(
 /// rounding, with a warning, and is named after the read path's `allow_lossy`
 /// for the same reason.
 ///
+/// `csc` / `csc_cols_per_shard` as for `from_anndata`: `csc=None` is `"auto"`,
+/// a CSC sidecar when `n_obs >= 50000` and `n_vars >= 5000`, appended to the
+/// written file in place (the MTX reader writes CSR only); `"off"` opts out.
+/// `memory_budget` (as for `from_h5ad`) bounds that sidecar build — its share
+/// sizes the shard widths and batches the emit — and `temp_dir` names where
+/// its buckets spill (default: the output's own directory).
+///
 /// Example:
 ///     pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
 #[pyfunction]
-#[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto", allow_lossy=false))]
+#[pyo3(signature = (
+    mtx_dir, scx_path, codec=None, shard_size=None, shard_obs="auto", allow_lossy=false,
+    csc=None, csc_cols_per_shard=5000, memory_budget=None, temp_dir=None,
+))]
+#[allow(clippy::too_many_arguments)]
 fn from_mtx(
     py: Python<'_>,
     mtx_dir: &str,
@@ -1017,7 +1028,20 @@ fn from_mtx(
     shard_size: Option<u32>,
     shard_obs: &str,
     allow_lossy: bool,
+    csc: Option<&str>,
+    csc_cols_per_shard: usize,
+    memory_budget: Option<Bound<'_, PyAny>>,
+    temp_dir: Option<std::path::PathBuf>,
 ) -> PyResult<()> {
+    let csc_policy = scx_format_io::CscPolicy::parse(scx_engine::index::resolve_csc_policy(csc))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    // Parsed before any I/O. `csc_sidecar_bytes` is the sidecar figure
+    // streaming ingest uses, so the shard widths and the bounded emit match
+    // what `from_h5ad` would write under the same budget. The spill threshold
+    // does not: this is a post-pass with nothing running beside it, so it is
+    // `build-csc`'s half of the limit, not ingest's same-pass quarter.
+    let csc_memory_limit = convert::parse_memory_budget(memory_budget.as_ref())?
+        .map(|b| scx_convert::csc_sidecar_bytes(Some(b)).to_string());
     let obs_shard_policy =
         scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
     let orientation = scx_mtx::mtx_to_scx(
@@ -1030,6 +1054,17 @@ fn from_mtx(
         allow_lossy,
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    py.detach(|| {
+        scx_ops::build_csc_for_policy(
+            std::path::Path::new(scx_path),
+            csc_policy,
+            csc_cols_per_shard,
+            csc_memory_limit.as_deref(),
+            temp_dir.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .map_err(PyRuntimeError::new_err)?;
 
     if allow_lossy {
         crate::pyimport::import_module(py, "warnings")?.call_method1(

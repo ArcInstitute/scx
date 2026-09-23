@@ -981,7 +981,7 @@ fn a_rewrite_does_not_fabricate_stats_for_an_unverifiable_index() {
         if label == "optimize" {
             scx_ops::optimize(&no_stats, &out, None, scx_format_io::ObsShardPolicy::Auto).unwrap();
         } else {
-            scx_ops::run_build_csc(&no_stats, &out, "64M", false, 0, None, None).unwrap();
+            scx_ops::run_build_csc(&no_stats, &out, Some("64M"), false, 0, None, None).unwrap();
         }
         assert!(
             csr_column_stats(&out).is_empty(),

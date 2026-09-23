@@ -846,3 +846,55 @@ fn a_dot_destination_is_not_treated_as_containing_everything() {
     );
     assert!(work.join("matrix.mtx.gz").exists());
 }
+
+// ---------------------------------------------------------------------------
+// The MTX direction follows the ingest CSC default, and honours a budget.
+// ---------------------------------------------------------------------------
+
+/// Convert the fixture with the `auto` thresholds lowered to 0 and `extra`
+/// flags; returns (exit ok, has_csc).
+fn mtx_csc(extra: &[&str]) -> (bool, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx");
+    create_mtx_dir(&mtx_dir);
+    let out = dir.path().join("out.scx");
+    let mut args = vec![
+        "convert".to_string(),
+        "--from".into(),
+        "mtx".into(),
+        mtx_dir.to_str().unwrap().into(),
+        out.to_str().unwrap().into(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let status = scx()
+        .args(&args)
+        .env("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
+        .env("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
+        .status()
+        .unwrap();
+    let has_csc = status.success()
+        && scx_format_io::ScxReader::open(&out)
+            .unwrap()
+            .header()
+            .n_csc_shards
+            > 0;
+    (status.success(), has_csc)
+}
+
+#[test]
+fn mtx_to_scx_builds_a_sidecar_by_default_and_not_under_csc_off() {
+    assert_eq!(mtx_csc(&[]), (true, true), "unset --csc is auto");
+    assert_eq!(mtx_csc(&["--csc", "off"]), (true, false));
+}
+
+/// `--memory-budget` reaches the MTX direction's sidecar build (it returned
+/// before the budget was parsed, so a budget never bounded that build), and an
+/// invalid one is refused rather than ignored.
+#[test]
+fn mtx_to_scx_honours_and_validates_memory_budget() {
+    assert_eq!(mtx_csc(&["--memory-budget", "1M"]), (true, true));
+    assert!(
+        !mtx_csc(&["--memory-budget", "10MB"]).0,
+        "decimal MB is rejected"
+    );
+}

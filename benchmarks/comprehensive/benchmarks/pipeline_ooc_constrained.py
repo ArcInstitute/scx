@@ -161,6 +161,23 @@ STAGES: tuple[str, ...] = (
     "rank_genes_groups",
 )
 
+#: What the DE-route metrics mean, recorded in each result's metadata.
+#:
+#: The pyscx arm's DE stage runs `rank_genes_groups` at the default
+#: `prefer_format="auto"`, on a default-cache backed handle that has been
+#: row-filtered (`filter_cells`), gene-filtered and normalised — the shape a
+#: real pipeline hands DE, and the one where the CSC sidecar matters most
+#: (the CSR route re-decodes every shard per gene chunk once the visited
+#: shards outgrow the 4-shard cache). `de_route_is_csc` is **not** vacuous on a
+#: sidecar-less fixture: it reads 0.0 there, and `fixture_has_csc` says why.
+#: The floors in `thresholds.yaml` require 1.0 only on the datasets whose
+#: fixture carries a sidecar; a fixture that loses it fails them on purpose.
+DE_ROUTE_NOTE = (
+    "de_route_is_csc = 1.0 iff the DE stage's recorded route contains 'csc'; "
+    "fixture_has_csc = 1.0 iff the input file carries a CSC sidecar. Both "
+    "are emitted on completed pyscx runs only."
+)
+
 N_COMPS = 50
 N_NEIGHBORS = 15
 LEIDEN_RESOLUTION = 1.0
@@ -326,6 +343,13 @@ def run_pipeline(engine: str, path: Path, reporter: StageReporter) -> dict[str, 
         reporter.stage("rank_genes_groups", lambda: pyscx.accel.rank_genes_groups(
             adata, groupby="leiden", method="wilcoxon", device="cpu",
         ))
+        # The route the DE stage actually took, read here because the parent
+        # never holds the AnnData — it only sees this summary line. See
+        # `DE_ROUTE_NOTE` for what the gate does with it.
+        info = (adata.uns.get("scx_accel") or {}).get("rank_genes_groups") or {}
+        summary["de_route"] = str(info.get("route", ""))
+        summary["de_csc_available"] = bool(info.get("csc_available", False))
+        summary["de_fallback_reason"] = str(info.get("fallback_reason") or "")
     else:
         import anndata
         import scanpy as sc
@@ -381,6 +405,13 @@ def run_pipeline(engine: str, path: Path, reporter: StageReporter) -> dict[str, 
         ))
 
     summary["total_wall_s"] = time.perf_counter() - t_all
+    if engine == "pyscx":
+        # Whether the fixture carries a sidecar, read off the file rather than
+        # inferred from the route: a floor that requires `cpu_csc` is only a
+        # route check while this is 1, and a reconvert that drops the sidecar
+        # has to show up as its own number, not as a route regression. Opened
+        # after the clock stops, so it costs the pipeline nothing.
+        summary["fixture_has_csc"] = bool(pyscx.open(str(path)).has_csc)
     summary["n_obs_final"] = int(adata.n_obs)
     summary["n_vars_final"] = int(adata.n_vars)
     summary["n_hvg"] = int(np.asarray(adata.var["highly_variable"]).sum())
@@ -548,6 +579,14 @@ def summarize_outcome(
         extras["n_vars_final"] = float(done.get("n_vars_final", float("nan")))
         extras["outcome_reason"] = OUTCOME_COMPLETED
         extras["failed_stage"] = ""
+        if "de_route" in done:
+            # pyscx arms only; see `DE_ROUTE_NOTE`.
+            route = str(done["de_route"])
+            extras["de_route"] = route
+            extras["de_route_is_csc"] = 1.0 if "csc" in route else 0.0
+            extras["de_csc_available"] = 1.0 if done.get("de_csc_available") else 0.0
+            extras["de_fallback_reason"] = str(done.get("de_fallback_reason", ""))
+            extras["fixture_has_csc"] = 1.0 if done.get("fixture_has_csc") else 0.0
         return extras, OUTCOME_COMPLETED
 
     extras["pipeline_completed_int"] = 0.0
@@ -659,6 +698,7 @@ def run(
             "n_hvg_requested": QUERY_N_HVGS,
             "random_seed": RANDOM_SEED,
             "worker_timeout_s": timeout_s,
+            "de_route_note": DE_ROUTE_NOTE,
             "stage_order_note": (
                 "seurat_v3 HVG runs on raw counts before normalisation and "
                 "marks var['highly_variable'] without subsetting; PCA takes "

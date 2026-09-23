@@ -632,6 +632,34 @@ def _stage_records(n: int) -> list[dict]:
     ]
 
 
+def test_a_completed_pyscx_pipeline_reports_its_de_route():
+    """The DE route travels back through the summary line and is scored.
+
+    The parent never holds the AnnData, so the route has to arrive in the
+    worker's `done` record; `de_route_is_csc` is the number the floors read,
+    and `fixture_has_csc` says whether a 0.0 is a route regression or a
+    fixture that lost its sidecar.
+    """
+    base = {"kind": "done", "total_wall_s": 9.0, "n_clusters": 5}
+    for route, has, want in (("cpu_csc", True, 1.0), ("cpu_csc_nnz", True, 1.0),
+                             ("cpu_csr", False, 0.0), ("cpu_csr", True, 0.0)):
+        recs = _stage_records(len(poc.STAGES)) + [{
+            **base, "de_route": route, "de_csc_available": has,
+            "fixture_has_csc": has,
+        }]
+        extras, reason = poc.summarize_outcome(_FakeOutcome(recs), 16)
+        assert reason == poc.OUTCOME_COMPLETED
+        assert extras["de_route"] == route
+        assert extras["de_route_is_csc"] == want
+        assert extras["fixture_has_csc"] == (1.0 if has else 0.0)
+        assert extras["de_csc_available"] == (1.0 if has else 0.0)
+
+    # The scanpy arm records no route, and so emits none of these keys.
+    recs = _stage_records(len(poc.STAGES)) + [base]
+    extras, _ = poc.summarize_outcome(_FakeOutcome(recs), 16)
+    assert "de_route_is_csc" not in extras and "fixture_has_csc" not in extras
+
+
 def test_a_completed_pipeline_reports_one_and_no_failed_stage():
     recs = _stage_records(len(poc.STAGES)) + [{
         "kind": "done", "total_wall_s": 99.0, "n_clusters": 12,

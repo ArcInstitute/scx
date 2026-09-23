@@ -27,7 +27,7 @@ use scx_sparse::{CscShardSource, ResidentCscSource, ScxCsr};
 
 use crate::encoder::FramingConfig;
 use crate::error::ScxError;
-use crate::writer::ScxWriter;
+use crate::writer::{CscShardBytes, ScxWriter};
 
 /// Default per-chunk memory budget for the streaming CSC transpose (4 GiB).
 /// Bounds the number of columns materialized at once independent of
@@ -121,6 +121,20 @@ pub struct CscEmitOptions {
     /// - `None` → single-modality file; [`ScxWriter::write_csc_shard`].
     /// - `Some(id)` → [`ScxWriter::write_csc_shard_for`] under modality `id`.
     pub modality_id: Option<u8>,
+    /// Nonzeros of emitted shards the single-modality emit may hold at once,
+    /// built and encoded as one batch ([`CscShardSource::next_batch`],
+    /// [`ScxWriter::write_csc_shards`]). `0` means one shard at a time. See
+    /// [`crate::csc_budget::csc_emit_batch_nnz`] for the value every caller
+    /// with a budget passes.
+    pub batch_nnz: u64,
+    /// Hand the encoder every shard of the emit groups a batch built, not just
+    /// `batch_nnz` of them. A coarse group is several shards (three at
+    /// census_1m's 4 GiB layout), and encoding them together is most of the
+    /// emit's speedup — and, measured at census_1m `build-csc`, +1.65 GB of
+    /// peak over one shard at a time (55.8 s / 6.75 GB against 77.1 s /
+    /// 5.63 GB for shard-granular batches and 94.6 s / 5.10 GB serial). So it
+    /// is the default, and a caller that named a memory budget turns it off.
+    pub whole_groups: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -147,10 +161,13 @@ pub struct CscSidecarStats {
 /// drain would restore the writer's previous framing part-way through.
 pub fn emit_csc_shards(
     writer: &mut ScxWriter,
-    source: &mut dyn CscShardSource,
+    source: &mut (dyn CscShardSource + Send),
     opts: &CscEmitOptions,
-    mut on_shard: impl FnMut(u32, u64, u64),
+    mut on_shard: impl FnMut(u32, u64, u64) + Send,
 ) -> Result<CscSidecarStats, ScxError> {
+    if opts.modality_id.is_none() {
+        return emit_csc_shard_batches(writer, source, opts, on_shard);
+    }
     let (mut indptr, mut indices, mut data) = (Vec::new(), Vec::new(), Vec::new());
     // One raw-value buffer for the whole drain. The predecessor allocated a
     // fresh one per chunk via `values_to_raw_bytes`.
@@ -197,6 +214,87 @@ pub fn emit_csc_shards(
     stats.spill_bytes = src.spilled_bytes;
     stats.first_non_strict_column = src.first_non_strict_column;
     Ok(stats)
+}
+
+/// [`emit_csc_shards`] for a single-modality file: shards come off the source
+/// a batch at a time and are value-encoded and codec-encoded in parallel.
+///
+/// Same bytes as one shard at a time: the source yields the same shards in the
+/// same order ([`CscShardSource::next_batch`]), the value encode is the same
+/// `encode_f32_into`, and [`ScxWriter::write_csc_shards`] is the same encoder
+/// and commit `write_csc_shard` runs.
+fn emit_csc_shard_batches(
+    writer: &mut ScxWriter,
+    source: &mut (dyn CscShardSource + Send),
+    opts: &CscEmitOptions,
+    mut on_shard: impl FnMut(u32, u64, u64) + Send,
+) -> Result<CscSidecarStats, ScxError> {
+    let fetch = |source: &mut (dyn CscShardSource + Send)| {
+        source
+            .next_batch(opts.batch_nnz, opts.whole_groups)
+            .map_err(|e| ScxError::CscTranspose(e.to_string()))
+    };
+    let mut stats = CscSidecarStats::default();
+    let mut next = fetch(source)?;
+    // Two batches in flight: while one is encoded and written, the next is
+    // built from the buckets. Building is the half that parallelises worst —
+    // a coarse bucket drains on one thread — so overlapping it with the
+    // encode is what keeps the pool busy. `csc_emit_batch_nnz` halves the
+    // batch so the pair's *arrays* fit the emit share; the encoders' own
+    // buffers are not charged, and under `whole_groups` a batch overshoots by
+    // up to a group — see `CscEmitOptions::whole_groups` for the measured
+    // cost of each.
+    while !next.is_empty() {
+        let batch = std::mem::take(&mut next);
+        #[cfg(feature = "parallel")]
+        let (written, fetched) =
+            rayon::join(|| write_csc_batch(writer, batch, opts), || fetch(source));
+        #[cfg(not(feature = "parallel"))]
+        let (written, fetched) = (write_csc_batch(writer, batch, opts), fetch(source));
+        // The written batch's error first: its shards precede the fetched ones.
+        for (col_start, nnz) in written? {
+            on_shard(stats.n_shards, col_start, nnz);
+            stats.n_shards += 1;
+            stats.total_nnz += nnz;
+        }
+        next = fetched?;
+    }
+    let src = source.stats();
+    stats.spill_bytes = src.spilled_bytes;
+    stats.first_non_strict_column = src.first_non_strict_column;
+    Ok(stats)
+}
+
+/// Value-encode a batch of built shards in parallel and write them; returns
+/// each shard's `(col_start, nnz)` in order.
+fn write_csc_batch(
+    writer: &mut ScxWriter,
+    batch: Vec<scx_sparse::CscShardArrays>,
+    opts: &CscEmitOptions,
+) -> Result<Vec<(u64, u64)>, ScxError> {
+    let encode = |a: scx_sparse::CscShardArrays| -> Result<CscShardBytes, ScxError> {
+        let mut values = Vec::new();
+        opts.value_encoding.encode_f32_into(&mut values, &a.data)?;
+        Ok(CscShardBytes {
+            col_start: a.col_start,
+            indptr: a.indptr,
+            indices: a.indices,
+            values,
+        })
+    };
+    #[cfg(feature = "parallel")]
+    let encoded: Vec<Result<CscShardBytes, ScxError>> = {
+        use rayon::prelude::*;
+        batch.into_par_iter().map(encode).collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let encoded: Vec<Result<CscShardBytes, ScxError>> = batch.into_iter().map(encode).collect();
+    let shards = encoded.into_iter().collect::<Result<Vec<_>, _>>()?;
+    writer.write_csc_shards(&shards, opts.codec_id, opts.value_encoding)?;
+    Ok(shards
+        .iter()
+        .map(|s| (s.col_start, s.indices.len() as u64))
+        .collect())
 }
 
 /// Transpose `csr_shards` and write the result as a CSC sidecar.
@@ -255,6 +353,11 @@ fn write_csc_sidecar_inner(
         value_encoding,
         codec_id,
         modality_id: opts.modality_id,
+        // Beside a caller that already holds the whole CSR, so only the batch
+        // is new; the emit share is the same one the streamed path uses.
+        batch_nnz: crate::csc_budget::csc_emit_batch_nnz(opts.memory_budget_bytes as u64),
+        // A resident source has no groups.
+        whole_groups: false,
     };
     emit_csc_shards(writer, &mut source, &emit, |_, _, _| {})
 }

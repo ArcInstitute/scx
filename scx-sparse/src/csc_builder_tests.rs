@@ -45,6 +45,14 @@ fn cfg(cols_per_shard: usize, memory_bytes: usize, spill_after_bytes: usize) -> 
     }
 }
 
+/// Build through the serial push and, with `parallel`, again through the
+/// parallel one, requiring the two to agree; returns the serial result.
+///
+/// Every test that goes through here is therefore also a test of the parallel
+/// push. The comparison is the emitted arrays, the error text when either
+/// fails, and every statistic except the two that depend on *when* blocks were
+/// spilled (`spilled_bytes`, `peak_in_memory_bytes`) — the parallel push picks
+/// its spill victim differently by design.
 fn run_with(
     shards: &[ScxCsr],
     n_rows: usize,
@@ -52,17 +60,81 @@ fn run_with(
     cfg: CscBuilderConfig,
     store: Box<dyn SpillStore>,
 ) -> Result<(Vec<(u64, CscArrays)>, CscBuilderStats), CscBuilderError> {
+    let serial = run_mode(shards, n_rows, n_cols, cfg, store, usize::MAX, None);
+    #[cfg(feature = "parallel")]
+    {
+        let par = run_mode(
+            shards,
+            n_rows,
+            n_cols,
+            cfg,
+            Box::new(MemSpillStore::new()),
+            0,
+            // Small batches, so a drain spans several of them and a batch can
+            // hold more than one group.
+            Some(7),
+        );
+        match (&serial, &par) {
+            (Ok((s_out, s_stats)), Ok((p_out, p_stats))) => {
+                assert_same(p_out, s_out);
+                assert_eq!(p_stats.nnz, s_stats.nnz, "parallel push nnz");
+                assert_eq!(
+                    p_stats.n_buckets, s_stats.n_buckets,
+                    "parallel push buckets"
+                );
+                assert_eq!(
+                    p_stats.first_non_strict_column, s_stats.first_non_strict_column,
+                    "parallel push first_non_strict_column"
+                );
+            }
+            (Err(s), Err(p)) => assert_eq!(p.to_string(), s.to_string(), "parallel push error"),
+            (s, p) => panic!(
+                "serial and parallel pushes disagree on success: serial ok={}, parallel ok={}",
+                s.is_ok(),
+                p.is_ok()
+            ),
+        }
+    }
+    serial
+}
+
+fn run_mode(
+    shards: &[ScxCsr],
+    n_rows: usize,
+    n_cols: usize,
+    cfg: CscBuilderConfig,
+    store: Box<dyn SpillStore>,
+    parallel_min_nnz: usize,
+    batch_nnz: Option<u64>,
+) -> Result<(Vec<(u64, CscArrays)>, CscBuilderStats), CscBuilderError> {
     let mut b = CscBuilder::new(n_rows, n_cols, cfg, store)?;
+    b.parallel_min_nnz = parallel_min_nnz;
     let mut row_start = 0u64;
     for s in shards {
         b.push_shard(row_start, s)?;
         row_start += s.n_rows() as u64;
     }
     let mut em = b.finish()?;
-    let (mut ip, mut ix, mut dt) = (Vec::new(), Vec::new(), Vec::new());
     let mut out = Vec::new();
-    while let Some(col_start) = em.next_shard_into(&mut ip, &mut ix, &mut dt)? {
-        out.push((col_start, to_csc_arrays(n_rows, &ip, &ix, &dt)));
+    if let Some(n) = batch_nnz {
+        loop {
+            // Shard-granular, so a batch can split a group.
+            let batch = em.next_batch(n, false)?;
+            if batch.is_empty() {
+                break;
+            }
+            for a in batch {
+                out.push((
+                    a.col_start,
+                    to_csc_arrays(n_rows, &a.indptr, &a.indices, &a.data),
+                ));
+            }
+        }
+    } else {
+        let (mut ip, mut ix, mut dt) = (Vec::new(), Vec::new(), Vec::new());
+        while let Some(col_start) = em.next_shard_into(&mut ip, &mut ix, &mut dt)? {
+            out.push((col_start, to_csc_arrays(n_rows, &ip, &ix, &dt)));
+        }
     }
     Ok((out, em.stats().clone()))
 }
@@ -333,6 +405,21 @@ proptest! {
             resident.push((col_start, to_csc_arrays(n_rows, &ip, &ix, &dt)));
         }
         assert_same(&resident, &pushed);
+
+        // And a batch at a time, which fills several shards concurrently.
+        let mut src = ResidentCscSource::new(&shards, n_rows, n_cols, cols_per_shard, memory_bytes)
+            .expect("resident");
+        let mut batched = Vec::new();
+        loop {
+            let batch = src.next_batch(5, false).expect("batch");
+            if batch.is_empty() {
+                break;
+            }
+            for a in batch {
+                batched.push((a.col_start, to_csc_arrays(n_rows, &a.indptr, &a.indices, &a.data)));
+            }
+        }
+        assert_same(&batched, &pushed);
     }
 }
 
@@ -822,7 +909,12 @@ fn staged_bytes_never_exceed_the_declared_bound() {
         .collect();
     let shards = shards_from(400, 96, &entries, &[100, 101, 250]);
 
-    for spill_after_bytes in [0usize, 1 << 10, 1 << 14, usize::MAX] {
+    // Both pushes: the parallel one spills a different victim, and the bound
+    // is the claim that choice must not break.
+    for (spill_after_bytes, parallel_min_nnz) in [0usize, 1 << 10, 1 << 14, usize::MAX]
+        .into_iter()
+        .flat_map(|s| [(s, usize::MAX), (s, 0)])
+    {
         let c = CscBuilderConfig {
             cols_per_shard: 8,
             memory_bytes: 400 * 12 * 8,
@@ -831,6 +923,7 @@ fn staged_bytes_never_exceed_the_declared_bound() {
             block_bytes: 512,
         };
         let mut b = CscBuilder::new(400, 96, c, Box::new(MemSpillStore::new())).expect("new");
+        b.parallel_min_nnz = parallel_min_nnz;
         let mut row_start = 0u64;
         for sh in &shards {
             b.push_shard(row_start, sh).expect("push");
@@ -853,8 +946,9 @@ fn staged_bytes_never_exceed_the_declared_bound() {
         let bound = spill_after_bytes.saturating_add(2 * stats.n_buckets * block_capacity);
         assert!(
             stats.peak_in_memory_bytes <= bound as u64,
-            "spill_after_bytes={spill_after_bytes}: peak {} exceeds the declared \
-             bound {bound} ({} buckets x {block_capacity} B of slack)",
+            "spill_after_bytes={spill_after_bytes}, parallel_min_nnz={parallel_min_nnz}: \
+             peak {} exceeds the declared bound {bound} ({} buckets x {block_capacity} B \
+             of slack)",
             stats.peak_in_memory_bytes,
             stats.n_buckets,
         );
@@ -963,4 +1057,75 @@ fn a_corrupt_spill_stream_errors_instead_of_panicking() {
         matches!(err, CscBuilderError::SpillCorrupt { .. }),
         "expected SpillCorrupt, got {err}"
     );
+}
+
+/// With `parallel`, fewer shards than `target_buckets` split each shard into
+/// equal buckets: every bucket lies inside one shard, every allocated bucket
+/// is reachable, and a shard width with no divisor in range stays coarse.
+#[cfg(feature = "parallel")]
+#[test]
+fn fine_buckets_never_straddle_a_shard() {
+    for (n_rows, n_cols, cols_per_shard, target) in [
+        (10usize, 61_497usize, 5000usize, 64usize),
+        (10, 100, 12, 64),
+        (10, 100, 7, 64), // prime width: coarse
+        (10, 40, 0, 16),  // no cap: one shard
+        (10, 13, 13, 4),
+        (0, 50, 10, 64), // no rows: one unbounded shard
+    ] {
+        let cfg = CscBuilderConfig {
+            cols_per_shard,
+            memory_bytes: 1 << 30,
+            spill_after_bytes: usize::MAX,
+            target_buckets: target,
+            block_bytes: 64,
+        };
+        let l = Layout::plan(n_rows, n_cols, &cfg).expect("plan");
+        let label = format!("{n_rows}x{n_cols} cols_per_shard={cols_per_shard} target={target}");
+        if l.buckets_per_shard > 1 {
+            assert!(
+                l.n_shards < target,
+                "{label}: fine with {} shards",
+                l.n_shards
+            );
+            assert!(l.n_buckets <= target.max(l.n_shards), "{label}");
+            for b in 0..l.n_buckets {
+                let lo = b * l.bucket_cols;
+                let hi = (lo + l.bucket_cols).min(n_cols) - 1;
+                assert!(
+                    lo < n_cols,
+                    "{label}: bucket {b} starts past the last column"
+                );
+                assert_eq!(
+                    lo / l.shard_cols,
+                    hi / l.shard_cols,
+                    "{label}: bucket {b} straddles"
+                );
+                assert_eq!(l.bucket_of(lo), b, "{label}");
+                assert_eq!(l.bucket_of(hi), b, "{label}");
+            }
+            // Each group's buckets are exactly its shard's.
+            for g in 0..l.n_groups() {
+                let ((s0, s1), (b0, b1)) = l.group(g);
+                assert_eq!((s0, s1), (g, g + 1), "{label}");
+                let (c0, c1) = l.shard_range(g, n_cols);
+                assert_eq!(b0 * l.bucket_cols, c0, "{label}: group {g}");
+                assert!((b1 * l.bucket_cols).min(n_cols) >= c1, "{label}: group {g}");
+            }
+        } else {
+            assert_eq!(l.n_groups(), l.n_buckets, "{label}");
+        }
+        if cols_per_shard == 7 {
+            assert_eq!(
+                l.buckets_per_shard, 1,
+                "{label}: a prime width has no divisor"
+            );
+        }
+        if cols_per_shard == 5000 {
+            assert!(
+                l.buckets_per_shard > 1,
+                "{label}: the census layout must go fine"
+            );
+        }
+    }
 }

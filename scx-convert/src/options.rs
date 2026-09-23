@@ -130,11 +130,10 @@ pub struct IngestOptions {
     pub shard_target_rows: u32,
     /// Explicit codec override. None = auto-select based on value distribution.
     pub codec: Option<CodecId>,
-    /// CSC-sidecar generation policy (`Off` / `Auto` / `Always`). When the
-    /// policy resolves to build (always, or auto + dataset over the size
-    /// thresholds), a multi-shard column-major CSC sidecar is emitted at
-    /// write time. The CSR shards are still written first; CSC chunks are
-    /// produced via streaming transpose over the in-memory CSR data.
+    /// CSC-sidecar generation policy (`Off` / `Auto` / `Always`; default
+    /// `Auto`). When the policy resolves to build (always, or auto + dataset
+    /// over the size thresholds), a multi-shard column-major CSC sidecar is
+    /// emitted at write time — on the streaming paths in the same pass as X.
     pub csc: CscPolicy,
     /// Columns per CSC shard when a CSC sidecar is emitted. `0` disables the
     /// cap (single CSC shard, memory permitting).
@@ -326,7 +325,7 @@ impl Default for IngestOptions {
         IngestOptions {
             shard_target_rows: 16384,
             codec: None,
-            csc: CscPolicy::Off,
+            csc: CscPolicy::default(),
             csc_cols_per_shard: 5000,
             // Framing on by default (Phase C): a plain `codec="auto"` write frames
             // at G=256 (codec-agnostic; no extra encode cost). `Some(0)` opts out

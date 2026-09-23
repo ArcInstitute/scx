@@ -348,6 +348,25 @@ page cache. Measured against that sequence (median of 3, one node):
 | `merge` | tabula_100k × 2 | 22.6 s → 22.0 s | 3,917 → 3,994 MB |
 | `convert` | census_500k | 66 s → 63 s | 5,241 → 5,756 MB |
 
+The builder has since gone parallel — the push routes each X shard with one
+task per column bucket, and the emit encodes several CSC shards at once — so
+the build no longer dominates. Same-pass with `--csc always`, serial builder
+→ parallel, against the op with `--csc off` (one node, median of 2–3, no
+budget):
+
+| op | dataset | serial → parallel | peak RSS, serial → parallel | `--csc off` |
+|---|---|---:|---:|---:|
+| `convert` | census_1m | 123.9 s → 45.1 s | 10,504 → 10,820 MB | 18.3 s |
+| `compact` | census_1m | 131.9 s → 72.0 s | 6,962 → 8,527 MB | 32.0 s |
+| `sort` | census_500k | 59.6 s → 37.4 s | 10,306 → 10,444 MB | 13.0 s |
+| `build-csc` | census_1m | 111.0 s → 50.9 s | 4,974 → 6,794 MB | — |
+
+The peak rises where the emit's concurrent shard encodes are the largest
+thing resident. Naming a budget (`--csc-memory-limit`, `--memory-limit`,
+`--memory-budget`) makes the emit batch whole shards against its share
+instead — at census_1m `build-csc` on a 12-core node, 55.8 s / 6.75 GB
+becomes 77.1 s / 5.63 GB — and never changes the bytes.
+
 These are without `--memory-budget`. With one, `sort`, `optimize` and
 streaming ingest split it with the builder instead of stacking the two: the
 builder spills at a quarter of the budget (never more than it would stage
@@ -395,7 +414,7 @@ scx append experiment.scx more_cells.scx --rebuild-csc
 scx compact experiment.scx compacted.scx --csc always
 ```
 
-The Python API exposes `pyscx.build_csc(input, output=None, memory_limit="4G", force=False, csc_cols_per_shard=5000)`
+The Python API exposes `pyscx.build_csc(input, output=None, memory_limit=None, force=False, csc_cols_per_shard=5000)`
 for standalone builds — `output=None` (the default) appends the sidecar in
 place, and a path writes a copy. Alternatively, set `csc="always"` at conversion time
 via `pyscx.from_anndata(..., csc="always")` to emit the sidecar during the

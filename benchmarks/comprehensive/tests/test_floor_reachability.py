@@ -1325,7 +1325,11 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
                 "peak_rss_mb": 123.0, "reader_threads": reader_threads,
                 "structural": {
                     "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
-                    "has_csc": 1 if kw.get("csc") else 0,
+                    # A present `csc` other than "off" builds a sidecar —
+                    # including `None`, which the worker drops so the ingest
+                    # default (`auto`) applies; base arms send no kwargs and
+                    # the worker pins them `off`.
+                    "has_csc": 1 if "csc" in kw and kw["csc"] != "off" else 0,
                 },
                 # An index preset that took effect writes more bytes than the
                 # default arm; that difference is the observable the parent
@@ -1365,13 +1369,15 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
                  for _, rt, kw in calls}
     assert (("csc", "'always'"),) in by_kwargs, calls
     assert (("index_preset", "'cellxgene'"),) in by_kwargs, calls
+    assert (("csc", "None"),) in by_kwargs, calls
     assert by_kwargs[(("csc", "'always'"),)] == cs.GATED_READER_THREADS
+    assert by_kwargs[(("csc", "None"),)] == cs.GATED_READER_THREADS
     assert set(result.metadata["extra_arms"]) == {
-        "csc_always", "index_preset_cellxgene"
+        "csc_always", "csc_auto", "index_preset_cellxgene"
     }
     labels = {r.extra["scenario"] for r in result.runs}
-    assert "csc_always" in labels and "index_preset_cellxgene" in labels
-    for label in ("csc_always", "index_preset_cellxgene"):
+    assert {"csc_always", "csc_auto", "index_preset_cellxgene"} <= labels
+    for label in ("csc_always", "csc_auto", "index_preset_cellxgene"):
         rows = [r for r in result.runs if r.extra["scenario"] == label]
         assert rows and all(f"{label}_peak_rss_mb" in r.extra for r in rows)
         assert all("streaming_peak_rss_mb" not in r.extra for r in rows), (
@@ -1398,6 +1404,7 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
     assert all((kw or {}).get("index_preset") is None for _, _, kw in calls), calls
     assert result.metadata["extra_arms"] == []
     assert "csc_always" in result.metadata["extra_arms_skipped"]
+    assert "csc_auto" in result.metadata["extra_arms_skipped"]
     assert "index_preset_cellxgene" in result.metadata["extra_arms_skipped"]
 
     # A dataset in neither scope runs the three base arms only.
@@ -1824,6 +1831,86 @@ def test_mtx_roundtrip_refuses_an_ingest_that_lost_an_entry(tiny_mtx_source):
         pyscx.open = real_open
 
 
+def test_csc_auto_arm_refuses_a_result_with_no_sidecar():
+    """The `csc_auto` arm is refused when its output carries no sidecar.
+
+    Mirror of the `csc_always` check, for the opposite leak: the base arms'
+    `csc="off"` pin reaching this arm (its `None` dropped before the worker),
+    or the ingest default reverting to `off`, would both time a CSR-only
+    conversion under the default's label. Only `csc_auto` builds nothing here;
+    every other arm is modelled as honouring its kwargs, so the raise can only
+    come from this arm's check.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                 reader_threads=None, extra_kwargs=None):
+        kw = extra_kwargs or {}
+        return [{
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+            "structural": {
+                "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                "has_csc": 1 if kw.get("csc") == "always" else 0,
+            },
+            "output_bytes": 20 if kw.get("index_preset") else 10,
+        }]
+
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = fake_arm
+        with pytest.raises(RuntimeError, match="csc_auto"):
+            cs._run_isolated(
+                pathlib.Path("/nonexistent.h5ad"), 1,
+                BenchmarkResult(
+                    benchmark="conversion_streaming",
+                    format="scx_streaming_vs_materialize",
+                    dataset="tabula_sapiens_100k",
+                    metadata={"scenarios": []},
+                ),
+                None,
+                "tabula_sapiens_100k",
+            )
+    finally:
+        cs._run_arm_subprocess = original
+
+
+def test_conversion_streaming_base_arms_pin_csc_off_and_csc_auto_passes_none(
+    monkeypatch, tmp_path,
+):
+    """The worker helper applies the base `csc="off"` pin, and `None` unsets it.
+
+    The pin lives in `_timed_streaming` rather than in each caller so the
+    thread-sweep path gets it too. Two properties: an arm with no kwargs
+    reaches `from_h5ad` with `csc="off"`, and the `csc_auto` arm's `None`
+    reaches it with **no** `csc` key at all — `csc=None` passed through would
+    be the library default too, but dropping it is what the arm claims.
+    """
+    import sys
+    import types
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+
+    seen: list[dict] = []
+    fake = types.ModuleType("pyscx")
+    fake.from_h5ad = lambda src, dst, **kw: seen.append(kw)
+    monkeypatch.setitem(sys.modules, "pyscx", fake)
+
+    cs._timed_streaming(tmp_path / "in.h5ad", tmp_path / "a.scx", 4, None)
+    cs._timed_streaming(
+        tmp_path / "in.h5ad", tmp_path / "b.scx", 4, cs._EXTRA_ARMS["csc_auto"][0],
+    )
+    cs._timed_streaming(
+        tmp_path / "in.h5ad", tmp_path / "c.scx", 4, cs._EXTRA_ARMS["csc_always"][0],
+    )
+    assert seen[0] == {"reader_threads": 4, "csc": "off"}
+    assert seen[1] == {"reader_threads": 4}
+    assert seen[2] == {"reader_threads": 4, "csc": "always"}
+
+
 def test_csc_always_arm_refuses_a_result_with_no_sidecar():
     """The `csc_always` premise is enforced, not merely recorded.
 
@@ -1911,7 +1998,7 @@ def test_index_preset_arm_refuses_a_result_with_no_index_effect(
             "peak_rss_mb": 123.0, "reader_threads": reader_threads,
             "structural": {
                 "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
-                "has_csc": 1 if kw.get("csc") else 0,
+                "has_csc": 1 if "csc" in kw and kw["csc"] != "off" else 0,
             },
         }
         if kw.get("index_preset"):

@@ -803,28 +803,10 @@ fn index_preset_columns_known_names() {
 }
 
 #[test]
-fn accel_ready_presets_imply_csc_auto() {
-    // DE/pseudobulk-heavy presets imply a CSC sidecar.
-    assert!(preset_implies_csc_auto("training"));
-    assert!(preset_implies_csc_auto("perturbseq"));
-    // Query/browse-oriented and unknown presets do not.
-    assert!(!preset_implies_csc_auto("cellxgene"));
-    assert!(!preset_implies_csc_auto("unknown"));
-}
-
-#[test]
-fn resolve_csc_policy_explicit_wins_else_preset_default() {
-    // An explicit value always wins, including "off" over an
-    // accel-ready preset.
-    assert_eq!(resolve_csc_policy(Some("off"), Some("training")), "off");
-    assert_eq!(resolve_csc_policy(Some("always"), None), "always");
-    // Unset + accel-ready preset upgrades to "auto".
-    assert_eq!(resolve_csc_policy(None, Some("training")), "auto");
-    assert_eq!(resolve_csc_policy(None, Some("perturbseq")), "auto");
-    // Unset + query-oriented / unknown / no preset stays "off".
-    assert_eq!(resolve_csc_policy(None, Some("cellxgene")), "off");
-    assert_eq!(resolve_csc_policy(None, Some("unknown")), "off");
-    assert_eq!(resolve_csc_policy(None, None), "off");
+fn resolve_csc_policy_explicit_wins_else_auto() {
+    assert_eq!(resolve_csc_policy(Some("off")), "off");
+    assert_eq!(resolve_csc_policy(Some("always")), "always");
+    assert_eq!(resolve_csc_policy(None), "auto");
 }
 
 #[test]

@@ -61,5 +61,5 @@ def make_runner(fmt) -> FormatRunner:
     # preserve back-compat.
     import os
     if cls is ScxRunner and os.environ.get("SCX_BENCH_WITH_CSC", "").strip() in ("1", "true", "TRUE"):
-        params.setdefault("with_csc", True)
+        params.setdefault("csc", "always")
     return cls(**params)

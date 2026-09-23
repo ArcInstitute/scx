@@ -5,7 +5,10 @@
 # orchestrator SLURM job that runs sequentially — the orchestrator itself
 # submits per-bench-row child SLURM jobs.
 #
-# Per-fixture CSC status (built by `_add_csc_to_fixtures.sh`):
+# Per-fixture CSC status at the time of G4.3, when sidecars were added by a
+# one-off `scx build-csc` pass over the fixtures (that script is gone: the
+# `scx_auto` fixtures now get their sidecar from conversion itself, under the
+# ingest `auto` rule — see `benchmarks/comprehensive/convert.py`):
 #   pbmc3k_auto.scx       → has CSC (v3 exercises CSC-direct)
 #   pbmc10k_auto.scx      → has CSC
 #   smartseq2_auto.scx    → has CSC

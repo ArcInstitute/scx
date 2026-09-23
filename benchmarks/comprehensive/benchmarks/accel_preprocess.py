@@ -208,7 +208,9 @@ def _ensure_scx_fixture(raw: Any, dataset_name: str) -> Path | None:
         if scx_path.exists():
             scx_path.unlink()
         import pyscx
-        pyscx.from_anndata(raw, str(scx_path))
+        # Pinned: the docstring's "no CSC sidecar" is otherwise the ingest
+        # default's call, and `auto` builds one at >= 50,000 x 5,000.
+        pyscx.from_anndata(raw, str(scx_path), csc="off")
     except Exception as e:
         logger.warning("accel_preprocess: pyscx.from_anndata(%s) failed: %s", dataset_name, e)
         return None

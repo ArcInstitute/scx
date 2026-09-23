@@ -22,6 +22,21 @@ parity over scanpy.
 | `accel_de__pyscx_wilcoxon_gpu`           | `pyscx.accel.rank_genes_groups`          | GPU    |
 | `accel_de__pyscx_pdex_ref_cpu`           | `pyscx.accel.pdex_ref`                   | CPU    |
 | `accel_de__pyscx_pdex_ref_gpu`           | `pyscx.accel.pdex_ref`                   | GPU    |
+| `accel_de__pyscx_wilcoxon_cpu_csc`       | `pyscx.accel.rank_genes_groups`, backed  | CPU    |
+| `accel_de__pyscx_pdex_ref_cpu_csc`       | `pyscx.accel.pdex_ref`, backed           | CPU    |
+
+The two `_cpu_csc` variants run the CPU ops on the **CSC fixture** — the
+bench-built SCX file the GPU variants already open, with a sidecar — through
+`to_anndata(backed=True)` at the default `prefer_format="auto"`, so they take
+`cpu_csc`. The plain `_cpu` variants run on the in-memory AnnData and never see
+a sidecar, which left the CPU CSC route with no DE timing and no route gate in
+this benchmark. Each emits `de_route_csc_cpu` (1.0 iff the recorded route is a
+`cpu_csc*` route) and, against the in-memory CPU peer, the same
+`de_pval_agreement_vs_cpu` / `de_top_gene_overlap_vs_cpu` the GPU variants do
+— which should be exact, the CSC kernels being bit-identical to CSR. If the
+CSC fixture failed to build, the variant still runs (on the in-memory AnnData)
+and records `de_route_csc_cpu = 0.0`, so a lost fixture fails its floor instead
+of scoping it out.
 
 The reference for the scanpy comparison is the Wilcoxon path — pdex's
 `mode="ref"` doesn't have a scanpy peer (it's a perturbation-screening
@@ -147,6 +162,16 @@ def accel_de_variants() -> list[FormatVariant]:
             key="accel_de__pyscx_pdex_ref_gpu",
             category="accel", runner="accel_runner",
         ),
+        FormatVariant(
+            name="pyscx rank_genes_groups (Wilcoxon, CPU, CSC fixture)",
+            key="accel_de__pyscx_wilcoxon_cpu_csc",
+            category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
+            name="pyscx pdex_ref (CPU, CSC fixture)",
+            key="accel_de__pyscx_pdex_ref_cpu_csc",
+            category="accel", runner="accel_runner",
+        ),
     ]
 
 
@@ -210,6 +235,43 @@ def _run_pyscx_pdex_ref_gpu(adata: Any, groupby: str, reference: str) -> Any:
         _propagate_route(scx_adata, adata)
         return df
     return pyscx.accel.pdex_ref(adata, groupby, reference=reference, device="gpu")
+
+
+def _run_pyscx_wilcoxon_cpu_csc(adata: Any, groupby: str, reference: str) -> str:
+    """CPU Wilcoxon on the backed CSC fixture, at the default `prefer_format`.
+
+    Falls back to the in-memory AnnData when no fixture was built; the caller
+    then records `de_route_csc_cpu = 0.0`.
+    """
+    import pyscx
+    scx_adata = _as_scx_backed_if_available(adata)
+    if scx_adata is not None:
+        pyscx.accel.rank_genes_groups(
+            scx_adata, groupby, reference=reference, device="cpu",
+        )
+        _propagate_route(scx_adata, adata)
+        # The parity helper reads `uns["rank_genes_groups"]` off the adata the
+        # runner holds, so the result has to travel with the route.
+        try:
+            adata.uns["rank_genes_groups"] = scx_adata.uns["rank_genes_groups"]
+        except Exception:
+            pass
+    else:
+        pyscx.accel.rank_genes_groups(adata, groupby, reference=reference, device="cpu")
+    return "pyscx-cpu-wilcoxon-csc"
+
+
+def _run_pyscx_pdex_ref_cpu_csc(adata: Any, groupby: str, reference: str) -> Any:
+    """CPU pdex_ref on the backed CSC fixture; see `_run_pyscx_wilcoxon_cpu_csc`."""
+    import pyscx
+    scx_adata = _as_scx_backed_if_available(adata)
+    if scx_adata is not None:
+        df = pyscx.accel.pdex_ref(
+            scx_adata, groupby, reference=reference, device="cpu",
+        )
+        _propagate_route(scx_adata, adata)
+        return df
+    return pyscx.accel.pdex_ref(adata, groupby, reference=reference, device="cpu")
 
 
 def _as_scx_backed_if_available(adata: Any) -> Any:
@@ -376,7 +438,16 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., Any], bool, str]] = {
     "accel_de__pyscx_wilcoxon_gpu":  (_run_pyscx_wilcoxon_gpu, True,  "wilcoxon"),
     "accel_de__pyscx_pdex_ref_cpu":  (_run_pyscx_pdex_ref_cpu, False, "pdex_ref"),
     "accel_de__pyscx_pdex_ref_gpu":  (_run_pyscx_pdex_ref_gpu, True,  "pdex_ref"),
+    "accel_de__pyscx_wilcoxon_cpu_csc": (_run_pyscx_wilcoxon_cpu_csc, False, "wilcoxon"),
+    "accel_de__pyscx_pdex_ref_cpu_csc": (_run_pyscx_pdex_ref_cpu_csc, False, "pdex_ref"),
 }
+
+# The CPU variants that run on the backed CSC fixture. They share the GPU
+# variants' parity comparison against the in-memory CPU peer.
+_CPU_CSC_VARIANTS: frozenset[str] = frozenset({
+    "accel_de__pyscx_wilcoxon_cpu_csc",
+    "accel_de__pyscx_pdex_ref_cpu_csc",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +647,9 @@ def run(
     if key not in _VARIANT_IMPLS:
         return None
     impl, requires_gpu, kind = _VARIANT_IMPLS[key]
+    cpu_csc = key in _CPU_CSC_VARIANTS
+    # Variants whose result is compared against the in-memory CPU peer.
+    compare_to_cpu = requires_gpu or cpu_csc
 
     if key.startswith("accel_de__pyscx") and not _HAS_PYSCX:
         return None
@@ -628,7 +702,7 @@ def run(
     # Cached per (dataset, kind) so we don't pay for it on every GPU run.
     cpu_baseline_key = ("accel_de_cpu_baseline", dataset.name, kind)
     cpu_pvals: dict[str, dict[str, float]] | None = None
-    if requires_gpu:
+    if compare_to_cpu:
         if cpu_baseline_key not in _fixture_cache:
             try:
                 cpu_adata = base_adata.copy()
@@ -777,7 +851,19 @@ def run(
                     1.0 if (not csc_fixture or route == "gpu_csc_v3") else 0.0
                 )
 
-        if requires_gpu and cpu_pvals is not None:
+        if cpu_csc:
+            # 1.0 iff a CPU CSC route ran. Not keyed on the fixture the way
+            # `de_route_csc_direct` is: a fixture that failed to build leaves
+            # this 0.0 rather than "not applicable", because the variant has
+            # no other purpose than this route.
+            extras["de_route_csc_cpu"] = (
+                1.0 if route is not None and route.startswith("cpu_csc") else 0.0
+            )
+            extras["csc_fixture_built"] = (
+                1.0 if a.uns.get("_bench_scx_with_csc_path") else 0.0
+            )
+
+        if compare_to_cpu and cpu_pvals is not None:
             try:
                 if kind == "wilcoxon":
                     gpu_pvals = _wilcoxon_pvals_by_gene(a)

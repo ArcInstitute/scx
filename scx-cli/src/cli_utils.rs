@@ -45,8 +45,11 @@ pub struct CscArgs {
     /// --memory-limit`: it bounds the builder's resident column buckets and
     /// sizes the sidecar's shard widths. Accepts a binary-prefixed size
     /// (`K`/`M`/`G`/`T` or `KiB`..`TiB`); decimal `KB`/`MB`/`GB` is rejected.
-    #[arg(long, default_value = "4G")]
-    pub csc_memory_limit: String,
+    /// Naming one also makes the emit encode a shard batch at a time against
+    /// it — slower, with the peak nearer the limit; unset (4G) encodes whole
+    /// emit groups.
+    #[arg(long)]
+    pub csc_memory_limit: Option<String>,
 }
 
 impl CscArgs {

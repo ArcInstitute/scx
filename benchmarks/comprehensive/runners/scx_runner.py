@@ -88,8 +88,8 @@ class ScxRunner(FormatRunner):
         self,
         codec: str = "auto",
         codec_per_modality: bool = True,
-        with_csc: bool = False,
         row_group_rows: int | None = None,
+        csc: str = "off",
     ) -> None:
         if codec not in _CODEC_NAMES:
             raise ValueError(
@@ -116,13 +116,19 @@ class ScxRunner(FormatRunner):
         # multimodal compression sweep; ignored on single-modality
         # convert paths.
         self.codec_per_modality = codec_per_modality
-        # G4.3: when True, also write a CSC sidecar (gene-major shards)
-        # at convert time. Required for `pdex_ref_gpu_streaming` to
-        # exercise the CSC-direct code path; default off to preserve
-        # back-compat with pre-G4.3 bench fixtures.
-        # Toggle via the `SCX_BENCH_WITH_CSC=1` env var picked up by
-        # the gate orchestrator (`gate_candidate.py`) and forwarded here.
-        self.with_csc = with_csc
+        # The CSC policy passed on every conversion — the one knob.
+        # `SCX_BENCH_WITH_CSC=1` sets it to `"always"` (G4.3: the GPU DE
+        # CSC-direct path needs a sidecar), via `make_runner`.
+        # Pinned rather than left to the library default: the ingest default
+        # is `auto`, which builds a sidecar on any file with n_obs >= 50,000
+        # and n_vars >= 5,000, so an unpinned runner would silently add a
+        # sidecar build to every benchmark that times a conversion here
+        # (`write`, `parallel_write_scaling`, the read benchmarks' temp
+        # conversions) and change what each one has always measured.
+        # `convert.convert_dataset_format` — the fixture path — sets `"auto"`
+        # so the shared `_auto.scx` fixtures carry what a default conversion
+        # writes.
+        self.csc = csc
 
     @property
     def name(self) -> str:
@@ -175,9 +181,10 @@ class ScxRunner(FormatRunner):
         t0 = time.perf_counter()
 
         adata = anndata.read_h5ad(h5ad_path)
-        from_anndata_kwargs: dict[str, object] = {"codec": self.codec}
-        if self.with_csc:
-            from_anndata_kwargs["csc"] = "always"
+        from_anndata_kwargs: dict[str, object] = {
+            "codec": self.codec,
+            "csc": self.csc,
+        }
         if self.row_group_rows is not None:
             from_anndata_kwargs["row_group_rows"] = self.row_group_rows
         if self.shard_size is not None:

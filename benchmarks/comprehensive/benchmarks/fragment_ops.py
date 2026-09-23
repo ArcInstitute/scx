@@ -120,6 +120,14 @@ def _copy_scx(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
+# `csc="off"` on every rewrite op below. The `scx_auto` fixture these copy
+# carries a CSC sidecar (it is converted at the ingest default), and the rewrite
+# ops carry an input's sidecar by default by building a fresh one in the same
+# pass — which would add a transpose to every timed op and change what each arm
+# has always measured. What the carry costs is not this benchmark's subject.
+_REWRITE_CSC = "off"
+
+
 def _time_op(fn, *args, **kwargs) -> tuple[float, float]:
     """Run *fn* and return ``(wall_s, peak_rss_mb)``.
 
@@ -267,7 +275,9 @@ def _run_compact(
         _copy_scx(dirty_path, input_path)
         size_before = input_path.stat().st_size
 
-        wall, rss = _time_op(pyscx.compact, str(input_path), str(output_path))
+        wall, rss = _time_op(
+            pyscx.compact, str(input_path), str(output_path), csc=_REWRITE_CSC,
+        )
 
         size_after = output_path.stat().st_size
         reclaimed = size_before - size_after
@@ -337,7 +347,9 @@ def _run_optimize(
         _copy_scx(base_scx, input_path)
         size_before = input_path.stat().st_size
 
-        wall, rss = _time_op(pyscx.optimize, str(input_path), str(output_path))
+        wall, rss = _time_op(
+            pyscx.optimize, str(input_path), str(output_path), csc=_REWRITE_CSC,
+        )
 
         size_after = output_path.stat().st_size
         throughput_mb_s = (size_before / (1024 * 1024)) / wall if wall > 0 else 0.0
@@ -406,7 +418,9 @@ def _run_compact_full(
         _copy_scx(full_scx, input_path)
         size_before = input_path.stat().st_size
 
-        wall, rss = _time_op(pyscx.compact, str(input_path), str(output_path))
+        wall, rss = _time_op(
+            pyscx.compact, str(input_path), str(output_path), csc=_REWRITE_CSC,
+        )
 
         size_after = output_path.stat().st_size
         throughput_mb_s = (size_before / (1024 * 1024)) / wall if wall > 0 else 0.0

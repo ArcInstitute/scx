@@ -95,7 +95,7 @@ fn same_pass_equals_second_pass(dir: &Path, tag: &str, op: impl Fn(&Path, CscCar
     scx_ops::rebuild_csc_inplace(
         &off,
         COLS,
-        "4G",
+        None,
         scx_ops::framing_for_csc_rebuild(&off),
         None,
     )

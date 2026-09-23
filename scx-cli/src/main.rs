@@ -108,15 +108,14 @@ enum Commands {
         codec: String,
         /// Whether to also emit a CSC sidecar at write time.
         ///
-        /// `off` (default): CSR-only output, matches existing behavior.
-        /// `auto`: emit a CSC sidecar when the dataset is large enough to
-        ///   benefit (n_obs ≥ 50000 and n_vars ≥ 5000 by default; tune via
-        ///   `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`).
+        /// `auto` (default): emit a CSC sidecar when the dataset is large
+        ///   enough to benefit (n_obs ≥ 50000 and n_vars ≥ 5000 by default;
+        ///   tune via `SCX_CSC_AUTO_OBS_THRESHOLD` /
+        ///   `SCX_CSC_AUTO_VARS_THRESHOLD`). It is built in the same pass as
+        ///   X, and costs disk (the sidecar holds every nonzero again) and
+        ///   convert time.
         /// `always`: always emit a CSC sidecar (column-major shards).
-        ///
-        /// When omitted, an accel-ready `--index-preset` (`training` /
-        /// `perturbseq`) upgrades the default to `auto`; otherwise the
-        /// default is `off`. An explicit value here always wins.
+        /// `off`: CSR-only output, the opt-out.
         #[arg(long, value_parser = ["off", "auto", "always"])]
         csc: Option<String>,
         /// Columns per CSC shard when a CSC sidecar is emitted (default 5000).
@@ -384,8 +383,11 @@ enum Commands {
         /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
         /// Accepts a binary-prefixed size (`K`/`M`/`G`/`T` or `KiB`..`TiB`);
         /// decimal `KB`/`MB`/`GB` is rejected. Ignored without `--rebuild-csc`.
-        #[arg(long, default_value = "4G")]
-        csc_memory_limit: String,
+        /// Naming one also makes the sidecar's emit
+        /// encode a shard batch at a time against it, which is slower but
+        /// keeps the peak nearer the limit; unset (4G) encodes whole emit groups.
+        #[arg(long)]
+        csc_memory_limit: Option<String>,
         /// Comma-separated obs columns to force-index after appending.
         /// Mirrors `scx convert --index-obs`; without this flag, any
         /// pre-existing predicate-index sections remain in place but
@@ -919,8 +921,11 @@ enum Commands {
         /// Accepts a bare byte count or a binary-prefixed size —
         /// `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024);
         /// decimal `KB`/`MB`/`GB`/`TB` is rejected as ambiguous.
-        #[arg(long, default_value = "4G")]
-        memory_limit: String,
+        /// Naming one also makes the sidecar's emit
+        /// encode a shard batch at a time against it, which is slower but
+        /// keeps the peak nearer the limit; unset (4G) encodes whole emit groups.
+        #[arg(long)]
+        memory_limit: Option<String>,
         /// Overwrite output if it exists. Not applicable to the in-place form
         /// (no <OUTPUT>), which always modifies <INPUT>.
         #[arg(long)]
@@ -1385,12 +1390,9 @@ fn main() {
             group_max_bytes,
             group_pass,
         } => {
-            // Resolve the CSC policy: an explicit `--csc` always wins;
-            // otherwise an accel-ready `--index-preset` upgrades the
-            // default to `auto` (column substrate for DE/pseudobulk).
-            // Shared with pyscx via `scx_engine::index::resolve_csc_policy`.
-            let csc =
-                scx_engine::index::resolve_csc_policy(csc.as_deref(), index_preset.as_deref());
+            // An explicit `--csc` wins; unset is `auto`. Shared with pyscx
+            // via `scx_engine::index::resolve_csc_policy`.
+            let csc = scx_engine::index::resolve_csc_policy(csc.as_deref());
             run_convert(
                 &input,
                 &output,
@@ -1401,7 +1403,7 @@ fn main() {
                 shard_size,
                 &shard_obs,
                 &codec,
-                &csc,
+                csc,
                 csc_cols_per_shard,
                 row_group_rows,
                 row_group_target_nnz,
@@ -1606,7 +1608,7 @@ fn main() {
             shard_size,
             rebuild_csc,
             csc_cols_per_shard,
-            &csc_memory_limit,
+            csc_memory_limit.as_deref(),
             parse_index_columns(index_obs.as_deref()),
             parse_index_columns(index_var.as_deref()),
             index_preset.filter(|s| !s.trim().is_empty()),
@@ -1863,7 +1865,7 @@ fn main() {
                 Some(output) => scx_ops::run_build_csc(
                     &input,
                     &output,
-                    &memory_limit,
+                    memory_limit.as_deref(),
                     force,
                     csc_cols_per_shard,
                     framing,
@@ -1883,7 +1885,7 @@ fn main() {
                 None => scx_ops::rebuild_csc_inplace(
                     &input,
                     csc_cols_per_shard,
-                    &memory_limit,
+                    memory_limit.as_deref(),
                     framing,
                     temp_dir.as_deref(),
                 )
@@ -2168,6 +2170,8 @@ fn run_convert(
                 csc_policy,
                 csc_cols_per_shard,
                 allow_lossy,
+                memory_budget,
+                temp_dir.as_deref(),
             );
         }
         "scx_to_mtx" => return dispatch_scx_to_mtx(input, output, modality, force),
@@ -2676,8 +2680,21 @@ fn dispatch_mtx_to_scx(
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
     allow_lossy: bool,
+    memory_budget: Option<&str>,
+    temp_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::mtx_pipeline;
+    // `--memory-budget` reaches the sidecar build as its memory limit, through
+    // the same `csc_sidecar_bytes` streaming ingest uses — so a budget bounds
+    // the emit here too, and the shard widths match what a streaming
+    // conversion under the same budget would write. Parsed before any I/O.
+    let csc_memory_limit = memory_budget
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| -> Result<String, Box<dyn std::error::Error>> {
+            let bytes = scx_format_io::MemoryBudget::parse(s)?;
+            Ok(convert::csc_sidecar_bytes(Some(bytes)).to_string())
+        })
+        .transpose()?;
     use indicatif::{ProgressBar, ProgressStyle};
 
     let pb = ProgressBar::new_spinner();
@@ -2715,30 +2732,17 @@ fn dispatch_mtx_to_scx(
         );
     }
 
-    // MTX conversion is delegated to the standalone `scx-mtx` crate,
-    // which doesn't know about CSC. When the policy resolves to build,
-    // append the sidecar to the just-written file in place — one extra read
-    // pass, no second copy of the file, and without modifying scx-mtx. `Auto`
-    // reads back the just-written header for the shape (scx-mtx doesn't
-    // return it to the caller).
-    let build_csc = match csc_policy {
-        convert::CscPolicy::Off => false,
-        convert::CscPolicy::Always => true,
-        convert::CscPolicy::Auto => {
-            let reader = scx_format_io::ScxReader::open(output)?;
-            let header = reader.header();
-            csc_policy.should_build_csc(header.n_obs, header.n_vars)
-        }
-    };
-    if build_csc {
-        scx_ops::rebuild_csc_inplace(
-            output,
-            csc_cols_per_shard,
-            "4G",
-            scx_ops::framing_for_csc_rebuild(output),
-            None,
-        )?;
-    }
+    // MTX conversion is delegated to the standalone `scx-mtx` crate, which
+    // doesn't know about CSC, so the sidecar is appended to the just-written
+    // file in place when the policy builds one — one extra read pass, no
+    // second copy of the file. Shared with `pyscx.from_mtx`.
+    scx_ops::build_csc_for_policy(
+        output,
+        csc_policy,
+        csc_cols_per_shard,
+        csc_memory_limit.as_deref(),
+        temp_dir,
+    )?;
 
     println!("Converted {} -> {}", input.display(), output.display());
     Ok(())

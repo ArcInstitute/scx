@@ -186,9 +186,9 @@ pyscx.from_h5ad("data.h5ad", "data.scx", csc="auto")
 pyscx.from_anndata(adata, "data.scx", csc="always", csc_cols_per_shard=10000)
 ```
 
-> **Note:** The `training` and `perturbseq` index presets automatically upgrade
-> an unset `csc` to `"auto"`. An explicit `csc="off"` / `--csc off` overrides
-> this.
+> **Note:** An unset `csc` is `"auto"`, so a dataset with at least 50,000 cells
+> and 5,000 genes gets a sidecar without asking. An explicit `csc="off"` /
+> `--csc off` opts out.
 
 #### Detection bitmaps
 

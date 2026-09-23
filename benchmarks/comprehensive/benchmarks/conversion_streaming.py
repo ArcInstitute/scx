@@ -22,14 +22,24 @@ divergence). The benchmark only needs to flag drift, not characterise it. Note
 the paths are *not* byte-identical under the default `--codec auto` on either
 format: eager forces one whole-matrix codec seed, streaming seeds per shard.
 
-**Three extra streaming arms** run on the datasets named in `_EXTRA_ARMS`. All
-three exist because the arms above pass *no* conversion options at all — their
-only kwarg is `reader_threads` — so this benchmark's memory numbers have only
-ever been measured in the default configuration:
+**The base arms pin `csc="off"`** (`--csc off` on the 10x CLI arms). The
+ingest default is `auto` — a sidecar on any file with n_obs >= 50,000 and
+n_vars >= 5,000 — and every base arm here predates that: its floors
+(`streaming_peak_rss_mb <= 4096` on census_1m among them) were set against a
+CSR-only conversion. Pinning keeps each number measuring the thing it always
+measured; what the default costs is the `csc_auto` arm's job.
 
-- **csc_always** — `from_h5ad(..., csc="always")`. `CscPolicy::default()` is
-  `off`, so nothing in this suite has exercised `write_csc_sidecar`, which takes
-  the whole CSR by value. Expected to breach the streaming ceiling.
+**Four extra streaming arms** run on the datasets named in `_EXTRA_ARMS`, each
+the pinned streaming conversion with one option changed:
+
+- **csc_always** — `from_h5ad(..., csc="always")`: the sidecar built in the
+  same pass as X, whatever the shape.
+- **csc_auto** — `from_h5ad(...)` with **no** `csc` kwarg, i.e. the ingest
+  default. Scoped to `tabula_sapiens_100k`, which clears the `auto` rule, and
+  premise-checked like `csc_always` (the output must carry a sidecar, or the
+  arm timed a CSR-only conversion under the default's label). Its
+  `csc_auto_output_bytes` beside `streaming_output_bytes` is the default's
+  disk cost, and `metadata["csc_auto_disk_ratio"]` states it as a ratio.
 - **index_preset_cellxgene** — `from_h5ad(..., index_preset="cellxgene")`,
   materialising predicate indexes at write time.
 - **budget_bound** — `from_h5ad(..., memory_budget=2GiB, shard_size=2048,
@@ -49,7 +59,7 @@ ever been measured in the default configuration:
   since the derate also fires when it shrinks only the queue depth, and a
   dropped budget produces a *passing* number.
 
-`csc_always` and `index_preset_cellxgene` are pinned to the same
+`csc_always`, `csc_auto` and `index_preset_cellxgene` are pinned to the same
 `GATED_READER_THREADS` as the gated arm so their numbers are comparable;
 `budget_bound` pins **12** in its own kwargs, because at 4 the derate leaves
 threads alone and shrinks only depth. Each gets `<label>_peak_rss_mb` /
@@ -179,12 +189,15 @@ def _skip_materialize_reason(n_obs: int) -> str | None:
 # (its only kwarg is `reader_threads`), so the bound this benchmark enforces is
 # measured in a configuration real callers do not always use.
 #
-# * `csc_always` — `CscPolicy::default()` is `off`, so nothing here has ever
-#   exercised `write_csc_sidecar`, which takes the whole CSR by value. Scoped to
-#   `tabula_sapiens_100k` deliberately: this arm is expected to breach its
-#   ceiling and therefore needs a justification, and justification suppression is
-#   **whole-triple** — attaching one to census_1m would also suppress the live
-#   `streaming_peak_rss_mb <= 4096` floor on that triple.
+# * `csc_always` — the base arms pin `csc="off"` (see `_BASE_ARM_KWARGS`), so
+#   this is the arm that builds a sidecar. Scoped to `tabula_sapiens_100k`
+#   deliberately: an arm that may breach its ceiling needs a justification, and
+#   justification suppression is **whole-triple** — attaching one to census_1m
+#   would also suppress the live `streaming_peak_rss_mb <= 4096` floor on that
+#   triple.
+# * `csc_auto` — no `csc` kwarg at all (`None` below means "leave it unset"),
+#   so it measures whatever the ingest default is: `auto`, which builds on
+#   tabula's 100k x 61,497. Scoped like `csc_always`, for the same reason.
 # * `index_preset_cellxgene` — materialises predicate indexes at write time.
 #   Scoped to the CELLxGENE-Census-derived datasets, which are the ones carrying
 #   the columns the preset names. Checked, not assumed: the preset names ten obs
@@ -219,8 +232,19 @@ _BUDGET_ARM_BYTES = 2 * 1024 * 1024 * 1024
 # `build_csc.py` uses the same convention (`_MEMORY_LIMIT_MB = 4 * 1024`).
 _BUDGET_ARM_MB = _BUDGET_ARM_BYTES / (1024 * 1024)
 
+# What every arm passes unless it says otherwise. `csc="off"` pins the base
+# arms to the CSR-only conversion their floors were set against; an arm that
+# wants the ingest default instead says `"csc": None`, which the worker drops
+# before calling `from_h5ad` (a JSON `null` survives the subprocess hop, an
+# absent key would be indistinguishable from "use the base default").
+_BASE_ARM_KWARGS: dict[str, object] = {"csc": "off"}
+
+# Arms whose output must carry a CSC sidecar (the premise check).
+_CSC_ARMS: tuple[str, ...] = ("csc_always", "csc_auto")
+
 _EXTRA_ARMS: dict[str, tuple[dict[str, object], frozenset[str]]] = {
     "csc_always": ({"csc": "always"}, frozenset({"tabula_sapiens_100k"})),
+    "csc_auto": ({"csc": None}, frozenset({"tabula_sapiens_100k"})),
     "budget_bound": (
         # `reader_threads` is inside the arm's kwargs deliberately, so
         # `kwargs.update` overrides the `GATED_READER_THREADS` pin every other
@@ -268,11 +292,11 @@ def _structural_summary(scx_path: Path) -> dict[str, int]:
     equality is asserted in the Rust tests — see Phase 8; this only needs to
     flag drift.
 
-    `has_csc` is here for the `csc_always` arm and is the premise `_run_isolated`
-    enforces: if that arm reports 0 it converted without building a sidecar, and
-    its wall and peak measured the default path under the wrong label. It is 0 on
-    every other arm, so adding it does not change the streaming-vs-materialize
-    equality above.
+    `has_csc` is here for the `csc_always` / `csc_auto` arms and is the premise
+    `_run_isolated` enforces: if one reports 0 it converted without building a
+    sidecar, and its wall and peak measured a CSR-only conversion under the
+    wrong label. It is 0 on every base arm (they pin `csc="off"`), so adding it
+    does not change the streaming-vs-materialize equality above.
 
     It reads the header flag. An earlier version counted `X_csc_shard_*` sections
     out of `reader.validate()`, which verifies the whole-file checksum and then
@@ -338,9 +362,14 @@ def _timed_streaming(
     )
     # `extra_kwargs` is the arm's conversion option (e.g. `csc="always"`). It is
     # merged rather than replacing, so an extra arm still runs at the pinned
-    # thread count and stays comparable with the default one.
+    # thread count and stays comparable with the default one. The base kwargs
+    # go in first so an arm overrides them; a `None` value then means "leave
+    # this option at the library default" and is dropped (see
+    # `_BASE_ARM_KWARGS`).
+    kwargs.update(_BASE_ARM_KWARGS)
     if extra_kwargs:
         kwargs.update(extra_kwargs)
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
     # Capture what the derate actually granted, so a `memory_budget` arm can
     # prove the budget bound rather than inferring it.
     #
@@ -406,7 +435,9 @@ def _timed_materialize(h5ad_path: Path, out_path: Path) -> dict[str, float]:
     t0 = time.perf_counter()
     with PeakRssSampler() as sampler:
         adata = anndata.read_h5ad(h5ad_path)
-        pyscx.from_anndata(adata, str(out_path))
+        # Pinned like the streaming base arm (`_BASE_ARM_KWARGS`), so the pair
+        # stays structurally equal and this arm keeps its CSR-only meaning.
+        pyscx.from_anndata(adata, str(out_path), **_BASE_ARM_KWARGS)
         del adata
     wall = time.perf_counter() - t0
     return {"wall_s": wall, "peak_rss_mb": sampler.peak_mb}
@@ -477,7 +508,11 @@ _TENX_WORKER_SCRIPT = textwrap.dedent("""\
     # monotone non-decreasing number. The parent spawns one of these per run.
     with tempfile.TemporaryDirectory(prefix="scx_bench_tenx_") as tmp:
         out = Path(tmp) / "out.scx"
-        argv = [scx_bin, "convert", "--from", "10x", "--stream=" + stream]
+        # `--csc off`: the pair gates the bounded *CSR* ingest, and the ingest
+        # default would otherwise add a sidecar build to both arms at census
+        # scale. Same pin as the h5ad arms' `_BASE_ARM_KWARGS`.
+        argv = [scx_bin, "convert", "--from", "10x", "--stream=" + stream,
+                "--csc", "off"]
         if reader_threads:
             argv += ["--reader-threads", reader_threads]
         argv += [tenx_path, str(out)]
@@ -1023,6 +1058,7 @@ def run(
     _assert_index_arm_changed_the_output(
         list(swept.metadata.get("extra_arms", [])), swept
     )
+    _record_csc_auto_disk_ratio(swept)
     # Run once, not swept: neither 10x arm varies along the thread axis (the
     # materialising one has no reader-threads knob at all), and a sweep capture
     # that silently dropped them would emit no value for the 10x floor.
@@ -1034,22 +1070,40 @@ def _assert_csc_arm_built_a_sidecar(
     labels: list[str] | tuple[str, ...],
     structural: dict[str, dict | None],
 ) -> None:
-    """Refuse a `csc_always` result whose output has no sidecar.
+    """Refuse a `csc_always` / `csc_auto` result whose output has no sidecar.
 
-    Without this the arm emits `csc_always_peak_rss_mb` after a worker that
-    dropped `csc="always"` on either subprocess hop — the default conversion
-    recorded under the CSC label. Self-contained: it needs only this arm's own
-    structural record, so it can run the moment that arm returns.
+    Without this `csc_always` emits `csc_always_peak_rss_mb` after a worker that
+    dropped `csc="always"` on either subprocess hop — a CSR-only conversion
+    recorded under the CSC label. `csc_auto` has the mirror failure: the base
+    `csc="off"` pin leaking into it (the `None` not reaching the worker), or the
+    ingest default changing back to `off`, would both time a CSR-only
+    conversion under the default's label. Self-contained: it needs only the
+    arm's own structural record, so it can run the moment that arm returns.
     """
-    if "csc_always" not in labels:
-        return
-    has_csc = (structural.get("csc_always") or {}).get("has_csc")
-    if not has_csc:
-        raise RuntimeError(
-            f"the csc_always arm produced has_csc={has_csc!r}: "
-            f"`csc=\"always\"` did not reach `from_h5ad`, so the arm timed "
-            f"the default conversion under the CSC label. Refusing to record it."
-        )
+    for label in _CSC_ARMS:
+        if label not in labels:
+            continue
+        has_csc = (structural.get(label) or {}).get("has_csc")
+        if not has_csc:
+            raise RuntimeError(
+                f"the {label} arm produced has_csc={has_csc!r}: its conversion "
+                f"built no CSC sidecar, so the arm timed a CSR-only conversion "
+                f"under the {label} label. Refusing to record it."
+            )
+
+
+def _record_csc_auto_disk_ratio(result: BenchmarkResult) -> None:
+    """State the ingest default's disk cost as one number, when both sides ran.
+
+    `csc_auto_output_bytes / streaming_output_bytes`: the same input, the same
+    codec and threads, differing only in the sidecar the default adds. Recorded
+    in `metadata`, not floored — the ratio is a property of the dataset's
+    density, and the `csc_auto` wall/peak keys are what a gate would watch.
+    """
+    auto = result.metadata.get("csc_auto_output_bytes")
+    plain = result.metadata.get("streaming_output_bytes")
+    if auto and plain:
+        result.metadata["csc_auto_disk_ratio"] = round(auto / plain, 4)
 
 
 def _assert_budget_arm_actually_derated(
@@ -1160,7 +1214,8 @@ def _run_isolated(
     * ``materialize`` — the comparison baseline. No reader-threads knob applies.
     * any entry of :data:`_EXTRA_ARMS` whose dataset allow-list contains
       ``dataset_name`` — the same pinned streaming conversion with one option
-      changed (``csc="always"``, ``index_preset="cellxgene"``). Each carries
+      changed (``csc="always"``, the ingest-default ``csc``,
+      ``index_preset="cellxgene"``). Each carries
       ``<label>_peak_rss_mb`` / ``<label>_wall_s`` for free from the f-string
       below, so no new emission path is needed.
 
@@ -1233,6 +1288,7 @@ def _run_isolated(
     # having timed the default conversion under the CSC label. Nothing reads
     # `metadata`, so storing `n_csc_shards` there was not a check.
     _assert_csc_arm_built_a_sidecar(applicable_extras, structural)
+    _record_csc_auto_disk_ratio(result)
     _assert_index_arm_changed_the_output(applicable_extras, result)
     _assert_budget_arm_actually_derated(applicable_extras, result)
 
@@ -1303,7 +1359,8 @@ def _run_extra_arms_once(
 ) -> None:
     """Run each in-scope `_EXTRA_ARMS` entry once, at its own pinned threads.
 
-    `GATED_READER_THREADS` for `csc_always` / `index_preset_cellxgene`;
+    `GATED_READER_THREADS` for `csc_always` / `csc_auto` /
+    `index_preset_cellxgene`;
     whatever the arm put in its own kwargs otherwise (`budget_bound` pins 12).
 
     Used by the thread-scaling path, which sweeps `streaming` vs `materialize`

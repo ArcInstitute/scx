@@ -278,6 +278,32 @@ pub fn decode_shard_regions_scipy(
     values_bytes: &[u8],
     block_index_bytes: &[u8],
 ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+    decode_shard_regions_scipy_with(
+        sh,
+        indptr_bytes,
+        indices_bytes,
+        values_bytes,
+        block_index_bytes,
+        false,
+    )
+}
+
+/// [`decode_shard_regions_scipy`], optionally decoding a framed shard's row
+/// groups in parallel (`parallel_groups`, with the `parallel` feature).
+///
+/// Parallel is for a caller that holds one shard and has nothing else to do
+/// while it decodes — the same-pass CSC sink, which runs on the writer's thread
+/// in row order and was measured serialising the convert pipeline behind it.
+/// Every other consumer keeps the serial walk: they already decode several
+/// shards at once, and nesting a second fan-out under that buys nothing.
+pub(crate) fn decode_shard_regions_scipy_with(
+    sh: &ShardHeader,
+    indptr_bytes: &[u8],
+    indices_bytes: &[u8],
+    values_bytes: &[u8],
+    block_index_bytes: &[u8],
+    parallel_groups: bool,
+) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
     // Resolve codec and encoding from shard header (NOT file header)
     let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
     let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
@@ -301,6 +327,7 @@ pub fn decode_shard_regions_scipy(
             codec_id,
             value_encoding,
             index_dtype_u16,
+            parallel_groups,
         )?
     } else {
         scx_codec::decode_shard_scipy(
@@ -436,6 +463,13 @@ impl MinorIndexBits for u32 {
 /// (`indptr[0] == 0`); we rebase the group indptrs into a single monotonic
 /// global indptr and concatenate indices/values. Output is byte-identical to a
 /// legacy whole-shard decode of the same matrix.
+///
+/// With `parallel_groups` the groups decode concurrently into slots of buffers
+/// sized from the validated block index, each indptr rebased by the nnz of the
+/// groups before it — what the serial walk's running total is, so the bytes
+/// are the same. A single group, or a header whose declared sizes
+/// [`clamped_reserve`] would cut, takes the serial walk: that is the
+/// untrusted-header case, where an exact-size allocation must not happen.
 fn decode_framed_shard_scipy(
     sh: &ShardHeader,
     encoded: &EncodedShardRef<'_>,
@@ -443,10 +477,40 @@ fn decode_framed_shard_scipy(
     codec_id: CodecId,
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
+    parallel_groups: bool,
 ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
     let spans = resolve_block_index(sh, block_index_bytes)?;
     let n_major = sh.n_major as usize;
     let nnz = sh.nnz as usize;
+    let decode_group = |span: &scx_codec::RowGroupSpan| -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        let decoded = scx_codec::decode_row_group(
+            codec_id,
+            span,
+            encoded.indptr_bytes,
+            encoded.indices_bytes,
+            encoded.values_bytes,
+            value_encoding,
+            index_dtype_u16,
+        )?;
+        // This group as a local scipy CSR, rebased by the caller.
+        Ok(scx_codec::decoded_shard_to_scipy(
+            decoded,
+            value_encoding,
+            scx_codec::clamp_index_bound(sh.n_minor),
+        )?)
+    };
+
+    #[cfg(feature = "parallel")]
+    if parallel_groups
+        && spans.len() > 1
+        && clamped_reserve(n_major + 1, encoded.indptr_bytes.len(), 8) == n_major + 1
+        && clamped_reserve(nnz, encoded.indices_bytes.len(), 4) == nnz
+        && clamped_reserve(nnz, encoded.values_bytes.len(), 4) == nnz
+    {
+        return decode_groups_into_slots(&spans, n_major, nnz, &decode_group);
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = parallel_groups;
 
     // `n_major` / `nnz` come straight off the untrusted header, so reserve
     // through `clamped_reserve` rather than trusting them: `Vec::with_capacity`
@@ -462,21 +526,7 @@ fn decode_framed_shard_scipy(
     let mut running: i64 = 0;
 
     for span in &spans {
-        let decoded = scx_codec::decode_row_group(
-            codec_id,
-            span,
-            encoded.indptr_bytes,
-            encoded.indices_bytes,
-            encoded.values_bytes,
-            value_encoding,
-            index_dtype_u16,
-        )?;
-        // Convert this group (local CSR) to scipy types, then rebase indptr.
-        let (g_indptr, g_indices, g_data) = scx_codec::decoded_shard_to_scipy(
-            decoded,
-            value_encoding,
-            scx_codec::clamp_index_bound(sh.n_minor),
-        )?;
+        let (g_indptr, g_indices, g_data) = decode_group(span)?;
         for &local in &g_indptr[1..] {
             indptr.push(running + local);
         }
@@ -487,6 +537,72 @@ fn decode_framed_shard_scipy(
         data.extend_from_slice(&g_data);
     }
 
+    Ok((indptr, indices, data))
+}
+
+/// A decoded shard or row group at scipy widths: `(indptr, indices, data)`.
+#[cfg(feature = "parallel")]
+type ScipyCsr = (Vec<i64>, Vec<i32>, Vec<f32>);
+
+/// The parallel half of [`decode_framed_shard_scipy`]: every group decoded by
+/// `decode_group` straight into its slot.
+#[cfg(feature = "parallel")]
+fn decode_groups_into_slots(
+    spans: &[scx_codec::RowGroupSpan],
+    n_major: usize,
+    nnz: usize,
+    decode_group: &(impl Fn(&scx_codec::RowGroupSpan) -> Result<ScipyCsr> + Sync),
+) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+    use rayon::prelude::*;
+
+    // `resolve_block_index` has checked that the groups tile `[0, n_major)` in
+    // order and that their nnz sum to `nnz`, so these slots partition the
+    // buffers exactly.
+    let mut indptr = vec![0i64; n_major + 1];
+    let mut indices = vec![0i32; nnz];
+    let mut data = vec![0f32; nnz];
+    let mut jobs = Vec::with_capacity(spans.len());
+    {
+        let (mut ip_rest, mut ix_rest, mut dv_rest) =
+            (&mut indptr[1..], &mut indices[..], &mut data[..]);
+        let mut nnz_before = 0i64;
+        for span in spans {
+            let (ip, r) = std::mem::take(&mut ip_rest).split_at_mut(span.n_rows as usize);
+            ip_rest = r;
+            let (ix, r) = std::mem::take(&mut ix_rest).split_at_mut(span.nnz as usize);
+            ix_rest = r;
+            let (dv, r) = std::mem::take(&mut dv_rest).split_at_mut(span.nnz as usize);
+            dv_rest = r;
+            jobs.push((span, nnz_before, ip, ix, dv));
+            nnz_before += span.nnz as i64;
+        }
+    }
+    jobs.into_par_iter()
+        .try_for_each(|(span, nnz_before, ip, ix, dv)| -> Result<()> {
+            let (g_indptr, g_indices, g_data) = decode_group(span)?;
+            // `decode_row_group` already holds a group to its span's row and
+            // nnz counts; checked again here because a mismatch would
+            // otherwise be a slice-length panic rather than an error.
+            if g_indptr.len() != ip.len() + 1
+                || g_indices.len() != ix.len()
+                || g_data.len() != dv.len()
+            {
+                return Err(ScxError::InvalidBlockIndex(format!(
+                    "row-group at row {} decoded to {} rows / {} nnz, its span declares {} / {}",
+                    span.row_start,
+                    g_indptr.len().saturating_sub(1),
+                    g_indices.len(),
+                    ip.len(),
+                    ix.len()
+                )));
+            }
+            for (dst, &local) in ip.iter_mut().zip(&g_indptr[1..]) {
+                *dst = nnz_before + local;
+            }
+            ix.copy_from_slice(&g_indices);
+            dv.copy_from_slice(&g_data);
+            Ok(())
+        })?;
     Ok((indptr, indices, data))
 }
 
@@ -1246,8 +1362,35 @@ mod tests {
                 &s.block_index_bytes,
             )
             .expect("decode_shard_regions_scipy");
+            // The sink's parallel twin must reassemble the same arrays, framed
+            // (one task per group, including the empty row's) or not.
+            #[cfg(feature = "parallel")]
+            {
+                let par = decode_shard_regions_scipy_with(
+                    &sh,
+                    &s.encoded.indptr_bytes,
+                    &s.encoded.indices_bytes,
+                    &s.encoded.values_bytes,
+                    &s.block_index_bytes,
+                    true,
+                )
+                .expect("decode_shard_regions_scipy_with(parallel)");
+                assert_eq!(
+                    par, regions,
+                    "parallel decode differs (framing {framing:?})"
+                );
+            }
             (sh.shard_format_version, regions)
         };
+
+        // One row per group: four groups, one of them holding an empty row.
+        let (v_single, single) = assemble(Some(FramingConfig {
+            row_group_rows: 1,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        }));
+        assert_eq!(v_single, 2);
 
         let (v_unframed, unframed) = assemble(None);
         let (v_framed, framed) = assemble(Some(FramingConfig {
@@ -1262,6 +1405,7 @@ mod tests {
         assert_eq!(framed.0, unframed.0, "indptr differs framed vs unframed");
         assert_eq!(framed.1, unframed.1, "indices differ framed vs unframed");
         assert_eq!(framed.2, unframed.2, "data differs framed vs unframed");
+        assert_eq!(single, unframed, "one-row groups differ from unframed");
         // And equals the source arrays.
         assert_eq!(framed.0, vec![0i64, 2, 2, 5, 7]);
         assert_eq!(
