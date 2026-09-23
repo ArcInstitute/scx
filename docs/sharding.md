@@ -1060,29 +1060,46 @@ methods (covariance and randomized SVD) explicitly reject
 ### Build policy: `off` / `auto` / `always`
 
 The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
-`from_h5ad` / `from_10x`, `scx convert --csc`) is a three-state policy:
+`from_h5ad` / `from_10x` / `from_h5mu`, `scx convert --csc`) is a three-state
+policy:
 
-- **`off`** — never emit a CSC sidecar; CSR-only output. This is what an
-  unset `csc` resolves to *unless* an accel-ready `index_preset` upgrades
-  it (see below) — the default is deferred, not a pinned `"off"`.
-- **`always`** — always emit a CSC sidecar regardless of dataset size.
-- **`auto`** — emit a sidecar only when the dataset is large enough that the
-  column-axis acceleration pays for the extra write-time transpose and
-  storage: `n_obs ≥ 50000` **and** `n_vars ≥ 5000`. Both thresholds are
-  tunable via the `SCX_CSC_AUTO_OBS_THRESHOLD` and `SCX_CSC_AUTO_VARS_THRESHOLD`
+- **`auto`** (the default) — emit a sidecar only when the dataset is large
+  enough that the column-axis acceleration pays for the extra build and
+  storage: `n_obs ≥ 50000` **and** `n_vars ≥ 5000`. Both thresholds are tunable
+  via the `SCX_CSC_AUTO_OBS_THRESHOLD` and `SCX_CSC_AUTO_VARS_THRESHOLD`
   environment variables (set either to `0` to force a build on any shape) — see
   [architecture.md § Environment variables](architecture.md#environment-variables).
+- **`always`** — always emit a CSC sidecar regardless of dataset size.
+- **`off`** — never emit one; CSR-only output. The opt-out.
 
 `auto` is resolved against the matrix shape at write time, so a (unimodal)
-streaming conversion picks it up from the X reader's reported dimensions.
+streaming conversion picks it up from the X reader's reported dimensions. An
+unset `csc` is `auto` on every entry point and for every `index_preset`;
+passing any explicit value — including `off` — always wins. The rule lives in
+`scx_engine::index::resolve_csc_policy` so the CLI and pyscx cannot drift
+apart. (Until this default changed, an unset `csc` was `off` and only the
+`training` / `perturbseq` presets upgraded it.)
 
-On the pyscx entry points and `scx convert`, the default is a *deferred*
-`off`: leaving `csc` unset lets an accel-ready `--index-preset` /
-`index_preset=` (`training` or `perturbseq`, whose substrate is the
-column-major sidecar) upgrade it to `auto`. `cellxgene` is query-oriented
-and does not. Passing any explicit value — including `off` — always wins.
-The rule lives in `scx_engine::index::resolve_csc_policy` so the CLI and
-pyscx cannot drift apart.
+**What the default costs.** On the streaming paths the sidecar is built in the
+same pass as X, and in parallel, so the price is encode work and disk rather
+than a second read. Measured on one node (median of 3, 2 at census_1m; no
+`--memory-budget`):
+
+| `scx convert` h5ad → SCX | `--csc off` | default (`auto`) | size, off → auto |
+|---|---:|---:|---:|
+| tabula_sapiens_100k | 2.6 s | 5.2 s | 222 → 381 MB (+71%) |
+| census_500k | 9.6 s | 24.0 s | 1,148 → 1,769 MB (+54%) |
+| census_1m | 18.3 s | 45.1 s | 2,737 → 3,887 MB (+42%) |
+
+Peak RSS moves little (census_1m 9.6 → 10.8 GB), because ingest's own working
+set dominates it. The in-memory `pyscx.from_anndata` path builds from the
+resident CSR instead: 3.8 → 8.5 s at tabula_sapiens_100k and 15.5 → 39 s at
+census_500k, where pyscx 0.18.0 took 207 s for the same sidecar. The sidecar is
+worth it for the column-major workloads in the table above — at census_1m the
+laptop-test pipeline's Wilcoxon DE went from 2,091 s on `cpu_csr` to 209 s on
+`cpu_csc` — and is dead weight for a file that is only ever read by rows (a
+training loader, `to_anndata()` of a row window), which is what `--csc off` is
+for.
 
 Multimodal (h5mu / MuData) inputs cannot build per-modality CSC while
 streaming, and `scx build-csc` is unimodal-only (it would collapse all
