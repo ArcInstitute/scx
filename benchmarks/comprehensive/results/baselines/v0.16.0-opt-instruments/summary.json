@@ -3098,54 +3098,6 @@
       "file_size_bytes": 1586699901,
       "source_file": "compression__annloader__tabula_sapiens_100k.json"
     },
-    "compression__cellstream__census_1m": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 1747015861,
-      "source_file": "compression__cellstream__census_1m.json"
-    },
-    "compression__cellstream__census_500k": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 920646679,
-      "source_file": "compression__cellstream__census_500k.json"
-    },
-    "compression__cellstream__pbmc10k": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 34574465,
-      "source_file": "compression__cellstream__pbmc10k.json"
-    },
-    "compression__cellstream__pbmc3k": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 6112811,
-      "source_file": "compression__cellstream__pbmc3k.json"
-    },
-    "compression__cellstream__smartseq2": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 255671470,
-      "source_file": "compression__cellstream__smartseq2.json"
-    },
-    "compression__cellstream__tabula_sapiens_100k": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 234530539,
-      "source_file": "compression__cellstream__tabula_sapiens_100k.json"
-    },
     "compression__h5ad_gzip__census_1m": {
       "median_wall_s": 0.0,
       "wall_s_iqr": null,
@@ -3962,54 +3914,6 @@
       "file_size_bytes": 349778298,
       "source_file": "compression__scx_zstd__tabula_sapiens_100k.json"
     },
-    "compression__shardad__census_1m": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 1622046035,
-      "source_file": "compression__shardad__census_1m.json"
-    },
-    "compression__shardad__census_500k": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 859210963,
-      "source_file": "compression__shardad__census_500k.json"
-    },
-    "compression__shardad__pbmc10k": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 31687759,
-      "source_file": "compression__shardad__pbmc10k.json"
-    },
-    "compression__shardad__pbmc3k": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 6210629,
-      "source_file": "compression__shardad__pbmc3k.json"
-    },
-    "compression__shardad__smartseq2": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 253195352,
-      "source_file": "compression__shardad__smartseq2.json"
-    },
-    "compression__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 0.0,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": 222196826,
-      "source_file": "compression__shardad__tabula_sapiens_100k.json"
-    },
     "compression__slaf__census_1m": {
       "median_wall_s": 0.0,
       "wall_s_iqr": null,
@@ -4457,38 +4361,6 @@
       "peak_rss_mb_median": 2365.45703125,
       "file_size_bytes": 1557121634,
       "source_file": "grouped_read__scx_auto__tahoe_c38.json"
-    },
-    "grouped_read__shardad__chemogenetic_rgfp": {
-      "median_wall_s": 0.9880146919749677,
-      "wall_s_iqr": 13.552336123480927,
-      "n_runs": 9,
-      "peak_rss_mb_median": 1438.046875,
-      "file_size_bytes": 802972855,
-      "source_file": "grouped_read__shardad__chemogenetic_rgfp.json"
-    },
-    "grouped_read__shardad__nb_glm_synth": {
-      "median_wall_s": 0.9429642445174977,
-      "wall_s_iqr": 0.746025426487904,
-      "n_runs": 10,
-      "peak_rss_mb_median": 1404.533203125,
-      "file_size_bytes": 73018985,
-      "source_file": "grouped_read__shardad__nb_glm_synth.json"
-    },
-    "grouped_read__shardad__replogle_k562": {
-      "median_wall_s": 4.025303607981186,
-      "wall_s_iqr": 4.215863001183607,
-      "n_runs": 10,
-      "peak_rss_mb_median": 6104.958984375,
-      "file_size_bytes": 2237549420,
-      "source_file": "grouped_read__shardad__replogle_k562.json"
-    },
-    "grouped_read__shardad__tahoe_c38": {
-      "median_wall_s": 5.2073505950393155,
-      "wall_s_iqr": 4.3757498655468225,
-      "n_runs": 9,
-      "peak_rss_mb_median": 4418.01953125,
-      "file_size_bytes": 1403295438,
-      "source_file": "grouped_read__shardad__tahoe_c38.json"
     },
     "grouped_sort__scx_auto__chemogenetic_rgfp": {
       "median_wall_s": 12.357462442014366,
@@ -5474,54 +5346,6 @@
       "file_size_bytes": 349778298,
       "source_file": "memory__scx_zstd__tabula_sapiens_100k.json"
     },
-    "memory__shardad__census_1m": {
-      "median_wall_s": 5.52620259806281,
-      "wall_s_iqr": 0.5205820749688428,
-      "n_runs": 6,
-      "peak_rss_mb_median": 798.9296875,
-      "file_size_bytes": 1622046035,
-      "source_file": "memory__shardad__census_1m.json"
-    },
-    "memory__shardad__census_500k": {
-      "median_wall_s": 5.115109260485042,
-      "wall_s_iqr": 2.537264704500558,
-      "n_runs": 6,
-      "peak_rss_mb_median": 771.712890625,
-      "file_size_bytes": 859210963,
-      "source_file": "memory__shardad__census_500k.json"
-    },
-    "memory__shardad__pbmc10k": {
-      "median_wall_s": 0.25897898542461917,
-      "wall_s_iqr": 0.016099057014798746,
-      "n_runs": 10,
-      "peak_rss_mb_median": 680.46484375,
-      "file_size_bytes": 31687759,
-      "source_file": "memory__shardad__pbmc10k.json"
-    },
-    "memory__shardad__pbmc3k": {
-      "median_wall_s": 0.06328983954153955,
-      "wall_s_iqr": 0.0051922405255027115,
-      "n_runs": 10,
-      "peak_rss_mb_median": 662.57421875,
-      "file_size_bytes": 6210629,
-      "source_file": "memory__shardad__pbmc3k.json"
-    },
-    "memory__shardad__smartseq2": {
-      "median_wall_s": 1.3566453430103138,
-      "wall_s_iqr": 0.06331562343984842,
-      "n_runs": 10,
-      "peak_rss_mb_median": 688.625,
-      "file_size_bytes": 253195352,
-      "source_file": "memory__shardad__smartseq2.json"
-    },
-    "memory__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 1.7622989270021208,
-      "wall_s_iqr": 0.056856988987419754,
-      "n_runs": 6,
-      "peak_rss_mb_median": 694.01953125,
-      "file_size_bytes": 222196826,
-      "source_file": "memory__shardad__tabula_sapiens_100k.json"
-    },
     "memory__slaf__census_1m": {
       "median_wall_s": 26.587892922980245,
       "wall_s_iqr": 39.374645962321665,
@@ -5705,54 +5529,6 @@
       "peak_rss_mb_median": 1488.005859375,
       "file_size_bytes": 360940989,
       "source_file": "memory__zarr_zstd__tabula_sapiens_100k.json"
-    },
-    "ml_loader__cellstream__census_1m": {
-      "median_wall_s": null,
-      "wall_s_iqr": null,
-      "n_runs": 0,
-      "peak_rss_mb_median": null,
-      "file_size_bytes": 1747015861,
-      "source_file": "ml_loader__cellstream__census_1m.json"
-    },
-    "ml_loader__cellstream__census_500k": {
-      "median_wall_s": null,
-      "wall_s_iqr": null,
-      "n_runs": 0,
-      "peak_rss_mb_median": null,
-      "file_size_bytes": 920646679,
-      "source_file": "ml_loader__cellstream__census_500k.json"
-    },
-    "ml_loader__cellstream__pbmc10k": {
-      "median_wall_s": null,
-      "wall_s_iqr": null,
-      "n_runs": 0,
-      "peak_rss_mb_median": null,
-      "file_size_bytes": 34574465,
-      "source_file": "ml_loader__cellstream__pbmc10k.json"
-    },
-    "ml_loader__cellstream__pbmc3k": {
-      "median_wall_s": null,
-      "wall_s_iqr": null,
-      "n_runs": 0,
-      "peak_rss_mb_median": null,
-      "file_size_bytes": 6112811,
-      "source_file": "ml_loader__cellstream__pbmc3k.json"
-    },
-    "ml_loader__cellstream__smartseq2": {
-      "median_wall_s": null,
-      "wall_s_iqr": null,
-      "n_runs": 0,
-      "peak_rss_mb_median": null,
-      "file_size_bytes": 255671470,
-      "source_file": "ml_loader__cellstream__smartseq2.json"
-    },
-    "ml_loader__cellstream__tabula_sapiens_100k": {
-      "median_wall_s": null,
-      "wall_s_iqr": null,
-      "n_runs": 0,
-      "peak_rss_mb_median": null,
-      "file_size_bytes": 234530539,
-      "source_file": "ml_loader__cellstream__tabula_sapiens_100k.json"
     },
     "ml_loader__h5ad_gzip__census_1m": {
       "median_wall_s": 262.4023544744705,
@@ -6185,38 +5961,6 @@
       "peak_rss_mb_median": 936.52734375,
       "file_size_bytes": 349778298,
       "source_file": "ml_loader__scx_zstd__tabula_sapiens_100k.json"
-    },
-    "ml_loader__shardad__pbmc10k": {
-      "median_wall_s": 3.5245345314615406,
-      "wall_s_iqr": 1.0465643445495516,
-      "n_runs": 20,
-      "peak_rss_mb_median": 902.27734375,
-      "file_size_bytes": 31687759,
-      "source_file": "ml_loader__shardad__pbmc10k.json"
-    },
-    "ml_loader__shardad__pbmc3k": {
-      "median_wall_s": 0.32800268195569515,
-      "wall_s_iqr": 0.2585808856820222,
-      "n_runs": 20,
-      "peak_rss_mb_median": 887.8046875,
-      "file_size_bytes": 6210629,
-      "source_file": "ml_loader__shardad__pbmc3k.json"
-    },
-    "ml_loader__shardad__smartseq2": {
-      "median_wall_s": 75.37740941141965,
-      "wall_s_iqr": 9.265418704162585,
-      "n_runs": 20,
-      "peak_rss_mb_median": 948.85546875,
-      "file_size_bytes": 253195352,
-      "source_file": "ml_loader__shardad__smartseq2.json"
-    },
-    "ml_loader__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 172.5022221939871,
-      "wall_s_iqr": 21.17672073552967,
-      "n_runs": 12,
-      "peak_rss_mb_median": 974.41796875,
-      "file_size_bytes": 222196826,
-      "source_file": "ml_loader__shardad__tabula_sapiens_100k.json"
     },
     "ml_loader__slaf__census_1m": {
       "median_wall_s": 260.49731074349256,
@@ -7258,54 +7002,6 @@
       "file_size_bytes": null,
       "source_file": "ooc_rss_boundary__scx_auto__tabula_sapiens_100k.json"
     },
-    "ooc_rss_boundary__shardad__census_1m": {
-      "median_wall_s": 6.700217460514978,
-      "wall_s_iqr": null,
-      "n_runs": 2,
-      "peak_rss_mb_median": 11933.12890625,
-      "file_size_bytes": null,
-      "source_file": "ooc_rss_boundary__shardad__census_1m.json"
-    },
-    "ooc_rss_boundary__shardad__census_500k": {
-      "median_wall_s": 6.913697097450495,
-      "wall_s_iqr": null,
-      "n_runs": 2,
-      "peak_rss_mb_median": 6657.533203125,
-      "file_size_bytes": null,
-      "source_file": "ooc_rss_boundary__shardad__census_500k.json"
-    },
-    "ooc_rss_boundary__shardad__pbmc10k": {
-      "median_wall_s": 0.3302022455027327,
-      "wall_s_iqr": null,
-      "n_runs": 2,
-      "peak_rss_mb_median": 865.75,
-      "file_size_bytes": null,
-      "source_file": "ooc_rss_boundary__shardad__pbmc10k.json"
-    },
-    "ooc_rss_boundary__shardad__pbmc3k": {
-      "median_wall_s": 0.13086628104792908,
-      "wall_s_iqr": null,
-      "n_runs": 2,
-      "peak_rss_mb_median": 684.52734375,
-      "file_size_bytes": null,
-      "source_file": "ooc_rss_boundary__shardad__pbmc3k.json"
-    },
-    "ooc_rss_boundary__shardad__smartseq2": {
-      "median_wall_s": 1.6414101115078665,
-      "wall_s_iqr": null,
-      "n_runs": 2,
-      "peak_rss_mb_median": 1723.796875,
-      "file_size_bytes": null,
-      "source_file": "ooc_rss_boundary__shardad__smartseq2.json"
-    },
-    "ooc_rss_boundary__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 1.8392162934760563,
-      "wall_s_iqr": null,
-      "n_runs": 2,
-      "peak_rss_mb_median": 2227.650390625,
-      "file_size_bytes": null,
-      "source_file": "ooc_rss_boundary__shardad__tabula_sapiens_100k.json"
-    },
     "parallel_scaling__annbatch__census_1m": {
       "median_wall_s": 49.4944305,
       "wall_s_iqr": 0.36486850000000004,
@@ -8265,54 +7961,6 @@
       "peak_rss_mb_median": 788.7149999999999,
       "file_size_bytes": 349778298,
       "source_file": "parallel_scaling__scx_zstd__tabula_sapiens_100k.json"
-    },
-    "parallel_scaling__shardad__census_1m": {
-      "median_wall_s": 6.9844095,
-      "wall_s_iqr": 2.2673162499999995,
-      "n_runs": 18,
-      "peak_rss_mb_median": 759.17,
-      "file_size_bytes": 1622046035,
-      "source_file": "parallel_scaling__shardad__census_1m.json"
-    },
-    "parallel_scaling__shardad__census_500k": {
-      "median_wall_s": 4.229848499999999,
-      "wall_s_iqr": 1.3439872500000005,
-      "n_runs": 18,
-      "peak_rss_mb_median": 769.1500000000001,
-      "file_size_bytes": 859210963,
-      "source_file": "parallel_scaling__shardad__census_500k.json"
-    },
-    "parallel_scaling__shardad__pbmc10k": {
-      "median_wall_s": 0.248661,
-      "wall_s_iqr": 0.0032617500000000077,
-      "n_runs": 30,
-      "peak_rss_mb_median": 669.175,
-      "file_size_bytes": 31687759,
-      "source_file": "parallel_scaling__shardad__pbmc10k.json"
-    },
-    "parallel_scaling__shardad__pbmc3k": {
-      "median_wall_s": 0.053812,
-      "wall_s_iqr": 0.0017819999999999989,
-      "n_runs": 30,
-      "peak_rss_mb_median": 667.3,
-      "file_size_bytes": 6210629,
-      "source_file": "parallel_scaling__shardad__pbmc3k.json"
-    },
-    "parallel_scaling__shardad__smartseq2": {
-      "median_wall_s": 1.2714885,
-      "wall_s_iqr": 0.02259174999999991,
-      "n_runs": 30,
-      "peak_rss_mb_median": 683.845,
-      "file_size_bytes": 253195352,
-      "source_file": "parallel_scaling__shardad__smartseq2.json"
-    },
-    "parallel_scaling__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 1.870467,
-      "wall_s_iqr": 0.019310250000000195,
-      "n_runs": 18,
-      "peak_rss_mb_median": 676.635,
-      "file_size_bytes": 222196826,
-      "source_file": "parallel_scaling__shardad__tabula_sapiens_100k.json"
     },
     "parallel_scaling__slaf__pbmc10k": {
       "median_wall_s": 0.8697805,
@@ -9449,54 +9097,6 @@
       "peak_rss_mb_median": 2497.443359375,
       "file_size_bytes": null,
       "source_file": "parallel_write_scaling__scx_zstd__tabula_sapiens_100k.json"
-    },
-    "parallel_write_scaling__shardad__census_1m": {
-      "median_wall_s": 22.549731914012227,
-      "wall_s_iqr": 9.755210150993662,
-      "n_runs": 18,
-      "peak_rss_mb_median": 1179.248046875,
-      "file_size_bytes": null,
-      "source_file": "parallel_write_scaling__shardad__census_1m.json"
-    },
-    "parallel_write_scaling__shardad__census_500k": {
-      "median_wall_s": 13.418144291965291,
-      "wall_s_iqr": 1.306254654075019,
-      "n_runs": 18,
-      "peak_rss_mb_median": 994.044921875,
-      "file_size_bytes": null,
-      "source_file": "parallel_write_scaling__shardad__census_500k.json"
-    },
-    "parallel_write_scaling__shardad__pbmc10k": {
-      "median_wall_s": 0.7859713910147548,
-      "wall_s_iqr": 0.0412435180041939,
-      "n_runs": 30,
-      "peak_rss_mb_median": 698.6640625,
-      "file_size_bytes": null,
-      "source_file": "parallel_write_scaling__shardad__pbmc10k.json"
-    },
-    "parallel_write_scaling__shardad__pbmc3k": {
-      "median_wall_s": 0.192218023003079,
-      "wall_s_iqr": 0.011071107001043856,
-      "n_runs": 30,
-      "peak_rss_mb_median": 697.916015625,
-      "file_size_bytes": null,
-      "source_file": "parallel_write_scaling__shardad__pbmc3k.json"
-    },
-    "parallel_write_scaling__shardad__smartseq2": {
-      "median_wall_s": 4.669546847988386,
-      "wall_s_iqr": 0.22683735299506225,
-      "n_runs": 30,
-      "peak_rss_mb_median": 747.568359375,
-      "file_size_bytes": null,
-      "source_file": "parallel_write_scaling__shardad__smartseq2.json"
-    },
-    "parallel_write_scaling__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 6.0250758859911,
-      "wall_s_iqr": 0.22475223994115368,
-      "n_runs": 18,
-      "peak_rss_mb_median": 771.97265625,
-      "file_size_bytes": null,
-      "source_file": "parallel_write_scaling__shardad__tabula_sapiens_100k.json"
     },
     "parallel_write_scaling__slaf__census_1m": {
       "median_wall_s": 70.03850436100038,
@@ -10649,54 +10249,6 @@
       "peak_rss_mb_median": 829.3671875,
       "file_size_bytes": 349778298,
       "source_file": "read_full__scx_zstd__tabula_sapiens_100k.json"
-    },
-    "read_full__shardad__census_1m": {
-      "median_wall_s": 7.745547202997841,
-      "wall_s_iqr": 0.13966887397691607,
-      "n_runs": 3,
-      "peak_rss_mb_median": 874.91015625,
-      "file_size_bytes": 1622046035,
-      "source_file": "read_full__shardad__census_1m.json"
-    },
-    "read_full__shardad__census_500k": {
-      "median_wall_s": 4.150385471060872,
-      "wall_s_iqr": 0.23724663897883147,
-      "n_runs": 3,
-      "peak_rss_mb_median": 773.40234375,
-      "file_size_bytes": 859210963,
-      "source_file": "read_full__shardad__census_500k.json"
-    },
-    "read_full__shardad__pbmc10k": {
-      "median_wall_s": 0.25184917100705206,
-      "wall_s_iqr": 0.0015020499704405665,
-      "n_runs": 5,
-      "peak_rss_mb_median": 671.8203125,
-      "file_size_bytes": 31687759,
-      "source_file": "read_full__shardad__pbmc10k.json"
-    },
-    "read_full__shardad__pbmc3k": {
-      "median_wall_s": 0.0511135469423607,
-      "wall_s_iqr": 0.0021578444284386933,
-      "n_runs": 5,
-      "peak_rss_mb_median": 687.3515625,
-      "file_size_bytes": 6210629,
-      "source_file": "read_full__shardad__pbmc3k.json"
-    },
-    "read_full__shardad__smartseq2": {
-      "median_wall_s": 1.3251443710178137,
-      "wall_s_iqr": 0.004837444925215095,
-      "n_runs": 5,
-      "peak_rss_mb_median": 661.48828125,
-      "file_size_bytes": 253195352,
-      "source_file": "read_full__shardad__smartseq2.json"
-    },
-    "read_full__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 1.8654582620365545,
-      "wall_s_iqr": 0.005528285983018577,
-      "n_runs": 3,
-      "peak_rss_mb_median": 679.43359375,
-      "file_size_bytes": 222196826,
-      "source_file": "read_full__shardad__tabula_sapiens_100k.json"
     },
     "read_full__slaf__census_1m": {
       "median_wall_s": 33.09938565501943,
@@ -11985,54 +11537,6 @@
       "peak_rss_mb_median": 1070.443359375,
       "file_size_bytes": 349778298,
       "source_file": "read_selective__scx_zstd__tabula_sapiens_100k.json"
-    },
-    "read_selective__shardad__census_1m": {
-      "median_wall_s": 5.288958412013017,
-      "wall_s_iqr": 3.0253485454595648,
-      "n_runs": 9,
-      "peak_rss_mb_median": 866.0390625,
-      "file_size_bytes": 1622046035,
-      "source_file": "read_selective__shardad__census_1m.json"
-    },
-    "read_selective__shardad__census_500k": {
-      "median_wall_s": 3.957668145070784,
-      "wall_s_iqr": 1.7509721790556796,
-      "n_runs": 9,
-      "peak_rss_mb_median": 782.2734375,
-      "file_size_bytes": 859210963,
-      "source_file": "read_selective__shardad__census_500k.json"
-    },
-    "read_selective__shardad__pbmc10k": {
-      "median_wall_s": 0.2674649370601401,
-      "wall_s_iqr": 0.03432531305588782,
-      "n_runs": 15,
-      "peak_rss_mb_median": 682.6875,
-      "file_size_bytes": 31687759,
-      "source_file": "read_selective__shardad__pbmc10k.json"
-    },
-    "read_selective__shardad__pbmc3k": {
-      "median_wall_s": 0.062488085008226335,
-      "wall_s_iqr": 0.0017804059898480773,
-      "n_runs": 15,
-      "peak_rss_mb_median": 674.09375,
-      "file_size_bytes": 6210629,
-      "source_file": "read_selective__shardad__pbmc3k.json"
-    },
-    "read_selective__shardad__smartseq2": {
-      "median_wall_s": 1.3745853640139103,
-      "wall_s_iqr": 0.243068638141267,
-      "n_runs": 15,
-      "peak_rss_mb_median": 707.23046875,
-      "file_size_bytes": 253195352,
-      "source_file": "read_selective__shardad__smartseq2.json"
-    },
-    "read_selective__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 1.8918735469924286,
-      "wall_s_iqr": 0.4025632519624196,
-      "n_runs": 9,
-      "peak_rss_mb_median": 685.96875,
-      "file_size_bytes": 222196826,
-      "source_file": "read_selective__shardad__tabula_sapiens_100k.json"
     },
     "read_selective__slaf__census_1m": {
       "median_wall_s": 10.678005620953627,
@@ -13418,22 +12922,6 @@
       "file_size_bytes": null,
       "source_file": "roundtrip__scx_zstd__tabula_sapiens_100k.json"
     },
-    "shardad_fidelity__shardad__pbmc3k": {
-      "median_wall_s": 0.5412214160896838,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": null,
-      "source_file": "shardad_fidelity__shardad__pbmc3k.json"
-    },
-    "shardad_fidelity__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 21.927608096040785,
-      "wall_s_iqr": null,
-      "n_runs": 1,
-      "peak_rss_mb_median": 0.0,
-      "file_size_bytes": null,
-      "source_file": "shardad_fidelity__shardad__tabula_sapiens_100k.json"
-    },
     "shuffle_layout__scx_auto__census_1m": {
       "median_wall_s": 70.79728239297401,
       "wall_s_iqr": 72.71531649900135,
@@ -14441,54 +13929,6 @@
       "peak_rss_mb_median": 2581.109375,
       "file_size_bytes": null,
       "source_file": "write__scx_zstd__tabula_sapiens_100k.json"
-    },
-    "write__shardad__census_1m": {
-      "median_wall_s": 21.9287506750552,
-      "wall_s_iqr": 1.3180727219441906,
-      "n_runs": 3,
-      "peak_rss_mb_median": 1202.83984375,
-      "file_size_bytes": null,
-      "source_file": "write__shardad__census_1m.json"
-    },
-    "write__shardad__census_500k": {
-      "median_wall_s": 13.92512979102321,
-      "wall_s_iqr": 1.8851123380009085,
-      "n_runs": 3,
-      "peak_rss_mb_median": 1003.34765625,
-      "file_size_bytes": null,
-      "source_file": "write__shardad__census_500k.json"
-    },
-    "write__shardad__pbmc10k": {
-      "median_wall_s": 0.7728291100356728,
-      "wall_s_iqr": 0.01693689147941768,
-      "n_runs": 5,
-      "peak_rss_mb_median": 700.96875,
-      "file_size_bytes": null,
-      "source_file": "write__shardad__pbmc10k.json"
-    },
-    "write__shardad__pbmc3k": {
-      "median_wall_s": 0.19598059507552534,
-      "wall_s_iqr": 0.017880787898320705,
-      "n_runs": 5,
-      "peak_rss_mb_median": 700.3125,
-      "file_size_bytes": null,
-      "source_file": "write__shardad__pbmc3k.json"
-    },
-    "write__shardad__smartseq2": {
-      "median_wall_s": 4.534324851934798,
-      "wall_s_iqr": 0.3513630100642331,
-      "n_runs": 5,
-      "peak_rss_mb_median": 749.625,
-      "file_size_bytes": null,
-      "source_file": "write__shardad__smartseq2.json"
-    },
-    "write__shardad__tabula_sapiens_100k": {
-      "median_wall_s": 6.2746201729169115,
-      "wall_s_iqr": 2.240738124004565,
-      "n_runs": 3,
-      "peak_rss_mb_median": 773.69140625,
-      "file_size_bytes": null,
-      "source_file": "write__shardad__tabula_sapiens_100k.json"
     },
     "write__slaf__census_1m": {
       "median_wall_s": 68.09844516799785,

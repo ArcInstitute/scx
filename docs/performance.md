@@ -23,4 +23,3 @@ Where each section of the old single page went:
 | Query Engine, File Operations | [query-and-file-ops.md](performance/query-and-file-ops.md) |
 | Doublet-Caller Interop | [doublet-interop.md](performance/doublet-interop.md) |
 | Comprehensive Benchmarking + Cloud Validation | [comprehensive-and-cloud.md](performance/comprehensive-and-cloud.md) |
-| scx vs shardad | [vs-shardad.md](performance/vs-shardad.md) |

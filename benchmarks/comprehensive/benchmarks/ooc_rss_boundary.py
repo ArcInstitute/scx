@@ -1,29 +1,24 @@
-"""Out-of-core peak-RSS boundary — scx (streaming) vs shardad (materialize).
+"""Out-of-core peak-RSS boundary — scx streaming vs. full materialize.
 
-The deepest structural difference between the two formats: scx can iterate the
-full expression matrix in **bounded** memory (backed / streaming — ~one chunk
-resident), while shardad **always materializes** the whole matrix into an
-in-memory AnnData on read. This benchmark measures true peak RSS for a full-data
-pass at increasing scale, so the report can show scx's peak staying ~flat while
-shardad's grows with `n_obs` (and, at census scale, approaches or exceeds node
-RAM — the capability boundary).
+scx can iterate the full expression matrix in **bounded** memory (backed /
+streaming — ~one chunk resident), or materialize it fully into an in-memory
+AnnData. This benchmark measures true peak RSS for a full-data pass at
+increasing scale, so the report can show scx's streaming peak staying ~flat
+against `n_obs` while a full materialize grows with it.
 
-Scenarios (per format):
+Scenarios:
   * ``scx_stream``    — scx `iterate_streaming` (backed row-chunk pass, bounded).
   * ``scx_materialize`` — scx `read_full` (to_anndata, full f32 CSR resident).
   * ``scx_materialize_u16`` — scx `read_full_narrow` (to_anndata data_dtype=uint16;
     F3 in-decode narrow — X assembles directly at 2 B/nnz, never building the f32
-    CSR). The peak-RSS analog of shardad's narrow uint16 materialize.
-  * ``shardad_materialize`` — shardad `read_full` (whole matrix in RAM, uint16).
-    shardad has no streaming path, so this is its only full-read mode.
+    CSR).
 
 Peak RSS is a **true high-water mark** via ``rss.PeakRssSampler`` (a background
 sampler), not the 2-sample max the other read benches use — the materialize peak
 is a transient that instantaneous sampling misses.
 
-Cross-format (``SUPPORTED_FORMATS = {"scx_auto", "shardad"}``); consumes the
-Phase-A converted file (not in ``run_parallel._NO_CONVERSION``). If the shardad
-materialize OOMs at the largest scale, the killed job *is* the boundary result.
+``SUPPORTED_FORMATS = {"scx_auto"}``; consumes the Phase-A converted file (not
+in ``run_parallel._NO_CONVERSION``).
 """
 
 from __future__ import annotations
@@ -39,7 +34,7 @@ from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto", "shardad"})
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
 
 # Full-matrix reads are heavy at census scale; cap reps well below N_RUNS_SMALL.
 _MAX_RUNS = 2
@@ -86,16 +81,12 @@ def run(
         metadata={"n_obs": dataset.n_obs, "n_vars": dataset.n_vars, "cold_cache": cold_cache},
     )
 
-    # (scenario, callable) per format. scx exposes both a bounded stream and a
-    # full materialize; shardad only materializes.
-    if fmt == "scx_auto":
-        scenarios = [
-            ("scx_stream", lambda: runner.iterate_streaming(path, STREAMING_CHUNK_ROWS)),
-            ("scx_materialize", lambda: runner.read_full(path)),
-            ("scx_materialize_u16", lambda: runner.read_full_narrow(path, "uint16")),
-        ]
-    else:  # shardad
-        scenarios = [("shardad_materialize", lambda: runner.read_full(path))]
+    # scx exposes both a bounded stream and a full materialize.
+    scenarios = [
+        ("scx_stream", lambda: runner.iterate_streaming(path, STREAMING_CHUNK_ROWS)),
+        ("scx_materialize", lambda: runner.read_full(path)),
+        ("scx_materialize_u16", lambda: runner.read_full_narrow(path, "uint16")),
+    ]
 
     for scenario, op in scenarios:
         for i in range(n):

@@ -1415,8 +1415,8 @@ absolute_floors:
 
   # --- ml_loader throughput floors -----------------------------------
   # SCX own-throughput floors: min = 0.85 × the min-observed run for
-  # that scenario (~15% noise headroom). Competitor floors (shardad,
-  # cellstream, tiledb_soma, h5ad_*): min = 0.5 × median.
+  # that scenario (~15% noise headroom). Competitor floors (tiledb_soma,
+  # h5ad_*): min = 0.5 × median.
   # Per-scenario keys (batches_per_sec__<scenario>) are emitted only
   # on that scenario's runs, so the gate's median is over scenario-
   # coherent runs (not aliased across raw/hvg/norm/hvg_norm).
@@ -1432,7 +1432,7 @@ absolute_floors:
   # `auto` decodes no slower). PROVISIONAL pending the P4.3 recapture,
   # which re-derives exact adaptive floors for every dataset.
   #
-  # Recalibrated 2026-07-12 from the v0.11.0-cellstream-recapture
+  # Recalibrated 2026-07-12 from the v0.11.0-recapture
   # Chimera capture (results/baseline_2026_07_10).
   # Headline claim ("82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader")
   # is in docs/performance/loader.md; these floors protect it at each tier.
@@ -1562,113 +1562,6 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__hvg_norm
     min: 10.0
-  # shardad row-slice loader (no native DataLoader; random-access read).
-  # Competitor floors at 0.5× median from the 2026-07-12 Chimera
-  # capture. shardad collapses to ~0.5 b/s ≥50k cells (no census run).
-  - benchmark: ml_loader
-    format: shardad
-    dataset: pbmc3k
-    metric: batches_per_sec__raw
-    min: 4.0
-  - benchmark: ml_loader
-    format: shardad
-    dataset: pbmc3k
-    metric: batches_per_sec__hvg_norm
-    min: 4.0
-  - benchmark: ml_loader
-    format: shardad
-    dataset: pbmc10k
-    metric: batches_per_sec__raw
-    min: 1.3
-  - benchmark: ml_loader
-    format: shardad
-    dataset: pbmc10k
-    metric: batches_per_sec__hvg_norm
-    min: 1.3
-  - benchmark: ml_loader
-    format: shardad
-    dataset: smartseq2
-    metric: batches_per_sec__raw
-    min: 0.3
-  - benchmark: ml_loader
-    format: shardad
-    dataset: smartseq2
-    metric: batches_per_sec__hvg_norm
-    min: 0.3
-  - benchmark: ml_loader
-    format: shardad
-    dataset: tabula_sapiens_100k
-    metric: batches_per_sec__raw
-    min: 0.25
-  - benchmark: ml_loader
-    format: shardad
-    dataset: tabula_sapiens_100k
-    metric: batches_per_sec__hvg_norm
-    min: 0.25
-  # cellstream scatter-immune gather store (no native DataLoader) — new
-  # competitor. Floors at 0.5× median from the 2026-07-12 Chimera
-  # capture; catches a harness/env break that tanks the gather path.
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: pbmc3k
-    metric: batches_per_sec__raw
-    min: 7.3
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: pbmc3k
-    metric: batches_per_sec__hvg_norm
-    min: 6.2
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: pbmc10k
-    metric: batches_per_sec__raw
-    min: 5.8
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: pbmc10k
-    metric: batches_per_sec__hvg_norm
-    min: 5.6
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: smartseq2
-    metric: batches_per_sec__raw
-    min: 4.1
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: smartseq2
-    metric: batches_per_sec__hvg_norm
-    min: 3.7
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: tabula_sapiens_100k
-    metric: batches_per_sec__raw
-    min: 1.3
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: tabula_sapiens_100k
-    metric: batches_per_sec__hvg_norm
-    min: 6.3
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: census_500k
-    metric: batches_per_sec__raw
-    min: 6.5
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: census_500k
-    metric: batches_per_sec__hvg_norm
-    min: 5.8
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: census_1m
-    metric: batches_per_sec__raw
-    min: 6.3
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: census_1m
-    metric: batches_per_sec__hvg_norm
-    min: 5.6
-
   # `num_workers > 0` (workers2) floors. Recalibrated 2026-07-12 to the
   # Chimera capture at 0.85× min-observed run. tabula_sapiens_100k still
   # runs workers2 (< the 250k workers2-skip threshold); census is
@@ -2694,13 +2587,12 @@ absolute_floors:
     metric: grouped_peak_rss_mb
     max: 12000.0
 
-  # ─── Grouped read (cross-format head-to-head: scx vs shardad) ──────
-  # Same correctness-only policy as grouped_sort, but gated for BOTH formats so
-  # a read_group / read_reference regression in either the scx or the shardad
-  # arm trips the gate. Head-to-head perf (grouped_write wall/size, read_group
+  # ─── Grouped read (scx's own grouped write/read round trip) ──────
+  # Correctness-only policy, same as grouped_sort: a read_group / read_reference
+  # regression trips the gate. Perf (grouped_write wall/size, read_group
   # throughput) is reported, not floored (hardware/density sensitive). Runs on
   # the integer-count grouping datasets only — the float pert_synth_10k fixture
-  # is scx-only (grouped_sort), since shardad is a counts format.
+  # is already covered by the SCX-only grouped_sort (see grouped_read._DATASETS).
   # nb_glm_synth (ref=control)
   - benchmark: grouped_read
     format: scx_auto
@@ -2709,16 +2601,6 @@ absolute_floors:
     min: 1
   - benchmark: grouped_read
     format: scx_auto
-    dataset: nb_glm_synth
-    metric: reference_isolated_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: nb_glm_synth
-    metric: correctness_passed_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
     dataset: nb_glm_synth
     metric: reference_isolated_int
     min: 1
@@ -2738,21 +2620,6 @@ absolute_floors:
     dataset: replogle_k562
     metric: reference_isolated_int
     min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: replogle_k562
-    metric: correctness_passed_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: replogle_k562
-    metric: n_group_records
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: replogle_k562
-    metric: reference_isolated_int
-    min: 1
   # tahoe_c38 (no reference)
   - benchmark: grouped_read
     format: scx_auto
@@ -2764,17 +2631,7 @@ absolute_floors:
     dataset: tahoe_c38
     metric: n_group_records
     min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: tahoe_c38
-    metric: correctness_passed_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: tahoe_c38
-    metric: n_group_records
-    min: 1
-  # chemogenetic_rgfp (real raw counts, ref=non-targeting) — both formats
+  # chemogenetic_rgfp (real raw counts, ref=non-targeting)
   - benchmark: grouped_read
     format: scx_auto
     dataset: chemogenetic_rgfp
@@ -2789,40 +2646,6 @@ absolute_floors:
     format: scx_auto
     dataset: chemogenetic_rgfp
     metric: reference_isolated_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: chemogenetic_rgfp
-    metric: correctness_passed_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: chemogenetic_rgfp
-    metric: n_group_records
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: chemogenetic_rgfp
-    metric: reference_isolated_int
-    min: 1
-
-  # ─── Shardad read-back fidelity (source h5ad -> .shad -> to_anndata) ──
-  # Correctness-only: the round-tripped matrix must equal the source
-  # (counts lossless; float32 preserved). One gate per fixture.
-  - benchmark: shardad_fidelity
-    format: shardad
-    dataset: pbmc3k
-    metric: overall_passed_int
-    min: 1
-  - benchmark: shardad_fidelity
-    format: shardad
-    dataset: nb_glm_synth
-    metric: overall_passed_int
-    min: 1
-  - benchmark: shardad_fidelity
-    format: shardad
-    dataset: tabula_sapiens_100k
-    metric: overall_passed_int
     min: 1
 
   # ─── F5 row-group block-index adoption (read_scattered) ──────────────
@@ -3969,7 +3792,6 @@ absolute_floors:
 #      cloud_read       census_10m 5
 #      accel_de_nb_glm  nb_glm_synth 3
 #      accel_eval_metrics     pert_synth_10k 2
-#      shardad_fidelity nb_glm_synth 1
 #
 #    `gate_candidate.py` forwards `--datasets` only when the operator passes it,
 #    and `check_absolute_floors` skips a triple that did not run *silently* —

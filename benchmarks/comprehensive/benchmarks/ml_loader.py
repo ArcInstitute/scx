@@ -103,22 +103,6 @@ try:
 except ImportError:
     pass
 
-_HAS_SHARDAD = False
-try:
-    import shardad  # noqa: F401
-
-    _HAS_SHARDAD = True
-except ImportError:
-    pass
-
-_HAS_CELLSTREAM = False
-try:
-    import cellstream  # noqa: F401
-
-    _HAS_CELLSTREAM = True
-except ImportError:
-    pass
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -134,7 +118,7 @@ _SCX_KEYS = {
 }
 
 SUPPORTED_FORMATS: frozenset[str] = frozenset(
-    _SCX_KEYS | {"h5ad_none", "h5ad_gzip", "tiledb_soma", "slaf", "shardad", "cellstream"}
+    _SCX_KEYS | {"h5ad_none", "h5ad_gzip", "tiledb_soma", "slaf"}
 )
 """Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
 incompatible (bench, format) cells never get submitted. Derived from
@@ -448,10 +432,6 @@ def _resolve_loader(format_key: str) -> str | None:
         return "soma"
     if format_key == "slaf":
         return "slaf"
-    if format_key == "shardad":
-        return "shardad"
-    if format_key == "cellstream":
-        return "cellstream"
     return None
 
 
@@ -472,10 +452,6 @@ def _loader_available(loader_type: str) -> bool:
         return _HAS_SOMA_ML and _HAS_TORCH
     if loader_type == "slaf":
         return _HAS_SLAF and _HAS_TORCH
-    if loader_type == "shardad":
-        return _HAS_SHARDAD
-    if loader_type == "cellstream":
-        return _HAS_CELLSTREAM
     return False
 
 
@@ -831,112 +807,6 @@ def _ttfb_slaf(slaf_path: str, batch_size: int, hvg: bool) -> None:
     )
     for _ in loader:
         break
-
-
-def _run_shardad_epoch(
-    shad_path: str, batch_size: int, hvg: bool, normalize: bool, seed: int
-) -> _EpochResult:
-    """Shuffled row-slice loader on a shardad archive.
-
-    shardad has no native batched DataLoader, so the honest "loader you'd build
-    on shardad" is a shuffled random-access reader: permute cell ids, slice into
-    batches, materialize each batch via ``arch[idx].to_anndata`` and apply the
-    same HVG / normalize as the other loaders. ``n_workers=1`` on the per-batch
-    read is deliberate — shardad's parallel subset read spawns a fresh process
-    pool per call (~1-2 s), which would dominate a per-batch loop; serial is the
-    representative random-access cost. (shardad's `iter_group_shards` streaming
-    path needs a grouped archive, which the ML datasets are not.)
-    """
-    from shardad import ShardedArchive
-
-    arch = ShardedArchive(shad_path)
-    n_obs = int(arch.n_obs)
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(n_obs)
-
-    n_batches = 0
-    n_cells = 0
-    for start in range(0, n_obs, batch_size):
-        # sort within-batch ids for read locality (order within a batch is
-        # irrelevant to throughput; the batch membership is unchanged).
-        idx = np.sort(perm[start : start + batch_size])
-        adata = arch[idx].to_anndata(container="csr", n_workers=1)
-        X = adata.X
-        if hasattr(X, "toarray"):
-            X = X.toarray()
-        X = np.asarray(X, dtype=np.float32)
-        if hvg and X.shape[1] > QUERY_N_HVGS:
-            X = X[:, :QUERY_N_HVGS]
-        if normalize:
-            row_sums = X.sum(axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1.0
-            X = np.log1p(X / row_sums * 1e4)
-        n_batches += 1
-        n_cells += X.shape[0]
-    return _EpochResult(n_batches=n_batches, n_cells=n_cells)
-
-
-def _ttfb_shardad(shad_path: str, batch_size: int, seed: int = RANDOM_SEED) -> None:
-    from shardad import ShardedArchive
-
-    arch = ShardedArchive(shad_path)
-    n_obs = int(arch.n_obs)
-    rng = np.random.default_rng(seed)
-    idx = np.sort(rng.permutation(n_obs)[:batch_size])
-    _ = arch[idx].to_anndata(container="csr", n_workers=1).X
-
-
-def _run_cellstream_epoch(
-    cellstream_path: str, batch_size: int, hvg: bool, normalize: bool, seed: int
-) -> _EpochResult:
-    """Shuffled row-gather loader on a cellstream store.
-
-    cellstream is a random-access gather store with no built-in DataLoader, so the
-    honest "loader you'd build on it" mirrors the shardad path: permute cell ids,
-    slice into batches, gather each batch via ``store.gather_rows`` and apply the
-    same HVG / normalize as the other loaders.
-    """
-    import cellstream
-
-    store = cellstream.open(cellstream_path)
-    try:
-        n_obs = int(store.n_obs)
-        rng = np.random.default_rng(seed)
-        perm = rng.permutation(n_obs)
-
-        n_batches = 0
-        n_cells = 0
-        for start in range(0, n_obs, batch_size):
-            # sort within-batch ids for read locality (batch membership unchanged).
-            idx = np.sort(perm[start : start + batch_size])
-            X = store.gather_rows(idx)
-            if hasattr(X, "toarray"):
-                X = X.toarray()
-            X = np.asarray(X, dtype=np.float32)
-            if hvg and X.shape[1] > QUERY_N_HVGS:
-                X = X[:, :QUERY_N_HVGS]
-            if normalize:
-                row_sums = X.sum(axis=1, keepdims=True)
-                row_sums[row_sums == 0] = 1.0
-                X = np.log1p(X / row_sums * 1e4)
-            n_batches += 1
-            n_cells += X.shape[0]
-        return _EpochResult(n_batches=n_batches, n_cells=n_cells)
-    finally:
-        store.close()
-
-
-def _ttfb_cellstream(cellstream_path: str, batch_size: int, seed: int = RANDOM_SEED) -> None:
-    import cellstream
-
-    store = cellstream.open(cellstream_path)
-    try:
-        n_obs = int(store.n_obs)
-        rng = np.random.default_rng(seed)
-        idx = np.sort(rng.permutation(n_obs)[:batch_size])
-        _ = store.gather_rows(idx)
-    finally:
-        store.close()
 
 
 def _run_scdataloader_epoch(
@@ -1400,38 +1270,6 @@ def run(
                 runner = make_runner(format_variant)
                 runner.convert_from_h5ad(h5ad_path, out)
                 data_path = str(out)
-    elif loader_type == "shardad":
-        if converted_path is not None and Path(converted_path).exists():
-            data_path = str(converted_path)
-        else:
-            persistent = dataset.shardad_path
-            if persistent.exists():
-                data_path = str(persistent)
-            else:
-                _cleanup = tempfile.TemporaryDirectory(
-                    prefix=f"scx_bench_shardad_{dataset.name}_"
-                )
-                out = Path(_cleanup.name) / f"{dataset.name}.shad"
-                logger.info("Converting %s -> %s", h5ad_path.name, out)
-                runner = make_runner(format_variant)
-                runner.convert_from_h5ad(h5ad_path, out)
-                data_path = str(out)
-    elif loader_type == "cellstream":
-        if converted_path is not None and Path(converted_path).exists():
-            data_path = str(converted_path)
-        else:
-            persistent = dataset.cellstream_path
-            if persistent.exists():
-                data_path = str(persistent)
-            else:
-                _cleanup = tempfile.TemporaryDirectory(
-                    prefix=f"scx_bench_cellstream_{dataset.name}_"
-                )
-                out = Path(_cleanup.name) / f"{dataset.name}.cellstream"
-                logger.info("Converting %s -> %s", h5ad_path.name, out)
-                runner = make_runner(format_variant)
-                runner.convert_from_h5ad(h5ad_path, out)
-                data_path = str(out)
     else:
         return None
 
@@ -1492,16 +1330,6 @@ def run(
                     data_path, ML_BATCH_SIZE, hvg, normalize
                 )
                 ttfb_fn = lambda hvg=hvg: _ttfb_slaf(data_path, ML_BATCH_SIZE, hvg)
-            elif loader_type == "shardad":
-                epoch_fn = lambda hvg=hvg, normalize=normalize: _run_shardad_epoch(
-                    data_path, ML_BATCH_SIZE, hvg, normalize, RANDOM_SEED
-                )
-                ttfb_fn = lambda: _ttfb_shardad(data_path, ML_BATCH_SIZE)
-            elif loader_type == "cellstream":
-                epoch_fn = lambda hvg=hvg, normalize=normalize: _run_cellstream_epoch(
-                    data_path, ML_BATCH_SIZE, hvg, normalize, RANDOM_SEED
-                )
-                ttfb_fn = lambda: _ttfb_cellstream(data_path, ML_BATCH_SIZE)
             else:
                 continue
 

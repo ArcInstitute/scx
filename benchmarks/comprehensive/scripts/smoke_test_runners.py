@@ -198,24 +198,6 @@ def main() -> None:
     except ImportError as exc:
         print(f"SKIP Parquet runner: {exc}")
 
-    # Shardad
-    try:
-        from benchmarks.comprehensive.runners.shardad_runner import ShardadRunner
-        runner = ShardadRunner()
-        runner._require_shardad()  # skip cleanly if shardad isn't installed
-        runners.append(runner)
-    except ImportError as exc:
-        print(f"SKIP Shardad runner: {exc}")
-
-    # CellStream
-    try:
-        from benchmarks.comprehensive.runners.cellstream_runner import CellStreamRunner
-        runner = CellStreamRunner()
-        runner._require_cellstream()  # skip cleanly if cellstream isn't installed
-        runners.append(runner)
-    except ImportError as exc:
-        print(f"SKIP CellStream runner: {exc}")
-
     if args.formats is not None:
         wanted = set(args.formats)
         available = {r.key for r in runners}

@@ -16,7 +16,6 @@ How to find a number on these pages, and how to trust or reproduce it.
 | What does a GPU buy me? | [GPU acceleration](gpu.md) |
 | Will the training loader keep my GPU busy? | [Training loader](loader.md#training-loader) |
 | What does a filtered query over GCS cost? | [Cost model](comprehensive-and-cloud.md#cost-model--usd-per-1m-cells-queried-gcs-same-region-pricing) |
-| How does SCX compare with shardad? | [scx vs shardad](vs-shardad.md) |
 
 ## How the numbers are produced
 

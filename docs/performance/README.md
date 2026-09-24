@@ -47,7 +47,6 @@ that answers them and explains how to reproduce a number.
 | [Query engine and file operations](query-and-file-ops.md) | Modality-scoped pushdown, sort, and grouped sharding |
 | [Doublet-caller interop](doublet-interop.md) | Round-trip fidelity, accuracy, and agreement of imported doublet calls |
 | [Comprehensive benchmarking and cloud](comprehensive-and-cloud.md) | SLAF parity, cloud throughput and queries, cost model, fragment ops, and regression gating |
-| [scx vs shardad](vs-shardad.md) | Full feature-parity comparison |
 
 ## Related
 

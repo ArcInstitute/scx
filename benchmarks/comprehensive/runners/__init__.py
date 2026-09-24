@@ -10,8 +10,6 @@ from benchmarks.comprehensive.runners.scx_runner import ScxRunner
 from benchmarks.comprehensive.runners.bpcells_runner import BPCellsRunner
 from benchmarks.comprehensive.runners.parquet_runner import ParquetRunner
 from benchmarks.comprehensive.runners.slaf_runner import SlafRunner
-from benchmarks.comprehensive.runners.shardad_runner import ShardadRunner
-from benchmarks.comprehensive.runners.cellstream_runner import CellStreamRunner
 from benchmarks.comprehensive.runners.annbatch_runner import AnnbatchRunner
 
 __all__ = [
@@ -27,8 +25,6 @@ __all__ = [
     "BPCellsRunner",
     "ParquetRunner",
     "SlafRunner",
-    "ShardadRunner",
-    "CellStreamRunner",
     "AnnbatchRunner",
     "make_runner",
 ]
@@ -44,8 +40,6 @@ _RUNNER_MAP = {
     "bpcells_runner": BPCellsRunner,
     "parquet_runner": ParquetRunner,
     "slaf_runner": SlafRunner,
-    "shardad_runner": ShardadRunner,
-    "cellstream_runner": CellStreamRunner,
     "annbatch_runner": AnnbatchRunner,
 }
 

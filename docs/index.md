@@ -161,7 +161,6 @@ performance/loader-data-load
 performance/query-and-file-ops
 performance/doublet-interop
 performance/comprehensive-and-cloud
-performance/vs-shardad
 ```
 
 ```{toctree}

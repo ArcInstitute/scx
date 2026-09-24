@@ -96,12 +96,9 @@ _NO_CONVERSION = {
     # conversion, which would fail for synthetic datasets that have no on-disk
     # h5ad to convert.
     "grouped_sort",
-    # grouped_read builds its own grouped .scx / .shad files in-process from
+    # grouped_read builds its own grouped .scx files in-process from
     # the source h5ad (same as grouped_sort) — no Phase-A dependency.
     "grouped_read",
-    # shardad_fidelity self-materializes the source + writes a temp .shad
-    # in-process (synthetic datasets have no on-disk h5ad) — no Phase-A dep.
-    "shardad_fidelity",
     # shuffle_layout consumes the persistent per-codec `.scx` fixtures directly
     # and writes its own shuffled copies in-process; it never needs a Phase-A
     # h5ad conversion.

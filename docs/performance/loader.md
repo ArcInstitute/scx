@@ -22,63 +22,26 @@ returns 0 batches per scenario (TTFB 90.2 s then timeout) — flagged as a
 SLAF-upstream tuning issue, not a harness defect. Source JSONs:
 `benchmarks/comprehensive/results/raw/ml_loader__slaf__census_{1m,10m}.json`.
 
-## scx vs shardad vs cellstream — random-gather training loader (2026-07-10)
-
-Head-to-head against the two custom per-cell stores built for scatter-heavy
-training: **shardad** (`.shad`, condition-grouped zstd CSR shards) and
-**cellstream** (`~/dev/python/cellstream` — a scatter-immune per-cell store over
-shardad's codec, `gather_rows(row_ids)→CSR`). Neither has a native batched
-DataLoader, so each is driven as the honest "loader you'd build on it": permute
-cell ids, slice into batches, gather each batch and apply the same HVG/normalize as
-scx. batch_size=1024; median batches/sec over the shuffled epoch.
-
-**`raw` scenario** (random gather, no HVG/normalize):
-
-| Dataset | **scx (auto)** | cellstream | shardad |
-|---|---|---|---|
-| pbmc3k | **35.2** | 14.6 | 8.1 |
-| pbmc10k | **27.7** | 11.7 | 2.7 |
-| smartseq2 | **18.1** | 8.2 | 0.6 |
-| tabula_sapiens_100k | **36.0** | 2.7 | 0.5 |
-| census_500k | **48.1** | 13.0 | — |
-| census_1m | **57.2** | 12.7 | — |
-
-**`hvg_norm` scenario** (HVG-2000 + normalize + log1p):
-
-| Dataset | **scx (auto)** | cellstream | shardad |
-|---|---|---|---|
-| pbmc3k | **49.2** | 12.5 | 8.2 |
-| pbmc10k | **36.6** | 11.3 | 2.6 |
-| smartseq2 | **23.0** | 7.5 | 0.6 |
-| tabula_sapiens_100k | **40.9** | 12.7 | 0.5 |
-| census_500k | **57.3** | 11.7 | — |
-| census_1m | **64.1** | 11.3 | — |
+## Training loader on-disk size — `auto` vs `fast` codec (2026-07-10)
 
 **On-disk fixture size (MB, lower is better):**
 
-| Dataset | scx fast (Scx1) | scx auto (ShufDeltaZstd) | cellstream | shardad |
-|---|---|---|---|---|
-| pbmc10k | 39.8 | 30.1 | 34.6 | 31.7 |
-| smartseq2 | 552.7 | 262.7 | 255.7 | 253.2 |
-| tabula_sapiens_100k | 448.9 | 233.5 | 234.5 | 222.2 |
-| census_500k | 1841.8 | 1182.9 | 920.6 | 859.2 |
-| census_1m | 3988.8 | 2800.1 | 1747.0 | 1622.0 |
+| Dataset | scx fast (Scx1) | scx auto (ShufDeltaZstd) |
+|---|---|---|
+| pbmc10k | 39.8 | 30.1 |
+| smartseq2 | 552.7 | 262.7 |
+| tabula_sapiens_100k | 448.9 | 233.5 |
+| census_500k | 1841.8 | 1182.9 |
+| census_1m | 3988.8 | 2800.1 |
 
-**Findings.**
-- **Throughput: scx is the fastest training loader at every scale** — ~2.4× cellstream
-  and ~10× shardad on pbmc10k random gather, widening to ~13× cellstream on tabula.
-  cellstream clearly beats shardad (shardad's per-call subset read collapses to
-  ~0.5 batches/sec at ≥50k cells; its census fixtures exist but the loader runs
-  did not complete).
-- **Storage: the default optimizes for size.** As of the 2026-07-12 codec-intent
-  flip, `codec="auto"` is **cost-aware adaptive** (predominantly ShufDeltaZstd) — the
-  column labeled `scx auto (ShufDeltaZstd)` above is what the new default `auto`
-  produces, and the `scx fast (Scx1)` column is `codec="fast"`. Adaptive
-  `auto` recovers ~30% of the disk vs `fast` (census_1m 3989→2800 MB) while staying
-  **within ≤~3% of `fast` on the realistic `hvg_norm` training scenario at every scale**
-  (see the head-to-head section below), narrowing but not closing the gap to
-  cellstream/shardad's aggressive zstd+dictionary codec. Latency-critical CPU training
-  that wants the old decode-max behavior pins `codec="fast"`.
+**Storage: the default optimizes for size.** As of the 2026-07-12 codec-intent
+flip, `codec="auto"` is **cost-aware adaptive** (predominantly ShufDeltaZstd) — the
+column labeled `scx auto (ShufDeltaZstd)` above is what the new default `auto`
+produces, and the `scx fast (Scx1)` column is `codec="fast"`. Adaptive
+`auto` recovers ~30% of the disk vs `fast` (census_1m 3989→2800 MB) while staying
+**within ≤~3% of `fast` on the realistic `hvg_norm` training scenario at every scale**.
+Latency-critical CPU training that wants the old decode-max behavior pins
+`codec="fast"`.
 
 > **Naming (2026-07-12 flip).** These tables use the current codec-intent names;
 > the numbers are the original pre-flip measurements. For reference, the old `auto`
@@ -91,54 +54,13 @@ scx. batch_size=1024; median batches/sec over the shuffled epoch.
 
 *Methodology: all rows from the `benchmarks/comprehensive` ml_loader capture
 (median-of-N, batch_size=1024, HVG=2000), 2026-07-10/11, consistent with the promoted
-`v0.11.0-cellstream-recapture` baseline. Emitting census scx rows required two harness
+`v0.11.0-recapture` baseline. Emitting census scx rows required two harness
 fixes: scaling the loader `memory_budget` to the SLURM allocation (`_scx_memory_budget_mb`,
 0.6×`--mem`) so `batch_size` stays at 1024 — the default 4096 MB is too small for 1M×61,497
 full width and the auto-tune otherwise collapses `batch_size` to 64 (a budget/estimator
 interaction, not a fixture bug: standard 62×16k-shard geometry) — and skipping the
 `pyscx_training_dataset_workers2` scenarios above 250k cells, which time out at census scale
 and would otherwise discard the whole (dataset, format) result.*
-
-## scx auto vs cellstream — the size-vs-throughput head-to-head
-
-The fairest apples-to-apples: scx's **adaptive default codec** (`auto` =
-ShufDeltaZstd, framed) vs **cellstream**, the storage-optimized scatter competitor.
-Both target smaller-on-disk random-access training. batch_size=1024; 2026-07-10/11.
-
-**Compression + on-disk size** (ratio vs source h5ad; MB):
-
-| Dataset | ratio auto | ratio cellstream | MB auto | MB cellstream |
-|---|---|---|---|---|
-| pbmc10k | **6.73** | 5.86 | 30 | 35 |
-| smartseq2 | 4.08 | 4.19 | 263 | 256 |
-| tabula_100k | 6.79 | 6.77 | 234 | 235 |
-| census_500k | 5.14 | **6.60** | 1183 | 921 |
-| census_1m | 4.07 | **6.52** | 2800 | **1747** |
-
-**Training throughput** (median batches/sec; higher = better):
-
-| Dataset | raw auto | raw cellstream | hvg_norm auto | hvg_norm cellstream | throughput edge |
-|---|---|---|---|---|---|
-| pbmc10k | 24.4 | 11.7 | 37.2 | 11.3 | **auto 2–3×** |
-| smartseq2 | 18.8 | 8.2 | 23.3 | 7.5 | **auto 2–3×** |
-| tabula_100k | 29.8 | 2.7 | 39.5 | 12.7 | **auto 3–11×** |
-| census_500k | 52.5 | 13.0 | 58.3 | 11.7 | **auto 4–5×** |
-| census_1m | 57.3 | 12.7 | 63.6 | 11.3 | **auto 4.5–5.6×** |
-
-**Tradeoff.** `auto` delivers **2–11× cellstream's training throughput at every
-scale**; the two are **comparable on compression through tabula**, and cellstream pulls
-ahead only at **census** (~6.5× vs ~4.1×, ~1.6× smaller on disk) via its trained zstd
-dictionary. cellstream also opens faster (pbmc10k TTFB ~0.035 s vs `auto`'s ~0.4 s —
-mmap store vs pipeline spin-up). Net: `auto` dominates on throughput; cellstream only
-edges it on atlas-scale footprint, at a 4–6× throughput cost.
-
-*Methodology: cellstream from the `benchmarks/comprehensive` ml_loader capture; `auto`
-throughput from a direct `_run_scx_epoch` measurement (warmup + timed epoch) that
-bypasses the `pyscx_training_dataset_workers2` scenario (which times out at scale in the
-full harness). Both use batch_size=1024, HVG=2000. The single-epoch direct `auto` figures
-run a few percent above the harness median-of-N (e.g. pbmc10k 24.4/37.2 here vs the baseline
-harness row 22.2/34.3); the at-scale `auto` harness capture is deferred, so these are the
-best available `auto` numbers at census scale.*
 
 ## ShufDeltaZstd loader-decode cost (Phase-D D0 profiling)
 

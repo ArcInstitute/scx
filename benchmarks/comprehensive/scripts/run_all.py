@@ -94,8 +94,7 @@ AVAILABLE_BENCHMARKS = [
     "read_full",           # Full file load
     "read_selective",      # Selective read (query / subsetting)
     "read_scattered",      # Scattered random-row read (F5 block-index path)
-    "grouped_read",        # Condition-grouped read (scx vs shardad; self-materializes)
-    "shardad_fidelity",    # shardad round-trip fidelity + materialization knobs (self-materializes)
+    "grouped_read",        # Condition-grouped read head-to-head (self-materializes)
     # NB: ooc_rss_boundary is intentionally NOT listed here — it consumes a
     # pre-converted fixture (Phase-A `converted_path`), which the serial run_all
     # path does not produce. Run it via run_parallel.py / capture_baseline.py.

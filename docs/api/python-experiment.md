@@ -353,8 +353,9 @@ scipy's, and below it the widen is a pessimization.
 stream (integer counts as `u32`, floats as `f32`) and cast straight into a
 full-matrix buffer *of the target dtype*, so the intermediate f32 CSR is never
 allocated. A narrow `data_dtype="uint16"` read therefore **lowers** peak RSS
-(2 B/nnz for the value buffer, not 4 B/nnz + a narrow copy) — see
-[performance/vs-shardad.md § Full read → AnnData](../performance/vs-shardad.md#full-read--anndata-wall-s--peak-rss-mb).
+(2 B/nnz for the value buffer, not 4 B/nnz + a narrow copy); see
+[performance/memory.md § Per-modality in-decode narrow](../performance/memory.md#per-modality-in-decode-narrow-eager-to_mudata)
+for the same effect measured on the `to_mudata` path.
 Eagerly-materialized **layers** still cast post-assembly (correct, no RSS win),
 because there is no typed layer reader yet. `to_gpu_anndata` is unchanged
 (f32-native device path).

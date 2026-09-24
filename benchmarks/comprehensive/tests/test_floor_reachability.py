@@ -568,12 +568,12 @@ def test_no_runner_reports_a_moved_api_as_a_missing_package():
     When the package is present but its API has moved, that message is false
     and it buries the real diagnosis.
 
-    Not hypothetical. The tier-full capture lost all 47 `cellstream` cells to
-    `from cellstream import format` and `from cellstream.writer import
-    write_store`, both gone upstream (`CellStream` is now `CellStore`) — while
-    every one of the 47 logs said the package was missing and the fix was to
-    install it, which it already was. 47 baseline rows and a misdirected
-    investigation, from an error message that was confidently wrong.
+    Not hypothetical. The tier-full capture lost all 47 cells of a competitor
+    runner to two submodule imports that had both moved upstream (the class
+    the runner imported had been renamed) — while every one of the 47 logs
+    said the package was missing and the fix was to install it, which it
+    already was. 47 baseline rows and a misdirected investigation, from an
+    error message that was confidently wrong.
 
     This is the class `pyscx/src/optional_deps.rs` exists to avoid: it rewrites
     a missing-module error only when the missing name *is* the requested

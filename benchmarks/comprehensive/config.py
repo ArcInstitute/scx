@@ -137,15 +137,6 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}.slaf"
 
     @property
-    def shardad_path(self) -> Path:
-        return DATA_DIR / f"{self.name}.shad"
-
-    @property
-    def cellstream_path(self) -> Path:
-        # cellstream stores are directories, not single files.
-        return DATA_DIR / f"{self.name}.cellstream"
-
-    @property
     def annbatch_path(self) -> Path:
         # annbatch pre-shuffles into a sharded zarr DatasetCollection
         # (directory). AnnLoader / scDataset read the source h5ad directly and
@@ -393,8 +384,6 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
-    "shardad": "shardad_path",
-    "cellstream": "cellstream_path",
     # Data-load Phase 0 competitor loaders. annbatch has its own pre-shuffled
     # zarr fixture; AnnLoader + scDataset read the source h5ad backed.
     "annbatch": "annbatch_path",
@@ -708,9 +697,9 @@ DATASETS: dict[str, DatasetConfig] = {
         source="tahoe-100m — c38-n10.h5ad (CSR X, drug)",
         approx_h5ad_mb=2_200, available=True,
     ),
-    # Real RAW-COUNT Perturb-seq fixture (integer UMIs, CSR) — shardad's
-    # integer-count home turf. group_by `target_gene` (2354 KOs) + `non-targeting`
-    # reference. ~909M nnz; the largest grouped fixture (7.3 GB h5ad).
+    # Real RAW-COUNT Perturb-seq fixture (integer UMIs, CSR). group_by
+    # `target_gene` (2354 KOs) + `non-targeting` reference. ~909M nnz; the
+    # largest grouped fixture (7.3 GB h5ad).
     "chemogenetic_rgfp": DatasetConfig(
         id="GS3", name="chemogenetic_rgfp",
         n_obs=136_051, n_vars=18_151,
@@ -891,8 +880,6 @@ PRIMARY_FORMATS: list[FormatVariant] = [
     FormatVariant("SCX (compact-trial)", "scx_compact_trial", "primary", "scx_runner",
                   {"codec": "compact-trial", "row_group_rows": 512}),
     FormatVariant("SLAF", "slaf", "primary", "slaf_runner"),
-    FormatVariant("Shardad", "shardad", "primary", "shardad_runner"),
-    FormatVariant("CellStream", "cellstream", "primary", "cellstream_runner"),
 ]
 
 ADDITIONAL_FORMATS: list[FormatVariant] = [
@@ -1626,8 +1613,8 @@ def estimate_memory_gb(
         # single reference shard held in memory during encode: a large reference
         # group (e.g. chemogenetic_rgfp's 127,705 `non-targeting` cells at
         # ~6,700 nnz/cell ≈ 7 GB CSR) plus the one-pass gather source buffers and
-        # (shardad) in-memory materialization. `dense_mb*0.5` under-sized RGFP
-        # (24 GB → OOM); size to the sparse footprint with generous headroom.
+        # a competing format's in-memory materialization. `dense_mb*0.5` under-sized
+        # RGFP (24 GB → OOM); size to the sparse footprint with generous headroom.
         peak_mb = max(base_mb * 2, dense_mb * 1.5, 48 * 1024)
     else:
         peak_mb = base_mb
@@ -1718,10 +1705,10 @@ def estimate_time_minutes(
         # the same 2-run cap, i.e. two more whole-file conversions of a
         # multi-GB Perturb-seq h5ad.
         "grouped_sort":           60,
-        # Cross-format grouped read/write head-to-head (scx_auto + shardad).
-        # Times a grouped write per format plus per-perturbation read_group
-        # over a handful of labels; the shardad arm materializes full groups,
-        # so keep the base generous like grouped_sort.
+        # Cross-format grouped read/write head-to-head. Times a grouped write
+        # per format plus per-perturbation read_group over a handful of
+        # labels; the competing-format arm materializes full groups, so keep
+        # the base generous like grouped_sort.
         "grouped_read":           40,
         "cloud_push":             20,
         "cloud_pull":             20,
@@ -1741,7 +1728,7 @@ def estimate_time_minutes(
         # in the suite. Base bumped 60→120 (2026-07-10): the workers2 /
         # gpu_train / competitor-gather scenarios pushed smartseq2/tabula/census
         # past the old 65-min cap (base 60 + 12-min/M slope rounds to 65 for
-        # ≤100k-cell sets), timing out the deferred auto_v2 + cellstream floors.
+        # ≤100k-cell sets), timing out the deferred auto_v2 floors.
         # 120 base + 12-min/M slope + 1.5× density gives comfortable headroom.
         # 120 -> 165 for the two `raw_obs_*` cardinality arms on census_1m:
         # 2 arms x (1 untimed warm + n_runs timed) epochs. Cheap warm, but a

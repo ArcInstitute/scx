@@ -448,8 +448,7 @@ Explicit codec forces (`none`/`scx1`/`zstd`/`lz4`/`pcodec`/`shufdelta`) and
 ### Codec tradeoff summary — Scx1 vs ShufDeltaZstd
 
 The two integer codecs serve different workloads. Summary of measured
-tradeoffs (from the comprehensive benchmark suite; full per-dataset
-tables in [performance/vs-shardad.md](performance/vs-shardad.md#scx-vs-shardad--full-feature-parity)):
+tradeoffs (from the comprehensive benchmark suite):
 
 | Dimension | Scx1 (auto default) | ShufDeltaZstd (compact-trial) |
 |---|---|---|
