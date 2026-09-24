@@ -667,7 +667,7 @@ GitHub-Release-wheel-vs-source guidance aimed at agents, see
 ```bash
 # Last published release — see https://github.com/ArcInstitute/scx/releases
 # for whether a newer one ever shipped
-VERSION=0.19.0
+VERSION=0.20.0
 # Pick the matching target for your platform:
 #   linux x86_64 → x86_64-unknown-linux-gnu
 #   linux arm64  → aarch64-unknown-linux-gnu
