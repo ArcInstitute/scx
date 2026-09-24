@@ -51,7 +51,7 @@ and `pyscx.write(adata, path, **kwargs)` (= `from_anndata`).
   - `raw`: `True` (default) reconstructs `adata.raw` where the mode allows and emits the `dropped_raw` notice where it cannot (backed, obs-filtered query, deletion-vector-active file). `False` does neither — the opt-out for workloads that never want raw.
   - `container` / `data_dtype` / `index_dtype` / `allow_lossy`: read-side materialisation. Default (`csr` / `float32` / `int32`) is zero-copy; a narrow request assembles X and raw directly at the target width (`backed=False` only). A lossy narrow raises unless `allow_lossy=True`.
   - `layers=` / `var_names=` force eager assembly of the aligned slots (`obsp` / `varp` / `varm`), whatever `eager=` says — pair them with the slot filters above to keep that bounded. Under `var_names=`, `X` and each selected layer are the exception: they are assembled already projected, shard by shard, and never exist at full width. `.raw` is never gene-projected (anndata does not slice it on that axis), so `raw=False` is what drops it.
-  - `modality`: select one modality of a multimodal file (requires `backed=True`; incompatible with `var_names`/`obs_filter`/`layers`/`obsm`/`obsp`/`varp`/`varm`/`raw=False` — it would silently ignore them, so it raises instead).
+  - `modality`: select one modality of a multimodal file (requires `backed=True`; incompatible with `var_names`/`obs_filter`/`layers`/`obsm`/`obsp`/`varp`/`varm`/`raw=False` — it would silently ignore them, so it raises instead). On a multimodal file with multiple overlapping tilings, calling `to_anndata()` without `modality` raises `ValueError` (unscoped whole-matrix reads are refused; use `to_mudata()`, or pass `modality=..., backed=True`, or extract one first with `scx subset --modality`).
   - `eager=False`: `obsp`/`varp`/`varm` (and `layers` in non-backed mode) are lazy bridges decoded on first access; `eager=True` materializes everything and detaches from the file handle (use before closing the experiment or shipping to a subprocess). `uns` is always eager.
   - **obsm modes**: `obsm=None` → all keys eager (default). `obsm=[...]` + (`eager=True` or `obs_filter`) → selected keys eager. `obsm=[...]` + `backed=False` + `eager=False` → `ScxLazyObsmMapping` (each key → dense numpy on first access). `obsm=[...]` + `backed=True` + `eager=False` + no `obs_filter` → `ScxLazyObsmMapping` of `ScxBackedObsmDataset` (shard-aware dense row-gather: `m[idx]` reads only touched obsm shards, per-key LRU = `cache_shards`; the scalable path for one huge embedding). Deletion vectors compose via `kept_to_global`.
 - `to_mudata(backed=False, cache_shards=4)` — multimodal `mudata.MuData` (eager raises on single-modality; backed wraps single-modality in a one-modality MuData).
@@ -88,29 +88,35 @@ produced when you apply lazy `normalize_total`/`log1p`.
 
 ## pyscx.accel.* — Rust-native accelerators
 All write to standard AnnData slots, so downstream scanpy works unchanged. Most
-take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Several take `prefer_format="csr"`
-(default) or `"csc"` (requires a CSC sidecar from `csc="auto"|"always"` at
-convert).
+take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Operations take `prefer_format="csr"`
+(default for stats / QC / HVG), `"auto"` (default for DE: `rank_genes_groups`,
+`pdex_ref`, `rank_genes_groups_df`), or `"csc"` (forces CPU column-major
+dispatch; requires a CSC sidecar from `csc="auto"|"always"` at convert).
 
 **How to get GPU CSC-direct DE (`gpu_csc_v3`).** `prefer_format` and `device`
 are two *different* axes, and the GPU CSC-direct route is selected by the
 planner, **not** by `prefer_format="csc"`:
 
-- For **GPU-fast** DE, keep the **default `prefer_format="csr"`** and pass
+- For **GPU-fast** DE, leave the **default `prefer_format="auto"`** and pass
   `device="gpu"` (or `"auto"`). When the file has a CSC sidecar the planner
   routes `rank_genes_groups`/`pdex_ref` to `gpu_csc_v3` automatically; without a
-  sidecar it uses `gpu_csr_v3`.
+  sidecar it uses `gpu_csr_v3`. CSC dispatch now serves row-filtered and
+  gene-subset handles, as well as row-indexed transforms (`normalize_total -> log1p`),
+  as long as the kept rows span at least half the CSR shards under `auto`
+  (a narrow window falls back to CSR; explicit `prefer_format="csc"` serves any window).
 - `prefer_format="csc"` selects the **CPU** column-major streaming path
-  (`cpu_csc`); it has no GPU kernel. With `device="auto"` it silently runs on
+  (`cpu_csc` or `cpu_csc_nnz`); it has no GPU kernel. With `device="auto"` it silently runs on
   CPU; with an explicit `device="gpu"` it raises a `RuntimeError` explaining
   that `prefer_format='csc'` is the CPU path and that GPU CSC-direct comes from
-  the default `prefer_format='csr'` + `device='gpu'`.
+  the default `prefer_format='auto'` + `device='gpu'`.
+- On CPU, 1-vs-rest `rank_genes_groups` with a CSC sidecar runs the exact-nnz
+  kernel (`cpu_csc_nnz`) by default (3.1–4.1× faster than densify `cpu_csc`,
+  bit-identical; `SCX_ACCEL_WILCOXON_NNZ=0` falls back to `cpu_csc`).
 
 Always confirm the backend that actually ran via
 `adata.uns["scx_accel"][op]["route"]` — `gpu_csc_v3` (GPU CSC-direct),
-`gpu_csr_v3` (GPU, no sidecar), or `cpu_csc` / `cpu_csr` (plus `cpu_csc_nnz`,
-the exact-nnz Wilcoxon kernel 1-vs-rest CSC DE takes by default;
-`SCX_ACCEL_WILCOXON_NNZ=0` falls back to `cpu_csc`). All accel ops stamp
+`gpu_csr_v3` (GPU, no sidecar), or `cpu_csc_nnz` (default CPU 1-vs-rest CSC DE) /
+`cpu_csc` / `cpu_csr`. All accel ops stamp
 this envelope, including `harmony_integrate` (`gpu_dense` / `cpu_dense`).
 
 **Preprocessing / QC (non-materializing on backed/lazy):**

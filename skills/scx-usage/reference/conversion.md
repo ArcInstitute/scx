@@ -19,6 +19,7 @@ from_h5ad(path, out, codec=None, shard_size=None, shard_obs="auto", csc=None,
           temp_dir=None, index_obs=None, index_var=None, index_preset=None,
           index_auto_threshold=1000, bitmap="off", reader_threads=None,
           writer_queue_depth=4, sort_by=None, reverse=False,
+          group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None, group_pass=None,
           obs_override=None, var_override=None, uns_override=None)
 ```
 
@@ -227,10 +228,18 @@ scx sort screen.scx screen_grouped.scx --group-by target_gene --reference non-ta
 - `pyscx.append_from_anndata(target, adata, ...)`.
 - `pyscx.mark_deleted(path, cell_indices)` — logical deletion (deletion vector).
 - `pyscx.compact(input, output, index_*=...)` — rewrite reclaiming deleted space.
-- `pyscx.rollback(path, to_seq=None)`.
+- `pyscx.rollback(path, to_seq=None)` — revert to a previous manifest sequence in place.
+- `pyscx.build_csc(input, output=None, memory_limit=None, force=False, csc_cols_per_shard=5000, temp_dir=None)` — add a CSC sidecar; `output=None` (default) appends in place (undoable with `pyscx.rollback`), pass a path to copy.
 - `pyscx.merge(inputs, output, index_*=..., assume_identical_var=False, uns_policy="first", shard_target_rows=None)` — streams obs shard-by-shard. `assume_identical_var=False` validates var index/columns/values across inputs (`True` checks only `n_vars`). `uns_policy`: `"first"` / `"require_equal"` / `"namespace"` / `"summary"`. Pass `index_*` or pushdown regresses to a full scan on the merged file.
 - `pyscx.subset(input_path, output_path=None, *, filter=None, genes=None, modality=None, dry_run=False, codec=None, shard_size=None, memory_budget=None, index_obs=None, index_var=None, index_preset=None)` — Python wrapper for `scx subset`.
 - `pyscx.delete(path, *, filter)` — Python wrapper for `scx delete --filter`.
+- `pyscx.obs_import(path, table, *, key=None, source_key=None, columns=None, rename=None, prefix="", overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` — import a delimited table (CSV/TSV) as obs columns in place without rewriting X or paying the eager `obsm` allocation; preserves existing predicate indexes and column stats.
+- `pyscx.attach_obs_columns(path, df, *, key=None, source_key=None, overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` — DataFrame twin of `obs_import` (in-memory).
+- `pyscx.var_import(path, table, *, key=None, source_key=None, columns=None, rename=None, prefix="", overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` — import a delimited table as var columns in place.
+- `pyscx.attach_var_columns(path, df, *, key=None, source_key=None, overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` — DataFrame twin of `var_import` (in-memory).
+- `pyscx.cellbender_import(path, cellbender_h5, *, layer_name="cellbender", latent_embedding=False, overwrite=False, dry_run=False)` — attach CellBender background-corrected counts as an SCX layer in place.
+- `pyscx.doublet_import(path, table, *, tool, key=None, source_key=None, key_added=None, overwrite=False, dry_run=False)` — import doublet caller predictions (scrublet, scdblfinder, doubletdetection, etc.) as canonical obs columns in place.
+- `pyscx.doublet_consensus(path, keys=None, method="majority", key_added="doublet_consensus")` — combine multiple doublet tool calls into a single consensus call.
 
 ## CLI (`scx`)
 
@@ -286,7 +295,11 @@ Other commands:
 - `scx set-uns <file> --uns JSON_FILE [--merge]` — replace the `uns` block in place (no X re-encode); `--merge` shallow-merges the JSON object's top-level keys into the existing block instead (`pyscx.update_uns`).
 - `scx modify-metadata <file> [--uns JSON] [--obs PARQUET] [--var PARQUET] [--obsm NAME=PATH.npy ...] [--varm NAME=PATH.npy ...] [--index-* ...] [--modality NAME]` — replace metadata sections in place.
 - `scx rollback <file> [--to-seq N]`.
-- `scx build-csc <input> <output> [--memory-limit 4G] [--force] [--csc-cols-per-shard N]` — `--memory-limit` takes the same size forms as `--memory-budget`.
+- `scx build-csc <input> [output] [--memory-limit SIZE] [--force] [--csc-cols-per-shard N] [--temp-dir DIR]` — add a CSC sidecar. Omit `[output]` to append the sidecar in place (without rewriting CSR shards, staging a copy, or stripping framing; undoable with `scx rollback`). Pass `[output]` to leave the input untouched and write a copy (`--force` applies only when `<output>` is given).
+- `scx obs-import <target.scx> <table.csv> [--key KEY] [--columns CSV] [--rename OLD:NEW,...] [--prefix STR] [--overwrite] [--dry-run]` — import a delimited annotation table (CSV/TSV) as obs columns in place without rewriting X.
+- `scx var-import <target.scx> <genes.csv> [--key KEY] [--columns CSV] [--rename OLD:NEW,...] [--prefix STR] [--overwrite] [--dry-run]` — import a delimited annotation table as var columns in place.
+- `scx cellbender-import <target.scx> <cellbender_h5> [--layer-name NAME] [--latent-embedding] [--overwrite] [--dry-run]` — import CellBender `remove-background` output as an SCX layer in place.
+- `scx doublet-import <target.scx> <calls.csv> --tool <tool> [--key KEY] [--overwrite] [--dry-run]` — import doublet caller output (scrublet, scdblfinder, doubletdetection, etc.) as canonical obs columns in place.
 - `scx upgrade <input> [output] [--force] [--in-place]`.
 - `scx query <input> <filter> [--filter EXPR] [--count] [--output P] [--force] [--select-genes PATH] [--normalize N] [--log1p] [--limit N] [--json] [--explain]` — `<filter>` is a positional obs predicate; alternatively pass `--filter EXPR` (one form, not both). `<input>` accepts a local `.scx`, `.scxd/` dir, or cloud URL. `--explain` prints the pushdown plan.
 - `scx benchmark <file> [--compare-h5ad] [--runs N] [--json]` — read/query benchmarks.

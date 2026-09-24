@@ -381,7 +381,7 @@ If you converted without `--csc` / `csc=`, you can build the sidecar later. See
 [docs/sharding.md § CSC sharding](sharding.md#csc-sharding) for layout details.
 
 ```bash
-# In place (temp file + atomic rename — a failure leaves data.scx intact)
+# In place (appends sidecar to EOF and updates catalog; rollback-able with scx rollback)
 scx build-csc data.scx --memory-limit 8G
 
 # Or write a copy, leaving the input alone
@@ -572,7 +572,7 @@ SCX maps failures to the Python exception a scanpy user expects:
 - Missing input file → `FileNotFoundError`.
 - Truncated / corrupt / wrong-magic / version-mismatch file → `ValueError` (the
   message says the file looks corrupt or was written by an incompatible SCX).
-- A stale CSC sidecar → `ValueError` naming the `--rebuild-csc` fix.
+- A stale CSC sidecar → `ValueError` naming the `scx build-csc` (or `--rebuild-csc`) fix.
 - A non-canonical scipy CSR passed to an accelerator → `ValueError` suggesting
   `X = X.tocsr(); X.sort_indices()` or a re-run of `pyscx.from_anndata`.
 

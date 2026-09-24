@@ -416,8 +416,8 @@ scx compact experiment.scx compacted.scx --csc always
 
 The Python API exposes `pyscx.build_csc(input, output=None, memory_limit=None, force=False, csc_cols_per_shard=5000)`
 for standalone builds — `output=None` (the default) appends the sidecar in
-place, and a path writes a copy. Alternatively, set `csc="always"` at conversion time
-via `pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
+place, and a path writes a copy. Alternatively, conversion defaults to `csc="auto"`
+(or pass `csc="always"` via `pyscx.from_anndata(..., csc="always")` / `scx convert --csc always`) to emit the sidecar during the
 initial write, or pass `csc="always"` to a rewrite op such as `pyscx.sort(..., csc="always")`.
 
 Neither `build-csc` form can change the input's row-group framing, because neither writes a

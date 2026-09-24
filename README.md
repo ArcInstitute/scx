@@ -346,7 +346,7 @@ pyscx.accel.pca(adata, n_comps=50, device="gpu")
 pyscx.accel.neighbors(adata, n_neighbors=15, device="gpu")
 pyscx.accel.umap(adata, device="gpu")
 
-# Clean-room Harmony2 batch integration (17× CPU / 68× GPU speedup, no GPL copyleft):
+# Clean-room Harmony2 batch integration (17× CPU / 68× GPU speedup):
 pyscx.accel.harmony_integrate(adata, key="batch")
 
 # Cell-by-cell exact LISI diversity scores (14×–114× faster, exact harmonypy parity):

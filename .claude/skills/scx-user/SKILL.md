@@ -7,7 +7,7 @@ description: Assume the role of a bioinformatician end-user of scx (pyscx + scx-
 
 This skill is a *role*, not a workflow. When invoked, you stop being a Claude Code assistant in dev mode and start being a working bioinformatician who is *using* scx (`pyscx` + `scx-cli`) to get real analysis done on real public datasets. The goal of the session is to do credible end-user science; the byproduct is a written record of every place scx made the work harder than it needed to be. Treat that record as the primary deliverable. The role applies for the duration of the session, or until the user explicitly switches you out of it.
 
-Sibling skill `.claude/skills/scx-dev/SKILL.md` covers releases / build / dev-env. This skill is the inverse: you are the consumer, not the maintainer.
+Sibling skill `.claude/skills/scx-dev/SKILL.md` covers releases / build / dev-env. Sibling skill `skills/scx-usage/SKILL.md` covers the end-user guide to converting data, backed/lazy processing, accelerators, and ML loading. This skill is the inverse: you are the consumer, not the maintainer.
 
 **Working directory.** All session artifacts live in a persistent scratch area *outside* the scx git checkout. The right location depends on which cluster you're on — this skill runs on either Lambda or Chimera:
 
@@ -70,9 +70,11 @@ cd "$SCX_USER_DIR"
 ( cd "$SCX_REPO" && cargo build --release -p scx-cli --features hdf5 )
 "$SCX_REPO/target/release/scx" convert \
   "$SCX_DATA_DIR/pbmc10k.h5ad" "$SCX_DATA_DIR/pbmc10k.scx" \
-  --stream --index-preset cellxgene
+  --stream --index-preset cellxgene --force
 "$SCX_REPO/target/release/scx" info "$SCX_DATA_DIR/pbmc10k.scx"
 ```
+
+(Note: `scx convert` guards against destination overwrite; pass `--force` (`-f`) if re-running or if the destination file exists.)
 
 **Convert the same h5ad via pyscx** (so the same session touches both surfaces — intentionally reuses pbmc10k.h5ad rather than introducing a second download):
 
@@ -129,13 +131,19 @@ Note: `accel.leiden(device="cpu")` is intentional — GPU Leiden has a documente
 - Did any function print a deprecation or `UserWarning`?
 - Did `scx info` round-trip the cell/gene counts cleanly?
 
-**Optional round-trip back to h5ad:**
+**Export back to h5ad vs. persisting analysis results:**
 
-```python
-pyscx.to_h5ad(f"{data}/pbmc10k.scx", f"{data}/pbmc10k_roundtrip.h5ad", stream=True)
-```
-
-Then `import anndata as ad; ad.read_h5ad(f"{data}/pbmc10k_roundtrip.h5ad")` and verify pipeline-added obs/var columns survived.
+- **Round-trip fidelity check:** `pyscx.to_h5ad` exports the **unmodified on-disk** `.scx` file back to `.h5ad`:
+  ```python
+  pyscx.to_h5ad(f"{data}/pbmc10k.scx", f"{data}/pbmc10k_roundtrip.h5ad", stream=True)
+  ```
+  Then `import anndata as ad; ad.read_h5ad(f"{data}/pbmc10k_roundtrip.h5ad")` to verify round-trip fidelity against the original raw `pbmc10k.h5ad`.
+- **Persisting pipeline-added annotations:** `pyscx.to_h5ad` does **not** persist changes from the in-memory `adata` (such as `pct_counts_mt`, `highly_variable`, `X_pca`, or `leiden`). To persist the analyzed AnnData, write it explicitly:
+  ```python
+  adata.write_h5ad(f"{data}/pbmc10k_processed.h5ad")
+  # or convert the processed AnnData to a new SCX file:
+  pyscx.from_anndata(adata, f"{data}/pbmc10k_processed.scx")
+  ```
 
 ## HPC clusters & partitions
 
@@ -189,10 +197,12 @@ export SCX_DATA_DIR=$SCX_DATA_DIR
 
 ( cd "\$SCX_REPO" && cargo build --release -p scx-cli --features hdf5 )
 
+# Ingest defaults to csc="auto" (builds CSC column sidecar for eligible datasets to
+# accelerate column DE; pass --csc off to skip). Pass --force to overwrite.
 "\$SCX_REPO/target/release/scx" convert \\
   "\$SCX_DATA_DIR/census_500k.h5ad" "\$SCX_DATA_DIR/census_500k.scx" \\
   --stream --memory-budget 64G --reader-threads 16 \\
-  --index-preset cellxgene
+  --index-preset cellxgene --force
 
 "\$SCX_REPO/target/release/scx" info "\$SCX_DATA_DIR/census_500k.scx"
 
@@ -308,11 +318,12 @@ export PATH=\$SCX_REPO/.venv/bin:\$PATH
 # .venv/ matches the active GPU/driver.
 ( cd "\$SCX_REPO/pyscx" && ../.venv/bin/maturin develop --release --features hdf5,gpu )
 
-( cd "\$SCX_REPO" && cargo build --release -p scx-cli --features hdf5 )
+# Ingest defaults to csc="auto" (builds CSC column sidecar for eligible datasets to
+# accelerate column DE; pass --csc off to skip). Pass --force to overwrite.
 "\$SCX_REPO/target/release/scx" convert \\
   "\$SCX_DATA_DIR/census_1m.h5ad" "\$SCX_DATA_DIR/census_1m.scx" \\
   --stream --memory-budget 128G --reader-threads 24 \\
-  --index-preset cellxgene
+  --index-preset cellxgene --force
 
 "\$SCX_REPO/.venv/bin/python" - <<'PY'
 import os, time
@@ -342,6 +353,9 @@ accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", device="gpu")
 accel.leiden(adata, resolution=1.0, device="cpu")     # cpu for label stability
 accel.umap(adata, device="gpu")
 
+# Check accelerator execution routes & fallbacks:
+print("Accel routes:", {k: v.get("route") for k, v in adata.uns.get("scx_accel", {}).items()})
+
 adata.write_h5ad(f"{data}/census_1m_embedded.h5ad")
 PY
 EOF
@@ -351,7 +365,8 @@ sbatch "$SCX_USER_DIR/scx_user_census1m_gpu.sbatch"
 **Watch-fors on Tier 3:**
 
 - Real GPU utilization. In a sidecar shell on the allocated node: `nvidia-smi dmon -s u -c 20`. If util hovers near 0% during GPU-tagged ops, the call probably fell back to CPU.
-- Was a CPU fallback announced? Silent fallbacks are a finding even when correctness is fine.
+- **Accelerator route metadata**: Inspect `adata.uns["scx_accel"]` after running ops. In-VRAM GPU operations (`pca`, `neighbors`, `umap`, `normalize_total`, `log1p`) route to `rapids-singlecell` (`route: rapids_singlecell_gpu`) when available in the environment. If running in a pip `.venv` lacking rapids, verify the recorded fallback reason (`FallbackReason::NoRapids`) and that native GPU or CPU fallbacks behaved cleanly.
+- **CSC sidecar routing**: With `csc="auto"` default, `scx convert` builds a CSC column sidecar for `census_1m`. Test column DE (`accel.rank_genes_groups`) to confirm it dispatches to `gpu_csc_v3`.
 - One CPU-vs-GPU PCA timing comparison is worth doing; a sweep across `n_comps` / `device` is not — that's a benchmark-team job.
 - Crash modes that only appear on real Census files (uns oddities, mixed dtype obs columns, dataset_id batch keys with hundreds of levels).
 

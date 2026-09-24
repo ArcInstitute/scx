@@ -403,8 +403,8 @@ Entry points:
 | Entry point | When |
 |-------------|------|
 | `scx build-csc` | Post-hoc addition to an existing file |
-| `scx convert --csc=always` | During h5ad/h5mu → SCX conversion |
-| `pyscx.from_anndata(csc="always")` | During Python-side conversion |
+| `scx convert` (default `--csc auto`, or `--csc always`) | During h5ad/h5mu → SCX conversion |
+| `pyscx.from_anndata` (default `csc="auto"`, or `csc="always"`) | During Python-side conversion |
 | `--csc carry\|always\|off` on rewrite ops | Same-pass rebuild in compact/merge/optimize/sort/subset (`carry` is the default) |
 | `append --rebuild-csc` | In-place rebuild after an append |
 
@@ -1125,7 +1125,7 @@ dataset size or per-key embedding dimension. The pyscx backed-routing
 path detects per-section mutation via top-level key comparison
 against the source h5ad; clean sections route through the disk
 streamer, mutated sections are extracted from Python and partitioned
-into the same sharded layout on the way out. `csc="always"` builds the
+into the same sharded layout on the way out. `csc="auto"` (the default) or `csc="always"` builds the
 sidecar in the same pass as X (`ScxWriter::enable_csc_sidecar`), so there is no
 extra read pass and no second copy of the file; under `--memory-budget` the
 builder's buckets take a quarter of the budget (the `IngestWithCscPush` phase in
