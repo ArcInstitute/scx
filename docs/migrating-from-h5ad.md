@@ -72,11 +72,11 @@ Experiment object with n_obs × n_vars = 2700 × 32738
 | Atlas-scale, full dataset | `exp.to_anndata(backed=True)` + `pyscx.accel.*` | ~1-shard working set; use `pyscx.accel.*` for preprocessing, not `sc.pp.*` |
 | A cell/gene subset of a large file | `exp.query().filter_obs(...).select_genes(...).collect()` | Predicate pushdown skips non-matching shards |
 | Reading from cloud storage | `pyscx.read_cloud(url, obs_filter=..., var_names=...)` | `gs://` / `s3://` / `az://` / `file://`; fetches only matching shards |
-| A dense / narrow matrix for sklearn / PyTorch / scVI | `exp.to_anndata(container="dense", data_dtype=...)` | Row-major ndarray and/or narrowed dtype (`float16`/`uint8`/…), fail-loud gate — see [docs/api.md](api.md#container-and-dtype-materialization) |
+| A dense / narrow matrix for sklearn / PyTorch / scVI | `exp.to_anndata(container="dense", data_dtype=...)` | Row-major ndarray and/or narrowed dtype (`float16`/`uint8`/…), fail-loud gate — see [docs/api/python-experiment.md](api/python-experiment.md#container-and-dtype-materialization) |
 | Training a model | `TrainingDataset` / `IndexPlanDataset` | See [docs/training.md](training.md) |
 
 Full trade-off table:
-[docs/scanpy.md § Choosing the right approach](scanpy.md#choosing-the-right-approach).
+[docs/scanpy/choosing-an-approach.md § Choosing the right approach](scanpy/choosing-an-approach.md#choosing-the-right-approach).
 
 ## Converting h5ad to SCX
 
@@ -91,7 +91,7 @@ Three entry points, from simplest to most scalable:
 All three accept the same optimization kwargs / flags and produce identical
 on-disk output. Streaming is the default for `from_h5ad` and the CLI. For
 detailed semantics of each entry point, see
-[docs/scanpy.md § Converting existing data to SCX](scanpy.md#converting-existing-data-to-scx).
+[docs/scanpy/conversion.md § Converting existing data to SCX](scanpy/conversion.md#converting-existing-data-to-scx).
 
 ### Basic usage
 
@@ -360,7 +360,7 @@ pyscx.write(adata, "atlas.scx",
 #### Verify the output
 
 For full validation semantics (checksum vs deep, production checkpoints), see
-[docs/scanpy.md § Validating files after write or transfer](scanpy.md#validating-files-after-write-or-transfer).
+[docs/scanpy/file-operations.md § Validating files after write or transfer](scanpy/file-operations.md#validating-files-after-write-or-transfer).
 
 ```bash
 scx info data.scx                # shape, codec, sidecars, indexes
@@ -412,7 +412,7 @@ scx validate --deep data_v4.scx
 #### Convert back to h5ad
 
 For full streaming export details, see
-[docs/scanpy.md § Exporting back to h5ad / h5mu](scanpy.md#exporting-back-to-h5ad--h5mu-to_h5ad-to_h5mu).
+[docs/scanpy/conversion.md § Exporting back to h5ad / h5mu](scanpy/conversion.md#exporting-back-to-h5ad--h5mu-to_h5ad-to_h5mu).
 
 ```bash
 scx convert data.scx data.h5ad --reader-threads 4 --memory-budget 8G
@@ -458,8 +458,8 @@ switch:
   never branches on which caller ran. The native columns are kept alongside as
   `<K>_<native>` unless you pass `keep_native_columns=False`.
 
-Full workflow: [docs/scanpy.md § Landing external per-cell
-annotations](scanpy.md#landing-external-per-cell-annotations-doublet-detection).
+Full workflow: [docs/scanpy/external-annotations.md § Landing external per-cell
+annotations](scanpy/external-annotations.md#landing-external-per-cell-annotations-doublet-detection).
 
 ## What changes when you convert
 
@@ -470,27 +470,27 @@ annotations](scanpy.md#landing-external-per-cell-annotations-doublet-detection).
   `to_anndata(container="dense")` for a row-major ndarray, or
   `data_dtype="float16"` / `"uint8"` to shrink the in-memory footprint (with a
   fail-loud cast gate; pass `allow_lossy=True` to force a narrowing). See
-  [docs/api.md § Container and dtype materialization](api.md#container-and-dtype-materialization).
+  [docs/api/python-experiment.md § Container and dtype materialization](api/python-experiment.md#container-and-dtype-materialization).
 - **obs/var are Arrow-backed**, not HDF5 datasets. Column dtypes, categorical
   categories, and the pandas `ordered` flag round-trip. The index (`obs_names` /
   `var_names`) round-trips as the pandas index.
 - **`pyscx.accel.*` replaces `sc.pp.*` in backed mode.** In-memory mode is plain
   scanpy. Backed mode needs the accelerators for preprocessing — `sc.pp.*` would
   force a full materialization. See
-  [docs/scanpy.md § scanpy operations in backed mode](scanpy.md#scanpy-operations-in-backed-mode).
+  [docs/scanpy/backed-mode.md § scanpy operations in backed mode](scanpy/backed-mode.md#scanpy-operations-in-backed-mode).
 
 ## What does and does not round-trip
 
 The canonical, always-current table lives in the API reference:
-[docs/api.md § Round-trip fidelity](api.md#round-trip-fidelity). Every conversion
+[docs/api/conversion.md § Round-trip fidelity](api/conversion.md#round-trip-fidelity). Every conversion
 that drops or transforms something also emits a structured warning — see
-[docs/api.md § Conversion warnings](api.md#conversion-warnings-convertwarning).
+[docs/api/conversion.md § Conversion warnings](api/conversion.md#conversion-warnings-convertwarning).
 Headlines:
 
 - **Preserved:** obs/var columns + dtypes, ordered categoricals (including
   **integer- and float-keyed** categoricals — e.g. integer cluster labels or
   dose levels), `obsm`/`varm` embeddings, layers, `obsp`/`varp` (as float32 CSR),
-  `adata.raw` ([docs/api.md § `adata.raw`](api.md#adataraw)), most `uns` entries
+  `adata.raw` ([docs/api/conversion.md § `adata.raw`](api/conversion.md#adataraw)), most `uns` entries
   including `None` scalars (round-trip as Python `None`, e.g.
   `uns['log1p']['base']`).
 - **Lossy / transformed (warns):** `X` and `obsp`/`varp` float64 → float32;
@@ -513,7 +513,7 @@ Headlines:
 ## scanpy-divergence gotchas
 
 A short list of places SCX's accelerators behave differently from a naive
-scanpy script. Each is documented in full in `docs/scanpy.md`.
+scanpy script. Each is documented in full under [`docs/scanpy/`](scanpy/README.md).
 
 - **MT genes must be tagged explicitly.** `pyscx.accel.calculate_qc_metrics`
   follows scanpy's contract: without `qc_vars=["mt"]` there is no
@@ -523,14 +523,14 @@ scanpy script. Each is documented in full in `docs/scanpy.md`.
   in a layer before normalizing. A high-cardinality `batch_key` can trigger a
   per-batch LOESS singularity; SCX drops those batches with a warning rather than
   crashing. See
-  [docs/scanpy.md § Lazy preprocessing](scanpy.md#lazy-preprocessing-in-backed-mode).
+  [docs/scanpy/lazy-preprocessing.md § Lazy preprocessing](scanpy/lazy-preprocessing.md#lazy-preprocessing-in-backed-mode).
 - **Leiden on GPU is not label-stable** vs Python `leidenalg`. `device="auto"`
   on a GPU host uses cuGraph (ARI ≈ 0.92 vs leidenalg). Pin `device="cpu"` to
   preserve label stability for downstream DE / annotation transfer. See
-  [docs/scanpy.md § Leiden clustering](scanpy.md#leiden-clustering-pyscxaccelleiden).
+  [docs/scanpy/accel-embedding-clustering.md § Leiden clustering](scanpy/accel-embedding-clustering.md#leiden-clustering-pyscxaccelleiden).
 - **Backed-mode preprocessing is lazy on CPU, eager on GPU.** CPU wraps `X` in a
   lazy transform; GPU streams through a fused kernel and materializes a scipy
-  CSR. See [docs/scanpy.md § Lazy vs eager preprocessing](scanpy.md#lazy-vs-eager-preprocessing).
+  CSR. See [docs/scanpy/lazy-preprocessing.md § Lazy vs eager preprocessing](scanpy/lazy-preprocessing.md#lazy-vs-eager-preprocessing).
 - **`pct_counts_<qc_var>` changed on lazy input.** After a lazy
   `normalize_total`, `calculate_qc_metrics` now takes the `qc_var` subset sums
   *through* the transform chain, so the ratio divides a transformed numerator by
@@ -555,9 +555,9 @@ scanpy script. Each is documented in full in `docs/scanpy.md`.
   public API — including `sc.pp.filter_genes`, which calls
   `adata._inplace_subset_var`. It now works: `adata[:, mask]` is a lazy view,
   `adata[:, mask].copy()` materializes, and the backed filter ops subset `raw`
-  and drop unused categorical levels like scanpy does. See [docs/api.md § Axis
+  and drop unused categorical levels like scanpy does. See [docs/api/python-accel.md § Axis
   subsetting and aligned
-  members](api.md#axis-subsetting-and-aligned-members).
+  members](api/python-accel.md#axis-subsetting-and-aligned-members).
 - **A backed axis subset now deep-copies `uns`.** anndata builds the replacement
   object with `deepcopy(uns)`, so an entry that cannot be deep-copied — a lock,
   an open file handle, a live client — makes `filter_cells` / `filter_genes`
@@ -579,6 +579,6 @@ SCX maps failures to the Python exception a scanpy user expects:
 ## See also
 
 - [docs/quickstart.md](quickstart.md) — 5-minute end-to-end pipeline.
-- [docs/scanpy.md](scanpy.md) — the full scanpy integration story.
-- [docs/api.md](api.md) — API reference, fidelity table, conversion warnings.
+- [docs/scanpy/](scanpy/README.md) — the full scanpy integration story.
+- [docs/api/](api/README.md) — API reference, fidelity table, conversion warnings.
 - [docs/training.md](training.md) — ML training loaders.

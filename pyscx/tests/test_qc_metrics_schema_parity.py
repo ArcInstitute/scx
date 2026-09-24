@@ -827,7 +827,7 @@ def test_a_materialised_layer_is_enough_even_when_x_stays_ordered(tmp_dir, op):
     """The accept side of the guard, for every op that resolves `layer=`.
 
     The refusal tells the caller to materialise "the matrix the op reads", and
-    `docs/api.md` says each op is guarded on the matrix it selects rather than
+    `docs/api/python-experiment.md` says each op is guarded on the matrix it selects rather than
     on `X`. Both were false while these prologues ran the X-only check *before*
     resolving `layer=`: materialising `counts` and asking for `layer="counts"`
     was still refused, over a matrix the op was not going to read. The prologue

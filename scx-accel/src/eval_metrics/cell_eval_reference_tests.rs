@@ -124,7 +124,8 @@ fn discrimination_scores_match_cell_eval_exactly() {
     }
 }
 
-/// The e-distance correlation, at the tolerance `docs/scanpy.md` states for it.
+/// The e-distance correlation, at the tolerance
+/// `docs/scanpy/accel-perturbation-metrics.md` states for it.
 ///
 /// Both backends are checked. `Gemm` is what `dtype="f32"` selects by default and
 /// `Scalar` is the arm the docs name as the reference shape; running only one of

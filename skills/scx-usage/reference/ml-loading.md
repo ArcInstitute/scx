@@ -339,7 +339,7 @@ rows into a dense numpy dict at open time — paid per key (even unused ones) an
 **per DataLoader worker** (each re-opens the reader), which OOMs at multi-million
 cell scale. `obsm=[embed_key]` loads only the key you use and (in backed mode)
 gathers rows lazily (`O(batch)` memory, per-key LRU = `cache_shards`). See
-[Selective + lazy `obsm`](../../../docs/scanpy.md#selective--lazy-obsm-obsm).
+[Selective + lazy `obsm`](../../../docs/scanpy/loading.md#selective--lazy-obsm-obsm).
 
 ## Troubleshooting
 - `RuntimeError: scx.TrainingDataset requires num_workers=0` — see fork-safety above.

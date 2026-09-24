@@ -30,14 +30,16 @@ fn default_shard_target_rows_pinned() {
 }
 
 /// The CPU covariance-PCA var cutoff (5000) is documented in AGENTS.md and
-/// docs/scanpy.md. Pin it (D7). The GPU cutoff (8000) lives behind the `gpu`
-/// feature and is pinned in scx-accel's own gpu tests.
+/// docs/scanpy/accel-embedding-clustering.md. Pin it (D7). The GPU cutoff
+/// (8000) lives behind the `gpu` feature and is pinned in scx-accel's own gpu
+/// tests.
 #[test]
 fn cpu_pca_threshold_pinned() {
     assert_eq!(
         scx_accel::pca::COVARIANCE_PCA_THRESHOLD,
         5_000,
-        "AGENTS.md / docs/scanpy.md cite the 5000-var CPU PCA cutoff; update them together"
+        "AGENTS.md / docs/scanpy/accel-embedding-clustering.md cite the 5000-var \
+         CPU PCA cutoff; update them together"
     );
 }
 
@@ -188,7 +190,7 @@ fn tracked_files_free_of_scratch_doc_citations_and_removed_gates() {
         collect_files(&root.join(crate_dir).join("src"), "rs", &mut files);
     }
     collect_files(&root.join("docs"), "md", &mut files);
-    for top in ["AGENTS.md", "ROADMAP.md"] {
+    for top in ["AGENTS.md"] {
         let p = root.join(top);
         if p.is_file() {
             files.push(p);
@@ -382,7 +384,7 @@ fn no_doc_claims_a_write_door_decodes_categoricals() {
     ];
     let mut docs: Vec<PathBuf> = Vec::new();
     collect_files(&root.join("docs"), "md", &mut docs);
-    for name in ["README.md", "ROADMAP.md", "AGENTS.md", "CLAUDE.md"] {
+    for name in ["README.md", "AGENTS.md", "CLAUDE.md"] {
         let p = root.join(name);
         if p.exists() {
             docs.push(p);

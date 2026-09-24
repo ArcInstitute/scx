@@ -1,6 +1,6 @@
 # Benchmark Manifest Format
 
-Every performance claim in `README.md` and `docs/performance.md` must be
+Every performance claim in `README.md` and `docs/performance/` must be
 backed by a **benchmark manifest entry** — a JSON result file checked into
 `benchmarks/comprehensive/results/` (either under `raw/` or promoted into
 `baselines/LATEST/summary.json`).
@@ -14,7 +14,7 @@ it is what the rule above governs. **Those claims must be manifested. No
 exceptions.**
 
 It is not a shape a `cargo bench` kernel microbenchmark can take — there is no
-format and no dataset, only a criterion id and a machine. `docs/performance.md`
+format and no dataset, only a criterion id and a machine. `docs/performance/`
 carries such numbers (covariance PCA, the pairwise distance kernels), and
 inventing a synthetic triple for them would put un-reproducible rows into the
 baseline that `gate_candidate.py` compares against. So they are **disclosed
@@ -32,7 +32,7 @@ harness.
 
 > [!IMPORTANT]
 > `benchmarks/scripts/check_readme_manifests.py` enforces only the first tier,
-> and only over `README.md` — it does not parse `docs/performance.md` at all.
+> and only over `README.md` — it does not parse `docs/performance/` at all.
 > The second tier is a review-time convention, not a checked one.
 
 ## Schema

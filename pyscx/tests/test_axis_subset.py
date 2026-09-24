@@ -324,8 +324,8 @@ def test_comparison_shortcircuit_respects_the_projection(scx_path, source):
     `_ComparisonResult` dropped `col_projection` while keeping the projected
     `shape_val`, so the short-circuit read the physical axis: `sum()` over-counted,
     `sum(axis=1)` returned physical-width row counts, and `sum(axis=0)` raised a
-    reshape error. `docs/scanpy.md` advertises this short-circuit as the
-    `sc.pp.calculate_qc_metrics` fast path, so it reached scanpy's own QC.
+    reshape error. `docs/scanpy/backed-mode.md` advertises this short-circuit as
+    the `sc.pp.calculate_qc_metrics` fast path, so it reached scanpy's own QC.
     """
     import pyscx
 

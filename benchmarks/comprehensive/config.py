@@ -1778,7 +1778,7 @@ def estimate_time_minutes(
         "accel_leiden":           90,
         # Harmony runs `max_iter` x `max_iter_kmeans` = 60 sub-iterations over
         # an N x n_comps embedding, three arms, and the harmonypy CPU reference
-        # is by far the slowest (docs/performance.md: R harmony 80.5 min where
+        # is by far the slowest (docs/performance/accel-qc-de-integration.md: R harmony 80.5 min where
         # scx-accel is minutes). Budgeted alongside accel_leiden rather than at
         # the 15-min fall-through.
         "accel_harmony":          90,

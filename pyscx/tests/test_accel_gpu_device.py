@@ -1,6 +1,7 @@
 """Device-string parsing tests for `pyscx.accel.*` (multi-GPU dispatch).
 
-`device="gpu:N"` is documented in README + docs/scanpy.md but historically
+`device="gpu:N"` is documented in README + docs/scanpy/accelerators.md but
+historically
 only the bool aspect of the string was honoured: the suffix was parsed and
 discarded, so every accelerator op ran on GPU 0. This file exercises the
 post-fix parser through the public surface.

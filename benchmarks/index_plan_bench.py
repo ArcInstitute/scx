@@ -22,8 +22,8 @@ Switches surfacing the locality optimisation deltas:
   - shard sort: `--config sort_off` vs `--config sort_on`.
   - Phase 4 (lookahead): `--config lookahead0` vs `--config lookahead4`.
   - Phase 5 (zero-allocation dense gather) is exercised by every
-    HVG-projected configuration; see `docs/performance.md`
-    § "Phase 5 — zero-allocation dense gather" for A/B numbers.
+    HVG-projected configuration; see `docs/performance/loader-index-plan.md`
+    § "Zero-allocation dense gather" for A/B numbers.
 
 Output goes to stdout (and optional `--output FILE.json`).
 """

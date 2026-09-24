@@ -1938,7 +1938,7 @@ fn export_memory_budget_applies_to_raw_and_names_it() {
     // which is why the refusal's own text offers `--reader-threads 1` as the
     // alternative to raising the budget. Pinned here because it is the
     // difference between a documented escape hatch and a hole: the docs on
-    // `pyscx.to_h5ad` and in `docs/api.md` say the check is parallel-only, and
+    // `pyscx.to_h5ad` and in `docs/api/python-functions.md` say the check is parallel-only, and
     // this is what would fail if that stopped being true in either direction.
     let seq_out = dir.path().join("budget_seq.h5ad");
     scx_to_h5ad_streaming(

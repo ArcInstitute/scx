@@ -327,4 +327,4 @@ transcriptions are kept in one place so that swap is mechanical.
 
 - [`docs/training.md`](training.md) — `SparseCellSetDataset`, the native
   collation kernel, and the plan-driven gather these kernels consume.
-- [`docs/api.md`](api.md) — the full `pyscx` API reference.
+- [`docs/api/`](api/README.md) — the full `pyscx` API reference.

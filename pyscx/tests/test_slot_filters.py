@@ -365,9 +365,10 @@ def test_unknown_key_raises_under_preserve_slots_too(multi_key_path, slot):
     [("layers", "layers"), ("obsm", "obsm"), ("obsp", "obsp"), ("varp", "varp"), ("varm", "varm")],
 )
 def test_the_error_names_the_kwarg_the_caller_passed(multi_key_path, slot, kwarg):
-    """`docs/scanpy.md` promises the message names the slot, so the label has to
-    be the kwarg the caller typed. `layers=` briefly said `layer key ... not
-    found`, which sends the reader looking for a kwarg that does not exist."""
+    """`docs/scanpy/loading.md` promises the message names the slot, so the
+    label has to be the kwarg the caller typed. `layers=` briefly said
+    `layer key ... not found`, which sends the reader looking for a kwarg
+    that does not exist."""
     import pyscx
 
     with pytest.raises(KeyError) as exc:

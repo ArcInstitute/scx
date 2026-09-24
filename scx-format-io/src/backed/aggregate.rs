@@ -293,7 +293,7 @@ impl BackedCsrReader {
             // non-canonical, but reaching that verdict here costs a full walk
             // the CSR path would otherwise skip; `finalize_implicit_zero_variance`
             // is where the count is checked, and it is never reached. Documented
-            // rather than silently divergent — see docs/api.md.
+            // rather than silently divergent — see docs/api/rust-format-io.md.
             return Ok(vec![0.0f64; self.n_vars]);
         }
 

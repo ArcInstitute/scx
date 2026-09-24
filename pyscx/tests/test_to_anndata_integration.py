@@ -2109,7 +2109,7 @@ def test_obs_filter_grammar_parity_common_ground(tmp_dir, expr):
     comparison operators (==, !=, <, <=, >, >=), keyword-form boolean
     operators (`and` / `or` / `not`), `in [...]` against a bracket-delimited
     list literal, and parenthesised sub-expressions. Divergences are
-    documented in docs/scanpy.md (see "Filter Expression Compatibility").
+    documented in docs/scanpy/loading.md (see "Filter Expression Compatibility").
 
     NOTE: this fixture has **no missing values**, and that is load-bearing for
     the `!=` / `not (...)` cases. Those two operators parse in both grammars
@@ -2196,7 +2196,7 @@ def test_obs_filter_grammar_parity_with_null_categorical(tmp_dir, expr):
     `not (...)` genuinely diverge on a NULL cell — the engine follows SQL
     (UNKNOWN, so the row does not match) while pandas is two-valued
     (`NaN != 'x'` is True, so it does) — and that divergence is documented in
-    docs/scanpy.md rather than asserted away here.
+    docs/scanpy/loading.md rather than asserted away here.
     """
     import warnings as warnings_mod
 

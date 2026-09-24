@@ -79,8 +79,7 @@ Run on the edited working tree, *before* committing (Phase 2 of the pipeline bel
 
 **Documentation:**
 
-- [ ] `ROADMAP.md` date stamp is current
-- [ ] `docs/performance.md` numbers match the promoted baseline
+- [ ] `docs/performance/` numbers match the promoted baseline
 - [ ] Cross-doc links resolve
 
 ### Release steps
@@ -93,7 +92,6 @@ The repo's remote is named `github`, NOT `origin`. Never commit the version bump
 
 1. **Bump versions** as described in [Version-bump scope](#version-bump-scope). Verify with `grep -E '^version' */Cargo.toml pyscx/pyproject.toml; grep '^Version' rscx/DESCRIPTION` — all should report the new version (except the integration tests crate, which stays at `0.0.0`).
 2. **Refresh the lockfile:** `cargo update --workspace --offline`.
-3. **Bump the `ROADMAP.md` "Last updated" date stamp** to today.
 
 **Phase 2 — Run pre-release checks (mandatory, not optional)**
 
@@ -200,5 +198,5 @@ why / how) into the tracked file instead of citing. When the citation
 was decorative, just delete it.
 
 Cross-references between tracked files (`docs/*.md`, `benchmarks/README.md`,
-`ROADMAP.md`, `AGENTS.md`/`CLAUDE.md`, generated reports under
+`AGENTS.md`/`CLAUDE.md`, generated reports under
 `benchmarks/comprehensive/results/reports/`) are fine — they ship together.

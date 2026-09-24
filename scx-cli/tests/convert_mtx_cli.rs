@@ -252,7 +252,7 @@ fn every_convert_direction_reachable_without_stream_flag() {
 // through `dispatch_mtx_to_scx` before the policy is ever parsed, so
 // `--shard-obs always` exited 0 having written one legacy `obs_metadata`
 // section. A successful no-op on an explicit request is worse than an error,
-// and it made `docs/api.md`'s "every scx convert ingest" claim false.
+// and it made `docs/api/section-types.md`'s "every scx convert ingest" claim false.
 // ---------------------------------------------------------------------------
 
 fn mtx_obs_shard_count(extra: &[&str]) -> usize {

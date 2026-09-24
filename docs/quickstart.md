@@ -5,11 +5,11 @@
 > planned at public release.
 
 A 5-minute end-to-end pipeline: convert an h5ad file to SCX, run QC, normalize,
-find HVGs, embed, cluster, and rank markers. Uses the [`pyscx.accel`](scanpy.md#rust-native-accelerators)
+find HVGs, embed, cluster, and rank markers. Uses the [`pyscx.accel`](scanpy/accelerators.md#rust-native-accelerators)
 Rust-native pipeline.
 
 For the design and architecture, see [docs/architecture.md](architecture.md).
-For the full scanpy integration story, see [docs/scanpy.md](scanpy.md).
+For the full scanpy integration story, see [docs/scanpy/](scanpy/README.md).
 Coming from h5ad? See [docs/migrating-from-h5ad.md](migrating-from-h5ad.md) for
 the round-trip fidelity table and the scanpy-divergence gotchas.
 
@@ -33,7 +33,7 @@ the round-trip fidelity table and the scanpy-divergence gotchas.
 
 Training a model? Use the `TrainingDataset` loader instead — see
 [docs/training.md](training.md). Full trade-off table:
-[docs/scanpy.md § Choosing the right approach](scanpy.md#choosing-the-right-approach).
+[docs/scanpy/choosing-an-approach.md § Choosing the right approach](scanpy/choosing-an-approach.md#choosing-the-right-approach).
 
 ## Install
 
@@ -188,13 +188,13 @@ intentional and documented:
   Pass `layer="counts"` (or run HVG before `normalize_total` / `log1p`) to avoid
   the "non-integers were found" warning and statistically wrong HVGs.
 - **GPU dispatch via `device=`.** Most ops accept `device="auto" | "cpu" | "gpu" | "gpu:N"`.
-  See [the compatibility matrix in docs/scanpy.md](scanpy.md#compatibility-matrix)
+  See [the compatibility matrix in docs/scanpy/accelerators.md](scanpy/accelerators.md#compatibility-matrix)
   for which ops have GPU implementations.
 
 ## Next steps
 
 - [docs/training.md](training.md) — ML training data loading guide (TrainingDataset, IndexPlanDataset, PyTorch Lightning).
-- [docs/scanpy.md](scanpy.md) — full scanpy integration guide and accelerator reference.
+- [docs/scanpy/](scanpy/README.md) — full scanpy integration guide and accelerator reference.
 - [docs/gpu-setup.md](gpu-setup.md) — CUDA / RAPIDS / SLURM setup for `device="gpu"`.
 - [docs/architecture.md](architecture.md) — crate graph, file format, codec system.
-- [docs/api.md](api.md) — API reference for the Python and Rust surfaces.
+- [docs/api/](api/README.md) — API reference for the Python and Rust surfaces.

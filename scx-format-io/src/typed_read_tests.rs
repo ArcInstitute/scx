@@ -507,7 +507,7 @@ fn typed_assembly_matches_f32_cast_across_codecs() {
 /// arm, and a column index that overflows `i16` (≥ 32768) fails loud unless
 /// `allow_lossy` (spec § 4 index-narrowing contract). This is the only coverage
 /// of the I16 fill arm (scipy upcasts int16→int32, so a Python CSR read can't
-/// observe it — see docs/api.md).
+/// observe it — see docs/api/python-experiment.md).
 #[test]
 fn typed_index_narrow_i16() {
     // In-range: n_vars small, indices < 32768 → I16 arm, exact.

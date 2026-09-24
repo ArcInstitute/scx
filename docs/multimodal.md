@@ -58,7 +58,7 @@ empty CSR row in that modality's shard, not by varying obs across
 modalities.
 
 See [docs/format.md § 13 Multimodal Extension](format.md#13-multimodal-extension-optional)
-for the on-disk byte layout and [docs/api.md § Section Types](api.md#section-types)
+for the on-disk byte layout and [docs/api/section-types.md § Section Types](api/section-types.md#section-types)
 for the `SectionType` enum.
 
 ---
@@ -500,7 +500,7 @@ not what makes a file spatial.
 
 The loader turns either key into cell-set plans — see
 [docs/training.md § Neighbourhood plans](training.md#neighbourhood-plans) for
-the API and [docs/api.md § Neighbourhood plans](api.md#neighbourhood-plans) for
+the API and [docs/api/python-training.md § Neighbourhood plans](api/python-training.md#neighbourhood-plans) for
 the parameter table. A neighbourhood is a set with the centre role-tagged, so
 the gather, the collation and the tokenisation kernels are the same ones the
 perturbation regime uses.
@@ -686,8 +686,8 @@ Nothing in the current builders depends on it arriving.
 ## 8. Cross-references
 
 - [docs/format.md § 13 Multimodal Extension](format.md#13-multimodal-extension-optional) — on-disk byte layout.
-- [docs/api.md § Multimodal API](api.md#multimodal-api) — Rust + PyO3 surface.
+- [docs/api/multimodal.md § Multimodal API](api/multimodal.md#multimodal-api) — Rust + PyO3 surface.
 - [docs/codec.md § Per-modality codec defaults](codec.md#8a-per-modality-codec-defaults) — auto-codec routing per modality.
 - [docs/cloud.md § Exploded `.scxd/` layout](cloud.md#exploded-scxd-layout) — `_modality_table.bin` + `X/{modality}/` directories.
-- [docs/scanpy.md](scanpy.md) — single-modality scanpy/AnnData integration (multimodal example follows the same `pyscx.from_mudata` / `to_mudata` pattern shown here).
+- [docs/scanpy/](scanpy/README.md) — single-modality scanpy/AnnData integration (multimodal example follows the same `pyscx.from_mudata` / `to_mudata` pattern shown here).
 - [docs/training.md § Neighbourhood plans](training.md#neighbourhood-plans) — the spatial regime's loader surface.

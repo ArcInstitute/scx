@@ -95,7 +95,7 @@ selection `scx convert` does) and pin one only if you want a specific encoding;
 the point of `sort` is read locality, not compression. Note `scx compact` is not
 a size remedy for this — it re-encodes under the same intent axis, so it will
 land where `sort` did. See
-[performance.md § Sort (physical layout)](performance.md#sort-physical-layout).
+[performance/query-and-file-ops.md § Sort (physical layout)](performance/query-and-file-ops.md#sort-physical-layout).
 
 ### Three ways to sort
 
@@ -139,7 +139,7 @@ union vocabulary folded from the input's shards rather than decoding and
 re-encoding per spilled shard, so declared levels, declared order, the
 `scx.categorical.ordered` stamp and the shared vocabulary survive a spilled sort
 exactly as they do an in-memory one. See
-[performance.md § Sort (physical layout)](performance.md#sort-physical-layout)
+[performance/query-and-file-ops.md § Sort (physical layout)](performance/query-and-file-ops.md#sort-physical-layout)
 for measured compression and locality numbers.
 
 ### Shuffling for training (`scx sort --shuffle`)
@@ -236,7 +236,7 @@ encoding — the input's `mixed (uint16, uint32)` comes back as a uniform
 (`scx_ops::helpers::widest_value_encoding`) instead of preserving each shard's.
 That is a separate, still-open issue from the codec flip; if output size on a
 mixed-width file matters, budget for it. See
-[performance.md § Global pre-shuffle](performance.md#global-pre-shuffle-data-load-phase-1-1d)
+[performance/loader-data-load.md § Global pre-shuffle](performance/loader-data-load.md#global-pre-shuffle-data-load-phase-1-1d)
 for the second dataset and the batch-mixing numbers.
 
 **Shard geometry is not preserved by default.** `--shard-size` defaults to 16,384
@@ -652,7 +652,7 @@ scans. (See [codec.md §7b](codec.md) for the bit-level layout and the full G sw
 **Loader adoption.** `IndexPlanDataset` defaults `scatter_block_index=True` and its
 prefetcher never warms a block-index-eligible framed shard *whole*, so the gather reaches the
 group-level path; `SparseCellSetDataset` takes the same kwarg and defaults it off, because
-its regime is cache-friendly (see [performance.md](performance.md) for the measurement —
+its regime is cache-friendly (see [performance/](performance/README.md) for the measurement —
 taken before the row-group LRU below existed). The process-wide kill-switch is
 `SCX_SCATTER_BLOCK_INDEX=0`. Adoption is observable on **both** classes via
 `cache_metrics()["block_index_groups"]` (> 0 ⇒ framed path taken; `full_shard_groups` is the
@@ -753,7 +753,7 @@ global order, then runs an offline byte-budget bin-packer that:
 > `read_group` / `read_reference` return the whole group transparently. In the
 > default in-memory path (no `--memory-budget`), grouped X is gathered from the
 > resident CSR and encoded **in parallel** (rayon) — byte-identical to the
-> single-threaded path but ~2–4× faster (see [performance.md](performance.md)).
+> single-threaded path but ~2–4× faster (see [performance/](performance/README.md)).
 > The parallel gather trades peak RSS for speed; cap it with `RAYON_NUM_THREADS`,
 > or set `SCX_SORT_NO_INMEM_FAST=1` to force the memory-lean single-threaded
 > emitter. `--group-write-block-bytes 0` disables the sub-flush entirely.
@@ -1057,11 +1057,11 @@ highly variable genes (`highly_variable_genes(prefer_format="csc")`) and the
 whole-matrix column reductions (`col_sums` / `col_nnz` / `col_min` /
 `col_max` / `col_var`) — both read every column of every CSC shard for a
 statistic one row-major sweep produces. See
-[scanpy.md § `prefer_format`](scanpy.md#prefer_formatautocsrcsc-column-major-dispatch)
+[scanpy/accel-csc.md § `prefer_format`](scanpy/accel-csc.md#prefer_formatautocsrcsc-column-major-dispatch)
 for the numbers. Both PCA
 methods (covariance and randomized SVD) explicitly reject
 `prefer_format="csc"` on the pyscx side; see
-[api.md §pyscx.accel](api.md#pyscxaccel--rust-native-accelerators).
+[api/python-accel.md §pyscx.accel](api/python-accel.md#pyscxaccel--rust-native-accelerators).
 
 ### Build policy: `off` / `auto` / `always`
 
@@ -1106,7 +1106,7 @@ census_500k, where pyscx 0.18.0 took 207 s for the same sidecar. The sidecar is
 worth it for the column-major workloads in the table above — at census_1m the
 laptop-test pipeline's Wilcoxon DE went from 2,091 s on `cpu_csr` to 209 s on
 `cpu_csc`, and to 88 s on the exact-nnz kernel `cpu_csc_nnz` that is now the
-default ([the laptop test](performance.md#the-laptop-test-a-full-pipeline-under-a-fixed-ceiling))
+default ([the laptop test](performance/memory.md#the-laptop-test-a-full-pipeline-under-a-fixed-ceiling))
 — and is dead weight for a file that is only ever read by rows (a
 training loader, `to_anndata()` of a row window), which is what `--csc off` is
 for.
@@ -1271,7 +1271,7 @@ The sidecar moves through four stages over a file's life:
    the `gpu_csc_v3` route (the default GPU DE route when a CSC sidecar is
    present). `BackedCscReader` serves column-range
    reads with shard-level pushdown. See
-   [scanpy.md § GPU-supported vs GPU-fast](scanpy.md#gpu-supported-vs-gpu-fast).
+   [scanpy/accel-gpu.md § GPU-supported vs GPU-fast](scanpy/accel-gpu.md#gpu-supported-vs-gpu-fast).
 3. **Mutation.** The rewrite ops (`compact`, `merge`, `optimize`, `sort`,
    `subset`) never copy the input's sidecar, because its `indices` would
    reference stale rows/columns; they rebuild it in the same pass iff an

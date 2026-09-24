@@ -48,7 +48,8 @@ use super::gpu::resolve_device;
 ///         degenerate, over-partitioned result, so the cuGraph path instead
 ///         uses cuGraph's own default of **100** whenever `n_iterations <= 2`
 ///         (including the `-1`/`0` convergence sentinels); only values `> 2` are
-///         forwarded verbatim as the cuGraph pass-cap. See docs/scanpy.md.
+///         forwarded verbatim as the cuGraph pass-cap. See
+///         docs/scanpy/accel-embedding-clustering.md.
 ///     device: Device selection — "auto" (default), "cpu", "gpu", or "gpu:N".
 ///     parallel: Run the Rust-native Leiden in parallel mode (conflict-free
 ///         graph coloring). Default `False`. **Ignored on the cuGraph path**

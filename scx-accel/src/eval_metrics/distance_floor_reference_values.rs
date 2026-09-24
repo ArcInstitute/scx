@@ -8,7 +8,8 @@
 //! path that dot product is accumulated in f32 **at the scale of the norms**, so
 //! for large-norm rows the difference is noise long before `d²` is small in
 //! absolute terms — and the `.max(0.0)` clamp that followed made the bias
-//! one-sided. `docs/scanpy.md` claims "f32 + gemm matches f64 + scalar" within a
+//! one-sided. `docs/scanpy/accel-perturbation-metrics.md` claims "f32 + gemm
+//! matches f64 + scalar" within a
 //! stated tolerance; ORG-7.21-5 recorded a large-norm f32 fixture as the missing
 //! evidence for that claim, and this is it.
 //!

@@ -28,7 +28,7 @@ Phase-A conversion dependency — it lives in ``run_parallel.py``'s
 ``peak_rss_mb`` is sampled immediately *after* each op (not a true peak), matching
 ``grouped_sort``. No perf floors are gated — grouped perf is hardware/density
 sensitive; only the correctness ints are hard-gated (see ``thresholds.yaml``).
-Head-to-head wall/size numbers land in the report and ``docs/performance.md``.
+Head-to-head wall/size numbers land in the report and ``docs/performance/query-and-file-ops.md``.
 """
 
 from __future__ import annotations

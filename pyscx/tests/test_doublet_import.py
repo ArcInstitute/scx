@@ -767,7 +767,7 @@ def test_consensus_still_says_a_score_only_tool_emits_no_call(tmp_path):
 
 
 def test_doublet_profiles_matches_the_docs_table():
-    """The per-tool table in docs/scanpy.md must not drift from the profiles.
+    """The per-tool table in docs/scanpy/external-annotations.md must not drift from the profiles.
 
     D2: that table not existing anywhere user-facing is what turned a
     call-column name mismatch into a silent score-only import — the only way to
@@ -781,9 +781,12 @@ def test_doublet_profiles_matches_the_docs_table():
     assert set(profiles) == set(pyscx.doublet_tools())
 
     doc = (
-        pathlib.Path(__file__).resolve().parents[2] / "docs" / "scanpy.md"
+        pathlib.Path(__file__).resolve().parents[2]
+        / "docs"
+        / "scanpy"
+        / "external-annotations.md"
     ).read_text()
-    section = doc.split("### The per-tool column table", 1)[1].split("###", 1)[0]
+    section = doc.split("\n## The per-tool column table", 1)[1].split("\n#", 1)[0]
     rows = {
         m.group(1): m.group(0)
         for m in re.finditer(r"^\| `([a-z]+)` \|.*$", section, re.M)

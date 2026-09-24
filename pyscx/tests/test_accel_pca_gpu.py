@@ -329,8 +329,8 @@ def test_normalize_log1p_pca_matches_scanpy(tmp_path):
     # NOTE: `to_anndata()` below leaves `backed` at its default of False, so `X`
     # is a materialized scipy CSR and this does NOT exercise the backed/lazy
     # streaming route — an earlier version of this comment said "backed + lazy"
-    # and that wording was copied into docs/scanpy.md's tolerance table as a
-    # route claim it does not support.
+    # and that wording was copied into docs/scanpy/accel-gpu.md's tolerance
+    # table as a route claim it does not support.
     scx_path = str(tmp_path / "pipeline_test.scx")
     pyscx.from_anndata(adata_src.copy(), scx_path)
     a_gpu = pyscx.open(scx_path).to_anndata()

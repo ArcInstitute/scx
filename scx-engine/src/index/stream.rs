@@ -591,7 +591,7 @@ impl ObsPredicateIndexBuilder {
                     // Level-1 pruning available on it, while this path keeps
                     // it for a handful of bytes. Unifying them would change
                     // batch-path behaviour, so it is left alone and documented
-                    // (docs/api.md) rather than changed here.
+                    // (docs/api/indexes.md) rather than changed here.
                     //
                     // It is also not a divergence any conversion front end can
                     // reach on obs: `scx convert` and `pyscx.from_anndata` go

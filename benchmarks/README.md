@@ -1602,7 +1602,7 @@ sbatch benchmarks/scripts/_run_phase0_data_wait_gate.sh
 ⚠️ **A null-model capture overwrites tracked manifest rows.** Every benchmark
 writes `results/raw/<benchmark>__<format>__<dataset>.json` before its snapshot
 is copied, and some of those files are git-tracked (force-added) because
-`docs/performance.md` cites them — the three `index_plan__scx_auto__*` rows
+`docs/performance/` cites them — the three `index_plan__scx_auto__*` rows
 among them. A capture with `SCX_BENCH_R3_NULL_MODEL_MS` set therefore replaces
 a published 25.14 batches/s row with a 16.89 one whose slowdown is the `sleep`
 the knob inserted. `_run_phase0_data_wait_gate.sh` restores those three paths

@@ -4,14 +4,14 @@ This directory contains the design and reference docs for SCX (Sparse Cell
 eXpression System). Use the index below to jump to the topic you need.
 
 If you're new here, start with [architecture.md](architecture.md) for the
-big picture, then [api.md](api.md) (Rust/CLI/Python APIs) or
-[scanpy.md](scanpy.md) (using SCX from a scanpy workflow).
+big picture, then [api/](api/README.md) (Rust/CLI/Python APIs) or
+[scanpy/](scanpy/README.md) (using SCX from a scanpy workflow).
 
 ## User guides
 
 - [quickstart.md](quickstart.md) — 5-minute end-to-end pipeline (convert → QC → normalize → HVG → embed → cluster → markers).
 - [migrating-from-h5ad.md](migrating-from-h5ad.md) — For scanpy users: which loader to use, what changes on conversion, round-trip fidelity, and scanpy-divergence gotchas.
-- [scanpy.md](scanpy.md) — Scanpy integration guide and Rust-native accelerator usage (PCA, kNN, UMAP, DE, Leiden, Harmony2, LISI, HVG, pseudobulk).
+- [scanpy/](scanpy/README.md) — Scanpy integration guide and Rust-native accelerator usage (PCA, kNN, UMAP, DE, Leiden, Harmony2, LISI, HVG, pseudobulk).
 - [gpu-setup.md](gpu-setup.md) — GPU setup: CUDA, RAPIDS, conda, containers, SLURM, troubleshooting.
 - [cloud.md](cloud.md) — Cloud auth, layouts, tuning, provider-specific notes, and cloud-native query.
 - [multimodal.md](multimodal.md) — CITE-seq / 10x Multiome / TEA-seq / spatial layout and APIs.
@@ -32,12 +32,12 @@ big picture, then [api.md](api.md) (Rust/CLI/Python APIs) or
 
 ## API reference
 
-- [api.md](api.md) — Full API reference: section types, Rust/CLI/Python entry points, conversion warnings, memory budgets, lazy/backed datasets.
+- [api/](api/README.md) — Full API reference: section types, Rust/CLI/Python entry points, conversion warnings, memory budgets, lazy/backed datasets.
 - [python_api.rst](python_api.rst) — Sphinx autodoc entry point for the `pyscx` Python package.
 
 ## Performance & testing
 
-- [performance.md](performance.md) — Benchmark results, memory and throughput figures, per-op speedups.
+- [performance/](performance/README.md) — Benchmark results, memory and throughput figures, per-op speedups.
 - [benchmark_manifest.md](benchmark_manifest.md) — Manifest format for benchmark result JSON files under `benchmarks/comprehensive/results/`.
 - [testing.md](testing.md) — Test matrix, benchmark harness, and correctness validation details.
 
@@ -53,6 +53,5 @@ big picture, then [api.md](api.md) (Rust/CLI/Python APIs) or
 ## Related top-level docs
 
 - [../README.md](../README.md) — Project README.
-- [../ROADMAP.md](../ROADMAP.md) — Capability tiers and status.
 - [../CLAUDE.md](../CLAUDE.md) — Agent-facing project overview with links into the docs above.
 - [../benchmarks/README.md](../benchmarks/README.md) — Practical benchmark guide: SLURM submission, dataset prep, regression gating.

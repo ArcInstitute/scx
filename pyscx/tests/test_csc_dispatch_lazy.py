@@ -558,7 +558,7 @@ def test_projected_lazy_qc_gene_axis_matches_the_csr_route(tmp_path):
 # full-axis, `adata.var` is already subset — so a non-prefix mask raised, and a
 # mask that kept every id below the visible width silently labelled file column
 # `c` with visible gene `c`. Pre-existing; reachable through the very path the
-# projection table in docs/scanpy.md recommends.
+# projection table in docs/scanpy/accel-csc.md recommends.
 # ---------------------------------------------------------------------------
 
 

@@ -45,7 +45,7 @@ from_h5ad(path, out, codec=None, shard_size=None, shard_obs="auto", csc=None,
   `uns` pandas DataFrame is in a nullable encoding with no lossless `uns` form
   and is left out; the index, the column order and every other column are
   intact). All formerly-silent skips now warn. For the full preserved/lossy/dropped matrix
-  see [docs/api.md § Round-trip fidelity](../../../docs/api.md#round-trip-fidelity).
+  see [docs/api/conversion.md § Round-trip fidelity](../../../docs/api/conversion.md#round-trip-fidelity).
 - `reader_threads`: parallel streaming reader. `None` → `RAYON_NUM_THREADS` or
   `os.cpu_count()`; `1` forces sequential; `>1` requests rayon workers
   (byte-identical output). Requires a thread-safe libhdf5 (conda-forge default);

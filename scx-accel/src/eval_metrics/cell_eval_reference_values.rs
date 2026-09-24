@@ -2,8 +2,9 @@
 //!
 //! # Why an external reference at all
 //!
-//! `docs/scanpy.md` claims the perturbation-evaluation metrics are "numerically
-//! equivalent to the Python references within the tolerances below", citing
+//! `docs/scanpy/accel-perturbation-metrics.md` claims the perturbation-evaluation
+//! metrics are "numerically equivalent to the Python references within the
+//! tolerances below", citing
 //! `pyscx/tests/test_cell_eval_parity.py`. That file `importorskip`s
 //! `cell_eval`, `arc_bench` and `polars`; **no conda env has them**, and CI's
 //! Python-bindings job does not install them either. The claim rested on a local
@@ -37,12 +38,13 @@
 //! |---|---|---|
 //! | bulk metrics, knockdown | `CE_ATOL` + `CE_RTOL·\|want\|` = 1e-6 + 1e-7·\|want\| | see below |
 //! | discrimination scores | `abs = 0` | an integer rank divided by `P`, so equality is exact or the ranking differs |
-//! | e-distance correlation | [`CE_EDISTANCE_ATOL`] = 1e-4 | `docs/scanpy.md`'s documented tolerance: an O(N²) reduction whose order differs from sklearn's BLAS |
+//! | e-distance correlation | [`CE_EDISTANCE_ATOL`] = 1e-4 | `docs/scanpy/accel-perturbation-metrics.md`'s documented tolerance: an O(N²) reduction whose order differs from sklearn's BLAS |
 //!
 //! Pinned **at** the documented bar and not tighter: a tighter pin would encode
 //! behaviour the docs promise not to have.
 //!
-//! The relative term is not a widening. `docs/scanpy.md` records these bars as
+//! The relative term is not a widening. `docs/scanpy/accel-perturbation-metrics.md`
+//! records these bars as
 //! `atol=1e-6`, but the test they describe writes
 //! `np.testing.assert_allclose(..., atol=1e-6)`, and **numpy's default `rtol` is
 //! `1e-7`** — so the bar the pytest suite has always enforced is
@@ -56,7 +58,8 @@
 //!
 //! * **Mixed-tie discrimination ranks** — `numpy.argsort`'s default kind is
 //!   `quicksort`, which is not stable, so the reference's own tie behaviour is
-//!   implementation-defined. `docs/scanpy.md` carves this out and
+//!   implementation-defined. `docs/scanpy/accel-perturbation-metrics.md` carves
+//!   this out and
 //!   `super::discrimination_cell_eval_tests` pins SCX's stable-argsort semantics
 //!   as a deliberate divergence.
 //! * **`clustering_agreement`** — Leiden is stochastic and the documented bar is
@@ -75,7 +78,7 @@
 /// Documented tolerance for the bulk metrics and the knockdown arrays.
 pub const CE_ATOL: f64 = 1e-6;
 /// Relative half of the bulk-metric / knockdown bar — numpy's `assert_allclose`
-/// default, which `docs/scanpy.md` omitted.
+/// default, which `docs/scanpy/accel-perturbation-metrics.md` omitted.
 pub const CE_RTOL: f64 = 1e-7;
 /// Documented tolerance for the e-distance correlation.
 pub const CE_EDISTANCE_ATOL: f64 = 1e-4;

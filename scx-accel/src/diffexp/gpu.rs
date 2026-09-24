@@ -348,8 +348,8 @@ pub fn pdex_ref_gpu(
                 //
                 // Without this the source keeps `ValidationPolicy::default()`, whose `op`
                 // is the placeholder "this GPU operation" — so a malformed file produced
-                // an error naming nothing, while `docs/scanpy.md` claimed the message
-                // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+                // an error naming nothing, while `docs/scanpy/accel-gpu.md` claimed the
+                // message named the operation you called. Found by Cursor Agent - Grok 4.6 High
                 // and codex - gpt-5.6-sol.
                 .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
@@ -375,8 +375,8 @@ pub fn pdex_ref_gpu(
                 //
                 // Without this the source keeps `ValidationPolicy::default()`, whose `op`
                 // is the placeholder "this GPU operation" — so a malformed file produced
-                // an error naming nothing, while `docs/scanpy.md` claimed the message
-                // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+                // an error naming nothing, while `docs/scanpy/accel-gpu.md` claimed the
+                // message named the operation you called. Found by Cursor Agent - Grok 4.6 High
                 // and codex - gpt-5.6-sol.
                 .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
@@ -405,8 +405,8 @@ pub fn pdex_ref_gpu(
             //
             // Without this the source keeps `ValidationPolicy::default()`, whose `op`
             // is the placeholder "this GPU operation" — so a malformed file produced
-            // an error naming nothing, while `docs/scanpy.md` claimed the message
-            // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+            // an error naming nothing, while `docs/scanpy/accel-gpu.md` claimed the
+            // message named the operation you called. Found by Cursor Agent - Grok 4.6 High
             // and codex - gpt-5.6-sol.
             .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
@@ -571,8 +571,8 @@ pub fn wilcoxon_rank_sum_gpu(
                 //
                 // Without this the source keeps `ValidationPolicy::default()`, whose `op`
                 // is the placeholder "this GPU operation" — so a malformed file produced
-                // an error naming nothing, while `docs/scanpy.md` claimed the message
-                // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+                // an error naming nothing, while `docs/scanpy/accel-gpu.md` claimed the
+                // message named the operation you called. Found by Cursor Agent - Grok 4.6 High
                 // and codex - gpt-5.6-sol.
                 .with_validation(ValidationPolicy::new(
                     ValidationChecks::ALL,
@@ -601,8 +601,8 @@ pub fn wilcoxon_rank_sum_gpu(
                 //
                 // Without this the source keeps `ValidationPolicy::default()`, whose `op`
                 // is the placeholder "this GPU operation" — so a malformed file produced
-                // an error naming nothing, while `docs/scanpy.md` claimed the message
-                // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+                // an error naming nothing, while `docs/scanpy/accel-gpu.md` claimed the
+                // message named the operation you called. Found by Cursor Agent - Grok 4.6 High
                 // and codex - gpt-5.6-sol.
                 .with_validation(ValidationPolicy::new(
                     ValidationChecks::ALL,
@@ -636,8 +636,8 @@ pub fn wilcoxon_rank_sum_gpu(
             //
             // Without this the source keeps `ValidationPolicy::default()`, whose `op`
             // is the placeholder "this GPU operation" — so a malformed file produced
-            // an error naming nothing, while `docs/scanpy.md` claimed the message
-            // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+            // an error naming nothing, while `docs/scanpy/accel-gpu.md` claimed the
+            // message named the operation you called. Found by Cursor Agent - Grok 4.6 High
             // and codex - gpt-5.6-sol.
             .with_validation(ValidationPolicy::new(
                 ValidationChecks::ALL,

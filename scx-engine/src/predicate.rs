@@ -968,7 +968,7 @@ pub fn parse_predicate(expr: &str, schema: &Schema, axis: &str) -> Result<Predic
 /// UNKNOWN, not `false`; `and` / `or` combine UNKNOWN per Kleene
 /// (`null OR true = true`, `null AND false = false`), `not` propagates it, and
 /// only the final mask turns a surviving UNKNOWN into "not matched". pandas,
-/// polars and SQL agree on `or`; see `docs/api.md` § QueryPipeline.
+/// polars and SQL agree on `or`; see `docs/api/rust-engine.md` § QueryPipeline.
 ///
 /// Getting this wrong is silent: combining with arrow's *non*-Kleene
 /// `boolean::or` makes `null OR true` null, and the top-level coalesce then

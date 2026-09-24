@@ -216,7 +216,7 @@ python "$CAPTURE" --name "$NAME_R3" \
 #
 # Every benchmark writes to `results/raw/<triple>.json` before the snapshot is
 # copied, and three `index_plan` rows there are **git-tracked** (force-added
-# past .gitignore) because `docs/performance.md`'s OPT-FORMATIO-1 claims cite
+# past .gitignore) because `docs/performance/loader-index-plan.md`'s OPT-FORMATIO-1 claims cite
 # them. This arm runs with a 25 ms/batch null model, so its numbers are
 # incomparable by construction — leaving them in place silently replaces a
 # published 25.14 batches/s row with a 16.89 one whose slowdown is a `sleep`

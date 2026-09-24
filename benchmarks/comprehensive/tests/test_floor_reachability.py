@@ -2469,7 +2469,7 @@ def test_full_fixture_path_is_declared_once():
 
 
 def test_performance_doc_streaming_table_matches_the_tracked_json():
-    """`docs/performance.md`'s census_1m streaming table must equal the medians in
+    """`docs/performance/conversion.md`'s census_1m streaming table must equal the medians in
     the tracked raw JSON.
 
     `docs/benchmark_manifest.md` requires every user-visible number to be backed by
@@ -2491,7 +2491,7 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
     import statistics
 
     raw = PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "raw"
-    doc = (PROJECT_ROOT / "docs" / "performance.md").read_text()
+    doc = (PROJECT_ROOT / "docs" / "performance" / "conversion.md").read_text()
 
     # (doc row label, results file, scenario key in runs[].extra)
     rows = [
@@ -2528,7 +2528,7 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
         # `| <label> | 25.37 s | **2 342 MB** |`, tolerating bold and thin spaces.
         pat = re.escape(label) + r"\s*\|\s*\*{0,2}([\d.]+)\s*s\*{0,2}\s*\|\s*\*{0,2}([\d\s,]+)\s*MB"
         m = re.search(pat, doc)
-        assert m, f"no MB-denominated table row for {label!r} in docs/performance.md"
+        assert m, f"no MB-denominated table row for {label!r} in docs/performance/conversion.md"
         got_wall = float(m.group(1))
         got_rss = float(m.group(2).replace(" ", "").replace(",", "").replace(" ", ""))
 
@@ -2546,7 +2546,7 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
 
 
 def test_performance_doc_export_table_matches_the_tracked_json():
-    """`docs/performance.md`'s export_streaming table must equal the medians in
+    """`docs/performance/conversion.md`'s export_streaming table must equal the medians in
     the tracked raw JSON.
 
     The table pin above covers only the *conversion* rows. The export numbers
@@ -2566,7 +2566,7 @@ def test_performance_doc_export_table_matches_the_tracked_json():
     import statistics
 
     raw = PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "raw"
-    doc = (PROJECT_ROOT / "docs" / "performance.md").read_text()
+    doc = (PROJECT_ROOT / "docs" / "performance" / "conversion.md").read_text()
     fname = "export_streaming__scx_streaming_vs_materialize__census_1m.json"
     assert (raw / fname).is_file(), (
         f"{fname} is not tracked, so the export numbers citing it cannot be "
@@ -2593,7 +2593,7 @@ def test_performance_doc_export_table_matches_the_tracked_json():
         # as the digit separator.
         pat = re.escape(label) + r"\s*\|\s*\*{0,2}([\d][\d\s,\u202f]*)\s*MB"
         m = re.search(pat, doc)
-        assert m, f"no MB row labelled {label!r} in docs/performance.md"
+        assert m, f"no MB row labelled {label!r} in docs/performance/conversion.md"
         got = float(
             m.group(1).replace("\u202f", "").replace(" ", "").replace(",", "")
         )
@@ -2610,7 +2610,7 @@ def test_performance_doc_export_table_matches_the_tracked_json():
     # so a fresh checkout could not audit them. Both are force-added now, and
     # this is what keeps them honest — a table pin that covered only census
     # would have let the other two drift exactly as the export prose did.
-    # tabula only: `docs/performance.md` quotes its streaming_full figure in the
+    # tabula only: `docs/performance/conversion.md` quotes its streaming_full figure in the
     # export prose. pbmc3k's JSON is tracked too — the PR description and the
     # thresholds comment cite it — but the doc does not publish it, and pinning a
     # number the doc never states would fail on the doc's silence rather than on
@@ -2620,7 +2620,7 @@ def test_performance_doc_export_table_matches_the_tracked_json():
     for ds in ("tabula_sapiens_100k",):
         f = raw / f"export_streaming__scx_streaming_vs_materialize__{ds}.json"
         assert f.is_file(), (
-            f"{f.name} is not tracked, but docs/performance.md publishes its "
+            f"{f.name} is not tracked, but docs/performance/conversion.md publishes its "
             f"streaming_full figure — force-add it (docs/benchmark_manifest.md)"
         )
         dd = json.loads(f.read_text())
@@ -2634,7 +2634,7 @@ def test_performance_doc_export_table_matches_the_tracked_json():
         # Doc quotes these to the nearest MB, with a thin/ordinary space.
         rendered = f"{round(med):,}".replace(",", " ")
         assert rendered in doc or f"{round(med)}" in doc, (
-            f"{ds}: docs/performance.md does not quote the tracked median "
+            f"{ds}: docs/performance/conversion.md does not quote the tracked median "
             f"{med:.0f} MB for streaming_full_peak_rss_mb"
         )
 

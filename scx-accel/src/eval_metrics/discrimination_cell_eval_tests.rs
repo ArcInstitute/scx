@@ -1,7 +1,8 @@
 //! The three `discrimination_score` divergences from cell-eval (review §7.13),
 //! and the fixtures that make each one visible.
 //!
-//! `docs/scanpy.md` pins this metric at `exact (abs=0)` against cell-eval. It was
+//! `docs/scanpy/accel-perturbation-metrics.md` pins this metric at
+//! `exact (abs=0)` against cell-eval. It was
 //! not exact in three ways, and none of them was detectable by the existing
 //! parity fixture (`_make_cell_eval_adata`, 400×20 continuous random): it has no
 //! ties, no duplicated gene names and no zero-norm rows, so all three passed
@@ -129,7 +130,8 @@ fn total_ties_rank_by_index_matching_cell_eval() {
 /// languages, which the reference's is not.
 ///
 /// What *is* a bug, and is fixed alongside this test, is having claimed exact
-/// cell-eval parity on ties in `docs/scanpy.md`. Ties agree with the reference
+/// cell-eval parity on ties in `docs/scanpy/accel-perturbation-metrics.md`.
+/// Ties agree with the reference
 /// only when the tie is total.
 #[test]
 fn mixed_ties_pin_scx_stable_semantics_not_cell_eval_parity() {

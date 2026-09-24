@@ -44,8 +44,8 @@ noise*:
 Observed mean per-PC r is deliberately NOT quoted here any more. It was
 — pbmc_small 0.9992, cell_lines 0.9885, hlca_subset 0.9991 — and those
 are pre-M-step numbers on the same gitignored fixtures whose published
-form Phase 7e withdrew from `docs/api.md`, `docs/scanpy.md` and
-`docs/performance.md`. Restating them in a test module would make that
+form Phase 7e withdrew from `docs/api/python-accel.md`, `docs/scanpy/accel-integration.md`
+and `docs/performance/accel-qc-de-integration.md`. Restating them in a test module would make that
 withdrawal internally inconsistent. Run with the fixtures present to see
 the current values. (Cell-lines remains the worst case: smartseq2 has 47
 batches at only ~9.5k cells, amplifying init-seed sensitivity.)

@@ -6,7 +6,7 @@ Before this, `pyscx.from_anndata` on an AnnData with `n_obs == 0` (or
 and `pandas_to_record_batch` took the first batch. The format, the Rust writer
 and every reader already handled zero CSR shards (`scx subset` with a predicate
 matching nothing has always written a valid 0-row file); only the pyscx
-boundary refused. These tests pin the contract `docs/api.md` § `pyscx.from_anndata`
+boundary refused. These tests pin the contract `docs/api/conversion.md` § `pyscx.from_anndata`
 now states:
 
 - a 0-row file keeps `X`'s column count, the full obs / var schema (declared

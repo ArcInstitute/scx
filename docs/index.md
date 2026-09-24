@@ -40,7 +40,7 @@ and autodoc for the Python-side helpers and integrations.
 :::
 
 :::{grid-item-card} Performance & Operations
-:link: performance
+:link: performance/README
 :link-type: doc
 
 Benchmarks, operational semantics (append/delete/compact), and test infrastructure.
@@ -57,11 +57,37 @@ quickstart
 migrating-from-h5ad
 training
 tokenize
-scanpy
 pseudobulk_nb_glm
 gpu-setup
 cloud
 operations
+```
+
+```{toctree}
+:caption: Scanpy Guide
+:maxdepth: 2
+:hidden:
+
+scanpy/README
+scanpy/quickstart
+scanpy/choosing-an-approach
+scanpy/workflows
+scanpy/conversion
+scanpy/loading
+scanpy/backed-mode
+scanpy/lazy-preprocessing
+scanpy/external-annotations
+scanpy/file-operations
+scanpy/accelerators
+scanpy/accel-csc
+scanpy/accel-gpu
+scanpy/accel-embedding-clustering
+scanpy/accel-integration
+scanpy/accel-scoring-normalization
+scanpy/accel-differential-expression
+scanpy/accel-perturbation-metrics
+scanpy/threading
+scanpy/ml-training
 ```
 
 ```{toctree}
@@ -90,15 +116,58 @@ codec
 :maxdepth: 2
 :hidden:
 
-api
+api/README
+api/quickstart
+api/python
+api/python-functions
+api/python-experiment
+api/python-query
+api/python-accel
+api/python-datasets
+api/python-training
+api/conversion
+api/memory-budgets
+api/indexes
+api/section-types
+api/rust-format-io
+api/multimodal
+api/rust-ops
+api/rust-engine
+api/rust-loader-cloud
+api/rust-gpu
+api/cli
 python_api
 ```
 
 ```{toctree}
-:caption: Performance & Testing
+:caption: Performance
 :maxdepth: 2
 :hidden:
 
-performance
+performance/README
+performance/quickstart
+performance/storage-and-reads
+performance/conversion
+performance/memory
+performance/accel-cpu-pipeline
+performance/accel-pca-pseudobulk
+performance/accel-qc-de-integration
+performance/perturbation-metrics
+performance/gpu
+performance/loader
+performance/loader-index-plan
+performance/loader-cell-sets
+performance/loader-data-load
+performance/query-and-file-ops
+performance/doublet-interop
+performance/comprehensive-and-cloud
+performance/vs-shardad
+```
+
+```{toctree}
+:caption: Testing
+:maxdepth: 2
+:hidden:
+
 testing
 ```

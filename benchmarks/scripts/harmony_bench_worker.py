@@ -239,7 +239,7 @@ def main() -> int:
     # harmony runner begins. This gives a clean baseline so the eventual
     # `peak_rss_mb` can be split into the input-load floor (PCA cache,
     # interpreter, scanpy/anndata imports) and the harmony-only delta.
-    # `docs/performance.md` quotes `harmony_delta_rss_mb` rather than the
+    # `docs/performance/accel-qc-de-integration.md` quotes `harmony_delta_rss_mb` rather than the
     # raw peak — the prior driver measured peak only, which conflated
     # PCA-load overhead (~N·d·4 bytes) with the algorithm's real footprint.
     #

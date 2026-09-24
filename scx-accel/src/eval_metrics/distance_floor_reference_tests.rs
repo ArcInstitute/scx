@@ -122,7 +122,8 @@ fn the_blocked_pairwise_kernel_matches_scipy_on_large_norm_f32() {
     );
 }
 
-/// `docs/scanpy.md`'s claim, tested as it is written: **f32 + gemm** against
+/// `docs/scanpy/accel-perturbation-metrics.md`'s claim, tested as it is
+/// written: **f32 + gemm** against
 /// **f64 + scalar**, on input large-norm enough to break it.
 ///
 /// The floor is keyed to the accumulator's precision, so the scalar f64 arm

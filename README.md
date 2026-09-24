@@ -127,7 +127,7 @@ hvg_adata = pyscx.open("atlas.scx").to_anndata(var_names=hvg_genes, obsp=[])
 ```
 
 Layers, deletion vectors, and `anndata.abc.CSRDataset` registration all work
-transparently. See [`docs/scanpy.md`](docs/scanpy.md#backed-mode-lazy-loading)
+transparently. See [`docs/scanpy/backed-mode.md`](docs/scanpy/backed-mode.md#backed-mode-lazy-loading)
 for details.
 
 ### Your training loop is bottlenecked on data loading
@@ -181,7 +181,7 @@ cropped = tok.top_k(batch["X"], k=1024, pad_token_id=0)
 
 #### Cell-set and spatial microenvironment gathering
 
-For cell-set transformers and spatial graph neural networks, [`pyscx.SparseCellSetDataset`](docs/api.md#sparsecellsetdataset)
+For cell-set transformers and spatial graph neural networks, [`pyscx.SparseCellSetDataset`](docs/api/python-training.md#sparsecellsetdataset)
 uses a **multi-set batch executor** that pre-allocates exact CSR batches, caches recurrent
 control groups, and parallelizes row-level transformations across Rayon threads — yielding
 a **7.76× throughput gain** and slashing heap allocations from 2,698 to **81 per batch**:
@@ -202,11 +202,11 @@ shard prefetch lookahead. Plan-driven access is intentionally random — at
 1M cells it reaches **20K cells/s** (3.7× slower than the sequential
 `TrainingDataset` ceiling) but is **106× faster** than the cell-load-scx
 `ScxBackedSparseDataset` Python-loop baseline. See
-[`docs/api.md` § IndexPlanDataset](docs/api.md#indexplandataset).
+[`docs/api/python-training.md` § IndexPlanDataset](docs/api/python-training.md#indexplandataset).
 
 Fork-safe under `DataLoader(num_workers > 0)` when the dataset is
 constructed lazily inside the worker's `__iter__` — see
-[`docs/api.md` § Fork safety under PyTorch DataLoader](docs/api.md#fork-safety-under-pytorch-dataloadernum_workers--0)
+[`docs/api/python-training.md` § Fork safety under PyTorch DataLoader](docs/api/python-training.md#fork-safety-under-pytorch-dataloadernum_workers--0)
 for the recommended `IterableDataset` wrapper, do/don't list, and the
 rayon-pool gotcha (the durable regression lives in
 `pyscx/tests/test_fork_safety.py`).
@@ -408,8 +408,8 @@ score = pyscx.accel.clustering_agreement(adata_real, adata_pred, metric="ami")
 ² 20K column is the canonical measurement (captured 2026-04-27 with the Phase 1+2 `(backend, dtype)` matrix). 100K–1M columns are pre-Phase-1 historical baselines.
 ³ Speedup grows with `n_perts` × embedding-dim; at 200 perts × 300 genes the ratio is 12.8×.
 
-See [`docs/scanpy.md`](docs/scanpy.md#perturbation-evaluation-metrics-cell-eval-parity)
-for the full API and [`docs/performance.md`](docs/performance.md#perturbation-metrics-cell-eval-parity)
+See [`docs/scanpy/accel-perturbation-metrics.md`](docs/scanpy/accel-perturbation-metrics.md#perturbation-evaluation-metrics-cell-eval-parity)
+for the full API and [`docs/performance/perturbation-metrics.md`](docs/performance/perturbation-metrics.md#perturbation-metrics-cell-eval-parity)
 for the benchmark methodology.
 
 ### No more file locking headaches
@@ -854,7 +854,7 @@ Headline numbers at Census 1M (CELLxGENE Census, 1M cells):
 | Selective query (55% shard skip) | **4.2 ms** | — | — |
 | Append 10K cells | **1 ms** | — | — |
 
-Full benchmark suite in [`docs/performance.md`](docs/performance.md): compression and read/write/conversion timings across h5ad / Zarr / TileDB-SOMA / SLAF, parallel read and write scaling, column projection, memory (peak RSS and out-of-core), CPU analysis accelerators (PCA / DE / Leiden), Harmony2 + LISI scaling, perturbation metrics (cell-eval parity), GPU codec and pipeline breakdowns, training loader across datasets, query engine, and file operations. Every number is backed by a manifest entry in `benchmarks/comprehensive/results/` — see [`docs/benchmark_manifest.md`](docs/benchmark_manifest.md) for the schema and verification workflow.
+Full benchmark suite in [`docs/performance/`](docs/performance/README.md): compression and read/write/conversion timings across h5ad / Zarr / TileDB-SOMA / SLAF, parallel read and write scaling, column projection, memory (peak RSS and out-of-core), CPU analysis accelerators (PCA / DE / Leiden), Harmony2 + LISI scaling, perturbation metrics (cell-eval parity), GPU codec and pipeline breakdowns, training loader across datasets, query engine, and file operations. Every number is backed by a manifest entry in `benchmarks/comprehensive/results/` — see [`docs/benchmark_manifest.md`](docs/benchmark_manifest.md) for the schema and verification workflow.
 
 ## Architecture
 
@@ -879,7 +879,7 @@ SCX is a Rust workspace with 16 crates:
 | `rscx` | R bindings (extendr) |
 | `scx-integration-tests` | Cross-crate integration tests: golden files, conformance vectors, lifecycle |
 
-For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/format.md`](docs/format.md), [`docs/codec.md`](docs/codec.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/cloud.md`](docs/cloud.md), and [`docs/scanpy.md`](docs/scanpy.md). For agent-oriented install and usage workflows in Claude Code, see [`skills/scx-usage/SKILL.md`](skills/scx-usage/SKILL.md).
+For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/format.md`](docs/format.md), [`docs/codec.md`](docs/codec.md), [`docs/api/`](docs/api/README.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/cloud.md`](docs/cloud.md), and [`docs/scanpy/README.md`](docs/scanpy/README.md). For agent-oriented install and usage workflows in Claude Code, see [`skills/scx-usage/SKILL.md`](skills/scx-usage/SKILL.md).
 
 ## License
 

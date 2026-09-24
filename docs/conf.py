@@ -64,7 +64,17 @@ source_suffix = {
 }
 
 master_doc = "index"
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+# `scanpy.md`, `api.md` and `performance.md` are redirect stubs for GitHub
+# readers of the old single-page docs; the site builds the split pages under
+# `scanpy/`, `api/` and `performance/` instead (see the toctrees in index.md).
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "scanpy.md",
+    "api.md",
+    "performance.md",
+]
 
 # -- MyST (markdown) ---------------------------------------------------------
 
@@ -76,7 +86,9 @@ myst_enable_extensions = [
     "linkify",
     "smartquotes",
 ]
-myst_heading_anchors = 4
+# 5, not 4: docs/scanpy/loading.md links its H5 "Filter Expression
+# Compatibility" section from several pages.
+myst_heading_anchors = 5
 
 # -- Autodoc / autosummary ---------------------------------------------------
 
@@ -153,7 +165,7 @@ html_theme_options = {
 }
 
 # suppress_warnings is intentionally unset. A small number of cross-repo
-# links (e.g. `../benchmarks/README.md` in performance.md) reliably emit
+# links (e.g. `../../benchmarks/README.md` in performance/*.md) reliably emit
 # `myst.xref_missing` at build time — those are known and harmless (the
 # build still succeeds; `fail_on_warning: false` in .readthedocs.yaml).
 # Leaving the warning live so a newly-introduced broken xref shows up

@@ -11,7 +11,7 @@ Zero Python on the hot path — your GPU stays fed.
 | vs SCX | — | 86× slower | 82× slower | 319× slower |
 
 > _batch_size=1024, HVG=2000, normalize+log1p. See
-> [performance.md](performance.md#training-loader) for the full suite._
+> [performance/loader.md](performance/loader.md#training-loader) for the full suite._
 
 Three dataset types cover different ML patterns:
 
@@ -221,12 +221,12 @@ Two things to know:
   `max_memory_mb`.
 - **On `SparseCellSetDataset` this is load-bearing by default.** The class
   defaults `scatter_block_index=False` (and no route wins everywhere — the two
-  cross near 1M cells, see [Cell-set scatter routes](performance.md#cell-set-scatter-routes-re-measured-after-the-row-group-lru-phase-0-gate)),
+  cross near 1M cells, see [Cell-set scatter routes](performance/loader-index-plan.md#cell-set-scatter-routes-re-measured-after-the-row-group-lru-phase-0-gate)),
   so a scattered gather decodes whole
   shards into the LRU and serves reuse from cache — sizing it correctly is worth
   **2,486×** and halves peak RSS (cold capture; an earlier warm probe of the same
   comparison gave 269× — see
-  [performance.md § Shard-cache sizing](performance.md#shard-cache-sizing-on-the-gather-path-data-load-phase-1-1a)).
+  [performance/loader-data-load.md § Shard-cache sizing](performance/loader-data-load.md#shard-cache-sizing-on-the-gather-path-data-load-phase-1-1a)).
   Pass `scatter_block_index=True` and the picture changes: on a framed (v4) file
   the gather then routes through the row-group block-index path, which decodes
   only the touched row-groups and never inserts a whole shard, so
@@ -264,7 +264,7 @@ loaders *size themselves to*, not a hard cap on process RSS.
 > range-read request. Grouped sharding reduces ~120 round-trips per
 > perturbation to 1–2 — a significant latency win on high-latency backends.
 
-See [api.md § Grouped reads](api.md#grouped-reads-conditionlabel-grouped-sharding) and
+See [api/rust-engine.md § Grouped reads](api/rust-engine.md#grouped-reads-conditionlabel-grouped-sharding) and
 [sharding.md § Grouped sharding](sharding.md#conditionlabel-grouped-sharding-f1--grouped-reads-f2)
 for the full API reference and on-disk layout details.
 
@@ -466,7 +466,7 @@ for batch in ds.iter_with_plans(plan_generator(perturbed, controls, 1024)):
 ```
 
 `IndexPlanDataset` is **106× faster** than Python-loop `ScxBackedSparseDataset`
-access (20K vs 189 cells/s). See [api.md § IndexPlanDataset](api.md#indexplandataset)
+access (20K vs 189 cells/s). See [api/python-training.md § IndexPlanDataset](api/python-training.md#indexplandataset)
 for the full constructor reference, batch schema, and iterator semantics.
 
 ### Feedback and curriculum plan generators
@@ -1368,7 +1368,7 @@ corr = accel.energy_distance(adata_real, adata_pred)
 score = accel.clustering_agreement(adata_real, adata_pred, metric="ami")
 ```
 
-See [scanpy.md § Perturbation evaluation metrics](scanpy.md#perturbation-evaluation-metrics-cell-eval-parity)
+See [scanpy/accel-perturbation-metrics.md § Perturbation evaluation metrics](scanpy/accel-perturbation-metrics.md#perturbation-evaluation-metrics-cell-eval-parity)
 for the full API.
 
 

@@ -418,7 +418,7 @@ Write to `$SCX_USER_DIR/SCX-USER-REPORT-$(date -u +%F).md`. Date is UTC. The rep
 
 ## Documentation gaps
 ### D1 — <one-line title>
-- **Where:** `docs/api.md` / `docs/scanpy.md` / docstring of `<fn>`
+- **Where:** `docs/api/*.md` / `docs/scanpy/*.md` / docstring of `<fn>`
 - **What was missing:** <what you searched for and couldn't find>
 - **Suggested addition:** <one sentence or paragraph>
 
@@ -432,7 +432,7 @@ Write to `$SCX_USER_DIR/SCX-USER-REPORT-$(date -u +%F).md`. Date is UTC. The rep
 - *Friction:* `F1 — pyscx.from_h5ad kwarg index_obs=[...] doesn't match scanpy's obs_names vocabulary`. Surface: pyscx. What hurt: had to grep the source to find the right kwarg name. Suggested change: accept `obs_index` as an alias, or rename.
 - *Perf:* `P1 — pyscx.from_h5ad on census_500k with --reader-threads 16 used only ~6 threads`. Dataset: census_500k.h5ad. Measured: 6.2 min wall, MaxRSS 71 GB, mean CPU util 22%. Expected: ~16-thread saturation. Suggested follow-up: confirm whether `ConvertWarning::Hdf5NotThreadsafe` fired (it didn't).
 - *Error:* `E1 — "shard mismatch" with no shard index`. Trigger: `scx pull census_500k.scx --filter "cell_type == 'B cell'"`. Message: literally `Error: shard mismatch`. What was missing: which shard, which file, what mismatched. Suggested: `shard 17 of <path>: catalog nnz=N1 disagrees with on-disk nnz=N2; rerun with --verify`.
-- *Docs gap:* `D1 — docs/scanpy.md doesn't say which accel ops have GPU implementations`. Where: `docs/scanpy.md § Rust-native accelerators`. What was missing: a table mapping op → CPU? → GPU? → fallback behaviour. Suggested: 6-row table covering normalize_total, log1p, HVG, PCA, neighbors, leiden, umap.
+- *Docs gap:* `D1 — docs/scanpy/accelerators.md doesn't say which accel ops have GPU implementations`. Where: `docs/scanpy/accelerators.md § Rust-native accelerators`. What was missing: a table mapping op → CPU? → GPU? → fallback behaviour. Suggested: 6-row table covering normalize_total, log1p, HVG, PCA, neighbors, leiden, umap.
 
 ## Guardrails — what NOT to do
 
@@ -451,8 +451,9 @@ Write to `$SCX_USER_DIR/SCX-USER-REPORT-$(date -u +%F).md`. Date is UTC. The rep
 
 Tracked docs only — never link to scratch / gitignored markdown.
 
-- API reference (open, query, from_h5ad, to_h5ad, accel): `docs/api.md`.
-- Scanpy parity / accelerators: `docs/scanpy.md`.
+- SCX usage guide (conversion, backed/lazy processing, accelerators, ML loading): `skills/scx-usage/SKILL.md`.
+- API reference (open, query, from_h5ad, to_h5ad, accel): `docs/api/` (index: `docs/api/README.md`).
+- Scanpy parity / accelerators: `docs/scanpy/` (index: `docs/scanpy/README.md`).
 - Format internals (rarely needed in this role): `docs/format.md`, `docs/codec.md`.
 - GPU setup: `docs/gpu-setup.md`.
 - Multimodal (CITE-seq / Multiome / TEA-seq): `docs/multimodal.md`.

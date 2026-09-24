@@ -2,7 +2,7 @@
 //
 // The pipeline is lazy: it stores configuration but performs no I/O
 // until `.collect()` is called. Schema errors are raised immediately
-// at construction time (docs/api.md (Query engine, lazy evaluation)).
+// at construction time (docs/api/rust-engine.md (Query engine, lazy evaluation)).
 
 use std::path::Path;
 

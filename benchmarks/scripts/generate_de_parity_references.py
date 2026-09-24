@@ -257,7 +257,7 @@ def pydeseq2_reference() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray
 
 
 def measure_python_side_bars() -> None:
-    """Print the Python-side max |Δ| figures `docs/scanpy.md` quotes.
+    """Print the Python-side max |Δ| figures `docs/scanpy/accel-differential-expression.md` quotes.
 
     The Rust tables above are the reference *values*; these are the *bars* the
     pytest suite compares at. They lived only in a session transcript until
@@ -279,8 +279,9 @@ def measure_python_side_bars() -> None:
 
         import pyscx  # noqa: F401
     except ImportError as e:
-        # LOUD, and non-zero. `docs/scanpy.md` says this script "fails if any
-        # field there exceeds the same bar" -- a silent `return` made that true
+        # LOUD, and non-zero. `docs/scanpy/accel-differential-expression.md` says
+        # this script "fails if any field there exceeds the same bar" -- a
+        # silent `return` made that true
         # only when the imports happened to succeed, so running it in a bare env
         # printed the reference tables, skipped the check, and exited 0. Found in
         # round-2 review. `SCX_SKIP_PYTHON_BARS=1` is the deliberate opt-out for

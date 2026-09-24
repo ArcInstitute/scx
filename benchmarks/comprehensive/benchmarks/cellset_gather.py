@@ -7,7 +7,7 @@ gather of small covariate-grouped **cell sets**: 64–512 cells grouped by
 a per-set gene-panel subsample. This benchmark measures exactly that, distinct
 from the ``ml_loader``/``ooc_loader`` batch rate, by driving
 ``pyscx.SparseCellSetDataset.iter_with_plans`` with fixed-size cell sets. Results
-and the premise-gate verdict live in ``docs/performance.md`` § "Out-of-core loader
+and the premise-gate verdict live in ``docs/performance/loader.md`` § "Out-of-core loader
 — cold-cache measurements and the P-1 premise gate".
 
 SCX-only (``format_variant.key`` in the SCX codec set) — returns ``None`` for

@@ -335,7 +335,7 @@ def test_modify_metadata_obs_numeric_categorical(target):
 
 
 def test_filtered_collect_carries_only_the_surviving_categories(target):
-    """`docs/api.md` § Filtered-obs categorical semantics: a `collect()` result's
+    """`docs/api/rust-engine.md` § Filtered-obs categorical semantics: a `collect()` result's
     categoricals carry only the categories present in the surviving rows
     (pandas' `remove_unused_categories`-on-subset rule), while `read_obs()` on
     the same file keeps the full declared list. Before this PR the prune on

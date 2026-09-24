@@ -15,7 +15,8 @@ a squared distance. The dot product is accumulated in the input's precision —
 f32 on the documented-default `dtype="f32"` path — at the scale of the *norms*,
 so for large-norm rows the difference is noise long before `d²` is small in
 absolute terms, and the `.max(0.0)` clamp then makes the bias one-sided.
-`docs/scanpy.md` claims "f32 + gemm matches f64 + scalar within these bounds";
+`docs/scanpy/accel-perturbation-metrics.md` claims "f32 + gemm matches f64 +
+scalar within these bounds";
 ORG-7.21-5 listed a large-norm f32 fixture as the missing evidence.
 
 ## The construction is the reference for the planted pairs

@@ -307,7 +307,7 @@ stamps its *own*, more specific transfer mode on the `to_gpu_anndata` op key —
 `scx_device_decode_gpu` for a fully-in-VRAM Scx1 sidecar decode (incl. dense
 ≥128-nnz rows via the BitPacker4x kernel), or `scx_device_handoff_streamed`
 when a non-Scx1 / sidecar-less shard host-bounces; see
-[scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).)
+[scanpy/accel-gpu.md § Data layout for fast GPU decode](scanpy/accel-gpu.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).)
 
 **`X` residency contract.** When the op uploads a host `X` (`anndata_to_gpu`),
 the result slots (`obsm`/`obsp`) **and** `X` are brought back to host afterwards
@@ -323,7 +323,7 @@ dominated by per-shard decode, which is set by the on-disk codec. Prefer storing
 raw integer counts (Scx1 codec, decode-sidecar-accelerated) and deriving
 `normalize_total` / `log1p` in VRAM, rather than persisting a log-normalized
 float `X` (Pcodec → host decode, no sidecar). See
-[scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).
+[scanpy/accel-gpu.md § Data layout for fast GPU decode](scanpy/accel-gpu.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).
 
 These stay **native** (SCX wins or is structurally unique): `seurat_v3` /
 `seurat_v3_paper` HVG, Leiden, CSC-direct / pdex DE, Harmony, NB-GLM pseudobulk
@@ -585,7 +585,7 @@ except RuntimeError as e:
 
 Because a failed op raises, it also leaves **no** `uns["scx_accel"]` entry — the
 stamp is rolled back rather than rewritten to claim a CPU run that never
-happened. See [api.md § Accelerator route metadata](api.md#accelerator-route-metadata).
+happened. See [api/python-accel.md § Accelerator route metadata](api/python-accel.md#accelerator-route-metadata).
 
 The one place a runtime failure is *survived* rather than raised is
 `Experiment.to_gpu_anndata`, and it is not a GPU→CPU fallback: when the in-VRAM

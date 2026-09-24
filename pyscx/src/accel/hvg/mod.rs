@@ -76,7 +76,7 @@ impl scx_format_io::ShardSource for InMemoryCsrSource<'_> {
 /// serves a filtered handle's CSC reads perfectly well, and an explicit
 /// `prefer_format="csc"` still gets them. But HVG is the one CSC consumer
 /// whose column-major walk is *slower* than the row-major sweep it replaces
-/// (see the `highly_variable_genes` row in `docs/api.md`), so this auto-route
+/// (see the `highly_variable_genes` row in `docs/api/python-accel.md`), so this auto-route
 /// exists only for the case where the sidecar is otherwise free. A row filter
 /// adds a compaction pass over every column shard on top of a walk that was
 /// already losing, and nobody asked for CSC: `filter_cells` →

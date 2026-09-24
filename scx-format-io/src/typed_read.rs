@@ -115,7 +115,7 @@ impl ScxReader {
     /// `plan.index_dtype` narrows the returned [`TypedCsr`]'s index buffer, but is
     /// effectively a **no-op for a Python CSR** consumer whose matrix fits in
     /// int32: scipy resolves the width from `max(nnz, n_rows)` and canonicalizes
-    /// in both directions on `csr_matrix` construction (see `docs/api.md`).
+    /// in both directions on `csr_matrix` construction (see `docs/api/python-experiment.md`).
     pub fn read_all_csr_shards_for_typed(
         &self,
         modality_id: u8,

@@ -1,7 +1,7 @@
 """Every in-repo markdown anchor link must resolve to a real heading (dogfood D1).
 
 `docs/operations.md#external-obs-import` was referenced from four places —
-`docs/api.md` twice, `docs/scanpy.md`, and `AGENTS.md` — and the section did not
+`docs/api.md` twice (now `docs/api/python-functions.md` and `docs/api/cli.md`), `docs/scanpy.md` (now `docs/scanpy/external-annotations.md`), and `AGENTS.md` — and the section did not
 exist. Those links are what tell a user where the import's invariants are
 documented, so four dead anchors meant the one place someone would look had
 nothing in it, and nothing detected that.
@@ -79,9 +79,9 @@ _WALK_INCLUDE_PREFIXES: tuple[str, ...] = (
 )
 
 # Repo-root markdown that IS tracked. Everything else at the root is scratch by
-# convention — dated reports (`2026-08-03_DOGFOOD.md`), all-caps working docs, and
+# convention — dated reports, all-caps working docs, and
 # `CLAUDE.local.md` (gitignored, and neither dated nor all-caps).
-_TRACKED_ROOT_DOCS = frozenset({"README.md", "ROADMAP.md", "AGENTS.md", "CLAUDE.md"})
+_TRACKED_ROOT_DOCS = frozenset({"README.md", "AGENTS.md", "CLAUDE.md"})
 
 # Never walk into these, whatever the prefix rule says.
 _WALK_SKIP_PARTS = frozenset(
@@ -202,13 +202,15 @@ def test_the_d1_anchor_specifically_resolves():
     anchors = _anchors(root / "docs" / "operations.md")
     assert "external-obs-import" in anchors, (
         "docs/operations.md must carry an `## External obs import` section — "
-        f"docs/api.md, docs/scanpy.md and AGENTS.md all link to it. Found: "
+        f"docs/api/python-functions.md, docs/api/cli.md, docs/scanpy/external-annotations.md "
+        f"and AGENTS.md all link to it. Found: "
         f"{sorted(a for a in anchors if 'import' in a)}"
     )
 
     referrers = [
-        Path("docs/api.md"),
-        Path("docs/scanpy.md"),
+        Path("docs/api/python-functions.md"),
+        Path("docs/api/cli.md"),
+        Path("docs/scanpy/external-annotations.md"),
         Path("AGENTS.md"),
     ]
     for rel in referrers:

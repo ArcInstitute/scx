@@ -179,7 +179,7 @@ def _sized_budget(scx_path: str) -> tuple[int | None, int | None, str]:
     the loader's adaptive budget resolves to ~4.16 GB, affording ~23 shards. A
     1 024-row random plan touches nearly every shard every batch, so the
     full-shard arm ran at **0.14 cellsets/s** at a 0.215 hit rate and 12.5 GB
-    RSS — 95 minutes per timed run. `docs/performance.md`'s data-load 1A
+    RSS — 95 minutes per timed run. `docs/performance/loader-data-load.md`'s data-load 1A
     capture is the same pathology (census_500k, `cache_shards` 16 -> 31: 0.2 ->
     546 cellsets/s).
 
@@ -233,7 +233,7 @@ def _plan_factory(kind: str, scx_path: str, n_obs: int):
     `random` draws each row independently over the whole corpus, which is the
     worst case for row-group retention: the plan's groups are spread over
     every shard. `grouped` draws each set from one covariate group, which is
-    what real models issue (`docs/performance.md`: "Real models issue grouped
+    what real models issue (`docs/performance/loader.md`: "Real models issue grouped
     sets, not uniform-random ones") and which clusters a set's cells into few
     shards. Measured at the shipped default, the difference decides whether
     the row-group LRU admits the plan at all: on census_1m a random plan
@@ -529,7 +529,7 @@ def main() -> int:
         )
 
     # Schema-v2 `BenchmarkResult`s at the canonical raw path/name, per
-    # `docs/benchmark_manifest.md`: every `docs/performance.md` claim that can be
+    # `docs/benchmark_manifest.md`: every `docs/performance/` claim that can be
     # a benchmark/format/dataset triple must be backed by one. `results/raw/` is
     # gitignored, so these are force-added — four tracked files already sit there
     # for exactly this reason.

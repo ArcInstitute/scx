@@ -6,7 +6,7 @@ model: each scans obs up front to build global vocab / one-hot maps. STATE3
 hand-rolled a `_H5adFastBacked` reader specifically to dodge ``anndata``'s eager
 obs load (60–80 s + tens of GB per file), and its manifests reach **26,453 files**,
 so per-file open cost is multiplied by files × workers × ranks. This microbench
-measures it directly. Results are in ``docs/performance.md`` § "Out-of-core
+measures it directly. Results are in ``docs/performance/loader.md`` § "Out-of-core
 loader — cold-cache measurements and the P-1 premise gate".
 
 **The measured split: obs reading is 96–99.8% of per-file cost at every scale**
@@ -20,7 +20,7 @@ numpy ``(codes, categories)`` accessor is aimed at the right term.
 per-file cost is open + catalog parse rather than obs reading"). That figure
 came from a warm interactive smoke of these same scenarios, where the first
 ``pyscx.open`` absorbed interpreter and pyo3 init plus page first-touch that
-``posix_fadvise`` does not evict. It was retracted in ``docs/performance.md``,
+``posix_fadvise`` does not evict. It was retracted in ``docs/performance/loader.md``,
 but survived here and kept the withdrawn work item alive — a small-fixture
 interactive smoke is not a measurement, and a cost *ratio* between a
 first-touch-contaminated term and a steady-state term can invert outright.

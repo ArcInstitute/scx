@@ -488,7 +488,7 @@ column count lives in the header, `obs` is a single 0-row section, and
 anything recorded only by its shards (layers, `raw`) is absent. Every reader
 treats zero shards as an empty `(0, n_vars)` matrix; `pyscx.from_anndata`
 writes such a file from an empty AnnData, with the policy in
-[api.md § Zero rows and zero columns](api.md#zero-rows-and-zero-columns).
+[api/conversion.md § Zero rows and zero columns](api/conversion.md#zero-rows-and-zero-columns).
 
 Readers must nonetheless accept an empty block index when the header agrees the
 shard is empty — `n_major == 0 && nnz == 0` resolves to zero spans, i.e. an

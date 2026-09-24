@@ -412,11 +412,11 @@ pub fn doublet_tools() -> Vec<String> {
 
 /// Every `tool=` profile's column vocabulary, straight from the definitions.
 ///
-/// Exists so the per-tool table in `docs/scanpy.md` is machine-checkable rather
-/// than hand-maintained, and so a user surprised by an import can look up what
-/// their `--tool` actually expects from a REPL instead of reading Rust. That
-/// lookup being unavailable is what made a call-column name mismatch a
-/// silent score-only import.
+/// Exists so the per-tool table in `docs/scanpy/external-annotations.md` is
+/// machine-checkable rather than hand-maintained, and so a user surprised by
+/// an import can look up what their `--tool` actually expects from a REPL
+/// instead of reading Rust. That lookup being unavailable is what made a
+/// call-column name mismatch a silent score-only import.
 #[pyfunction]
 pub fn doublet_profiles(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let out = PyDict::new(py);
