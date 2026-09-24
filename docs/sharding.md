@@ -1105,7 +1105,9 @@ resident CSR instead: 3.8 → 8.5 s at tabula_sapiens_100k and 15.5 → 39 s at
 census_500k, where pyscx 0.18.0 took 207 s for the same sidecar. The sidecar is
 worth it for the column-major workloads in the table above — at census_1m the
 laptop-test pipeline's Wilcoxon DE went from 2,091 s on `cpu_csr` to 209 s on
-`cpu_csc` — and is dead weight for a file that is only ever read by rows (a
+`cpu_csc`, and to 88 s on the exact-nnz kernel `cpu_csc_nnz` that is now the
+default ([the laptop test](performance.md#the-laptop-test-a-full-pipeline-under-a-fixed-ceiling))
+— and is dead weight for a file that is only ever read by rows (a
 training loader, `to_anndata()` of a row window), which is what `--csc off` is
 for.
 
