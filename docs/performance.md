@@ -425,15 +425,16 @@ path never makes resident and would break the very arm under test.
 
 | Dataset | pyscx @ 16 GB | pyscx @ 32 GB | scanpy @ 16 GB | scanpy @ 32 GB |
 |---|---|---|---|---|
-| pbmc10k (11.5K) | 61.2 s / 1,083 MB | 61.5 s / 1,083 MB | 51.6 s / 1,336 MB | 53.1 s / 1,339 MB |
-| tabula_sapiens_100k | 266.8 s / 4,259 MB | 267.1 s / 4,177 MB | 289.8 s / 5,006 MB | 249.6 s / 5,007 MB |
-| census_500k | **1,494 s / 6,336 MB** | 1,506 s / 6,425 MB | **OOM** (`filter`) | 2,574 s / 17,825 MB |
-| census_1m | **3,186 s / 8,819 MB** | 3,373 s / 8,898 MB | **OOM** (`qc_metrics`) | **OOM** (`filter`) |
+| pbmc10k (11.5K) | 66.2 s / 1,081 MB | 66.6 s / 1,083 MB | 57.0 s / 1,343 MB | 58.0 s / 1,347 MB |
+| tabula_sapiens_100k | **112.6 s / 2,587 MB** | 112.1 s / 2,548 MB | 272.7 s / 5,007 MB | 246.6 s / 5,005 MB |
+| census_500k | **548.3 s / 3,496 MB** | 559.3 s / 3,448 MB | **OOM** (`filter`) | 2,547 s / 17,828 MB |
+| census_1m | **1,227 s / 4,332 MB** | 1,278 s / 4,288 MB | **OOM** (`qc_metrics`) | **OOM** (`filter`) |
 
-SCX completes a 1M-cell pipeline inside a **16 GB** ceiling at 8.6 GB peak.
-scanpy needs more than 16 GB at 500K cells and more than 32 GB at 1M. Where
-both finish — census_500k, scanpy given 32 GB — SCX is **1.72× faster on
-2.8× less resident memory**.
+SCX completes a 1M-cell pipeline inside a **16 GB** ceiling at 4.2 GB peak,
+in 20 minutes. scanpy needs more than 16 GB at 500K cells and more than
+32 GB at 1M. Where both finish at 100K and above, SCX is faster *and*
+lighter: **4.6× faster on 5.1× less resident memory** at census_500k (scanpy given 32 GB), and **2.2× faster
+on 1.9× less resident memory** at tabula_sapiens_100k.
 
 An OOM here is a recorded result, not a missing one: the worker prints one
 JSON line per completed stage and raises its own `oom_score_adj` so the
@@ -442,29 +443,47 @@ kernel takes the child rather than the parent, which then writes
 A cell that merely vanished would be skipped by the regression gate in
 silence and read as coverage.
 
-**Where the time goes, and where SCX loses.** At census_1m the aggregate is
-dominated by one stage:
+**Where the time goes.** At census_1m the aggregate is now dominated by the
+graph stages:
 
 | Stage | pyscx @ 16 GB, census_1m | share |
 |---|---:|---:|
-| `rank_genes_groups` (Wilcoxon) | 2,022 s | 63 % |
-| `umap_leiden` | 642 s | 20 % |
-| `neighbors` | 314 s | 10 % |
-| `pca` | 48 s | 1.5 % |
-| `normalize_log1p` | 39 s | 1.2 % |
-| `hvg` (seurat_v3) | 36 s | 1.1 % |
-| everything else (load, QC, filter) | 30 s | 1.0 % |
+| `umap_leiden` | 609 s | 50 % |
+| `neighbors` | 364 s | 30 % |
+| `rank_genes_groups` (Wilcoxon) | 88 s | 7 % |
+| `pca` | 54 s | 4 % |
+| `normalize_log1p` | 43 s | 3 % |
+| `hvg` (seurat_v3) | 40 s | 3 % |
+| everything else (load, QC, filter) | 32 s | 3 % |
 
-DE is not where SCX is strong. On pbmc10k, where both engines complete,
-SCX's `rank_genes_groups` takes **45.5 s against scanpy's 6.5 s — a 7×
-loss** — while its `neighbors` takes **1.5 s against scanpy's 26.3 s, a 17×
-win**. The two roughly cancel at that size (61 s vs 52 s, SCX behind); at
-100K they cancel the other way (267 s vs 290 s). What actually changes the
-outcome at census scale is not speed but whether the run finishes at all.
+DE used to be 63 % of this pipeline (2,022 s of 3,186 s on pyscx 0.18.0).
+It is 88 s now because the DE stage takes the column-major route, recorded
+as `route="cpu_csc_nnz"`: the census fixtures carry a CSC sidecar (the
+ingest default is `csc="auto"`), the route survives the pipeline's row
+filter, gene filter and `normalize_total → log1p` chain, and the Wilcoxon
+kernel ranks only each gene's nonzeros. The same stage at census_500k fell
+from 992 s to 54 s, and at tabula_sapiens_100k from 179 s to 19 s — where
+scanpy's own DE takes 128–153 s.
+
+**Where SCX still loses: a file without a sidecar.** pbmc10k is below the
+`auto` rule's 50,000-cell threshold, so it has no sidecar and its DE runs
+the row-major path, which re-decodes every shard per gene chunk under the
+default 4-shard cache: **49.2 s against scanpy's 7.8 s, a 6× loss**. Its
+`neighbors` takes **1.7 s against scanpy's 29 s, a 17× win**, and the two
+roughly cancel (66 s vs 57 s, SCX behind). `scx build-csc` on the file, or
+`csc="always"` at conversion, moves it onto the fast route.
+
+`neighbors` is also the stage that varies most between nodes: at
+census_500k the same build measured 64 s and 124 s on two different nodes,
+which is why the `total_wall_s` floors carry 1.5× headroom and the DE stage
+has floors of its own.
 
 Source: `benchmarks/comprehensive/results/raw/pipeline_ooc_constrained__pipeline_ooc_constrained__{pyscx,scanpy}_{16g,32g}__{pbmc10k,tabula_sapiens_100k,census_500k,census_1m}.json`,
-capture `candidate_community_20260920` (`--tier full`, pyscx 0.18.0 release,
-median of 3 runs at census scale).
+capture `candidate_community_csc_20260923` (pyscx 0.19.0 release at
+`819bfd72` / `9b84561e`, which differ only in documentation; one cell at a
+time on one partition, median of 3 runs at 100K cells and above, 5 below).
+The three scanpy OOM cells are from `candidate_community_20260920`
+(pyscx 0.18.0), unchanged because nothing in them depends on pyscx.
 
 > [!NOTE]
 > **Manifest entries** for all four community benchmarks are the 70
@@ -475,18 +494,24 @@ median of 3 runs at census scale).
 > file per `(benchmark, arm, dataset)` cell, because a `BenchmarkResult`
 > pooling a 23 s backed arm with a 52 s scanpy one yields a `median_wall_s`
 > describing neither. They are **force-added** (`results/raw/` is
-> gitignored), and the promoted snapshot
+> gitignored). The promoted snapshot
 > `results/baselines/v0.18.0-community-benchmarks/summary.json` carries the
-> same 82 rows in medianed form.
+> original 82 rows in medianed form and so still holds the pre-sidecar
+> pipeline numbers; the 13 pipeline cells above that were re-run exist only
+> as raw results. Their `system.library_versions.pyscx` reads `0.18.0`
+> although they measured the 0.19.0 tree: the field is the distribution
+> metadata of the release `scx-bench` has installed, while the module
+> imported was the repository's release build on `PYTHONPATH`, which each
+> job asserted by path and build profile before timing anything.
 >
-> Captured on `scx-bench`'s **pyscx 0.18.0 release** — not the 0.19.0 of the
-> tree these docs ship with — which is why the baseline is named 0.18.0.
-> `system.provenance.git_dirty` is `true`: during the five-hour wave the
-> only dirty tracked paths were `benchmarks/comprehensive/reporting/*` and
-> `tests/test_reporting_pipeline.py`, landed mid-capture, and no benchmark
-> worker imports either. The measured modules under
-> `benchmarks/comprehensive/benchmarks/` and pyscx itself were unmodified at
-> `ba3a2bbc` throughout. This is the documented-as-acceptable case in
+> The other three benchmarks' numbers were captured on `scx-bench`'s
+> **pyscx 0.18.0 release**, which is why that baseline is named 0.18.0. They
+> were not re-run because the sidecar changes nothing on their paths
+> (re-checked at census_1m, see below).
+> `system.provenance.git_dirty` is `true` on both captures: the dirty
+> tracked paths were the result files being written and, in the first,
+> `benchmarks/comprehensive/reporting/*`, which no benchmark worker imports.
+> This is the documented-as-acceptable case in
 > [`docs/benchmark_manifest.md` § Workflow](benchmark_manifest.md#workflow).
 
 ### Read iteration: streaming vs in-memory

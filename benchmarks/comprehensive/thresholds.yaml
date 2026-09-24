@@ -3398,18 +3398,24 @@ absolute_floors:
 
   # --- pipeline_ooc_constrained: the laptop test ---------------------------
   #
-  # The nine-stage pipeline under a cgroup ceiling. This capture is the first
-  # to run it at census scale, and it is where the benchmark's reason for
-  # existing is settled:
+  # The nine-stage pipeline under a cgroup ceiling. Recalibrated from
+  # `candidate_community_csc_20260923` — pyscx 0.19.0 release, one cell at a
+  # time, after the fixtures gained CSC sidecars and the DE stage started
+  # taking `cpu_csc_nnz` — with every completing scanpy cell re-run in the
+  # same capture:
   #
-  #   dataset      pyscx 16G              scanpy 16G        scanpy 32G
-  #   census_500k  1,494 s / 6,336 MB     OOM @ filter      2,574 s / 17,825 MB
-  #   census_1m    3,186 s / 8,819 MB     OOM @ qc_metrics  OOM @ filter
+  #   dataset      pyscx 16G            scanpy 16G        scanpy 32G
+  #   tabula_100k  113 s / 2,587 MB     273 s / 5,007 MB  247 s / 5,005 MB
+  #   census_500k  548 s / 3,496 MB     OOM @ filter      2,547 s / 17,828 MB
+  #   census_1m    1,227 s / 4,332 MB   OOM @ qc_metrics  OOM @ filter
   #
-  # SCX completes a 1M-cell pipeline inside a 16 GB ceiling at 8.6 GB peak.
-  # scanpy needs more than 16 GB at 500K and more than 32 GB at 1M. Where
-  # both finish (census_500k, scanpy at 32 GB) SCX is 1.72x faster on 2.8x
-  # less resident memory.
+  # SCX completes a 1M-cell pipeline inside a 16 GB ceiling at 4.2 GB peak.
+  # scanpy needs more than 16 GB at 500K and more than 32 GB at 1M (those
+  # three OOM cells are from `candidate_community_20260920`; nothing in them
+  # depends on pyscx). Where both finish at census_500k SCX is 4.6x faster
+  # on 5.1x less resident memory. On pyscx 0.18.0, before the sidecar, the
+  # census_1m cell was 3,186 s / 8,819 MB and DE was 63 % of it; DE is now
+  # 88 s (7 %), and `umap_leiden` + `neighbors` are 80 %.
   #
   # The scanpy arms are **not** floored. `pipeline_completed_int: max 0.0`
   # would assert that scanpy still runs out of memory, and a scanpy release
@@ -3417,10 +3423,11 @@ absolute_floors:
   # regression here. The OOM cells remain as recorded evidence for the claim,
   # gated by nothing.
   #
-  # `total_wall_s` carries wider headroom than the accel floors: the
-  # within-capture spread on `pyscx_16g / census_1m` was 1.29x (3,036-3,909 s),
-  # because `rank_genes_groups` is 63% of the run and its cluster count varies
-  # with the Leiden seed.
+  # `total_wall_s` carries 1.5x headroom although the within-capture spread
+  # is now 1.00-1.02x: `neighbors` (HNSW) is the node-sensitive stage, and at
+  # census_500k the same build measured it at 64 s and 124 s on two nodes.
+  # That headroom is also why the DE stage has floors of its own below — a
+  # fallback to the densify kernel would move the total by less than it.
   - benchmark: pipeline_ooc_constrained
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: census_1m
@@ -3430,12 +3437,12 @@ absolute_floors:
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: census_1m
     metric: pipeline_peak_rss_mb
-    max: 12000.0          # 1.36x measured 8,819 MB, inside the 16,384 ceiling
+    max: 6000.0           # 1.39x measured 4,332 MB, inside the 16,384 ceiling
   - benchmark: pipeline_ooc_constrained
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: census_1m
     metric: total_wall_s
-    max: 5500.0           # 1.73x measured 3,186 s; within-capture spread 1.29x
+    max: 1850.0           # 1.51x measured 1,227 s; within-capture spread 1.02x
   - benchmark: pipeline_ooc_constrained
     format: pipeline_ooc_constrained__pyscx_32g
     dataset: census_1m
@@ -3450,12 +3457,12 @@ absolute_floors:
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: census_500k
     metric: pipeline_peak_rss_mb
-    max: 8700.0           # 1.37x measured 6,336 MB
+    max: 4800.0           # 1.37x measured 3,496 MB
   - benchmark: pipeline_ooc_constrained
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: census_500k
     metric: total_wall_s
-    max: 2300.0           # 1.54x measured 1,494 s
+    max: 830.0            # 1.51x measured 548 s
   - benchmark: pipeline_ooc_constrained
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: tabula_sapiens_100k
@@ -3465,7 +3472,7 @@ absolute_floors:
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: tabula_sapiens_100k
     metric: pipeline_peak_rss_mb
-    max: 5900.0           # 1.39x measured 4,259 MB
+    max: 3600.0           # 1.39x measured 2,587 MB
   - benchmark: pipeline_ooc_constrained
     format: pipeline_ooc_constrained__pyscx_16g
     dataset: pbmc10k
@@ -3503,6 +3510,26 @@ absolute_floors:
     dataset: census_1m
     metric: de_route_is_csc
     min: 1.0
+
+  # The DE stage's own time, which `de_route_is_csc` cannot stand in for: it
+  # reads 1.0 on `cpu_csc` and on `cpu_csc_nnz` alike, and neither the route
+  # floor nor `total_wall_s` notices the exact-nnz kernel falling back to the
+  # densify one. Measured on the same fixtures, the densify kernel's DE stage
+  # took 114 s (census_500k) and 228 s (census_1m) against nnz's 53.5 s and
+  # 87.7 s, while `neighbors` alone moved 64 -> 124 s at census_500k between
+  # two nodes — so a densify fallback shifts the pipeline total by less than
+  # node noise does. The bounds sit at 1.6x the nnz medians, below both
+  # densify figures; within-capture spread on this stage is 1.02-1.06x.
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_500k
+    metric: stage_wall_s__rank_genes_groups
+    max: 85.0             # 1.59x measured 53.5 s; densify measured 114 s
+  - benchmark: pipeline_ooc_constrained
+    format: pipeline_ooc_constrained__pyscx_16g
+    dataset: census_1m
+    metric: stage_wall_s__rank_genes_groups
+    max: 140.0            # 1.60x measured 87.7 s; densify measured 228 s
 
   # --- multimodal_atlas_streaming: atlas-scale multiome / CITE-seq ---------
   #
