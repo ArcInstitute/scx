@@ -190,11 +190,9 @@ fn tracked_files_free_of_scratch_doc_citations_and_removed_gates() {
         collect_files(&root.join(crate_dir).join("src"), "rs", &mut files);
     }
     collect_files(&root.join("docs"), "md", &mut files);
-    for top in ["AGENTS.md"] {
-        let p = root.join(top);
-        if p.is_file() {
-            files.push(p);
-        }
+    let agents_md = root.join("AGENTS.md");
+    if agents_md.is_file() {
+        files.push(agents_md);
     }
 
     let mut offenders = Vec::new();
