@@ -102,23 +102,6 @@ dependencies:
     # self-classify as Skipped and the 4 pseudobulk rows in the Scanpy
     # API Equivalence table render as "pydeseq2 not installed — skipped".
     - pydeseq2>=0.5.4
-    # Shardad — condition-grouped sharded .shad format, benchmarked as a
-    # competing format (shardad_runner) + the grouped_read head-to-head.
-    # Not on PyPI/conda; installed from the local repo, which builds its
-    # Rust core in release per its pyproject (needs a Rust toolchain — the
-    # pure-Python fallback is byte-identical but ~3x slower). Deps
-    # (anndata/h5py/hdf5plugin/numpy/scipy/pandas/pyarrow/bitshuffle/
-    # zstandard) are all compatible with this env — no Lance/DuckDB
-    # conflict, so shardad shares scx-bench rather than needing an isolated
-    # env. Override with a checkout elsewhere as needed.
-    - -e /home/nickyoungblut/dev/python/shardad
-    # CellStream — scatter-immune per-cell store over shardad's codec,
-    # benchmarked as a competing training loader (cellstream_runner) via random
-    # row-gather. Not on PyPI; installed from the local repo. Depends on shardad
-    # (above) + pyfastpfor (its PFOR codec); both CPU-only, no env conflict, so
-    # cellstream shares scx-bench alongside shardad.
-    - pyfastpfor>=1.4
-    - -e /home/nickyoungblut/dev/python/cellstream
     # Data-load Phase 0 competitor loaders (exercised by ooc_loader):
     #   * annbatch (scverse/Lamin) — pre-shuffle-to-sharded-zarr + Loader. The
     #     [zarrs] extra pulls the Rust zarr codec pipeline (local-FS perf; not

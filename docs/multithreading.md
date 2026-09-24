@@ -527,7 +527,7 @@ global pool from inside the consume closure, exactly as the embeddings pass
 already did. Depth is `SCX_ACCEL_PREFETCH_DEPTH` (default 4) additionally lowered
 by `SCX_ACCEL_NUM_THREADS`, which also caps the column-block count — so on PCA
 that knob bounds speed and memory and provably cannot change the numbers (see
-[scanpy.md § PCA reproducibility](scanpy.md#reproducibility)). The
+[scanpy/accel-embedding-clustering.md § PCA reproducibility](scanpy/accel-embedding-clustering.md#reproducibility)). The
 decoded-but-unconsumed shards are reserved out of `pca(memory_budget=…)` rather
 than added on top of it.
 
@@ -663,7 +663,7 @@ the catalog's own entry order (reading through `csr_shards_sorted` re-sorts by
 
 > [!NOTE]
 > These are **not** manifest-backed captures, and they are here rather than in
-> [performance.md](performance.md) for that reason. Producing them needs one
+> [performance/](performance/README.md) for that reason. Producing them needs one
 > release binary per commit — a two-worktree A/B — which is not a shape the
 > comprehensive harness (`benchmark × format × dataset`) can take, so
 > [benchmark_manifest.md](benchmark_manifest.md)'s tier-1 rule cannot be
@@ -809,7 +809,7 @@ per-shard device buffers and replays those, so host decode and H→D happen
 separately rather than concatenated: the DE kernels take a per-shard view plus a
 `global_row` offset, so the callback sees the identical shard sequence, shapes
 and launch geometry it saw while streaming. See
-[scanpy.md § GPU DE device residency](scanpy.md#gpu-de-device-residency).
+[scanpy/threading.md § GPU DE device residency](scanpy/threading.md#gpu-de-device-residency).
 
 ## Thread safety of key types
 

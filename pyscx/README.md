@@ -37,11 +37,11 @@ For the overall project, file format, and benchmarks see the
 
 | Pattern | Use when | Reference |
 |---|---|---|
-| **In-memory** — `open().to_anndata()` + `sc.pp.*` | Dataset fits in RAM (< ~500K cells) | [docs/scanpy.md § In-memory](../docs/scanpy.md) |
-| **Backed + lazy** — `to_anndata(backed=True)` + `pyscx.accel.*` | Atlas-scale (500K–10M+ cells) on modest RAM | [docs/scanpy.md § Backed + lazy](../docs/scanpy.md) |
-| **Query pipeline** — `.query().filter_obs().collect()` | Pull a subset out of a large file | [docs/scanpy.md § Query pipeline](../docs/scanpy.md) |
+| **In-memory** — `open().to_anndata()` + `sc.pp.*` | Dataset fits in RAM (< ~500K cells) | [docs/scanpy § Quick start: in-memory](../docs/scanpy/quickstart.md#quick-start-in-memory) |
+| **Backed + lazy** — `to_anndata(backed=True)` + `pyscx.accel.*` | Atlas-scale (500K–10M+ cells) on modest RAM | [docs/scanpy § Backed mode](../docs/scanpy/backed-mode.md) |
+| **Query pipeline** — `.query().filter_obs().collect()` | Pull a subset out of a large file | [docs/scanpy § Query pipeline](../docs/scanpy/loading.md#querying-subsets-before-loading) |
 
-[docs/scanpy.md](../docs/scanpy.md) walks through each pattern end-to-end,
+[docs/scanpy/](../docs/scanpy/README.md) walks through each pattern end-to-end,
 including the lazy preprocess → PCA → kNN → UMAP → Leiden pipeline and the
 backed-mode scanpy compatibility table.
 
@@ -110,11 +110,11 @@ caller to rebuild with `--features hdf5`. Other paths are unaffected.
 
 ## Documentation map
 
-- **[../docs/scanpy.md](../docs/scanpy.md)** — scanpy / scverse integration:
+- **[../docs/scanpy/](../docs/scanpy/README.md)** — scanpy / scverse integration:
   in-memory, backed-lazy, and query-pipeline patterns; accelerator
   reference; backed-mode compatibility table. **Start here for everyday
   analysis recipes.**
-- **[../docs/api.md](../docs/api.md)** — full API reference for the
+- **[../docs/api/](../docs/api/README.md)** — full API reference for the
   Rust seam and the Python surface (`Experiment`, `from_h5ad`,
   `from_anndata`, query pipeline kwargs, `TrainingPipeline`).
 - **[../docs/multimodal.md](../docs/multimodal.md)** — CITE-seq / 10x
@@ -127,7 +127,7 @@ caller to rebuild with `--features hdf5`. Other paths are unaffected.
 - **[../docs/compatibility-matrix.md](../docs/compatibility-matrix.md)**
   — tested vs. declared Python / numpy / scipy / pyarrow / anndata /
   scanpy combinations.
-- **[../docs/performance.md](../docs/performance.md)** — benchmark
+- **[../docs/performance/](../docs/performance/README.md)** — benchmark
   results and memory / throughput characteristics.
 - **[../docs/architecture.md](../docs/architecture.md)** — workspace
   crate graph, feature flags, format / codec overview.

@@ -20,14 +20,14 @@ The two artifacts are released **independently** with **prefixed tags**. There i
 
 A unified `vX.Y.Z` tag triggers **nothing**. Always tag with both prefixes when shipping a synchronized release.
 
-`gh release list` shows the canonical pattern: `pyscx-v0.3.2`, `scx-cli-v0.3.0`, etc.
+`gh release list` shows the canonical pattern: `pyscx-v0.19.0`, `scx-cli-v0.19.0`, etc.
 
 ### Version-bump scope
 
 Two conventions coexist; pick based on what changed:
 
-- **Synchronized minor (e.g. v0.3.0, v0.4.0):** bump *all 16 versioned workspace members* to the same version — 14 lib crates (`scx-format`, `scx-format-io`, `scx-codec`, `scx-sparse`, `scx-cli`, `scx-convert`, `scx-ops`, `scx-engine`, `scx-loader`, `scx-cloud`, `scx-gpu`, `scx-mtx`, `scx-accel`, `scx-testkit`), plus `pyscx` and `rscx`. `scx-testkit` is `publish = false` but *is* versioned and a workspace member, so it drifts if you work from a stale list — derive the list from `grep -E '^version' */Cargo.toml` rather than trusting this one. The integration-test crate at `tests/scx-integration-tests/` stays at `0.0.0` (`publish = false`).
-- **pyscx-only patch (e.g. v0.3.1 → v0.3.2):** bump only `pyscx/Cargo.toml` + `pyscx/pyproject.toml`. pyscx may drift ahead of the rest between minor releases.
+- **Synchronized minor (e.g. v0.18.0, v0.19.0):** bump *all 16 versioned workspace members* to the same version — 14 lib crates (`scx-format`, `scx-format-io`, `scx-codec`, `scx-sparse`, `scx-cli`, `scx-convert`, `scx-ops`, `scx-engine`, `scx-loader`, `scx-cloud`, `scx-gpu`, `scx-mtx`, `scx-accel`, `scx-testkit`), plus `pyscx` and `rscx`. `scx-testkit` is `publish = false` but *is* versioned and a workspace member, so it drifts if you work from a stale list — derive the list from `grep -E '^version' */Cargo.toml` rather than trusting this one. The integration-test crate at `tests/scx-integration-tests/` stays at `0.0.0` (`publish = false`).
+- **pyscx-only patch (e.g. v0.18.0 → v0.18.1):** bump only `pyscx/Cargo.toml` + `pyscx/pyproject.toml`. pyscx may drift ahead of the rest between minor releases.
 
 Files touched on a synchronized bump:
 - `<crate>/Cargo.toml` for each member (`version = "..."` on line 3)
@@ -46,6 +46,8 @@ Run on the edited working tree, *before* committing (Phase 2 of the pipeline bel
 - [ ] `cargo test --workspace --exclude rscx` passes (CPU-only). **Two known non-blocking environmental failures:**
   - `scx-cloud::backend::tests::create_gcs_backend` (and potentially `create_s3_backend`) **fail in a sandbox with no network** — the `object_store` GCS builder probes the GCE metadata server at `build()` time. They pass in CI, which has network. To confirm a failure is this and not a real regression, re-run the single test on plain `main` (`git stash` or a clean checkout): an *identical* failure on `main` means environmental, not introduced by your change.
   - See also the extendr note below.
+- [ ] `cargo test -p scx-convert --features hdf5` passes. (The default workspace test above runs at default features and skips all h5ad/h5mu tests; this runs the gated scx-convert tests).
+- [ ] `cargo test -p scx-cli --features hdf5 -- --test-threads=1` passes. (`--test-threads=1` is required to avoid libhdf5 file locking conflicts during parallel harness runs).
 - [ ] `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings` clean. `--exclude rscx` matches CI (see the extendr note below); `--all-targets` lints test and bench code, which CI also does.
 - [ ] `cargo fmt --check` clean
 - [ ] `cargo test --workspace --exclude rscx --features cloud` passes if cloud changes
@@ -59,10 +61,11 @@ Run on the edited working tree, *before* committing (Phase 2 of the pipeline bel
 
 **Python bindings** (always via `../.venv/bin/`, never system Python):
 
-- [ ] `cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v`
+- [ ] `cd pyscx && ../.venv/bin/maturin develop --release && ../.venv/bin/pytest tests/ -v`
 - [ ] Same with `--features hdf5,cloud` if cloud touched
 - [ ] Same with `--features hdf5,gpu` if GPU touched
 - [ ] (`--features` REPLACES the pyproject default set, which includes `hdf5` — always re-list `hdf5`, else `from_h5ad`/`to_h5ad` break)
+- [ ] Check `pyscx.__version__`: maturin's editable install writes only a `.pth`, so if the old version persists from a stale `*.dist-info` in site-packages, reinstall with `uv pip install --no-deps --no-build-isolation -e ./pyscx`.
 
 **R bindings** (when rscx changed):
 
@@ -79,8 +82,7 @@ Run on the edited working tree, *before* committing (Phase 2 of the pipeline bel
 
 **Documentation:**
 
-- [ ] `ROADMAP.md` date stamp is current
-- [ ] `docs/performance.md` numbers match the promoted baseline
+- [ ] `docs/performance/` numbers match the promoted baseline
 - [ ] Cross-doc links resolve
 
 ### Release steps
@@ -93,16 +95,15 @@ The repo's remote is named `github`, NOT `origin`. Never commit the version bump
 
 1. **Bump versions** as described in [Version-bump scope](#version-bump-scope). Verify with `grep -E '^version' */Cargo.toml pyscx/pyproject.toml; grep '^Version' rscx/DESCRIPTION` — all should report the new version (except the integration tests crate, which stays at `0.0.0`).
 2. **Refresh the lockfile:** `cargo update --workspace --offline`.
-3. **Bump the `ROADMAP.md` "Last updated" date stamp** to today.
 
 **Phase 2 — Run pre-release checks (mandatory, not optional)**
 
 4. **Sanity build:** `cargo check` (default-members only). Expect the rscx/extendr failure on `cargo check --workspace`; that's pre-existing.
-5. **Run the full [Pre-release verification](#pre-release-verification) checklist** appropriate to what changed — this is part of the bump, not a separate later step. For a version-only bump the format/codec/Python checks should be unaffected, but at minimum **all three of** `cargo fmt --check`, `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings`, and `cargo test --workspace --exclude rscx` MUST be clean before you commit and open the PR. Run them locally first; let CI be the second signal, not the first. Do not proceed to Phase 3 with a failing check.
+5. **Run the full [Pre-release verification](#pre-release-verification) checklist** appropriate to what changed — this is part of the bump, not a separate later step. For a version-only bump the format/codec/Python checks should be unaffected, but at minimum **all three of** `cargo fmt --check`, `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings`, and `cargo test --workspace --exclude rscx` MUST be clean before you commit and open the PR (plus the `scx-convert` and `scx-cli` HDF5 test suites if conversion/ingest changed). Run them locally first; let CI be the second signal, not the first. Do not proceed to Phase 3 with a failing check.
 
 **Phase 3 — Commit on a branch**
 
-6. **Create a release branch** (e.g. `bump-version-X.Y.Z`) off `main` and **commit** the bump there. Past commits follow `chore: bump workspace version to X.Y.Z` as the subject — see `git log v0.3.0~1..v0.3.0` and the v0.4.0 commit `c21e833` for the body shape. Stage only tracked files (`git add -u`) so untracked scratch docs (e.g. ALL-CAPS root markdown) are never swept in.
+6. **Create a release branch** (e.g. `bump-version-X.Y.Z`) off `main` and **commit** the bump there. Past commits follow `chore: bump workspace version to X.Y.Z` as the subject — see commit `890813dd` (`chore: bump workspace version to 0.19.0`) or `e8d1f9a9` (`0.18.1`) for the body shape. Stage only tracked files (`git add -u`) so untracked scratch docs (e.g. ALL-CAPS root markdown) are never swept in.
 
 **Phase 4 — Open and merge the PR**
 
@@ -200,5 +201,5 @@ why / how) into the tracked file instead of citing. When the citation
 was decorative, just delete it.
 
 Cross-references between tracked files (`docs/*.md`, `benchmarks/README.md`,
-`ROADMAP.md`, `AGENTS.md`/`CLAUDE.md`, generated reports under
+`AGENTS.md`/`CLAUDE.md`, generated reports under
 `benchmarks/comprehensive/results/reports/`) are fine — they ship together.

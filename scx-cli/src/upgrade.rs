@@ -107,7 +107,7 @@ pub fn run_upgrade(
     // **After** the version gates, deliberately. Placing it first also turned a
     // multimodal *v3 or v4* file — which is never rewritten and was a harmless
     // exit-0 "nothing to do" — into a hard error, contradicting this module's
-    // own contract and `docs/api.md`. Refuse what would be damaged, not what
+    // own contract and `docs/api/cli.md`. Refuse what would be damaged, not what
     // would be left alone.
     if reader.is_multimodal() {
         return Err(format!(
@@ -838,7 +838,7 @@ mod tests {
     /// The rewrite is not a no-op on a v4 input: it re-emits every shard
     /// unframed and stamps v3, silently destroying the sub-shard random access
     /// v4 exists to provide — and it collapses the sharded obs layout on the
-    /// way past. Nothing in the CLI help or `docs/api.md` says it does either.
+    /// way past. Nothing in the CLI help or `docs/api/cli.md` says it does either.
     #[test]
     fn upgrade_declines_a_framed_v4_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1398,7 +1398,7 @@ mod tests {
     /// there is nothing to protect it from — it must stay the exit-0 "nothing to
     /// do" it always was. Placing the refusal before the version gates turned
     /// that into a hard error for the common modern case, contradicting the
-    /// module contract and `docs/api.md`.
+    /// module contract and `docs/api/cli.md`.
     #[test]
     fn upgrade_leaves_an_at_target_multimodal_file_alone() {
         use crate::test_utils::write_multimodal_test_file;

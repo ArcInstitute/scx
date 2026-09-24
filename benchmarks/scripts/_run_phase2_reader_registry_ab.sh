@@ -12,7 +12,7 @@
 # It is NOT the phase's headline. The headline is resident memory — ~104 kB per
 # open reader, 66-76x lower at `reader_limit=16` — and that is an allocation
 # count, captured separately by `measure_reader_registry_rss.py` and published
-# in docs/performance.md. No arm here is bounded, because a bounded arm's cost
+# in docs/performance/loader-cell-sets.md. No arm here is bounded, because a bounded arm's cost
 # is reopen latency, which depends entirely on how many files a plan touches and
 # would be a measurement of the plan shape rather than of the change.
 #
@@ -188,7 +188,7 @@ if arm == "before" and has_limit:
 
 # Both arms must agree that the manifest costs no descriptors, which is the
 # premise the whole phase was re-aimed on. If this ever stops holding, every
-# number in docs/performance.md's phase-2 section needs re-deriving.
+# number in docs/performance/loader-cell-sets.md's phase-2 section needs re-deriving.
 _fds0 = len(os.listdir("/proc/self/fd"))
 _ds = pyscx.SparseCellSetDataset(paths=[_p] * 64)
 _fds1 = len(os.listdir("/proc/self/fd"))

@@ -2250,7 +2250,7 @@ class TestLeiden:
 
 
 def test_numpy_default_argsort_still_disagrees_with_stable():
-    """Canary for the mixed-tie caveat in `docs/scanpy.md`.
+    """Canary for the mixed-tie caveat in `docs/scanpy/accel-perturbation-metrics.md`.
 
     `discrimination_score` breaks ties by ascending index — a deterministic,
     stable rule. cell-eval instead reads its rank off `np.argsort`, whose default
@@ -2277,6 +2277,6 @@ def test_numpy_default_argsort_still_disagrees_with_stable():
     assert default_order != stable_order, (
         f"numpy {np.__version__} now agrees with a stable sort on {list(d)} "
         f"({default_order}). The mixed-tie divergence documented in "
-        f"docs/scanpy.md § Discrimination score may no longer exist — recheck it "
-        f"and drop the caveat if so."
+        f"docs/scanpy/accel-perturbation-metrics.md § Discrimination score may "
+        f"no longer exist — recheck it and drop the caveat if so."
     )

@@ -188,6 +188,48 @@ control) reads hit the shard LRU cache when groups are co-located.
 scatters across 30–50 shards (large `cache_shards` + high RSS); with grouping
 each perturbation is in 1–2 shards.
 
+## SparseCellSetDataset and collation
+
+Gathers multi-file, role-tagged **cell sets** as sparse CSR batches — the shape
+set-transformer models over cell populations consume. Sibling to `IndexPlanDataset`,
+but sparse (not dense pairs) and multi-file.
+
+```python
+import pyscx
+
+paths = ["atlas1.scx", "atlas2.scx"]
+ds = pyscx.SparseCellSetDataset(
+    paths,
+    max_memory_mb=1024,
+    cache_shards=64,
+    reader_limit=64,             # bounded reader registry for large manifests
+)
+
+# Epoch loop with prefetch and bounded cache:
+# Each plan is (file_ids, rows, role_tags, set_offsets)
+for batch in ds.iter_with_plans(plans_iterable, lookahead=4):
+    # batch is a dict: "indptr", "indices", "data", "cell_indices", "role_tags", "set_offsets"
+    tensors = pyscx.collate_cellset_gathered(
+        batch,
+        encoder_crop_k=2048,
+        preprocess="log1p_raw",
+        # see pyscx.COLLATE_CELLSET_CONTRACT_VERSION (currently 3)
+    )
+
+# Synchronous single-plan gather (interactive probing or testing):
+b = ds.gather(file_ids, rows, role_tags, set_offsets)
+ds.close()
+```
+
+**Key constructor kwargs:**
+- `paths`: list of file paths.
+- `reader_limit`: cap simultaneously open file handles (useful for manifests with hundreds of files; default opens all).
+- `remap_tables`: per-file global vocabulary remapping (emits unified-vocab CSR).
+- `downsample_target_library_size` / `downsample_method="multinomial"`: seeded per-row count downsampling inside the gather.
+- `scatter_block_index`: defaults to `False` (full-shard LRU reuse). Pass `True` for large corpora ($N > 1\text{M}$ cells) with local plans or low shard reuse to bound peak RAM.
+
+**Collation (`pyscx.collate_cellset_gathered`):** turns gathered CSR batches into stacked encoder/target tensors with top-K cropping, drop-to-PAD masking, and preprocessing. Assert `pyscx.COLLATE_CELLSET_CONTRACT_VERSION == 3` at setup.
+
 ## Tokenisation kernels (`pyscx.tokenize`)
 
 The per-cell numeric steps a transformer-class tokeniser is built from, over a
@@ -339,7 +381,7 @@ rows into a dense numpy dict at open time — paid per key (even unused ones) an
 **per DataLoader worker** (each re-opens the reader), which OOMs at multi-million
 cell scale. `obsm=[embed_key]` loads only the key you use and (in backed mode)
 gathers rows lazily (`O(batch)` memory, per-key LRU = `cache_shards`). See
-[Selective + lazy `obsm`](../../../docs/scanpy.md#selective--lazy-obsm-obsm).
+[Selective + lazy `obsm`](../../../docs/scanpy/loading.md#selective--lazy-obsm-obsm).
 
 ## Troubleshooting
 - `RuntimeError: scx.TrainingDataset requires num_workers=0` — see fork-safety above.

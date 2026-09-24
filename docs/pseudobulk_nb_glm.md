@@ -64,7 +64,7 @@ results trustworthy.
 It is the **wrong** tool when you have **one profile per condition** (no
 replicates): a pseudobulk NB-GLM cannot estimate dispersion from a single sample,
 so the estimator degenerates. For no-replicate layouts use the per-cell tests
-instead — [`pyscx.accel.pdex_ref`](api.md#python-api-pyscx) (Mann–Whitney U +
+instead — [`pyscx.accel.pdex_ref`](api/python.md#python-api-pyscx) (Mann–Whitney U +
 pseudobulk log fold change) or `pyscx.accel.rank_genes_groups` (Wilcoxon rank-sum). The
 `pdex_nb_glm` entry point **enforces** this: it errors with guidance when no
 stratifier is supplied (see [§ Replicate requirement](#replicate-requirement)).
@@ -423,7 +423,7 @@ dict; unspecified keys keep their defaults:
   `["pdex_nb_glm"]` as `{"route": "cpu_nb_glm", "fallback_reason": "none"}` — a
   first-class native CPU route (it is **never** stamped `no_rapids`; that reason
   applies only to rapids-absent GPU fallbacks). See
-  [docs/api.md § Accelerator route metadata](api.md#accelerator-route-metadata).
+  [docs/api/python-accel.md § Accelerator route metadata](api/python-accel.md#accelerator-route-metadata).
 - Genes that hit a dispersion clamp, fail to converge, or are all-zero
   (`pvalue = 1`, `dispersion = NaN`, `log2FoldChange = 0`) are counted in internal
   diagnostics, alongside the number exempted from shrinkage as dispersion
@@ -451,6 +451,6 @@ threads — well within the budget for any pseudobulk DE.
 
 ## See also
 
-- [docs/scanpy.md § Pseudobulk Differential Expression](scanpy.md#pseudobulk-differential-expression-pyscxaccelpseudobulk_dex)
-- [docs/api.md § Python API](api.md#python-api-pyscx) — exact signatures
-- [docs/api.md § Accelerator route metadata](api.md#accelerator-route-metadata)
+- [docs/scanpy/accel-differential-expression.md § Pseudobulk Differential Expression](scanpy/accel-differential-expression.md#pseudobulk-differential-expression-pyscxaccelpseudobulk_dex)
+- [docs/api/python.md § Python API](api/python.md#python-api-pyscx) — exact signatures
+- [docs/api/python-accel.md § Accelerator route metadata](api/python-accel.md#accelerator-route-metadata)

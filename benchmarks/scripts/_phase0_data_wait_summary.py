@@ -2,7 +2,7 @@
 """Collect the phase-0 data-wait fractions out of two capture snapshots.
 
 The docs table is transcribed from **one artifact**, not from a job log: a
-number read off a log and retyped into `docs/performance.md` has no manifest
+number read off a log and retyped into `docs/performance/loader.md` has no manifest
 row behind it, and `docs/benchmark_manifest.md` requires every triple-shaped
 claim to have one.
 

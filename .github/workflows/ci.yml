@@ -885,8 +885,9 @@ jobs:
       # `discrimination.rs` carried a private masked copy of all three metrics
       # that disagreed with the shared kernel on two of cosine's edge
       # conventions (a zero denominator gave 0.0 instead of 1.0, and the [0, 2]
-      # clamp was missing). Every cell-eval parity claim in docs/scanpy.md rests
-      # on those conventions, so a second kernel is a second set of them.
+      # clamp was missing). Every cell-eval parity claim in
+      # docs/scanpy/accel-perturbation-metrics.md rests on those conventions, so
+      # a second kernel is a second set of them.
       - name: One distance kernel per metric
         run: |
           set -euo pipefail
@@ -921,8 +922,8 @@ jobs:
           fi
 
           # Negative half: within eval_metrics -- where every cell-eval parity
-          # claim in docs/scanpy.md lives -- no file but distances.rs accumulates
-          # cosine norms.
+          # claim in docs/scanpy/accel-perturbation-metrics.md lives -- no file
+          # but distances.rs accumulates cosine norms.
           #
           # Scope, stated so it is not mistaken for more: this catches a
           # re-implemented *cosine*, which is the metric whose edge conventions
@@ -1336,8 +1337,9 @@ jobs:
       # ORG-7.21-4: every documented cell-eval / arc-bench tolerance is pinned
       # Rust-side, so `cargo test` gates it with no Python installed.
       #
-      # `docs/scanpy.md` cited `test_cell_eval_parity.py` as its evidence. That
-      # file `importorskip`s `cell_eval` / `arc_bench` / `polars`; no conda env
+      # `docs/scanpy/accel-perturbation-metrics.md` cited
+      # `test_cell_eval_parity.py` as its evidence. That file `importorskip`s
+      # `cell_eval` / `arc_bench` / `polars`; no conda env
       # has them and neither does CI's Python job, so the claim rested on a local
       # run in a developer venv. Across `eval_metrics/` exactly three external
       # numbers were pinned -- sklearn's AMI/NMI/ARI -- and the rest was
@@ -1349,12 +1351,12 @@ jobs:
           tst=scx-accel/src/eval_metrics/cell_eval_reference_tests.rs
           gen=benchmarks/scripts/generate_eval_metrics_references.py
           for f in "$vals" "$tst" "$gen"; do
-            test -f "$f" || { echo "::error::$f is missing — the cell-eval tolerances in docs/scanpy.md are back to being backed only by a pytest file that skips everywhere (ORG-7.21-4)."; exit 1; }
+            test -f "$f" || { echo "::error::$f is missing — the cell-eval tolerances in docs/scanpy/accel-perturbation-metrics.md are back to being backed only by a pytest file that skips everywhere (ORG-7.21-4)."; exit 1; }
           done
 
           # Positive half: defined AND read, per metric family. Pinning one family
           # and letting the others lapse is the failure mode -- the table in
-          # docs/scanpy.md has a row for each.
+          # docs/scanpy/accel-perturbation-metrics.md has a row for each.
           #
           # All SIX discrimination tables, not four. The first version named
           # `L1_EXCL`, `L1_ALL`, `L2_EXCL` and `COSINE_EXCL`, so dropping
@@ -1446,7 +1448,8 @@ jobs:
               print(
                   f"::error file={sys.argv[1]}::`check_untied` is no longer defined "
                   f"— on a tie cell-eval's discrimination rank comes from numpy's "
-                  f"unstable quicksort, which docs/scanpy.md explicitly does not "
+                  f"unstable quicksort, which "
+                  f"docs/scanpy/accel-perturbation-metrics.md explicitly does not "
                   f"claim, and pinning a tied fixture freezes that arbitrary order "
                   f"as the contract (ORG-7.21-4)."
               )

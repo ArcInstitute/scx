@@ -297,7 +297,7 @@ retained in the shard LRU under the loader's byte budget (see
 [sharding.md § Row-group LRU](sharding.md)), so a repeated gather does not
 re-decode them. `SparseCellSetDataset`
 defaults the other way (`scatter_block_index=False`) and pre-warms, because its
-regime is cache-friendly — see [performance.md § Loader adoption]. Both classes
+regime is cache-friendly — see [performance/loader-index-plan.md § Scattered pair-gather via the row-group BlockIndex](performance/loader-index-plan.md#scattered-pair-gather-via-the-row-group-blockindex-l1l2). Both classes
 take the same per-dataset `scatter_block_index=` kwarg, in opposite defaults,
 over the same env kill-switch `SCX_SCATTER_BLOCK_INDEX=0`. Adoption is observable via
 `IndexPlanDataset.cache_metrics()["block_index_groups"]` (`> 0` ⇒ the framed path
@@ -359,7 +359,7 @@ unframed fallback for `codec="auto"`, and one of the two candidates `auto` /
 below). Canonical implementation: `scx-format/src/codec_select.rs::select_codec()`.
 
 - Float32 / Float16 values → **Pcodec** (typical 7–16 % better than Zstd
-  on log-normalized data; see `docs/api.md` § "Codec Selection").
+  on log-normalized data; see `docs/api/rust-format-io.md` § "Codec Selection").
 - Integer values with `floor(median) ≤ 8` → **Scx1** (Rice).
 - Integer values with `floor(median) > 8` → **Zstd**.
 
@@ -448,8 +448,7 @@ Explicit codec forces (`none`/`scx1`/`zstd`/`lz4`/`pcodec`/`shufdelta`) and
 ### Codec tradeoff summary — Scx1 vs ShufDeltaZstd
 
 The two integer codecs serve different workloads. Summary of measured
-tradeoffs (from the comprehensive benchmark suite; full per-dataset
-tables in [performance.md](performance.md#scx-vs-shardad--full-feature-parity)):
+tradeoffs (from the comprehensive benchmark suite):
 
 | Dimension | Scx1 (auto default) | ShufDeltaZstd (compact-trial) |
 |---|---|---|

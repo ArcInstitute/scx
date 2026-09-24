@@ -228,8 +228,9 @@ pub fn compute_discrimination_score(
             //
             // whose default `quicksort` is unstable, so its tie order is
             // implementation-defined. The two agree on the total ties measured so
-            // far and can differ on a mixed tie; `docs/scanpy.md` scopes the parity
-            // claim accordingly and
+            // far and can differ on a mixed tie;
+            // `docs/scanpy/accel-perturbation-metrics.md` scopes the parity claim
+            // accordingly and
             // `mixed_ties_pin_scx_stable_semantics_not_cell_eval_parity` pins ours.
             //
             // Counting only strictly-smaller distances is the position of the

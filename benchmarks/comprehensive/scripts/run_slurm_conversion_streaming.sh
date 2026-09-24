@@ -14,7 +14,7 @@
 #
 # Resource defaults are sized so the *materialize* path can fit the
 # whole CSR in memory at census-1m scale (~12 GB peak observed in
-# docs/performance.md). For census_5m / census_10m, push --mem
+# docs/performance/conversion.md). For census_5m / census_10m, push --mem
 # higher or accept that the materialize path will OOM and the
 # streaming row reports cleanly.
 # =============================================================================

@@ -365,7 +365,7 @@ static DEVIEW_WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 /// descending selection, e.g. `adata[[2, 2, 7]]` — see
 /// [`crate::anndata_hooks`]) already holds a materialized `view.X`. The rebuild
 /// then installs scipy, exactly as anndata's copy-on-write would. Nothing to
-/// special-case; it is documented in `docs/api.md`.
+/// special-case; it is documented in `docs/api/python-accel.md`.
 pub(crate) fn devirtualize_scx_view(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,

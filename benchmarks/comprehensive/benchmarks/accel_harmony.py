@@ -17,7 +17,7 @@ that directory's own README says new benchmarks must not go there.
 
 **Correctness metric.** `mean_per_pc_r_vs_harmonypy` — the mean per-PC Pearson
 correlation of the corrected embedding against harmonypy's, which is the same
-quantity `docs/performance.md` reports against R harmony. It is *not* a
+quantity `docs/performance/accel-qc-de-integration.md` reports against R harmony. It is *not* a
 bit-parity claim and cannot be: SCX seeds k-means++ from `rand_chacha` where
 harmonypy uses `sklearn.KMeans`, and the two objective cross-entropies differ by
 a `log(2)` term (pinned as a divergence in

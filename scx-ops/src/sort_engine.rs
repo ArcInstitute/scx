@@ -59,7 +59,7 @@
 //! scx1/zstd`, uint32) by `cell_type` grew the X matrix ~8%. Value encoding is
 //! preserved (`x_value_encoding` widens only to fit the global max), so the
 //! growth is purely codec/order-dependent. See docs/sharding.md and
-//! docs/performance.md § Sort.
+//! docs/performance/query-and-file-ops.md § Sort.
 //!
 //! Lifted the earlier scope-outs: **multimodal** inputs reorder every
 //! modality's X by the global obs order ([`sort_multimodal`], mirroring

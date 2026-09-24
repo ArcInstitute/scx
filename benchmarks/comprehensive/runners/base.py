@@ -38,11 +38,10 @@ def probe_optional(
     top-level import *and* its submodules, then reported "X is not installed in
     this env. Install it with …". When the package is installed but its API has
     moved, that message is false and it buries the real diagnosis: a tier-full
-    capture lost all 47 ``cellstream`` cells to
-    ``from cellstream import format`` and ``from cellstream.writer import
-    write_store``, both gone upstream (``CellStream`` is now ``CellStore``),
-    while the log insisted the package was missing and the fix was to install
-    it — which it already was.
+    capture lost every cell of a competitor runner to two submodule imports
+    that had both moved upstream (the class the runner imported had been
+    renamed), while the log insisted the package was missing and the fix was
+    to install it — which it already was.
 
     This mirrors ``pyscx/src/optional_deps.rs``, which rewrites a missing-module
     error only when the missing name *is* the requested top-level package and

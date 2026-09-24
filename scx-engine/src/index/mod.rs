@@ -1,5 +1,5 @@
 //! Predicate index — the level-2 half of the two-level pushdown strategy
-//! (docs/api.md (Query engine, optimizations)), split by concern.
+//! (docs/api/rust-engine.md (Query engine, optimizations)), split by concern.
 //!
 //! | Module | Holds |
 //! |---|---|

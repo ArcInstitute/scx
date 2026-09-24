@@ -9,8 +9,9 @@ Paste the output into
 
 ## Why this script exists
 
-`docs/scanpy.md` claims the perturbation-evaluation metrics are "numerically
-equivalent to the Python references within the tolerances below", and cites
+`docs/scanpy/accel-perturbation-metrics.md` claims the perturbation-evaluation
+metrics are "numerically equivalent to the Python references within the
+tolerances below", and cites
 `pyscx/tests/test_cell_eval_parity.py` as the evidence. That file
 `importorskip`s `cell_eval`, `arc_bench` and `polars`, and **none of the six
 conda envs has them** — nor does CI, whose Python-bindings job installs
@@ -40,7 +41,8 @@ matrices and call the difference a tolerance.
 
   * **Mixed-tie discrimination ranks.** `numpy.argsort`'s default kind is
     `quicksort`, which is not stable, so the reference's own tie behaviour is
-    implementation-defined. `docs/scanpy.md` already carves this out and
+    implementation-defined. `docs/scanpy/accel-perturbation-metrics.md` already
+    carves this out and
     `test_cell_eval_parity.py` pins SCX's stable-argsort semantics as a
     deliberate *divergence*.
   * **`clustering_agreement`.** Leiden is stochastic; the documented bar is an
@@ -79,8 +81,9 @@ def cells(seed: int) -> np.ndarray:
     `1/CELLS_PER_PERT` and two perturbations' L1 distances came out exactly equal
     (`29.25` twice). On a tie, cell-eval's rank depends on `numpy.argsort`'s
     default `quicksort`, which is **not stable**, so its answer there is
-    implementation-defined — `docs/scanpy.md` says the discrimination claim is
-    "not claimed on mixed ties" and `discrimination_cell_eval_tests.rs` pins
+    implementation-defined — `docs/scanpy/accel-perturbation-metrics.md` says
+    the discrimination claim is "not claimed on mixed ties" and
+    `discrimination_cell_eval_tests.rs` pins
     SCX's stable-argsort semantics as a deliberate divergence. Pinning a tied
     fixture would have frozen the reference's arbitrary choice as the contract.
     `check_untied` below refuses to emit one.
@@ -244,8 +247,9 @@ def main() -> int:
                 failures.append(
                     f"discrimination {metric}/excl={excl}: perturbation {target!r} "
                     f"ties with another at distance {d[p_i]!r}. On a tie cell-eval's "
-                    f"rank comes from numpy's unstable quicksort, which docs/scanpy.md "
-                    f"explicitly does not claim — reseed rather than pin it"
+                    f"rank comes from numpy's unstable quicksort, which "
+                    f"docs/scanpy/accel-perturbation-metrics.md explicitly does not "
+                    f"claim — reseed rather than pin it"
                 )
 
     print("// --- cell-eval discrimination_score ---")

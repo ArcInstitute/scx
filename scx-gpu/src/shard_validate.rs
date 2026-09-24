@@ -205,8 +205,8 @@ fn validate_csr(csr: &scx_sparse::ScxCsr, policy: &ValidationPolicy) -> Result<(
                 "ScxCsr contains a non-finite value ({val}) at nonzero index {pos}: the GPU \
                  kernels behind {op} cannot represent it and will corrupt the result silently \
                  rather than failing, so it is rejected here (sanitise/QC before running \
-                 {op}; see docs/scanpy.md for which kernel does what with a NaN or an \
-                 infinity)"
+                 {op}; see docs/scanpy/accel-gpu.md for which kernel does what with a NaN or \
+                 an infinity)"
             )));
         }
     }
@@ -290,8 +290,8 @@ fn validate_csc(
                 "ScxCsc contains a non-finite value ({val}) at nonzero index {pos}: the GPU \
                  kernels behind {op} cannot represent it and will corrupt the result silently \
                  rather than failing, so it is rejected here (sanitise/QC before running \
-                 {op}; see docs/scanpy.md for which kernel does what with a NaN or an \
-                 infinity)"
+                 {op}; see docs/scanpy/accel-gpu.md for which kernel does what with a NaN or \
+                 an infinity)"
             )));
         }
     }

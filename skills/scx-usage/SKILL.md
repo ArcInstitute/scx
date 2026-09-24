@@ -1,6 +1,6 @@
 ---
 name: scx-usage
-description: How to USE scx (pyscx + scx-cli) to get real work done — installing pyscx (GitHub Release wheels vs source, optional features, common install failures), converting data into/out of SCX (h5ad/h5mu/10x/mtx), processing single-cell data (in-memory / backed-lazy / query pipeline, the pyscx.accel.* accelerators), and ML data loading (TrainingDataset, IndexPlanDataset, MultimodalTrainingDataset). Trigger when installing, writing, or debugging pyscx/scx-cli code for conversion, preprocessing/QC/clustering, or training loaders.
+description: How to use scx (pyscx + scx-cli) to get real work done — installing pyscx (GitHub Release wheels vs source, optional features, common install failures), converting data into/out of SCX (h5ad/h5mu/10x/mtx), processing single-cell data (in-memory / backed-lazy / query pipeline, the pyscx.accel.* accelerators), and ML data loading (TrainingDataset, IndexPlanDataset, SparseCellSetDataset, MultimodalTrainingDataset). Trigger when installing, writing, or debugging pyscx/scx-cli code for conversion, preprocessing/QC/clustering, or training loaders.
 ---
 
 # Using scx (pyscx + scx-cli)
@@ -21,7 +21,7 @@ directory):
   venv/conda conflicts).
 - `reference/conversion.md` — every ingest/export entry point + all kwargs.
 - `reference/processing.md` — the three approaches in depth + the full `pyscx.accel.*` catalog.
-- `reference/ml-loading.md` — TrainingDataset / IndexPlanDataset / multimodal / Lightning, full constructor refs.
+- `reference/ml-loading.md` — TrainingDataset / IndexPlanDataset / SparseCellSetDataset / multimodal / Lightning, full constructor refs.
 
 ---
 
@@ -115,7 +115,7 @@ materializing path.
 
 | Source | Python | CLI |
 |---|---|---|
-| h5ad file on disk | `pyscx.from_h5ad(path, out, ...)` | `scx convert in.h5ad out.scx --stream` |
+| h5ad file on disk | `pyscx.from_h5ad(path, out, ...)` | `scx convert in.h5ad out.scx` |
 | AnnData in memory | `pyscx.from_anndata(adata, out, ...)` | — |
 | h5mu (multimodal) | `pyscx.from_h5mu(path, out, modalities=..., modality_types=...)` | `scx convert in.h5mu out.scx --modalities rna,adt` |
 | MuData in memory | `pyscx.from_mudata(mdata, out, ...)` | — |
@@ -144,16 +144,20 @@ Most-used kwargs (shared across ingest entry points):
   `pyscx.open(...).query().filter_obs(...)` pushes the filter down. Without
   them, pushdown silently regresses to a full obs scan. Set these if the file
   will be queried.
-- `csc="off"|"auto"|"always"` — write a column-major sidecar (needed for
-  `prefer_format="csc"` accel paths + the CSC-direct `gpu_csc_v3` DE route; built
-  in the same write as X, no extra read or second copy on disk; later
-  `compact`/`merge`/`optimize`/`sort`/`subset` carry it by default, `append`
-  drops it). `"auto"` builds it only when the dataset is large
-  enough to benefit (`n_obs ≥ 50000` and `n_vars ≥ 5000`, env-tunable via
-  `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`). To get the
-  **GPU-fast** CSC-direct DE route (`gpu_csc_v3`), call `rank_genes_groups`/`pdex_ref`
-  with the **default `prefer_format="csr"`** and `device="gpu"` (or `"auto"`) on a
-  file that has the sidecar — the planner picks `gpu_csc_v3` automatically.
+- `csc="off"|"auto"|"always"` — write a column-major sidecar (default `"auto"`
+  across single-modality ingest paths; builds in the same pass as X when
+  `n_obs ≥ 50000` and `n_vars ≥ 5000`, env-tunable via
+  `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`). Required for
+  `prefer_format="csc"` accel paths and the CSC-direct `gpu_csc_v3` DE route.
+  Later `compact`/`merge`/`optimize`/`sort`/`subset` carry it by default
+  (`--csc carry`, rebuilt in the same pass as X); `append` drops it.
+  To get the **GPU-fast** CSC-direct DE route (`gpu_csc_v3`), call
+  `rank_genes_groups`/`pdex_ref` with the **default `prefer_format="auto"`** and
+  `device="gpu"` (or `"auto"`) on a file that has the sidecar — the planner picks
+  `gpu_csc_v3` automatically. On CPU, the default `prefer_format="auto"` routes
+  1-vs-rest Wilcoxon to the exact-nnz kernel (`cpu_csc_nnz`, 3.1–4.1× faster).
+  CSC dispatch also serves row-filtered, gene-projected, and lazy-transformed
+  handles under `auto` (provided kept rows span at least half the CSR shards).
   `prefer_format="csc"` is the **CPU** column-major path (no GPU kernel);
   combining it with `device="gpu"` raises.
 - `sort_by=[...]` / `reverse=True` — globally reorder the cell axis by obs
@@ -177,16 +181,21 @@ Most-used kwargs (shared across ingest entry points):
 
 ### Inspect / file ops (CLI)
 `scx info <file> [--json --history]`, `scx validate <file>`,
-`scx subset <in> --filter <expr> --genes <path>`, `scx merge`, `scx append`,
+`scx subset <in> [out] --filter <expr> --genes <path>`, `scx merge`, `scx append`,
 `scx compact`, `scx optimize` (in-place re-encode + row-group-frame → v4;
 `--shard-obs off|auto|always`, default `auto`, migrates a legacy single-section
 obs to the sharded layout when `n_obs > shard_target_rows`),
-`scx build-csc <in> <out>` (add a CSC sidecar),
+`scx build-csc <in> [out]` (add a CSC sidecar in place, or pass `[out]` to copy),
 `scx sort <in> <out> --by CSV` (reorder cells by obs key for query locality),
 `scx sort <in> <out> --shuffle --seed N` / `pyscx.shuffle` (seeded random reorder for training-batch diversity — the inverse of a sort; pin `--codec`),
+`scx obs-import <file> <table.csv>` / `pyscx.obs_import` (import annotations as obs columns in place; DataFrame twin: `attach_obs_columns`),
+`scx var-import <file> <genes.csv>` / `pyscx.var_import` (import annotations as var columns in place; DataFrame twin: `attach_var_columns`),
+`scx cellbender-import <file> <h5_path>` / `pyscx.cellbender_import` (import CellBender counts as an SCX layer in place),
+`scx doublet-import <file> <calls.csv> --tool <tool>` / `pyscx.doublet_import` + `pyscx.doublet_consensus` (import doublet predictions in place),
 `scx set-uns <file> --uns JSON [--merge]` (replace uns in place; `--merge` lays the JSON's top-level keys over the existing uns),
 `scx modify-metadata <file> --obs PARQUET --var PARQUET --obsm NAME=NPY ...
 --index-*` (replace metadata sections in place).
+`--force` is required on subcommands writing a destination if it already exists (`convert`, `compact`, `merge`, `optimize`, `sort`, `subset`, `build-csc <in> <out>`, etc.).
 Full flag lists in `reference/conversion.md`.
 
 **Selective read / count from the CLI:** `scx query <file> <filter> [--count]
@@ -378,6 +387,16 @@ for batch in ds.iter_with_plans(iter(plans), lookahead=4):
     X, X_paired, pairs = batch["X"], batch["X_paired"], batch["pairs"]
 ```
 
+### SparseCellSetDataset — multi-file cell sets & collation
+For population / set-transformer models. Gathers role-tagged sparse CSR batches
+across multiple files:
+```python
+ds = pyscx.SparseCellSetDataset(["atlas1.scx", "atlas2.scx"], max_memory_mb=1024, cache_shards=64)
+for batch in ds.iter_with_plans(plans_iterable, lookahead=4):
+    tensors = pyscx.collate_cellset_gathered(batch, encoder_crop_k=2048, preprocess="log1p_raw")
+```
+Synchronous single-plan gather via `ds.gather(file_ids, rows, role_tags, set_offsets)`.
+
 ### Other
 - **Multimodal:** `pyscx.MultimodalTrainingDataset(path, modalities=[...])`.
 - **PyTorch Lightning:** `from pyscx.scx_integrations.scvi import ScxDataModule`
@@ -414,11 +433,13 @@ splitting, grouped sharding details, and Lightning examples are in
 - Pick the approach by *subset?* × *fits in RAM?* — `query().collect()` materializes, so a too-big subset needs `to_anndata(backed=True, obs_filter=...)`.
 - Predicate grammar differs: `query().filter_obs()` (engine + pushdown) vs backed `obs_filter=` (pandas `.query()`).
 - Convert with `index_obs=`/`--index-preset` if the file will be queried, else pushdown is a full scan.
-- `pyscx.to_h5ad` / `from_h5ad` are **free functions**; `to_anndata` / `query` are Experiment methods.
+- `pyscx.to_h5ad` / `from_h5ad` are **free functions**; `to_anndata` / `query` are Experiment methods. Calling `to_anndata()` without `modality` on a multimodal file raises `ValueError`; use `to_mudata()`, or `to_anndata(modality="rna", backed=True)` for one modality.
 - Backed mode: `pyscx.accel.normalize_total/log1p`, **not** `sc.pp.*` (which materialize).
 - `qc_vars=["mt"]` + tag `var["mt"]` yourself; HVG seurat_v3 on raw counts; `leiden(device="cpu")` for stable labels.
 - Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done. `pflog=True` for PFlog (v4) normalization (replaces `normalize`/`log1p`; `pflog_alpha=None` estimates α once, or pin a float).
 - GPU ops fall back to CPU silently — check `pyscx.accel.gpu_info()` / `nvidia-smi` / `adata.uns["scx_accel"]` route. PCA/kNN/UMAP/preprocess route to rapids-singlecell when installed; `SCX_DISABLE_RAPIDS=1` forces CPU fallback for testing. Build pyscx `--features gpu` once, then **run from the conda env that has rapids** (a plain `.venv` usually doesn't).
-- GPU-fast CSC-direct DE (`gpu_csc_v3`): call `rank_genes_groups`/`pdex_ref` with the **default `prefer_format="csr"`** + `device="gpu"` (or `"auto"`) on a file with a `csc=` sidecar — the planner picks it automatically. `prefer_format="csc"` is the **CPU** path; `prefer_format="csc"` + `device="gpu"` raises.
+- GPU-fast CSC-direct DE (`gpu_csc_v3`): call `rank_genes_groups`/`pdex_ref` with the **default `prefer_format="auto"`** + `device="gpu"` (or `"auto"`) on a file with a `csc=` sidecar — the planner picks it automatically. On CPU, the default `prefer_format="auto"` routes 1-vs-rest Wilcoxon to the exact-nnz kernel (`cpu_csc_nnz`, 3.1–4.1× faster). `prefer_format="csc"` is the **CPU** path; `prefer_format="csc"` + `device="gpu"` raises.
+- In-place annotation edits: use `scx obs-import` / `var-import` or `pyscx.obs_import` / `var_import` (DataFrame twins: `attach_obs_columns` / `attach_var_columns`) to add or patch annotations in place without rewriting X or paying the eager `obsm` allocation. Use `scx cellbender-import` / `doublet-import` for layers and doublet scores.
+- Destination overwrite safety: CLI subcommands writing a destination require `--force` if the target already exists.
 - CLI predicate: `scx query <file> <filter>` accepts the filter positionally **or** via `--filter EXPR` (matching `scx subset`/`delete`; one form, not both); cloud subcommands (`scx pull`/`push`/…) only exist in a `--features cloud` build.
 - `compute_lisi` defaults to O(N²) exact kNN — minutes-to-tens-of-minutes at ≥1M cells; pass `approximate_knn=True` for an HNSW kNN (~10× faster, small drift) or subsample to evaluate integration.

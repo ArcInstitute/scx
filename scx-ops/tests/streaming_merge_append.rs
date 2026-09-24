@@ -3609,7 +3609,7 @@ fn merge_still_rejects_a_genuine_obs_dtype_mismatch() {
 
 #[test]
 fn filtered_collect_on_a_merge_output_returns_categories() {
-    // `docs/api.md` § Filtered-obs categorical semantics: a `collect()` whose
+    // `docs/api/rust-engine.md` § Filtered-obs categorical semantics: a `collect()` whose
     // rows the caller narrowed carries only the categories its surviving rows
     // use. A merge output could not honour that at all while it was plain
     // strings — `docs/sharding.md` documented the gap explicitly.

@@ -18,28 +18,6 @@ whose runners you want exercised, then launch from there.
 
 Create everything at once: `install_dependencies.sh --all`.
 
-## Shardad
-
-The `shardad` runner (`shardad_runner`) and the `grouped_read` head-to-head
-share the `scx-bench` env — shardad's deps (anndata/h5py/hdf5plugin/numpy/
-scipy/pandas/pyarrow/bitshuffle/zstandard) don't conflict with the main stack,
-so unlike SLAF it needs no isolated env. It's not on PyPI/conda; `scx-bench.yml`
-installs it editable from the local repo:
-
-```yaml
-- -e /home/nickyoungblut/dev/python/shardad
-```
-
-That build compiles shardad's Rust core in release (needs a Rust toolchain; the
-pure-Python fallback is byte-identical but ~3× slower — set
-`SHARDAD_DISABLE_RUST=1` to force it). If your checkout lives elsewhere, edit the
-path. Verify:
-
-```bash
-conda activate scx-bench
-python -c "import shardad, shardad.v2._rust; print('shardad', shardad.__version__, 'rust-core OK')"
-```
-
 Check what's installed: `install_dependencies.sh --check` (does not modify anything).
 
 Rebuild just pyscx without reinstalling deps: `install_dependencies.sh --rebuild` (or `--rebuild --gpu`).

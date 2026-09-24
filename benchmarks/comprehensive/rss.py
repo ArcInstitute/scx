@@ -56,7 +56,8 @@ class PeakRssSampler:
     allocates *and frees* a large transient buffer (e.g. a full-matrix
     materialization) misses the spike. This polls RSS on a daemon thread so the
     true in-region peak is captured — needed for the out-of-core boundary bench,
-    where shardad's ``read_full`` is a single call with no loop to sample inside.
+    where a competing format's ``read_full`` is a single call with no loop to
+    sample inside.
 
     Usage::
 

@@ -14,7 +14,7 @@ none of the six conda envs has these packages, and neither does CI. That is why
 every documented tolerance in this file is now **also** pinned Rust-side in
 `scx-accel/src/eval_metrics/cell_eval_reference_tests.rs`, which `cargo test`
 runs with no Python at all — this file strengthens the local gate and cannot be
-the only evidence for a claim in `docs/scanpy.md`.
+the only evidence for a claim in `docs/scanpy/accel-perturbation-metrics.md`.
     cd pyscx && maturin develop --release && cd ..
     pytest pyscx/tests/test_cell_eval_parity.py -v
 
@@ -747,7 +747,8 @@ class TestDiscriminationTieParity:
         1. SCX's scores equal the **stable** argsort ranks (its documented rule).
         2. that on this numpy the divergence is real — cell-eval scores this
            fixture differently, which is what makes the "not claimed" scope in
-           `docs/scanpy.md` load-bearing rather than defensive.
+           `docs/scanpy/accel-perturbation-metrics.md` load-bearing rather than
+           defensive.
 
         The numpy-only half of the canary lives in `test_accel.py`, which has no
         module-level optional-dependency skip and therefore actually runs in CI.
@@ -786,8 +787,9 @@ class TestDiscriminationTieParity:
             scx[p] != pytest.approx(ce[p], abs=0) for p in ce
         ), (
             f"cell-eval now agrees with SCX on this mixed tie (SCX={scx}, "
-            f"cell-eval={dict(ce)}). The mixed-tie exclusion in docs/scanpy.md "
-            f"may be broader than it needs to be — recheck it."
+            f"cell-eval={dict(ce)}). The mixed-tie exclusion in "
+            f"docs/scanpy/accel-perturbation-metrics.md may be broader than it "
+            f"needs to be — recheck it."
         )
 
     def test_all_ties_match_cell_eval(self):
@@ -1256,7 +1258,8 @@ class TestDEBridgeParity:
 class TestFullPipelineParity:
     """Full pipeline integration against cell-eval."""
 
-    # Tolerance table (see docs/scanpy.md "Perturbation evaluation metrics")
+    # Tolerance table (see docs/scanpy/accel-perturbation-metrics.md
+    # "Perturbation evaluation metrics")
     TOLERANCE = {
         "pearson_delta": 1e-6,
         "mse": 1e-6,

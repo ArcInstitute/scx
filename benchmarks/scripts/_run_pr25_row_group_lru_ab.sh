@@ -157,7 +157,7 @@ SCX_ROW_GROUP_CACHE=0 python "$CAPTURE" --name "$NAME_OFF" "${COMMON[@]}" 2>&1 \
 # Arm ON — the shipped default. Also carries the `scx_auto` loader benchmarks:
 # those fixtures are framed too (format v4), so `index_plan`'s scattered
 # scenarios exercise the row-group path under the default `IndexPlanDataset`
-# budget (the 26–57x in docs/performance.md), while `cellset_gather` takes the
+# budget (the 26–57x in docs/performance/loader-index-plan.md), while `cellset_gather` takes the
 # whole-shard route by default and must come out flat against LATEST.
 # ---------------------------------------------------------------------------
 echo ""

@@ -63,7 +63,7 @@ class IndexPlanBatchIter:
 class IndexPlanDataset:
     """Plan-driven paired-batch reader for ML training.
 
-    See `docs/api.md` § `IndexPlanDataset` for a full description; the
+    See `docs/api/python-training.md` § `IndexPlanDataset` for a full description; the
     short version: each yielded batch is a list of
     `(perturbed_cell, control_cell)` pairs gathered via the cached
     `BackedCsrReader`, with optional HVG projection + normalize+log1p.

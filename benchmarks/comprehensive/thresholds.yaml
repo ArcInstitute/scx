@@ -32,7 +32,7 @@ absolute_floors:
   # turns "benchmarked the wrong route" into a hard gate failure. The metric
   # is always present (never a missing-metric violation); a 0.0 means the
   # planner/dispatch silently dropped off the intended CSC-direct path. See
-  # docs/performance.md § pdex_ref GPU v3-CSC and the accelerator route
+  # docs/performance/gpu.md § pdex_ref GPU v3-CSC and the accelerator route
   # metadata on adata.uns["scx_accel"].
   #
   # Gated on three tiers: pbmc3k (single CSC shard — the minimal route check),
@@ -714,7 +714,7 @@ absolute_floors:
   # net at the resolution a stochastic init allows.
   #
   # Set from the MEASURED first gate run (job 2840853), not from the
-  # `0.989-0.999` figure `docs/performance.md` used to report against R harmony:
+  # `0.989-0.999` figure `docs/performance/accel-qc-de-integration.md` used to report against R harmony:
   # that number pre-dates the Phase 7e M-step and was measured on gitignored
   # fixtures nobody can rerun.
   #
@@ -1415,8 +1415,8 @@ absolute_floors:
 
   # --- ml_loader throughput floors -----------------------------------
   # SCX own-throughput floors: min = 0.85 × the min-observed run for
-  # that scenario (~15% noise headroom). Competitor floors (shardad,
-  # cellstream, tiledb_soma, h5ad_*): min = 0.5 × median.
+  # that scenario (~15% noise headroom). Competitor floors (tiledb_soma,
+  # h5ad_*): min = 0.5 × median.
   # Per-scenario keys (batches_per_sec__<scenario>) are emitted only
   # on that scenario's runs, so the gate's median is over scenario-
   # coherent runs (not aliased across raw/hvg/norm/hvg_norm).
@@ -1432,10 +1432,10 @@ absolute_floors:
   # `auto` decodes no slower). PROVISIONAL pending the P4.3 recapture,
   # which re-derives exact adaptive floors for every dataset.
   #
-  # Recalibrated 2026-07-12 from the v0.11.0-cellstream-recapture
+  # Recalibrated 2026-07-12 from the v0.11.0-recapture
   # Chimera capture (results/baseline_2026_07_10).
   # Headline claim ("82x vs TileDB-SOMA-ML, ~340x vs SLAFDataLoader")
-  # is in docs/performance.md; these floors protect it at each tier.
+  # is in docs/performance/loader.md; these floors protect it at each tier.
   #
   # GPU utilization (avg_gpu_util_pct__gpu_train) is intentionally
   # NOT gated yet — `nvidia-smi dmon` polls at 1 Hz but pbmc3k epochs
@@ -1562,113 +1562,6 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__hvg_norm
     min: 10.0
-  # shardad row-slice loader (no native DataLoader; random-access read).
-  # Competitor floors at 0.5× median from the 2026-07-12 Chimera
-  # capture. shardad collapses to ~0.5 b/s ≥50k cells (no census run).
-  - benchmark: ml_loader
-    format: shardad
-    dataset: pbmc3k
-    metric: batches_per_sec__raw
-    min: 4.0
-  - benchmark: ml_loader
-    format: shardad
-    dataset: pbmc3k
-    metric: batches_per_sec__hvg_norm
-    min: 4.0
-  - benchmark: ml_loader
-    format: shardad
-    dataset: pbmc10k
-    metric: batches_per_sec__raw
-    min: 1.3
-  - benchmark: ml_loader
-    format: shardad
-    dataset: pbmc10k
-    metric: batches_per_sec__hvg_norm
-    min: 1.3
-  - benchmark: ml_loader
-    format: shardad
-    dataset: smartseq2
-    metric: batches_per_sec__raw
-    min: 0.3
-  - benchmark: ml_loader
-    format: shardad
-    dataset: smartseq2
-    metric: batches_per_sec__hvg_norm
-    min: 0.3
-  - benchmark: ml_loader
-    format: shardad
-    dataset: tabula_sapiens_100k
-    metric: batches_per_sec__raw
-    min: 0.25
-  - benchmark: ml_loader
-    format: shardad
-    dataset: tabula_sapiens_100k
-    metric: batches_per_sec__hvg_norm
-    min: 0.25
-  # cellstream scatter-immune gather store (no native DataLoader) — new
-  # competitor. Floors at 0.5× median from the 2026-07-12 Chimera
-  # capture; catches a harness/env break that tanks the gather path.
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: pbmc3k
-    metric: batches_per_sec__raw
-    min: 7.3
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: pbmc3k
-    metric: batches_per_sec__hvg_norm
-    min: 6.2
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: pbmc10k
-    metric: batches_per_sec__raw
-    min: 5.8
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: pbmc10k
-    metric: batches_per_sec__hvg_norm
-    min: 5.6
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: smartseq2
-    metric: batches_per_sec__raw
-    min: 4.1
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: smartseq2
-    metric: batches_per_sec__hvg_norm
-    min: 3.7
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: tabula_sapiens_100k
-    metric: batches_per_sec__raw
-    min: 1.3
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: tabula_sapiens_100k
-    metric: batches_per_sec__hvg_norm
-    min: 6.3
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: census_500k
-    metric: batches_per_sec__raw
-    min: 6.5
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: census_500k
-    metric: batches_per_sec__hvg_norm
-    min: 5.8
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: census_1m
-    metric: batches_per_sec__raw
-    min: 6.3
-  - benchmark: ml_loader
-    format: cellstream
-    dataset: census_1m
-    metric: batches_per_sec__hvg_norm
-    min: 5.6
-
   # `num_workers > 0` (workers2) floors. Recalibrated 2026-07-12 to the
   # Chimera capture at 0.85× min-observed run. tabula_sapiens_100k still
   # runs workers2 (< the 250k workers2-skip threshold); census is
@@ -2195,7 +2088,7 @@ absolute_floors:
   # Derivation for census_1m, 2026-08-22. Measured figures are from job **2834737**,
   # whose results are tracked at
   # `results/raw/conversion_streaming__scx_streaming_vs_materialize__census_1m.json`
-  # — the same capture docs/performance.md publishes, so the two cannot drift.
+  # — the same capture docs/performance/conversion.md publishes, so the two cannot drift.
   # (An earlier revision of this comment quoted job 2834726's 2278/2335/2423 MB,
   # a different run of the same code; the numbers agree to ~2% but citing an
   # untracked capture is what let the doc and its backing diverge.)
@@ -2218,7 +2111,7 @@ absolute_floors:
   # wins on datasets that fit in RAM (parallel shard encode over
   # pre-computed boundaries), and a streaming wall regression doesn't
   # change the bounded-memory contract. Track wall numbers in
-  # docs/performance.md; gate only the memory ceiling here.
+  # docs/performance/conversion.md; gate only the memory ceiling here.
   - benchmark: conversion_streaming
     format: scx_streaming_vs_materialize
     dataset: census_1m
@@ -2245,7 +2138,7 @@ absolute_floors:
   # **Not yet a tracked capture.** Unlike the census_1m block above, which
   # cites job 2834737's results JSON, these numbers come from a direct local
   # run of the two arms — enough to derive a floor, not enough to quote in
-  # `docs/performance.md`, which needs a manifest entry
+  # `docs/performance/conversion.md`, which needs a manifest entry
   # (`docs/benchmark_manifest.md`). Replace this paragraph with the job id and
   # results path once a full-tier capture has populated the metric.
   #   500,000 cells × 61,497 genes, 747,048,147 nnz, 5.59 GB source
@@ -2694,13 +2587,12 @@ absolute_floors:
     metric: grouped_peak_rss_mb
     max: 12000.0
 
-  # ─── Grouped read (cross-format head-to-head: scx vs shardad) ──────
-  # Same correctness-only policy as grouped_sort, but gated for BOTH formats so
-  # a read_group / read_reference regression in either the scx or the shardad
-  # arm trips the gate. Head-to-head perf (grouped_write wall/size, read_group
+  # ─── Grouped read (scx's own grouped write/read round trip) ──────
+  # Correctness-only policy, same as grouped_sort: a read_group / read_reference
+  # regression trips the gate. Perf (grouped_write wall/size, read_group
   # throughput) is reported, not floored (hardware/density sensitive). Runs on
   # the integer-count grouping datasets only — the float pert_synth_10k fixture
-  # is scx-only (grouped_sort), since shardad is a counts format.
+  # is already covered by the SCX-only grouped_sort (see grouped_read._DATASETS).
   # nb_glm_synth (ref=control)
   - benchmark: grouped_read
     format: scx_auto
@@ -2709,16 +2601,6 @@ absolute_floors:
     min: 1
   - benchmark: grouped_read
     format: scx_auto
-    dataset: nb_glm_synth
-    metric: reference_isolated_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: nb_glm_synth
-    metric: correctness_passed_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
     dataset: nb_glm_synth
     metric: reference_isolated_int
     min: 1
@@ -2738,21 +2620,6 @@ absolute_floors:
     dataset: replogle_k562
     metric: reference_isolated_int
     min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: replogle_k562
-    metric: correctness_passed_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: replogle_k562
-    metric: n_group_records
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: replogle_k562
-    metric: reference_isolated_int
-    min: 1
   # tahoe_c38 (no reference)
   - benchmark: grouped_read
     format: scx_auto
@@ -2764,17 +2631,7 @@ absolute_floors:
     dataset: tahoe_c38
     metric: n_group_records
     min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: tahoe_c38
-    metric: correctness_passed_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: tahoe_c38
-    metric: n_group_records
-    min: 1
-  # chemogenetic_rgfp (real raw counts, ref=non-targeting) — both formats
+  # chemogenetic_rgfp (real raw counts, ref=non-targeting)
   - benchmark: grouped_read
     format: scx_auto
     dataset: chemogenetic_rgfp
@@ -2789,40 +2646,6 @@ absolute_floors:
     format: scx_auto
     dataset: chemogenetic_rgfp
     metric: reference_isolated_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: chemogenetic_rgfp
-    metric: correctness_passed_int
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: chemogenetic_rgfp
-    metric: n_group_records
-    min: 1
-  - benchmark: grouped_read
-    format: shardad
-    dataset: chemogenetic_rgfp
-    metric: reference_isolated_int
-    min: 1
-
-  # ─── Shardad read-back fidelity (source h5ad -> .shad -> to_anndata) ──
-  # Correctness-only: the round-tripped matrix must equal the source
-  # (counts lossless; float32 preserved). One gate per fixture.
-  - benchmark: shardad_fidelity
-    format: shardad
-    dataset: pbmc3k
-    metric: overall_passed_int
-    min: 1
-  - benchmark: shardad_fidelity
-    format: shardad
-    dataset: nb_glm_synth
-    metric: overall_passed_int
-    min: 1
-  - benchmark: shardad_fidelity
-    format: shardad
-    dataset: tabula_sapiens_100k
-    metric: overall_passed_int
     min: 1
 
   # ─── F5 row-group block-index adoption (read_scattered) ──────────────
@@ -3728,7 +3551,7 @@ absolute_floors:
 #    `scx_auto` throughput floors for `pbmc3k` / `tabula_sapiens_100k` / census,
 #    and tightening every PROVISIONAL floor to the captured adaptive medians
 #    (min = 0.85× the measured min run). The recapture must also add the looser
-#    raw-path (G1b) floor documented in docs/performance.md.
+#    raw-path (G1b) floor documented in docs/performance/loader.md.
 #
 # 6. discrimination_route_gpu_correct (GPU discrimination_score)
 #    The GPU eval-metric route floors (perturbation_metrics_route_gpu_correct,
@@ -3833,7 +3656,7 @@ absolute_floors:
 #        own noise floor fails on noise, which trains operators to ignore the
 #        gate. They stay as recorded diagnostics; the finding they support (obs
 #        read is 96-99.8% of per-file cost, so the open side is not worth
-#        optimizing) is in docs/performance.md.
+#        optimizing) is in docs/performance/loader.md.
 #    BioNeMo-SCDL ooc_loader row stays DEFERRED (isolated NeMo/CUDA env not yet
 #    added — see envs/scx-bench.yml note). Only AnnLoader + annbatch + scDataset
 #    are wired for Phase 0.
@@ -3846,7 +3669,7 @@ absolute_floors:
 #        indices are coded independently of row order); `zstd` / `shufdelta`
 #        move by whatever cross-row redundancy the corpus happened to carry, in
 #        either direction. A floor would fire on a fixture refresh rather than
-#        on a regression. The measured values live in docs/performance.md, which
+#        on a regression. The measured values live in docs/performance/loader-data-load.md, which
 #        is where a data-dependent number belongs.
 #      * `samples_per_sec__train_{unshuffled,shuffled}`: single capture, and the
 #        arm's purpose is a *neutrality* check (~1.00x) rather than a throughput
@@ -3969,7 +3792,6 @@ absolute_floors:
 #      cloud_read       census_10m 5
 #      accel_de_nb_glm  nb_glm_synth 3
 #      accel_eval_metrics     pert_synth_10k 2
-#      shardad_fidelity nb_glm_synth 1
 #
 #    `gate_candidate.py` forwards `--datasets` only when the operator passes it,
 #    and `check_absolute_floors` skips a triple that did not run *silently* —
@@ -4490,7 +4312,7 @@ absolute_floors:
 #          `batches_per_sec__gpu_train` above.
 #
 #     Read the published values as a decision input recorded in
-#     `docs/performance.md`, not as a contract. They are CPU-side *exposed*
+#     `docs/performance/loader.md`, not as a contract. They are CPU-side *exposed*
 #     wait (the H2D copy is `non_blocking=True` and there is no per-step
 #     synchronise), so they measure what a consumer actually stalls on rather
 #     than total I/O — which is the quantity the tier decision needs.

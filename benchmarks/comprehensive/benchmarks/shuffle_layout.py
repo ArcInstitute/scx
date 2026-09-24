@@ -134,7 +134,7 @@ def _geometry(scx_bin: str | None, path: Path) -> dict[str, int | str | None]:
     only variable that may differ between the two files is row order.
 
     **X-section bytes, not whole-file bytes.** obs, var and the predicate index
-    all change under a reorder too; `docs/performance.md` had to rule each out by
+    all change under a reorder too; `docs/performance/query-and-file-ops.md` had to rule each out by
     hand when the 149M-cell sort grew. Isolating X is what makes the claim about
     *compression* rather than about bookkeeping.
 
@@ -176,7 +176,7 @@ def _geometry(scx_bin: str | None, path: Path) -> dict[str, int | str | None]:
     # Per-shard codec histogram. This is what separates "the permutation cost
     # this codec compression" from "the adaptive `auto` heuristic picked a
     # different codec for the reordered shard" — two very different findings
-    # that a size ratio alone cannot tell apart. `docs/performance.md`'s sort
+    # that a size ratio alone cannot tell apart. `docs/performance/query-and-file-ops.md`'s sort
     # section had to reason about exactly this flip without the data.
     out["codec_breakdown"] = info.get("codec_breakdown")
     if info.get("shard_target_rows"):

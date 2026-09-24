@@ -65,11 +65,14 @@ pip install "$(ls ./pyscx-*.whl)[mudata]"     # in-memory MuData round-trip (fro
 pip install "$(ls ./pyscx-*.whl)[10x]"        # from_10x (pulls scanpy)
 pip install "$(ls ./pyscx-*.whl)[eval]"       # polars for pyscx.eval helpers
 pip install "$(ls ./pyscx-*.whl)[scvi]"       # scvi-tools integration helpers
+pip install "$(ls ./pyscx-*.whl)[nbglm]"      # formulaic for custom design formulas in NB-GLM DE
+pip install "$(ls ./pyscx-*.whl)[hvg]"        # scikit-misc for seurat_v3 loess regression
+pip install "$(ls ./pyscx-*.whl)[pydeseq2]"   # pydeseq2 for exact PyDESeq2 pseudobulk DE
 pip install "$(ls ./pyscx-*.whl)[cloud,gpu]"  # combine as needed
 ```
 
 Or just spell out the full filename, e.g.
-`pip install './pyscx-0.7.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl[cloud]'` (a v0.7.0 per-minor wheel; post-v0.15.0 the filename segment is `cp311-abi3`).
+`pip install './pyscx-0.19.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl[cloud]'` (post-v0.15.0 wheels use the `cp311-abi3` filename segment; older releases used per-minor `cp3XX-cp3XX` names).
 
 Notes on extras:
 
@@ -83,6 +86,12 @@ Notes on extras:
   `Experiment.to_mudata()`). File-based h5mu ingest/export (`from_h5mu`,
   `to_h5mu`) is covered by the base wheel's HDF5 support — no `[mudata]`
   extra required for path-based h5mu workflows.
+- **`[nbglm]`** adds `formulaic` for custom design formulas in
+  `pseudobulk_dex(backend="nb_glm", design=...)` and `pdex_nb_glm(design=...)`.
+- **`[hvg]`** adds `scikit-misc` for the default `seurat_v3` loess regression.
+- **`[pydeseq2]`** adds `pydeseq2` for exact PyDESeq2 parity in
+  `pseudobulk_dex(backend="pydeseq2")` (the default `backend="nb_glm"` is
+  Rust-native and needs no extra).
 
 **Python version:** `>=3.11` (`requires-python` in `pyproject.toml`).
 `docs/development.md` mentions Python 3.10+ for the wider workspace, but
@@ -271,6 +280,9 @@ unset VIRTUAL_ENV    # when using conda for the build
 | 10x HDF5 (`from_10x`) | `pip install "$(ls ./pyscx-*.whl)[10x]"` (scanpy) |
 | GPU accelerators | Source build with `--features gpu` + `pip install "$(ls ./pyscx-*.whl)[gpu]"` (cupy) |
 | cell-eval parity helpers | `pip install "$(ls ./pyscx-*.whl)[eval]"` (polars) |
+| NB-GLM custom formulas | `pip install "$(ls ./pyscx-*.whl)[nbglm]"` (formulaic) |
+| seurat_v3 loess HVG | `pip install "$(ls ./pyscx-*.whl)[hvg]"` (scikit-misc) |
+| PyDESeq2 pseudobulk DE | `pip install "$(ls ./pyscx-*.whl)[pydeseq2]"` (pydeseq2) |
 
 ### Dependency version conflicts
 
@@ -288,7 +300,7 @@ x86_64 and arm64, glibc ≥ 2.35. Bundles hdf5 + cloud; libhdf5 statically linke
 
 ```bash
 # Set VERSION to the latest release — see the Releases page above.
-VERSION=0.7.1
+VERSION=0.19.0
 TARGET=x86_64-unknown-linux-gnu   # or: aarch64-unknown-linux-gnu
 gh release download "scx-cli-v${VERSION}" -R ArcInstitute/scx \
   -p "scx-cli-${VERSION}-${TARGET}.tar.gz"

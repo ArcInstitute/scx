@@ -9,7 +9,7 @@
 # runs three arms and isolates both.
 #
 # Kept, rather than deleted as review suggested, for one reason:
-# `results/raw/phase5_admission/` is cited by name in `docs/performance.md`, and
+# `results/raw/phase5_admission/` is cited by name in `docs/performance/loader-index-plan.md`, and
 # `docs/benchmark_manifest.md` requires a committed performance claim to have a
 # reproducible producer. Deleting this script would leave that row unreproducible.
 #
@@ -34,7 +34,7 @@
 # Datasets: pbmc3k and tabula_sapiens_100k. Census is NOT here for the reason
 # phase 1 recorded — a `cellset_gather` census cell does not finish (census_500k
 # killed at 205 minutes still on run 1 of 3). The census headroom figures in
-# docs/performance.md came from `bench_cellset_scatter_routes.py`'s
+# docs/performance/loader-index-plan.md came from `bench_cellset_scatter_routes.py`'s
 # `cache_metrics()` probes, and that is the vehicle that can reproduce them.
 #
 #SBATCH --job-name=scx-phase5-admission-ab

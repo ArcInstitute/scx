@@ -730,7 +730,7 @@ pub(crate) fn chunk_boundaries(n_obs: usize, target_rows: usize) -> Vec<(usize, 
 /// file has none (the format forbids framed zero-row shards: "emit no shard
 /// at all instead"), so the layer's very name cannot be recorded. Say so
 /// rather than drop it silently; X's shape, obs / var, obsm / varm and uns all
-/// survive. See docs/api.md § `pyscx.from_anndata`.
+/// survive. See docs/api/conversion.md § `pyscx.from_anndata`.
 pub(crate) fn warn_layers_dropped_at_zero_rows(
     py: Python<'_>,
     layer_keys: &[String],

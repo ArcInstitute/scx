@@ -1,7 +1,7 @@
 """Peak memory of the column-selector paths (REC-7, PR D), each in a fresh
 process against a full `to_memory()` decode.
 
-The contract `docs/api.md` states: `X[:, cols]` is a handle (no decode), and
+The contract `docs/api/python-datasets.md` states: `X[:, cols]` is a handle (no decode), and
 the two forms that must materialise — repeated columns on any handle, and a
 reorder on a lazily transformed handle — materialise the *projected unique
 columns*, never the whole matrix. Before this, `to_memory()` on a projected

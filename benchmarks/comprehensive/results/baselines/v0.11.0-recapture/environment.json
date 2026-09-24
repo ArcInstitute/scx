@@ -1,7 +1,7 @@
 {
   "captured_at": "2026-07-11T21:30:15-0700",
   "git_sha": "250a444c6732b74dc995101f81d6d20650f325f7",
-  "git_branch": "bench-cellstream-recapture",
+  "git_branch": "bench-recapture",
   "git_dirty": true,
   "git_describe": "pyscx-v0.11.0-12-g250a444",
   "determinism_env": {

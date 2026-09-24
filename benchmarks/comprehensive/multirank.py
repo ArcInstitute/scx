@@ -5,7 +5,7 @@ The question this answers: **does per-rank loader cost and page-cache pressure
 scale**, i.e. is the loader a *shared* bottleneck once several DDP ranks read the
 same files on one node? A single-process throughput number cannot say — contention
 on the OS page cache, the shared filesystem, and the node's memory bandwidth only
-appears with concurrent readers. See ``docs/performance.md`` § "Out-of-core loader
+appears with concurrent readers. See ``docs/performance/loader.md`` § "Out-of-core loader
 — cold-cache measurements and the P-1 premise gate" for the results and for the
 stated limit (one node is not multi-node DDP).
 

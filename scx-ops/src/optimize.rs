@@ -106,7 +106,7 @@ pub fn optimize_with_framing(
 /// hold in flight.
 ///
 /// A separate entry point rather than a sixth parameter on
-/// `optimize_with_framing`: that function is documented in `docs/api.md` and
+/// `optimize_with_framing`: that function is documented in `docs/api/rust-ops.md` and
 /// `scx-ops` carries no `publish = false`, so a downstream git or path
 /// dependency would fail to compile on a changed arity. There is no behavioural
 /// difference — `optimize_with_framing` delegates here with `None`.

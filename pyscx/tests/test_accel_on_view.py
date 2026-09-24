@@ -3,8 +3,9 @@
 Companion to `test_accel_axis_view.py`. That file covers the *handle's* window
 (`accel.subset_var` / `filter_cells`, which never produce an `AnnData` view).
 This one covers plain anndata indexing — `adata[:, mask]` — which
-`docs/scanpy.md` advertises as supported on a backed `X`, and which is the
-first thing a scanpy user reaches for after `highly_variable_genes`.
+`docs/scanpy/accelerators.md` advertises as supported on a backed `X`, and
+which is the first thing a scanpy user reaches for after
+`highly_variable_genes`.
 
 Handed a view, an accelerator wants to write its result back. Every write on a
 view goes through anndata's copy-on-write, and copy-on-write is

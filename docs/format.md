@@ -488,7 +488,7 @@ column count lives in the header, `obs` is a single 0-row section, and
 anything recorded only by its shards (layers, `raw`) is absent. Every reader
 treats zero shards as an empty `(0, n_vars)` matrix; `pyscx.from_anndata`
 writes such a file from an empty AnnData, with the policy in
-[api.md § Zero rows and zero columns](api.md#zero-rows-and-zero-columns).
+[api/conversion.md § Zero rows and zero columns](api/conversion.md#zero-rows-and-zero-columns).
 
 Readers must nonetheless accept an empty block index when the header agrees the
 shard is empty — `n_major == 0 && nnz == 0` resolves to zero spans, i.e. an
@@ -520,11 +520,12 @@ genes → ~24M non-zeros per shard → ~50–100 MB compressed. Rationale and tr
 ## 4.1 CSC Shard Internal Layout
 
 CSC sidecar shards are an **optional column-major view** of the same
-data the CSR shards hold. They are emitted by `scx convert
---csc=always`, `pyscx.from_anndata(csc="always")`, `scx build-csc`,
-`scx append --rebuild-csc`, and the rewrite ops (`compact`, `merge`,
-`optimize`, `sort`, `subset`), which carry a sidecar by default by rebuilding
-it from the output's X in the same pass (`--csc carry|always|off`).
+data the CSR shards hold. They are emitted by `scx convert` (default
+`--csc auto`, or `--csc always`), `pyscx.from_anndata` (default `csc="auto"`,
+or `csc="always"`), `scx build-csc`, `scx append --rebuild-csc`, and the
+rewrite ops (`compact`, `merge`, `optimize`, `sort`, `subset`), which carry
+a sidecar by default by rebuilding it from the output's X in the same pass
+(`--csc carry|always|off`).
 
 A CSC shard has the **same on-disk structure** as a CSR shard — same
 76-byte shard header, same encoded `indptr` / `indices` / `values`

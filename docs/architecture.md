@@ -6,7 +6,7 @@ scipy.sparse, and the scanpy I/O layer with a unified Rust-native stack.
 
 This document describes the high-level architecture, crate structure, and data flow.
 For the full binary format specification, see [format.md](format.md) and [codec.md](codec.md).
-For the API reference, see [api.md](api.md).
+For the API reference, see [api/](api/README.md).
 
 ---
 
@@ -403,8 +403,8 @@ Entry points:
 | Entry point | When |
 |-------------|------|
 | `scx build-csc` | Post-hoc addition to an existing file |
-| `scx convert --csc=always` | During h5ad/h5mu → SCX conversion |
-| `pyscx.from_anndata(csc="always")` | During Python-side conversion |
+| `scx convert` (default `--csc auto`, or `--csc always`) | During h5ad/h5mu → SCX conversion |
+| `pyscx.from_anndata` (default `csc="auto"`, or `csc="always"`) | During Python-side conversion |
 | `--csc carry\|always\|off` on rewrite ops | Same-pass rebuild in compact/merge/optimize/sort/subset (`carry` is the default) |
 | `append --rebuild-csc` | In-place rebuild after an append |
 
@@ -790,7 +790,7 @@ The two types share LRU shard caching (`BackedCsrReader::read_shard_cached`),
 `fused_normalize_log1p_dense`, and `extract_obs_columns`. They do **not**
 share `pipeline.rs` — the streaming pipeline's I/O stage sorts shard groups
 by file offset, an optimisation that doesn't apply to plan-driven access.
-See `docs/api.md` § `IndexPlanDataset` for details.
+See [docs/api/python-training.md § `IndexPlanDataset`](api/python-training.md#indexplandataset) for details.
 
 ### Pipeline Architecture (TrainingDataset)
 
@@ -865,7 +865,7 @@ pyscx.to_mtx("output.scx", "/path/to/mtx_dir")
 `from_10x` reads through `scanpy.read_10x_h5` and hands the in-memory AnnData to
 `from_anndata`, so peak memory scales with the whole matrix. For a *raw*
 all-droplet `raw_feature_bc_matrix.h5`, use `scx convert --from 10x`, which
-streams by default — see [docs/scanpy.md § From 10x HDF5](scanpy.md#from-10x-hdf5).
+streams by default — see [docs/scanpy/conversion.md § From 10x HDF5](scanpy/conversion.md#from-10x-hdf5).
 
 
 The `to_anndata()` path is **zero-copy** for the expression matrix — `ScxCsr`'s
@@ -875,7 +875,7 @@ Arrow metadata goes to pandas via pyarrow. The `container` / `data_dtype` /
 materialize `X` into a chosen container (scipy CSR or dense ndarray) and numeric
 dtype via a read-then-convert (with a fail-loud cast gate), trading the zero-copy
 move for a narrower / dense output. See
-[docs/api.md § Container and dtype materialization](api.md#container-and-dtype-materialization).
+[docs/api/python-experiment.md § Container and dtype materialization](api/python-experiment.md#container-and-dtype-materialization).
 
 ### Training Dataset
 
@@ -1125,7 +1125,7 @@ dataset size or per-key embedding dimension. The pyscx backed-routing
 path detects per-section mutation via top-level key comparison
 against the source h5ad; clean sections route through the disk
 streamer, mutated sections are extracted from Python and partitioned
-into the same sharded layout on the way out. `csc="always"` builds the
+into the same sharded layout on the way out. `csc="auto"` (the default) or `csc="always"` builds the
 sidecar in the same pass as X (`ScxWriter::enable_csc_sidecar`), so there is no
 extra read pass and no second copy of the file; under `--memory-budget` the
 builder's buckets take a quarter of the budget (the `IngestWithCscPush` phase in
@@ -1331,7 +1331,7 @@ re-describe them. All are optional — defaults apply when unset.
 | `SCX_FORCE_NATIVE_GPU` | `pyscx` | unset | Any non-empty, non-`0` value pins the surviving native GPU kernels instead of routing in-VRAM ops to rapids-singlecell. |
 | `SCX_DISABLE_RAPIDS` | `pyscx` | unset | Any non-empty, non-`0` value treats rapids-singlecell as unavailable, forcing the CPU fallback (testing). |
 | `SCX_PCA_COV_MEMORY_BUDGET` | `scx-accel` | — | **Removed after v0.13.0; warns once if set.** Capped concurrent `n_vars × n_vars` f64 covariance-PCA accumulators back when there was one per worker. The build now partitions one shared accumulator, so peak no longer scales with the thread count and there is nothing to cap. |
-| `SCX_ACCEL_DETERMINISTIC_LINALG` | `scx-accel` | unset | `1`/`true`/`yes`/`on` pins faer's dense decompositions to sequential execution, making **CPU PCA / PFlog** bit-identical across thread counts. Opt-in: ~2.3× slower on the covariance route's eigendecomposition. Read once, at the first CPU PCA/PFlog call. The setting it writes is a faer process-global, so every *implicit* faer decomposition (Harmony, NB-GLM, native-GPU PCA's host SVD) also runs sequentially once it is pinned; the *guarantee*, however, is PCA/PFlog-scoped, and kNN's and eval-metrics' gemms pass an explicit `Par` and ignore it entirely. See [scanpy.md § PCA reproducibility](scanpy.md#reproducibility). |
+| `SCX_ACCEL_DETERMINISTIC_LINALG` | `scx-accel` | unset | `1`/`true`/`yes`/`on` pins faer's dense decompositions to sequential execution, making **CPU PCA / PFlog** bit-identical across thread counts. Opt-in: ~2.3× slower on the covariance route's eigendecomposition. Read once, at the first CPU PCA/PFlog call. The setting it writes is a faer process-global, so every *implicit* faer decomposition (Harmony, NB-GLM, native-GPU PCA's host SVD) also runs sequentially once it is pinned; the *guarantee*, however, is PCA/PFlog-scoped, and kNN's and eval-metrics' gemms pass an explicit `Par` and ignore it entirely. See [scanpy/accel-embedding-clustering.md § PCA reproducibility](scanpy/accel-embedding-clustering.md#reproducibility). |
 | `SCX_ACCEL_WILCOXON_NNZ` | `scx-accel` | on | `0`/`false`/`FALSE`/`off` turns the **CPU CSC** Wilcoxon kernel's exact sparse-nnz path (§5.3) **off**, falling back to the densify kernel; unset or any other value leaves it on (the default since 0.20 — before, it was opt-in with `1`). The nnz kernel ranks each gene's nonzeros plus an analytic implicit-zero tie block instead of a dense `n_obs`-length per-gene sort, and is bit-identical to densify (pinned at zero tolerance). 1-vs-rest only — an explicit `reference=` or `rankby_abs=True` keeps the densify path whatever this is set to. The route records as **`cpu_csc_nnz`** when it runs and `cpu_csc` otherwise, so a benchmark can tell which kernel it timed. Read once, through a `OnceLock`, so it must be set before the process's first CSC DE call. |
 | `SCX_ACCEL_PAIRWISE_MEMORY_BUDGET` | `scx-accel` | `268435456` (256 MiB) | Byte ceiling for **one** pairwise-distance Gram block on the `gemm` backend (`pyscx.accel.energy_distance` / `energy_distance_details`, i.e. `backend="auto"` on euclidean or cosine). The Gram is built one row block of `a` at a time and reduced before the next overwrites it, rather than as `n_a · n_b · itemsize`. An input whose whole Gram already fits is a single block, i.e. the unblocked computation, so lowering this can only add blocks and raising it can only remove them — the same pairs are summed either way, though a different block width repanels the gemm and moves Gram ulps (inside the `atol=1e-4` parity bound; at one block the **cross** result is bit-identical to pre-0.13.1 — the self path changed convention independently of this knob, so `energy_distance` as a whole is not). **Three things it does not bound:** the block is `max(budget, one Gram row)`, since the planner never returns a zero-row block; `metric="cosine"` separately materialises `n_a · n_dims` (+ `n_b · n_dims` when the sides differ) normalized copies outside it — ~800 MB / ~1.6 GB at 100K × 2000 f32; and `energy_distance` runs perturbations on a rayon `par_iter`, so all of the above is `RAYON_NUM_THREADS ×` over, on top of each task's own dense copy of the perturbation and control rows. Unparseable / zero falls back to the default. Read once. |
 | `SCX_CSC_AUTO_OBS_THRESHOLD` | `scx-format` | `50000` | `CscPolicy::Auto` builds a CSC sidecar only when `n_obs ≥` this. |
@@ -1355,7 +1355,7 @@ the Rust crates — see [benchmarks/README.md](../benchmarks/README.md).
 
 - [format.md](format.md) — Binary format reference: header, catalogs, CSR shards, fragment/manifest, checksums
 - [codec.md](codec.md) — Bit-level codec specification
-- [api.md](api.md) — API reference for Rust, Python, and CLI
-- [scanpy.md](scanpy.md) — Scanpy integration, backed mode, and accelerator usage
-- [performance.md](performance.md) — Benchmark results and performance characteristics
+- [api/](api/README.md) — API reference for Rust, Python, and CLI
+- [scanpy/](scanpy/README.md) — Scanpy integration, backed mode, and accelerator usage
+- [performance/](performance/README.md) — Benchmark results and performance characteristics
 - [testing.md](testing.md) — Test infrastructure and benchmarks

@@ -544,7 +544,7 @@ def test_scatter_ratio_is_none_when_the_on_arm_measured_zero():
 def test_obs_open_docstring_states_the_measured_split():
     """The "~87% open" split was retracted; the docstring must not revive it.
 
-    `docs/performance.md` records that the 87% figure came from a warm
+    `docs/performance/loader.md` records that the 87% figure came from a warm
     interactive smoke whose first `pyscx.open` absorbed interpreter and pyo3
     init, and that the measured split is the opposite. The docstring is what
     keeps proposing the withdrawn `ScxObsReader` work item.

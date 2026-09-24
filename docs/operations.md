@@ -32,7 +32,7 @@ rollback`. Copy out first if you want a way back.
 > reading through it raises rather than answering. Call `Experiment.reload()`,
 > or re-derive from a fresh `pyscx.open(...)`. Mutating *through* a handle
 > (`pyscx.obs_import(exp, ...)`, `exp.mark_deleted(...)`) reloads it for you.
-> See [docs/api.md § Handles and files that change underneath them](api.md#handles-and-files-that-change-underneath-them).
+> See [docs/api/python-experiment.md § Handles and files that change underneath them](api/python-experiment.md#handles-and-files-that-change-underneath-them).
 
 | Operation | Writes | Matrix shards | Obs metadata | Var metadata | CSC sidecar | Predicate indexes | Deletion vectors |
 |-----------|--------|---------------|--------------|--------------|-------------|-------------------|-------------------|
@@ -416,8 +416,8 @@ scx compact experiment.scx compacted.scx --csc always
 
 The Python API exposes `pyscx.build_csc(input, output=None, memory_limit=None, force=False, csc_cols_per_shard=5000)`
 for standalone builds — `output=None` (the default) appends the sidecar in
-place, and a path writes a copy. Alternatively, set `csc="always"` at conversion time
-via `pyscx.from_anndata(..., csc="always")` to emit the sidecar during the
+place, and a path writes a copy. Alternatively, conversion defaults to `csc="auto"`
+(or pass `csc="always"` via `pyscx.from_anndata(..., csc="always")` / `scx convert --csc always`) to emit the sidecar during the
 initial write, or pass `csc="always"` to a rewrite op such as `pyscx.sort(..., csc="always")`.
 
 Neither `build-csc` form can change the input's row-group framing, because neither writes a
@@ -674,7 +674,7 @@ CSR shards (the format forbids framed zero-row shards — "emit no shard at all
 instead"), a single 0-row `obs` section carrying the full schema, `var`,
 `obsm` / `varm` / `uns`, and no layers or `raw` (both exist on disk only as
 their shards). `pyscx.from_anndata` writes one from an empty AnnData — see
-[api.md § Zero rows and zero columns](api.md#zero-rows-and-zero-columns) — and
+[api/conversion.md § Zero rows and zero columns](api/conversion.md#zero-rows-and-zero-columns) — and
 the mutating ops treat it consistently:
 
 - **compact** after deleting every row (or of an already-empty file) writes
@@ -723,7 +723,7 @@ every CSR-backed shard (`X`, layers, and obs×obs `obsp` CSR graphs), stamping
 `format_version=4` when framed (or `format_version=3` if unframed via `--row-group-rows 0`) — without a full reconvert. This is how an older file gains the
 row-group random-access substrate and GPU device-decode benefits: framed Scx1
 shards keep the GPU device-decode route (decoding group-by-group in VRAM). No
-decode sidecar is written (see [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis)).
+decode sidecar is written (see [scanpy/accel-gpu.md § Data layout for fast GPU decode](scanpy/accel-gpu.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis)).
 
 Unlike `compact`, `optimize` is a faithful 1:1 upgrade:
 - It does **not** apply deletions — the deletion-vector section is carried
@@ -846,7 +846,7 @@ delimited-table reader is **ungated** (no libhdf5); an `.h5ad` source needs
 
 For the analyst-facing walkthrough — which caller writes which column, how to
 export per-batch h5ads, how to combine several tools — see
-[docs/scanpy.md § Landing external per-cell annotations](scanpy.md#landing-external-per-cell-annotations-doublet-detection).
+[docs/scanpy/external-annotations.md § Landing external per-cell annotations](scanpy/external-annotations.md#landing-external-per-cell-annotations-doublet-detection).
 This section covers the operational invariants.
 
 ### uns payloads ride in the same commit
@@ -880,7 +880,7 @@ is a new per-cell column (a batch key, a score, a QC flag) should
 survives (see the invariants below), and `scx rollback` undoes it. It is also
 sandbox-safe — callable from restricted-exec `python` steps whose builtins
 lack `__import__` (see
-[docs/api.md § Restricted-exec (sandbox) safety](api.md#restricted-exec-sandbox-safety)).
+[docs/api/python.md § Restricted-exec (sandbox) safety](api/python.md#restricted-exec-sandbox-safety)).
 
 ### In place, via the same harness as append
 

@@ -2,8 +2,8 @@
 
 `test_experiment_stub_coverage.py` does this for `Experiment.to_anndata` from a
 hand-written `_DOC_SIGNATURES` table of `(file, method, regex)` rows. That shape
-does not scale here: `docs/api.md` and `skills/scx-usage/reference/processing.md`
-carry roughly seventy `pyscx.accel.*` signature bullets between them, so a table
+does not scale here: `docs/api/python-accel.md` and
+`skills/scx-usage/reference/processing.md` carry roughly seventy `pyscx.accel.*` signature bullets between them, so a table
 would rot exactly like the docs it guards and a newly added bullet would be
 covered by nothing. This module **discovers** the bullets instead.
 
@@ -31,7 +31,7 @@ guard passed it. A documented default that is not a literal, and a pyo3 sentinel
 default (`...`), are exempt — see `_same_default`.
 
 The docs also state kwargs in a *second*, non-signature shape: the accel
-compatibility matrix in `docs/scanpy.md`. That table is deliberately incomplete
+compatibility matrix in `docs/scanpy/accelerators.md`. That table is deliberately incomplete
 (rows read "(PCA + neighbors kwargs, see below)"), so it is checked one way only
 — see `test_scanpy_matrix_names_no_phantom_kwargs`.
 """
@@ -51,13 +51,17 @@ import pyscx.accel as accel
 # The files carrying hand-maintained accel signature bullets, and whether a
 # bare (unqualified) name in one of them is an accel function.
 #
-# `docs/api.md` documents several APIs and **must** be read qualified-only: its
-# `ScxBackedSparseDataset` section has `- \`row_sums()\` / \`col_sums()\``
-# bullets for the *handle* methods, whose names collide with
-# `pyscx.accel.col_sums` and whose signatures are empty. The skills reference is
-# the accel usage page, so bare names there are ours.
+# The API reference is read qualified-only. Before it was split into
+# `docs/api/`, one page also carried the `ScxBackedSparseDataset` section, whose
+# `- \`row_sums()\` / \`col_sums()\`` bullets are *handle* methods that collide
+# with `pyscx.accel.col_sums` and have empty signatures; qualified-only keeps
+# that safe if handle bullets ever land beside the accel ones again. Every
+# qualified accel bullet in `docs/api/` lives in `python-accel.md` — add a page
+# here if that changes (`test_the_sweep_found_bullets` requires each listed
+# file to carry at least one). The skills reference is the accel usage page, so
+# bare names there are ours.
 _DOC_FILES = {
-    "docs/api.md": "qualified",
+    "docs/api/python-accel.md": "qualified",
     "skills/scx-usage/reference/processing.md": "bare-ok",
 }
 
@@ -105,7 +109,7 @@ def _balanced_group(text: str, open_at: int) -> str | None:
     Stops at the *matching* close paren, which is what keeps a trailing return
     annotation (`) -> pandas.DataFrame`) and any prose parentheses after the
     bullet out of the captured signature. A naive `\\((.*?)\\)` regex runs past
-    the arrow and mis-parses the ~19 `api.md` bullets that carry one.
+    the arrow and mis-parses the ~19 `python-accel.md` bullets that carry one.
     """
     assert text[open_at] == "("
     depth = 0
@@ -149,7 +153,7 @@ def parse_doc_params(signature: str) -> list[tuple[str, str, object]]:
     `def _f(<signature>): pass`, which gives names, `*`/`/` separators,
     `*args`/`**kwargs` and defaults from one grammar that already agrees with
     `inspect.signature`. Two substitutions make the docs' shorthand parseable —
-    `#` comments are stripped (the `docs/scanpy.md` fenced blocks annotate every
+    `#` comments are stripped (the `docs/scanpy/` fenced blocks annotate every
     line, and `# None = load all layers` would otherwise contribute a parameter
     called `None`), and a bare `...` elision marker becomes a named placeholder,
     since `def _f(...)` is not valid Python.
@@ -386,8 +390,11 @@ def test_doc_signature_matches_runtime(doc_path, lineno, name, signature):
     )
 
 
+_SCANPY_MATRIX_DOC = "docs/scanpy/accelerators.md"
+
+
 def test_scanpy_matrix_names_no_phantom_kwargs():
-    """`docs/scanpy.md`'s accel matrix may abbreviate, but not invent.
+    """`docs/scanpy/accelerators.md`'s accel matrix may abbreviate, but not invent.
 
     The table's two kwarg columns are split by provenance (scanpy-parity vs
     scx-only) and are deliberately **incomplete** — several rows read
@@ -401,7 +408,7 @@ def test_scanpy_matrix_names_no_phantom_kwargs():
     checked = 0
     phantom: list[str] = []
     for lineno, line in enumerate(
-        (root / "docs/scanpy.md").read_text().splitlines(), 1
+        (root / _SCANPY_MATRIX_DOC).read_text().splitlines(), 1
     ):
         m = re.match(r"^\|\s*`(\w+)`\s*\|", line)
         if not m:
@@ -416,14 +423,14 @@ def test_scanpy_matrix_names_no_phantom_kwargs():
         params = set(inspect.signature(fn).parameters)
         for kw in sorted(set(re.findall(r"`([a-z_][a-z_0-9]*)`", cells[3] + " " + cells[4]))):
             if kw not in params:
-                phantom.append(f"docs/scanpy.md:{lineno} `{m.group(1)}` names `{kw}`")
+                phantom.append(f"{_SCANPY_MATRIX_DOC}:{lineno} `{m.group(1)}` names `{kw}`")
 
     assert checked >= 20, (
-        f"only {checked} accel rows matched in docs/scanpy.md's compatibility "
+        f"only {checked} accel rows matched in {_SCANPY_MATRIX_DOC}'s compatibility "
         "matrix — the row shape changed and this check went vacuous"
     )
     assert not phantom, (
-        "docs/scanpy.md's accel matrix names kwargs that do not exist at "
+        f"{_SCANPY_MATRIX_DOC}'s accel matrix names kwargs that do not exist at "
         "runtime:\n  " + "\n  ".join(phantom)
     )
 
@@ -581,7 +588,7 @@ def test_pyscx_and_accel_are_the_same_module_the_docs_describe():
 def test_no_documented_accel_function_has_disappeared():
     """A `pyscx.accel.`-qualified bullet must name something that exists.
 
-    Without this a rename leaves the old bullet in `docs/api.md` documenting a
+    Without this a rename leaves the old bullet in `docs/api/python-accel.md` documenting a
     function nobody can call, and the sweep would simply not collect it — a
     stale signature that never goes red. The bare-name file is exempt: it mixes
     accel calls with `Experiment` methods and `sc.pp.*` references, none of

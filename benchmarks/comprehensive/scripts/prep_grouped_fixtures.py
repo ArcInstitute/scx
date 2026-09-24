@@ -30,10 +30,10 @@ _LOADER = Path("/large_storage/arcinfra/projects/state-designer/loader")
 FIXTURES: dict[str, Path] = {
     "replogle_k562": _LOADER / "Replogle2022" / "k562_n600.h5ad",
     "tahoe_c38": _LOADER / "tahoe-100m" / "c38-n10.h5ad",
-    # Real RAW-COUNT Perturb-seq fixture (integer UMIs, CSR) — shardad's home
-    # turf for the integer-count compression + grouped head-to-head. The other
-    # two real fixtures are float/normalized. 136,051 cells x 18,151 genes,
-    # ~909M nnz; obs `target_gene` (2354 KOs) + `non-targeting` control.
+    # Real RAW-COUNT Perturb-seq fixture (integer UMIs, CSR) for the
+    # integer-count compression + grouped head-to-head. The other two real
+    # fixtures are float/normalized. 136,051 cells x 18,151 genes, ~909M nnz;
+    # obs `target_gene` (2354 KOs) + `non-targeting` control.
     "chemogenetic_rgfp": _LOADER / "chemogenetic_h1" / "run1" / "RGFP-n5.h5ad",
 }
 

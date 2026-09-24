@@ -7,7 +7,7 @@ up credentials, choose the right on-cloud layout, and tune throughput.
 
 For related references:
 - [docs/architecture.md §Cloud Operations](architecture.md#cloud-operations-scx-cloud) — crate internals
-- [docs/api.md §scx-cloud](api.md#scx-cloud--cloud-operations) — API reference
+- [docs/api/rust-loader-cloud.md §scx-cloud](api/rust-loader-cloud.md#scx-cloud--cloud-operations) — API reference
 - [docs/sharding.md §Cloud operations](sharding.md#cloud-operations-shard-level-selectivity) — shard-level selective pull
 - [docs/multithreading.md §Cloud I/O](multithreading.md#cloud-io) — concurrency model
 
@@ -471,7 +471,7 @@ Predicate evaluation uses, in order:
 1. predicate-index sections when present
    (`scx convert --index-obs cell_type,…` or
    `--index-preset cellxgene` at write time — see
-   [docs/api.md § Conversion-time predicate indexes and detection bitmaps](api.md#conversion-time-predicate-indexes-and-detection-bitmaps)),
+   [docs/api/indexes.md § Conversion-time predicate indexes and detection bitmaps](api/indexes.md#conversion-time-predicate-indexes-and-detection-bitmaps)),
 2. catalog shard statistics otherwise,
 3. a full obs scan as a fallback.
 
@@ -531,7 +531,7 @@ adata = pyscx.read_cloud(
 )
 ```
 
-See [docs/api.md § Declaring the dtype at `collect()`](api.md#declaring-the-dtype-at-collect)
+See [docs/api/python-query.md § Declaring the dtype at `collect()`](api/python-query.md#declaring-the-dtype-at-collect)
 for the decode-vs-cast rule. Returns a regular `anndata.AnnData`. `file://` URLs and local
 paths work too, so the same call serves local exploded directories.
 

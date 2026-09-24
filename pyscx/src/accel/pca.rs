@@ -392,7 +392,8 @@ pub(crate) fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResul
 ///         method="covariance".
 ///
 /// Note: GPU mode uses f32 precision throughout (CPU uses f64 intermediates),
-/// producing slightly different but equally valid results. See docs/scanpy.md.
+/// producing slightly different but equally valid results. See
+/// docs/scanpy/accel-gpu.md § GPU vs CPU numerical differences.
 /// Stable `&'static str` label for a validated `spmm_policy` kwarg.
 #[cfg(feature = "gpu")]
 fn spmm_policy_label(spmm_policy: &str) -> &'static str {

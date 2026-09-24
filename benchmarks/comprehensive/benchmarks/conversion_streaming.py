@@ -139,7 +139,7 @@ SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
 
 # Above this many cells the `materialize` arm is skipped and only `streaming`
 # runs. The materialize arm loads the whole h5ad: measured 13.6 GB peak RSS on
-# census_1m (98.2 s / 851 MB for streaming — see docs/performance.md
+# census_1m (98.2 s / 851 MB for streaming — see docs/performance/conversion.md
 # "Streaming conversion"), which extrapolates to ~68 GB at census_5m and ~136 GB
 # at census_10m. It is a comparison baseline, not the thing under contract — the
 # `streaming_peak_rss_mb` floor gates the streaming arm — so it is bounded here

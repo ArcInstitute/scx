@@ -1,11 +1,11 @@
 """`Experiment.to_anndata`'s signature exists in five hand-maintained copies.
 
 The pyo3 `#[pyo3(signature = ...)]`, the `.pyi` stub, the kwarg list in
-`docs/api.md`, the fenced "Full signature" block in `docs/scanpy.md`, and a
+`docs/api/python-experiment.md`, the fenced "Full signature" block in `docs/scanpy/loading.md`, and a
 second bulleted copy in `skills/scx-usage/reference/processing.md`. Nothing
 checked them against each other, and by the time this test was written two had
 already drifted: the skills copy had lost `container` / `data_dtype` /
-`index_dtype` / `allow_lossy`, and the scanpy.md block had never gained
+`index_dtype` / `allow_lossy`, and the scanpy-guide block had never gained
 `preserve_slots` / `modality` / the four dtype kwargs.
 
 `test_accel_stub_coverage.py` does the equivalent job for `accel.pyi`, but it
@@ -39,14 +39,14 @@ from test_docstring_coverage import _kwargs_from_text_signature  # noqa: E402
 _STUB_CHECKED = ("to_anndata", "to_gpu_anndata")
 
 # (file, method, regex capturing the signature text). Three shapes, because the
-# copies are written three ways: a markdown bullet in api.md and processing.md,
-# and a fenced python call in scanpy.md. `processing.md` summarises `Experiment`
+# copies are written three ways: a markdown bullet in python-experiment.md and processing.md,
+# and a fenced python call in docs/scanpy/loading.md. `processing.md` summarises `Experiment`
 # for the usage skill and never mentions `to_gpu_anndata`, so listing it there
 # would fail on an absence that is not drift.
 _DOC_SIGNATURES = (
-    ("docs/api.md", "to_anndata", r"^- `to_anndata\((.*?)\)`"),
-    ("docs/api.md", "to_gpu_anndata", r"^- `to_gpu_anndata\((.*?)\)`"),
-    ("docs/scanpy.md", "to_anndata", r"^exp\.to_anndata\(\n(.*?)^\)"),
+    ("docs/api/python-experiment.md", "to_anndata", r"^- `to_anndata\((.*?)\)`"),
+    ("docs/api/python-experiment.md", "to_gpu_anndata", r"^- `to_gpu_anndata\((.*?)\)`"),
+    ("docs/scanpy/loading.md", "to_anndata", r"^exp\.to_anndata\(\n(.*?)^\)"),
     (
         "skills/scx-usage/reference/processing.md",
         "to_anndata",

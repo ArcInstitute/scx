@@ -649,7 +649,7 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
 /// The filtered read's half of the categorical contract. A full `read_obs()`
 /// keeps the declared vocabulary whole (unused levels included); a
 /// `filter_obs(...).collect()` result carries only the categories present in
-/// the surviving rows (`docs/api.md` § Filtered-obs categorical semantics), the
+/// the surviving rows (`docs/api/rust-engine.md` § Filtered-obs categorical semantics), the
 /// way an AnnData subset does. The engine applies this to a result whose rows
 /// the caller narrowed (an obs predicate or a limit) on both obs layouts; an
 /// unfiltered `collect()` keeps the declared list like `read_obs()`. Before

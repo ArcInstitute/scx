@@ -28,7 +28,8 @@ use super::gpu::resolve_device;
 ///         "gpu:N" to target CUDA device N on multi-GPU systems.
 ///
 /// Note: GPU mode uses cuVS CAGRA (graph-based ANN) instead of HNSW. Both are
-/// approximate; neighbor sets may differ slightly. See docs/scanpy.md.
+/// approximate; neighbor sets may differ slightly. See
+/// docs/scanpy/accel-embedding-clustering.md.
 #[pyfunction]
 #[pyo3(signature = (adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto"))]
 #[allow(clippy::too_many_arguments)]

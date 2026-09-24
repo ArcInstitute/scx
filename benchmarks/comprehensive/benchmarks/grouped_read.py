@@ -1,26 +1,29 @@
-"""Cross-format grouped-sharding head-to-head — scx vs shardad.
+"""Grouped-sharding read/write benchmark — scx's F1/F2 condition grouping.
 
-This is the direct comparison between scx's F1/F2 condition-grouped sharding and
-shardad's native condition grouping (``.shad``). For every grouping dataset (the
-:data:`grouped_sort.GROUP_SPEC` entries) it times, **per format**, a grouped
-write plus per-perturbation grouped reads, and verifies the read-back layout:
+Times scx's grouped write plus per-perturbation grouped reads, and verifies the
+read-back layout, for every grouping dataset (the :data:`grouped_sort.GROUP_SPEC`
+entries):
 
   * ``grouped_write`` — write a reference-first / group-clustered file directly
-    from the source h5ad. scx: ``pyscx.from_h5ad(group_by=, reference=)``;
-    shardad: ``write_sharded(group_by=, reference=)``.
+    from the source h5ad via ``pyscx.from_h5ad(group_by=, reference=)``.
   * ``read_group``    — read one perturbation's cells back
     (``read_group(label)``), once per sampled label; the median is the headline.
     ``cells_read`` is recorded so cells/s throughput is derivable.
   * ``read_reference`` — read the isolated reference/control cells
     (``read_reference()``), when the dataset configures a reference.
+  * ``query_filter``  — the same "read one perturbation" access pattern via the
+    lazy query engine + predicate pushdown (the group_by column is
+    auto-indexed on grouped convert).
+  * ``iter_group_shards`` — a full streaming pass over every (non-reference)
+    group, for throughput (cells/s) and true peak RSS.
   * ``correctness``   — a zero-wall record: every read group's rows carry its
     label, and the reference rows all carry the reference label (same semantics
-    as ``grouped_sort._check_correctness``, but for *both* formats).
+    as ``grouped_sort._check_correctness``).
 
-Supported formats: ``scx_auto`` and ``shardad`` — every other variant returns
-``None`` so the orchestrator skips it. Datasets absent from ``GROUP_SPEC`` also
-return ``None``. Like ``grouped_sort`` this benchmark builds its own grouped
-files in-process from the source h5ad (real datasets via
+Supported formats: ``scx_auto`` only — every other variant returns ``None`` so
+the orchestrator skips it. Datasets absent from ``GROUP_SPEC`` also return
+``None``. Like ``grouped_sort`` this benchmark builds its own grouped files
+in-process from the source h5ad (real datasets via
 ``prep_grouped_fixtures.py``; synthetic via ``_pert_synth``), so it carries no
 Phase-A conversion dependency — it lives in ``run_parallel.py``'s
 ``_NO_CONVERSION`` set.
@@ -28,12 +31,11 @@ Phase-A conversion dependency — it lives in ``run_parallel.py``'s
 ``peak_rss_mb`` is sampled immediately *after* each op (not a true peak), matching
 ``grouped_sort``. No perf floors are gated — grouped perf is hardware/density
 sensitive; only the correctness ints are hard-gated (see ``thresholds.yaml``).
-Head-to-head wall/size numbers land in the report and ``docs/performance.md``.
+Numbers land in the report and ``docs/performance/query-and-file-ops.md``.
 """
 
 from __future__ import annotations
 
-import functools
 import logging
 import tempfile
 from pathlib import Path
@@ -51,17 +53,16 @@ from benchmarks.comprehensive.rss import PeakRssSampler
 
 logger = logging.getLogger(__name__)
 
-# scx grouped sharding vs shardad's native grouping. Both keys trigger the
-# benchmark; run_parallel.py's cohort builder reads this to skip other formats.
-SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto", "shardad"})
+# scx's grouped sharding. `scx_auto` is the single trigger (read by
+# run_parallel.py's cohort builder to skip other format variants).
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
 
-# grouped_read is a head-to-head, so it only runs on datasets both formats can
-# ingest. shardad is an integer-count format (its grouped path-source writer
-# narrow-casts X.data to uint32 and raises LossyCastError on float X), so the
-# float paired-expression fixture ``pert_synth_10k`` (make_paired_adata) is
-# excluded here — it stays covered by the SCX-only ``grouped_sort``. The
-# remaining GROUP_SPEC datasets are all raw counts: ``nb_glm_synth`` (synthetic
-# stratified counts), ``replogle_k562`` (dense counts), ``tahoe_c38`` (CSR counts).
+# The float paired-expression fixture (`pert_synth_10k`, `make_paired_adata`)
+# is already covered end-to-end by the SCX-only `grouped_sort` (sort_group /
+# convert_one / convert_two / convert_sort_by); excluded here to avoid
+# duplicating that coverage. The remaining GROUP_SPEC datasets are all raw
+# counts: `nb_glm_synth` (synthetic stratified counts), `replogle_k562` (dense
+# counts), `tahoe_c38` (CSR counts).
 _DATASETS: frozenset[str] = frozenset(GROUP_SPEC) - {"pert_synth_10k"}
 
 # Grouped writes are minutes-scale on real Perturb-seq files; cap reps low.
@@ -70,23 +71,8 @@ _MAX_WRITE_RUNS = 2
 _MAX_READ_LABELS = 5
 
 
-def _workers() -> int:
-    """shardad worker count (see shardad_runner._workers)."""
-    import os
-
-    env = os.environ.get("RAYON_NUM_THREADS", "").strip()
-    if env:
-        try:
-            n = int(env)
-            if n > 0:
-                return n
-        except ValueError:
-            pass
-    return os.cpu_count() or 1
-
-
 # ----------------------------------------------------------------------------
-# Per-format adapters. Each returns callables over a grouped output path.
+# scx grouped write / open, and per-format-independent helpers.
 # ----------------------------------------------------------------------------
 
 
@@ -110,62 +96,15 @@ def _scx_open(out: Path):
     return exp, labels, exp.read_group, exp.read_reference
 
 
-def _shardad_grouped_write(out: Path, src: Path, col: str, ref: str | None):
-    """Grouped write for shardad, timed to include the source read (so it's
-    comparable to scx's ``from_h5ad``, which also reads + groups + encodes).
-
-    shardad's *backed* (path-source) grouped encoder is integer-count only — it
-    hardcodes a uint32 cast and raises ``LossyCastError`` on float or dense X.
-    The available real perturbation fixtures are float/normalized (and one is
-    dense), so we load the source into an in-memory CSR AnnData and pass that to
-    ``write_sharded`` — its in-memory grouped encoder preserves float32 and
-    accepts any layout. This is the honest shardad workflow for non-integer /
-    dense data; scx streams from the h5ad path instead. The in-memory load is
-    inside the timed op so both formats' write timings include the source read.
-    """
-    from shardad import write_sharded
-
-    ref_arg = [ref] if ref is not None else None
-    nworkers = _workers()
-
-    def _do() -> None:
-        import anndata
-        import scipy.sparse as sp
-
-        a = anndata.read_h5ad(str(src))
-        if not sp.isspmatrix_csr(a.X):
-            a.X = sp.csr_matrix(a.X)
-        write_sharded(
-            a, str(out), group_by=col, reference=ref_arg,
-            overwrite=True, n_workers=nworkers,
-        )
-
-    return _time_op(_do)
+def _grouped_output_path(workdir: Path, i: int) -> Path:
+    return workdir / f"grouped_{i}.scx"
 
 
-def _shardad_open(out: Path, group_col: str):
-    import pandas as pd
-    from shardad import ShardedArchive
-
-    arch = ShardedArchive(str(out))
-    # obs is readable without decoding X; unique group_col values are the labels
-    # (the reference cells carry the reference label too, mirroring scx's
-    # group_labels() which also includes the reference).
-    labels = [str(x) for x in pd.unique(arch.obs[group_col])]
-    return arch, labels, arch.read_group, arch.read_reference
-
-
-def _grouped_output_path(workdir: Path, fmt_key: str, i: int) -> Path:
-    ext = "shad" if fmt_key == "shardad" else "scx"
-    return workdir / f"grouped_{i}.{ext}"
-
-
-def _iter_all_groups(fmt: str, handle) -> tuple[int, float, float]:
+def _iter_all_groups(handle) -> tuple[int, float, float]:
     """Full streaming pass over all (non-reference) groups.
 
-    Returns ``(total_cells, wall_s, true_peak_rss_mb)``. scx and shardad both
-    expose ``iter_group_shards`` yielding a per-shard object with ``to_anndata``;
-    shardad takes prefetch/worker knobs for its background-decode pipeline.
+    Returns ``(total_cells, wall_s, true_peak_rss_mb)``. scx exposes
+    ``iter_group_shards`` yielding a per-shard object with ``to_anndata``.
     """
     import gc
     import time
@@ -174,12 +113,7 @@ def _iter_all_groups(fmt: str, handle) -> tuple[int, float, float]:
     total = 0
     with PeakRssSampler() as sampler:
         t0 = time.perf_counter()
-        if fmt == "shardad":
-            nw = _workers()
-            it = handle.iter_group_shards(prefetch=nw, n_workers=nw)
-        else:
-            it = handle.iter_group_shards()
-        for shard in it:
+        for shard in handle.iter_group_shards():
             total += int(shard.to_anndata().n_obs)
         wall = time.perf_counter() - t0
     return total, wall, sampler.peak_mb
@@ -223,23 +157,16 @@ def run(
     cold_cache: bool = False,
     converted_path: Path | None = None,
 ) -> BenchmarkResult | None:
-    """Execute the grouped read/write head-to-head for one (dataset, format)."""
+    """Execute the grouped read/write benchmark for one (dataset, scx_auto) pair."""
     if format_variant is None or format_variant.key not in SUPPORTED_FORMATS:
         return None
     if dataset.name not in _DATASETS:
-        return None  # no grouping column configured, or float source (see _DATASETS)
+        return None  # no grouping column configured, or covered by grouped_sort (see _DATASETS)
     spec = GROUP_SPEC.get(dataset.name)
     if spec is None:
         return None
     group_col, reference = spec
     fmt = format_variant.key
-
-    if fmt == "shardad":
-        grouped_write = _shardad_grouped_write
-        open_grouped = functools.partial(_shardad_open, group_col=group_col)
-    else:
-        grouped_write = _scx_grouped_write
-        open_grouped = _scx_open
 
     result = BenchmarkResult(
         benchmark="grouped_read",
@@ -262,15 +189,11 @@ def run(
         result.metadata["source_matrix_format"] = _detect_matrix_format(source_h5ad)
 
         # --- grouped_write (timed, capped reps) ---
-        # Both arms read from the same source h5ad. scx streams via from_h5ad;
-        # shardad loads an in-memory CSR AnnData inside its timed op (see
-        # _shardad_grouped_write) — the write timing includes the source read
-        # for both formats.
         write_runs = min(n_runs, _MAX_WRITE_RUNS)
         last_out: Path | None = None
         for i in range(write_runs):
-            out = _grouped_output_path(workdir, fmt, i)
-            _, wall, rss = grouped_write(out, source_h5ad, group_col, reference)
+            out = _grouped_output_path(workdir, i)
+            _, wall, rss = _scx_grouped_write(out, source_h5ad, group_col, reference)
             result.add_run(
                 wall_s=wall,
                 peak_rss_mb=rss,
@@ -289,7 +212,7 @@ def run(
         result.file_size_bytes = last_out.stat().st_size
 
         # --- read_group (per sampled label) + read_reference + correctness ---
-        _handle, labels, read_group, read_reference = open_grouped(last_out)
+        _handle, labels, read_group, read_reference = _scx_open(last_out)
         sample = [lbl for lbl in labels if lbl != reference][:_MAX_READ_LABELS]
         logger.info(
             "  read_group[%s]: %d labels sampled of %d", fmt, len(sample), len(labels)
@@ -313,29 +236,28 @@ def run(
                 cells_read=int(ref_ad.n_obs) if ref_ad is not None else 0,
             )
 
-        # --- query_filter (scx only): "read one perturbation" via the lazy
-        # query engine + predicate pushdown, vs read_group's byte-range read.
-        # The group_by column is auto-indexed on grouped convert, so filter_obs
-        # pushes down. shardad has no query engine → scx-only scenario. ---
-        if fmt == "scx_auto":
-            for lbl in sample:
-                def _q(label=lbl):
-                    return _handle.query().filter_obs(
-                        f"{group_col} == '{label}'"
-                    ).collect()
+        # --- query_filter: "read one perturbation" via the lazy query engine +
+        # predicate pushdown, vs read_group's byte-range read. The group_by
+        # column is auto-indexed on grouped convert, so filter_obs pushes
+        # down. ---
+        for lbl in sample:
+            def _q(label=lbl):
+                return _handle.query().filter_obs(
+                    f"{group_col} == '{label}'"
+                ).collect()
 
-                res, wall, rss = _time_op(_q)
-                result.add_run(
-                    wall_s=wall,
-                    peak_rss_mb=rss,
-                    scenario="query_filter",
-                    label=lbl,
-                    cells_read=int(getattr(res, "n_obs", 0) or 0),
-                )
+            res, wall, rss = _time_op(_q)
+            result.add_run(
+                wall_s=wall,
+                peak_rss_mb=rss,
+                scenario="query_filter",
+                label=lbl,
+                cells_read=int(getattr(res, "n_obs", 0) or 0),
+            )
 
-        # --- iter_group_shards: full streaming pass over all groups (both
-        # formats) — throughput (cells/s) + true peak RSS (~one shard resident).
-        cells, wall, peak = _iter_all_groups(fmt, _handle)
+        # --- iter_group_shards: full streaming pass over all groups —
+        # throughput (cells/s) + true peak RSS (~one shard resident).
+        cells, wall, peak = _iter_all_groups(_handle)
         result.add_run(
             wall_s=wall,
             peak_rss_mb=peak,

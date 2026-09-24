@@ -825,7 +825,7 @@ fn mean_pairwise_distance_self_with_budget<F: PairwiseFloat>(
             // *gemm* only once there is more than one block, since the first
             // block's operand is still all of `a` — total gemm work is
             // `≈ (k+1)/2k` of the square at `k` blocks. Measured 1.03× at one
-            // block and 1.38× at eight (docs/performance.md).
+            // block and 1.38× at eight (docs/performance/perturbation-metrics.md).
             pairwise_gemm_row_sums(a, a, n, n, n_dims, metric, GemmShape::UpperTriangle, budget)
         }
         DistanceBackend::Scalar => {

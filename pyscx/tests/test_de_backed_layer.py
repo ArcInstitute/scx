@@ -14,8 +14,9 @@ raised, because `adata.layers[name]` is `ScxBackedLayerDataset` — a separate
 
 (`rank_genes_groups` fell past the sparse arm — `scipy.sparse.issparse(handle)`
 is `False` — into the dense arm's `np.asarray`; `pdex_ref` died earlier, in
-`is_log1p` auto-detection's `np.max`.) `docs/scanpy.md` documented the kwarg for
-both with no such restriction.
+`is_log1p` auto-detection's `np.max`.)
+`docs/scanpy/accel-differential-expression.md` documented the kwarg for both
+with no such restriction.
 
 The second half is a silent one. `rank_genes_groups_df` used the prologue
 without the `preserve_var_order` guard, so on a presentation-ordered backed `X`
@@ -346,7 +347,7 @@ def test_the_documented_remedy_works_on_an_ordered_x(ordered):
     """Materialising the matrix the op reads must actually let it run.
 
     The refusal tells the caller to materialise "the matrix the op reads", and
-    `docs/api.md` says the guard covers that matrix rather than `adata.X`. Both
+    `docs/api/python-experiment.md` says the guard covers that matrix rather than `adata.X`. Both
     were false while the entry prologue ran the X-only check *before*
     `select_de_matrix` chose the layer: with a presentation-ordered `X`, the
     caller could materialise `counts`, ask for `layer="counts"`, and still be

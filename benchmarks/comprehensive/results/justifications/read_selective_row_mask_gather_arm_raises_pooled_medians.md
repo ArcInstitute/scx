@@ -350,24 +350,6 @@ triples:
     format: scx_zstd
     dataset: tabula_sapiens_100k
   - benchmark: read_selective
-    format: shardad
-    dataset: census_1m
-  - benchmark: read_selective
-    format: shardad
-    dataset: census_500k
-  - benchmark: read_selective
-    format: shardad
-    dataset: pbmc10k
-  - benchmark: read_selective
-    format: shardad
-    dataset: pbmc3k
-  - benchmark: read_selective
-    format: shardad
-    dataset: smartseq2
-  - benchmark: read_selective
-    format: shardad
-    dataset: tabula_sapiens_100k
-  - benchmark: read_selective
     format: slaf
     dataset: census_1m
   - benchmark: read_selective

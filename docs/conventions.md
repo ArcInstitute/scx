@@ -110,7 +110,7 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
     - **A route that materializes and defers to another library runs no guard
       at all.** Projected `max(axis=1)` / `min(axis=1)` go through
       `to_memory()` into scipy, so they answer where their unprojected twins
-      reject. Written down in `docs/api.md`'s route table rather than left for
+      reject. Written down in `docs/api/rust-format-io.md`'s route table rather than left for
       the next reader to discover.
   - **A consumer bounded by a *different* axis owes its own check.** The dense
     scatter in `typed_read.rs` sizes its buffer from the file header's `n_vars`

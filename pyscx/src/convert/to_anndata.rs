@@ -857,7 +857,7 @@ fn eval_preserve_slots_mask<'py>(
         (format!(
             "preserve_slots=True evaluated obs_filter {expr:?} via pandas.eval; \
              grammar differs from the SCX predicate engine used by \
-             preserve_slots=False (see docs/scanpy.md \"Filter Expression Compatibility\")."
+             preserve_slots=False (see docs/scanpy/loading.md \"Filter Expression Compatibility\")."
         ),),
     )?;
     Ok(mask)

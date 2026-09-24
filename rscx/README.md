@@ -174,7 +174,7 @@ controls row-group framing; the defaults produce v4-framed files matching
 pyscx/CLI.
 
 **Parity note.** A few pyscx/CLI write-side knobs are intentionally not exposed
-in R (tracked in `ROADMAP.md` § 3.3): streaming-convert threading
+in R: streaming-convert threading
 (`reader_threads`/`writer_queue_depth`), grouped-write args (`group_by` /
 `reference` — R has the F2 *reads* `read_group`/`read_reference` only), the accel
 `device=` selector (rscx accelerators are CPU-only), and the byte/nnz-aware

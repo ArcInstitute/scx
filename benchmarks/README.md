@@ -149,7 +149,6 @@ The benchmark suite compares SCX against all relevant single-cell data formats:
 | **Zarr** (blosc-lz4) | CSR arrays, Zarr v3, blosc-lz4 | `zarr` >= 3.0 | Fast decompression variant |
 | **TileDB-SOMA** | SOMAExperiment | `tiledbsoma` >= 2.3 + `tiledbsoma_ml` | CELLxGENE Census native format |
 | **SLAF** | SLAF directory (Lance + DuckDB) | `slafdb` >= 0.5.2 | SQL-native lazy format. Isolated `scx-bench-slaf` env (DuckDB/Lance conflict with TileDB/Zarr pins) |
-| **Shardad** | Single `.shad` file (condition-grouped CSR shards) | `shardad` (local build) | Counts-oriented sharded h5ad replacement; condition (`group_by`) grouping is its specialty — the head-to-head axis for `grouped_read`. Shares the `scx-bench` env (deps compatible; not on PyPI/conda — installed editable from `~/dev/python/shardad`, builds a Rust core). |
 | **SCX** | auto, none, scx1, zstd, pcodec, lz4 | `pyscx` / `scx-cli` | System under test (multiple codec variants) |
 
 ### Additional Competitors
@@ -190,10 +189,7 @@ The suite measures seven core dimensions, plus accelerator, GPU, lazy preprocess
 | **Streaming export** (3.7d) | `export_streaming.py` | Phase 8 — paired `pyscx.to_h5ad` / `pyscx.to_h5mu` with `stream=True` vs `stream=False`. Wall time and peak RSS for both paths; gates on the streaming row's `streaming_peak_rss_mb` floor at `census_1m`. Multimodal datasets auto-dispatch to `to_h5mu`. SCX-only |
 | **Cell-eval parity perf** (3.15) | `cell_eval_parity_perf.py` | SCX `pyscx.accel.*` perturbation metrics vs cell-eval reference, on synthetic perturbation datasets at 100K–1M cells |
 | **Grouped sharding** (SCX-only) | `grouped_sort.py` | `scx sort --group-by` + convert-time grouping (one-pass vs two-pass density auto-route) + read-back correctness, on the perturbation grouping fixtures |
-| **Grouped read/write** (scx vs shardad) | `grouped_read.py` | Cross-format head-to-head: grouped write + per-perturbation `read_group` / `query_filter` / `iter_group_shards` throughput + reference isolation, scx vs shardad, on integer-count grouping fixtures (`nb_glm_synth`, `replogle_k562`, `tahoe_c38`, `chemogenetic_rgfp`) |
-| **Out-of-core peak RSS** (scx vs shardad) | `ooc_rss_boundary.py` | Full-data-pass true-peak RSS: scx bounded streaming vs shardad full materialize, across `census_500k/1m/5m` — scx-flat vs shardad-linear (the out-of-core moat) |
-| **Shardad fidelity** | `shardad_fidelity.py` | shardad round-trip parity (source h5ad → `.shad` → `to_anndata` equals source) + dtype/materialization knobs. shardad-only (`roundtrip`/`correctness` are SCX-codec-specific) |
-| **ML loader (shardad arm)** | `ml_loader.py` | shardad row-slice loader alongside SCX `TrainingDataset` / AnnData / TileDB-SOMA-ML / SLAF (batches/s, TTFB, peak RSS) |
+| **Out-of-core peak RSS** (SCX-only) | `ooc_rss_boundary.py` | Full-data-pass true-peak RSS: scx bounded streaming vs scx full materialize, across `census_500k/1m/5m` — the out-of-core moat |
 
 ### Measurement Protocol
 
@@ -1199,7 +1195,6 @@ every capture run picks it up automatically.
 >
 > | absent | why |
 > |---|---|
-> | `cellstream` (all benchmarks) | upstream package restructured; the runner's member imports fail. 12 `ml_loader` floors are justification-suppressed as a result. `v0.11.2` had 47 rows. |
 > | `cloud_large_atlas` | its `<ds>.scxd/` fixtures are not staged in the bucket (~4.5 GB); the benchmark deliberately does not auto-upload. `v0.11.2` had 5 rows. |
 > | `cell_eval_parity_perf` | `cell_eval` / `pdex` are editable installs in `.venv` only and no conda env has them, while the orchestrator must run from `scx-bench`. `v0.11.2` had none either. |
 > | `cellset_gather` at census scale | does not fit a practical time budget — killed at 205 min on run 1/3 of one scenario. See thresholds' Deferred item 15. |
@@ -1602,7 +1597,7 @@ sbatch benchmarks/scripts/_run_phase0_data_wait_gate.sh
 ⚠️ **A null-model capture overwrites tracked manifest rows.** Every benchmark
 writes `results/raw/<benchmark>__<format>__<dataset>.json` before its snapshot
 is copied, and some of those files are git-tracked (force-added) because
-`docs/performance.md` cites them — the three `index_plan__scx_auto__*` rows
+`docs/performance/` cites them — the three `index_plan__scx_auto__*` rows
 among them. A capture with `SCX_BENCH_R3_NULL_MODEL_MS` set therefore replaces
 a published 25.14 batches/s row with a 16.89 one whose slowdown is the `sleep`
 the knob inserted. `_run_phase0_data_wait_gate.sh` restores those three paths

@@ -340,7 +340,7 @@ def test_index_dtype_after_a_typed_collect_is_refused_not_ignored(tmp_dir):
     # Declared at collect, it is honoured; repeating the same value is a no-op.
     #
     # `indices.dtype` is deliberately *not* the assertion: scipy normalises a
-    # `csr_matrix`'s index width on construction (docs/api.md says so for
+    # `csr_matrix`'s index width on construction (docs/api/python-experiment.md says so for
     # int16), so the buffer's dtype is not observable through the returned
     # matrix. What is observable is that a *conflicting* request is refused —
     # which can only happen if the collected buffer really is int64.

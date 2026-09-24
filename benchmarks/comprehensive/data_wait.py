@@ -9,7 +9,7 @@ applied to an exposed fraction `p` is worth `1 / [(1 - p) + p/s]` and no more â€
 Its own module rather than a helper inside `benchmarks/ml_loader.py`, because
 `index_plan` needs the same functions and importing `ml_loader` for them would
 drag every competitor-loader availability probe (soma_ml, scdataloader,
-annbatch, cellstream, ...) into `index_plan`'s import path.
+annbatch, ...) into `index_plan`'s import path.
 
 `steady_state_wait` is the one to quote: see its docstring for the measured
 case where the all-steps fraction and the same run's p95 said opposite things.
